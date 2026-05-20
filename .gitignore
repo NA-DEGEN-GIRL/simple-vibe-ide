@@ -1,0 +1,7 @@
+node_modules/
+dist/
+src-tauri/target/
+.vibe-ide/attachments/
+.vibe-ide/tmp/
+*.log
+.DS_Store
