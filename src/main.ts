@@ -209,6 +209,7 @@ interface WorkspaceSnapshot {
   noteTabs: NoteTabSnapshot[];
   activeNoteTabId: string;
   notePinned: boolean;
+  noteOpacity?: number;
   browserTabs: BrowserTab[];
   activeBrowserTabId: string;
   browserDeviceId: string;
@@ -418,6 +419,7 @@ const state = {
   noteTabs: [] as NoteTabState[],
   activeNoteTabId: '',
   notePinned: false,
+  noteOpacity: 100,
   forwards: [] as PortForwardResult[],
   detectedPorts: [] as DetectedPortItem[],
   browserTabs: [] as BrowserTab[],
@@ -447,6 +449,7 @@ let ideScale = 1;
 let editorFontSize = 13;
 let terminalFontSize = 13;
 let noteFontSize = 14;
+let noteOpacity = 100;
 let calculatorFontSize = 15;
 let restoringWorkspace = false;
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
@@ -569,6 +572,10 @@ app.innerHTML = `
           <span>Notes</span>
           <span id="notes-status" class="muted notes-status">Autosaved</span>
           <span class="spacer"></span>
+          <label class="notes-opacity-control" title="Note background opacity">
+            <span id="notes-opacity-value">100%</span>
+            <input id="notes-opacity" type="range" min="45" max="100" step="5" value="100" />
+          </label>
           <select id="notes-theme" class="notes-theme-select" title="Note theme"></select>
           <button id="notes-pin" class="panel-mode" title="Keep Notes above other widgets" aria-pressed="false">Pin</button>
           <button id="notes-new-tab" class="panel-mode" title="New note">+</button>
@@ -708,6 +715,8 @@ const el = {
   notesNewTab: document.querySelector<HTMLButtonElement>('#notes-new-tab')!,
   notesPin: document.querySelector<HTMLButtonElement>('#notes-pin')!,
   notesTheme: document.querySelector<HTMLSelectElement>('#notes-theme')!,
+  notesOpacity: document.querySelector<HTMLInputElement>('#notes-opacity')!,
+  notesOpacityValue: document.querySelector<HTMLSpanElement>('#notes-opacity-value')!,
   notesBody: document.querySelector<HTMLTextAreaElement>('#notes-body')!,
   notesStatus: document.querySelector<HTMLSpanElement>('#notes-status')!,
   notesPath: document.querySelector<HTMLDivElement>('#notes-path')!,
@@ -828,6 +837,7 @@ async function init() {
   setBrowserConsolePosition(state.browserConsolePosition);
   setBrowserConsoleVisible(false);
   applyNoteFontSize();
+  applyNoteOpacity();
   applyCalculatorFontSize();
   applyBrowserZoom();
   scheduleEditorRuntimeWarmup();
@@ -1334,6 +1344,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     noteTabs: [],
     activeNoteTabId: '',
     notePinned: false,
+    noteOpacity: 100,
     browserTabs: [],
     activeBrowserTabId: '',
     browserDeviceId: 'desktop',
@@ -1412,6 +1423,7 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
     noteTabs: state.noteTabs.map((tab) => ({ id: tab.id, path: tab.path, title: tab.title, theme: tab.theme })),
     activeNoteTabId: state.activeNoteTabId,
     notePinned: state.notePinned,
+    noteOpacity,
     browserTabs: state.browserTabs,
     activeBrowserTabId: state.activeBrowserTabId,
     browserDeviceId: el.browserShell.classList.contains('desktop') ? 'desktop' : state.browserDeviceId,
@@ -1473,6 +1485,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
     state.imageOpenInNewTab = Boolean(snapshot.imageOpenInNewTab);
     state.notePinned = Boolean(snapshot.notePinned);
+    noteOpacity = clamp(snapshot.noteOpacity || 100, 45, 100);
     state.browserZoom = clamp(snapshot.browserZoom || 1, 0.5, 2);
     state.calculatorExpression = snapshot.calculatorExpression || '';
     state.calculatorHistory = Array.isArray(snapshot.calculatorHistory) ? snapshot.calculatorHistory.slice(0, 20) : [];
@@ -1485,6 +1498,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     document.documentElement.style.setProperty('--editor-font-size', `${editorFontSize}px`);
     document.documentElement.style.setProperty('--ide-scale', ideScale.toFixed(3));
     applyNoteFontSize();
+    applyNoteOpacity();
     applyCalculatorFontSize();
     applyBrowserZoom();
     el.profileSelect.value = profile.id;
@@ -2237,6 +2251,12 @@ function bindEvents() {
   el.notesTheme.addEventListener('change', () => {
     setActiveNoteTheme(el.notesTheme.value as NoteThemeId);
   });
+  el.notesOpacity.addEventListener('input', () => {
+    setNoteOpacity(Number(el.notesOpacity.value), { save: false });
+  });
+  el.notesOpacity.addEventListener('change', () => {
+    setNoteOpacity(Number(el.notesOpacity.value), { save: true });
+  });
   el.notesBody.addEventListener('input', handleNoteInput);
   el.notesBody.addEventListener('blur', () => void saveActiveNoteNow());
   el.notesBody.addEventListener('keydown', (event) => {
@@ -2657,6 +2677,19 @@ function resizeNoteFont(direction: number) {
 
 function applyNoteFontSize() {
   document.documentElement.style.setProperty('--notes-font-size', `${noteFontSize}px`);
+}
+
+function setNoteOpacity(value: number, options: { save: boolean }) {
+  noteOpacity = clamp(Number.isFinite(value) ? value : 100, 45, 100);
+  applyNoteOpacity();
+  if (options.save) saveActiveWorkspaceSnapshot();
+}
+
+function applyNoteOpacity() {
+  const percent = `${Math.round(noteOpacity)}%`;
+  document.documentElement.style.setProperty('--notes-opacity', percent);
+  el.notesOpacity.value = String(Math.round(noteOpacity));
+  el.notesOpacityValue.textContent = percent;
 }
 
 function resizeBrowserZoom(direction: number) {
@@ -3265,6 +3298,8 @@ function clearWorkspacePanels() {
   state.noteTabs = [];
   state.activeNoteTabId = '';
   state.notePinned = false;
+  noteOpacity = 100;
+  applyNoteOpacity();
   renderNoteTabs();
   renderNotes();
   renderNotePin();

@@ -16,6 +16,17 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Notes opacity
+
+#### Added
+
+- Notes now has a background opacity slider in the panel header.
+- The opacity setting is saved per workspace and restores with the rest of the
+  Notes layout state.
+- Opacity affects the note body and footer backgrounds while keeping the header
+  and text readable.
+
+
 ### 2026-05-22 - Toolbar clock and ticker colors
 
 #### Changed

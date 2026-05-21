@@ -215,6 +215,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - Pin을 켜면 Notes 패널이 다른 IDE 위젯 위에 고정됩니다.
 - 각 note tab은 Default, Sticky, Mint, Rose, Paper 테마를 따로 선택할 수 있습니다.
 - 테마 색상은 각 note tab에서 미리 보이고, 선택된 테마는 tab bar 아래 메모 영역에만 적용됩니다.
+- 투명도 슬라이더로 Notes 본문 배경을 반투명하게 조절할 수 있고, 값은 workspace별로 저장됩니다.
 - 메모는 현재 workspace 아래 `.vibe-ide-temp/notes/*.txt`에 저장됩니다.
 - workspace를 다시 열면 열려 있던 note tab과 Notes 패널 상태가 복원됩니다.
 
@@ -516,6 +517,7 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 - Pin keeps the Notes panel above other IDE widgets.
 - Each note tab can use its own Default, Sticky, Mint, Rose, or Paper theme.
 - Theme colors are previewed on each note tab, while the selected theme only applies below the tab bar.
+- The opacity slider makes the Notes body background translucent and is saved per workspace.
 - Notes are stored as `.vibe-ide-temp/notes/*.txt` inside the current workspace.
 - Reopening a workspace restores open note tabs and the Notes panel state.
 
