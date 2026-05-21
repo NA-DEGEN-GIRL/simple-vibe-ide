@@ -73,6 +73,7 @@ interface BrowserTab {
   id: string;
   url: string;
   label: string;
+  frameUrl?: string;
 }
 
 interface BrowserConsoleLog {
@@ -104,9 +105,18 @@ interface FontChoice {
   stack: string;
 }
 
+type EditorThemeId = 'simple-dark' | 'deep-contrast' | 'soft-slate' | 'warm-terminal';
+
+interface EditorThemeChoice {
+  id: EditorThemeId;
+  label: string;
+  vars: Record<string, string>;
+}
+
 interface IdeSettings {
   uiFont: string;
   monoFont: string;
+  editorTheme: EditorThemeId;
   extraMaskPatterns: string[];
 }
 
@@ -262,6 +272,8 @@ interface EditorRuntime {
   searchKeymap: typeof import('@codemirror/search').searchKeymap;
   syntaxHighlighting: typeof import('@codemirror/language').syntaxHighlighting;
   defaultHighlightStyle: typeof import('@codemirror/language').defaultHighlightStyle;
+  HighlightStyle: typeof import('@codemirror/language').HighlightStyle;
+  tags: typeof import('@lezer/highlight').tags;
   languageCompartment: import('@codemirror/state').Compartment;
 }
 
@@ -411,11 +423,127 @@ const MONO_FONT_CHOICES: FontChoice[] = [
   { id: 'jetbrains', label: 'JetBrains Mono (mono)', stack: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace' },
   { id: 'consolas', label: 'Consolas (mono)', stack: 'Consolas, "Cascadia Mono", monospace' }
 ];
+const EDITOR_THEME_CHOICES: EditorThemeChoice[] = [
+  {
+    id: 'simple-dark',
+    label: 'Simple Dark',
+    vars: {
+      '--cm-bg': '#0a0f18',
+      '--cm-text': '#dfe8f4',
+      '--cm-gutter-bg': '#0b1019',
+      '--cm-gutter-text': '#7c8da3',
+      '--cm-border': '#1d2635',
+      '--cm-active-line': 'rgba(77, 141, 255, 0.16)',
+      '--cm-active-gutter-bg': '#1b2d4a',
+      '--cm-active-gutter-text': '#f8fbff',
+      '--cm-caret': '#f8fbff',
+      '--cm-selection': 'rgba(91, 149, 255, 0.36)',
+      '--cm-focus': 'rgba(77, 141, 255, 0.34)',
+      '--cm-comment': '#8fa0b5',
+      '--cm-keyword': '#8ab4ff',
+      '--cm-string': '#9fe6a0',
+      '--cm-number': '#ffd37a',
+      '--cm-variable': '#dfe8f4',
+      '--cm-definition': '#91c9ff',
+      '--cm-type': '#c9a7ff',
+      '--cm-property': '#8bd3ff',
+      '--cm-operator': '#f2a7d8',
+      '--cm-punctuation': '#aebbd0',
+      '--cm-invalid': '#ff8a8a'
+    }
+  },
+  {
+    id: 'deep-contrast',
+    label: 'Deep Contrast',
+    vars: {
+      '--cm-bg': '#05080d',
+      '--cm-text': '#f0f6ff',
+      '--cm-gutter-bg': '#080d14',
+      '--cm-gutter-text': '#92a6c0',
+      '--cm-border': '#2b3a52',
+      '--cm-active-line': 'rgba(102, 180, 255, 0.2)',
+      '--cm-active-gutter-bg': '#203858',
+      '--cm-active-gutter-text': '#ffffff',
+      '--cm-caret': '#ffffff',
+      '--cm-selection': 'rgba(126, 194, 255, 0.42)',
+      '--cm-focus': 'rgba(126, 194, 255, 0.46)',
+      '--cm-comment': '#a8b7ca',
+      '--cm-keyword': '#9bc8ff',
+      '--cm-string': '#b5f0a5',
+      '--cm-number': '#ffe08a',
+      '--cm-variable': '#f0f6ff',
+      '--cm-definition': '#9ee8ff',
+      '--cm-type': '#d9b7ff',
+      '--cm-property': '#9edcff',
+      '--cm-operator': '#ffaddf',
+      '--cm-punctuation': '#d2dbea',
+      '--cm-invalid': '#ff9a9a'
+    }
+  },
+  {
+    id: 'soft-slate',
+    label: 'Soft Slate',
+    vars: {
+      '--cm-bg': '#111820',
+      '--cm-text': '#d8e2ed',
+      '--cm-gutter-bg': '#0e151d',
+      '--cm-gutter-text': '#8192a6',
+      '--cm-border': '#243142',
+      '--cm-active-line': 'rgba(125, 161, 205, 0.16)',
+      '--cm-active-gutter-bg': '#223149',
+      '--cm-active-gutter-text': '#edf5ff',
+      '--cm-caret': '#e7f0ff',
+      '--cm-selection': 'rgba(132, 173, 220, 0.36)',
+      '--cm-focus': 'rgba(132, 173, 220, 0.34)',
+      '--cm-comment': '#98a7b8',
+      '--cm-keyword': '#9bbcff',
+      '--cm-string': '#a5d6a7',
+      '--cm-number': '#e6c986',
+      '--cm-variable': '#d8e2ed',
+      '--cm-definition': '#91d0e8',
+      '--cm-type': '#c5ace8',
+      '--cm-property': '#8fc8e8',
+      '--cm-operator': '#e7a5c7',
+      '--cm-punctuation': '#b6c2cf',
+      '--cm-invalid': '#ef8f8f'
+    }
+  },
+  {
+    id: 'warm-terminal',
+    label: 'Warm Terminal',
+    vars: {
+      '--cm-bg': '#12100c',
+      '--cm-text': '#eee4d1',
+      '--cm-gutter-bg': '#0e0c09',
+      '--cm-gutter-text': '#a0927d',
+      '--cm-border': '#30281d',
+      '--cm-active-line': 'rgba(255, 190, 104, 0.14)',
+      '--cm-active-gutter-bg': '#332716',
+      '--cm-active-gutter-text': '#fff3d8',
+      '--cm-caret': '#fff2cc',
+      '--cm-selection': 'rgba(255, 190, 104, 0.34)',
+      '--cm-focus': 'rgba(255, 190, 104, 0.34)',
+      '--cm-comment': '#a99b86',
+      '--cm-keyword': '#ffbd7a',
+      '--cm-string': '#b8e38f',
+      '--cm-number': '#ffd37a',
+      '--cm-variable': '#eee4d1',
+      '--cm-definition': '#8fd8d2',
+      '--cm-type': '#d8b7ff',
+      '--cm-property': '#a7d7ff',
+      '--cm-operator': '#ffb1c8',
+      '--cm-punctuation': '#d5c8b5',
+      '--cm-invalid': '#ff8f8f'
+    }
+  }
+];
 const DEFAULT_IDE_SETTINGS: IdeSettings = {
   uiFont: 'system',
   monoFont: 'cascadia',
+  editorTheme: 'simple-dark',
   extraMaskPatterns: ['*.env', '*.env.*', '*.secret', '*.private', '*.credentials']
 };
+const PANEL_RESIZE_DIRECTIONS: WindowResizeDirection[] = ['North', 'East', 'South', 'West', 'NorthEast', 'NorthWest', 'SouthEast', 'SouthWest'];
 
 const state = {
   profiles: [] as ConnectionProfile[],
@@ -460,6 +588,7 @@ const state = {
   notePinned: false,
   noteOpacity: 100,
   forwards: [] as PortForwardResult[],
+  previewProxies: [] as PortForwardResult[],
   detectedPorts: [] as DetectedPortItem[],
   browserTabs: [] as BrowserTab[],
   activeBrowserTabId: '',
@@ -718,6 +847,7 @@ app.innerHTML = `
         <div class="settings-body">
           <label>UI font <select id="settings-ui-font"></select></label>
           <label>Mono font <select id="settings-mono-font"></select></label>
+          <label>Editor theme <select id="settings-editor-theme"></select></label>
           <label class="settings-textarea-label">
             Mask file patterns
             <textarea id="settings-mask-patterns" spellcheck="false" placeholder="*.env&#10;*.secret"></textarea>
@@ -819,6 +949,7 @@ const el = {
   calculatorClear: document.querySelector<HTMLButtonElement>('#calculator-clear')!,
   settingsUiFont: document.querySelector<HTMLSelectElement>('#settings-ui-font')!,
   settingsMonoFont: document.querySelector<HTMLSelectElement>('#settings-mono-font')!,
+  settingsEditorTheme: document.querySelector<HTMLSelectElement>('#settings-editor-theme')!,
   settingsMaskPatterns: document.querySelector<HTMLTextAreaElement>('#settings-mask-patterns')!,
   settingsSave: document.querySelector<HTMLButtonElement>('#settings-save')!
 };
@@ -976,6 +1107,7 @@ function loadIdeSettings() {
     state.ideSettings = {
       ...DEFAULT_IDE_SETTINGS,
       ...parsed,
+      editorTheme: isEditorThemeId(parsed.editorTheme) ? parsed.editorTheme : DEFAULT_IDE_SETTINGS.editorTheme,
       extraMaskPatterns: Array.isArray(parsed.extraMaskPatterns)
         ? parsed.extraMaskPatterns.map(String).filter(Boolean)
         : DEFAULT_IDE_SETTINGS.extraMaskPatterns
@@ -993,10 +1125,15 @@ function persistIdeSettings() {
 function renderSettings() {
   renderFontOptions(el.settingsUiFont, UI_FONT_CHOICES, state.ideSettings.uiFont);
   renderFontOptions(el.settingsMonoFont, MONO_FONT_CHOICES, state.ideSettings.monoFont);
+  renderChoiceOptions(el.settingsEditorTheme, EDITOR_THEME_CHOICES, state.ideSettings.editorTheme);
   el.settingsMaskPatterns.value = state.ideSettings.extraMaskPatterns.join('\n');
 }
 
 function renderFontOptions(select: HTMLSelectElement, choices: FontChoice[], activeId: string) {
+  renderChoiceOptions(select, choices, activeId);
+}
+
+function renderChoiceOptions(select: HTMLSelectElement, choices: Array<{ id: string; label: string }>, activeId: string) {
   select.innerHTML = '';
   for (const choice of choices) {
     const option = document.createElement('option');
@@ -1011,6 +1148,7 @@ function saveSettingsFromForm() {
   state.ideSettings = {
     uiFont: el.settingsUiFont.value,
     monoFont: el.settingsMonoFont.value,
+    editorTheme: editorThemeId(el.settingsEditorTheme.value),
     extraMaskPatterns: el.settingsMaskPatterns.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
   };
   persistIdeSettings();
@@ -1024,6 +1162,7 @@ function applyIdeSettings() {
   const monoFont = fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack;
   document.documentElement.style.setProperty('--ui-font', uiFont);
   document.documentElement.style.setProperty('--mono-font', monoFont);
+  applyEditorTheme(state.ideSettings.editorTheme);
   configurePrivacyPolicy(state.ideSettings.extraMaskPatterns);
   for (const pane of state.terminals) {
     pane.term.options.fontFamily = monoFont;
@@ -1035,6 +1174,26 @@ function applyIdeSettings() {
 
 function fontChoice(choices: FontChoice[], id: string) {
   return choices.find((choice) => choice.id === id) ?? choices[0];
+}
+
+function editorThemeChoice(id: string) {
+  return EDITOR_THEME_CHOICES.find((choice) => choice.id === id) ?? EDITOR_THEME_CHOICES[0];
+}
+
+function editorThemeId(id: string): EditorThemeId {
+  return editorThemeChoice(id).id;
+}
+
+function isEditorThemeId(id: unknown): id is EditorThemeId {
+  return typeof id === 'string' && EDITOR_THEME_CHOICES.some((choice) => choice.id === id);
+}
+
+function applyEditorTheme(id: string) {
+  const theme = editorThemeChoice(id);
+  document.documentElement.dataset.editorTheme = theme.id;
+  for (const [name, value] of Object.entries(theme.vars)) {
+    document.documentElement.style.setProperty(name, value);
+  }
 }
 
 function loadMarketTickerConfig() {
@@ -1596,7 +1755,7 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
     activeNoteTabId: state.activeNoteTabId,
     notePinned: state.notePinned,
     noteOpacity,
-    browserTabs: state.browserTabs,
+    browserTabs: state.browserTabs.map((tab) => ({ id: tab.id, url: tab.url, label: tab.label })),
     activeBrowserTabId: state.activeBrowserTabId,
     browserDeviceId: el.browserShell.classList.contains('desktop') ? 'desktop' : state.browserDeviceId,
     browserOrientation: state.browserOrientation,
@@ -2349,7 +2508,11 @@ function formatCalculatorResult(value: number) {
 }
 
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
-  state.browserTabs = Array.isArray(snapshot.browserTabs) ? snapshot.browserTabs : [];
+  state.browserTabs = Array.isArray(snapshot.browserTabs)
+    ? snapshot.browserTabs
+      .filter((tab) => tab && typeof tab.url === 'string')
+      .map((tab) => ({ id: tab.id || makeBrowserTabId(), url: tab.url, label: tab.label || browserTabLabel(tab.url) }))
+    : [];
   state.activeBrowserTabId = '';
   state.browserDeviceId = snapshot.browserDeviceId || DEFAULT_BROWSER_DEVICE_ID;
   state.browserOrientation = snapshot.browserOrientation || 'portrait';
@@ -2511,6 +2674,9 @@ function bindEvents() {
     state.browserConsoleLogs = [];
     renderBrowserConsole();
   });
+  el.browserShell.addEventListener('pointerenter', activateBrowserPanel);
+  el.previewFrame.addEventListener('pointerenter', activateBrowserPanel);
+  el.previewFrame.addEventListener('focus', activateBrowserPanel);
   el.calculatorExpression.addEventListener('input', () => {
     state.calculatorExpression = el.calculatorExpression.value;
     updateCalculatorPreview();
@@ -2562,6 +2728,13 @@ function bindWindowChrome() {
       void currentWindow.startResizeDragging(direction);
     });
   });
+}
+
+function activateBrowserPanel() {
+  const panel = getPanel('browser');
+  if (panel.classList.contains('hidden')) return;
+  bringPanelToFront(panel);
+  setKeyboardResizeTarget({ kind: 'panel', id: 'browser' });
 }
 
 function handleTitlebarMouseDown(event: MouseEvent) {
@@ -3025,13 +3198,15 @@ function bindFloatingPanels() {
   for (const id of FLOATING_PANELS) {
     const panel = getPanel(id);
     const handle = panel.querySelector<HTMLElement>('.panel-drag-handle');
-    const grip = ensureResizeGrip(panel, id);
+    const grips = ensureResizeGrips(panel, id);
     panel.addEventListener('pointerdown', () => {
       bringPanelToFront(panel);
       setKeyboardResizeTarget({ kind: 'panel', id });
     });
     handle?.addEventListener('pointerdown', (event) => startPanelDrag(event, panel));
-    grip.addEventListener('pointerdown', (event) => startPanelResize(event, panel, grip));
+    grips.forEach((grip) => {
+      grip.addEventListener('pointerdown', (event) => startPanelResize(event, panel, grip));
+    });
 
     if (id === 'editor') {
       new ResizeObserver(() => codeView?.requestMeasure()).observe(panel);
@@ -3058,26 +3233,23 @@ function getPanelToggle(id: FloatingPanelId) {
   return document.querySelector<HTMLButtonElement>(`[data-toggle-panel="${id}"]`);
 }
 
-function ensureResizeGrip(panel: HTMLElement, id: FloatingPanelId) {
-  const existing = panel.querySelector<HTMLElement>('.panel-resize-grip');
-  if (existing) return existing;
-  const grip = document.createElement('div');
-  grip.className = 'panel-resize-grip';
-  grip.title = `Resize ${id}`;
-  grip.setAttribute('aria-hidden', 'true');
-  panel.append(grip);
-  return grip;
-}
-
-function ensureTerminalResizeGrip(card: HTMLElement) {
-  const existing = card.querySelector<HTMLElement>('.panel-resize-grip');
-  if (existing) return existing;
-  const grip = document.createElement('div');
-  grip.className = 'panel-resize-grip';
-  grip.title = 'Resize terminal';
-  grip.setAttribute('aria-hidden', 'true');
-  card.append(grip);
-  return grip;
+function ensureResizeGrips(panel: HTMLElement, label: string) {
+  const grips: HTMLElement[] = [];
+  for (const direction of PANEL_RESIZE_DIRECTIONS) {
+    const existing = panel.querySelector<HTMLElement>(`[data-panel-resize-direction="${direction}"]`);
+    if (existing) {
+      grips.push(existing);
+      continue;
+    }
+    const grip = document.createElement('div');
+    grip.className = `panel-resize-grip panel-resize-${direction.toLowerCase()}`;
+    grip.title = `Resize ${label}`;
+    grip.dataset.panelResizeDirection = direction;
+    grip.setAttribute('aria-hidden', 'true');
+    panel.append(grip);
+    grips.push(grip);
+  }
+  return grips;
 }
 
 function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipSave?: boolean } = {}) {
@@ -3170,6 +3342,11 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
   if (event.button !== 0) return;
   event.preventDefault();
   event.stopPropagation();
+  const direction = (grip.dataset.panelResizeDirection as WindowResizeDirection | undefined) ?? 'SouthEast';
+  const resizeWest = direction.includes('West');
+  const resizeEast = direction.includes('East');
+  const resizeNorth = direction.includes('North');
+  const resizeSouth = direction.includes('South');
   bringPanelToFront(panel);
   if (panel.classList.contains('terminal-card')) {
     const pane = activePaneForElement(panel);
@@ -3190,13 +3367,36 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
   panel.classList.add('resizing');
 
   const move = (moveEvent: PointerEvent) => {
-    const rawRect = {
-      left: panelRect.left,
-      top: panelRect.top,
-      width: clamp(panelRect.width + moveEvent.clientX - startX, minWidth, workspace.clientWidth - panelRect.left),
-      height: clamp(panelRect.height + moveEvent.clientY - startY, minHeight, workspace.clientHeight - panelRect.top)
-    };
-    applyPanelRect(panel, snapPanelRect(panel, rawRect, { resizeX: true, resizeY: true }));
+    const deltaX = moveEvent.clientX - startX;
+    const deltaY = moveEvent.clientY - startY;
+    let left = panelRect.left;
+    let top = panelRect.top;
+    let width = panelRect.width;
+    let height = panelRect.height;
+
+    if (resizeEast) {
+      width = clamp(panelRect.width + deltaX, minWidth, workspace.clientWidth - panelRect.left);
+    }
+    if (resizeSouth) {
+      height = clamp(panelRect.height + deltaY, minHeight, workspace.clientHeight - panelRect.top);
+    }
+    if (resizeWest) {
+      const boundedDelta = clamp(deltaX, -panelRect.left, panelRect.width - minWidth);
+      left = panelRect.left + boundedDelta;
+      width = panelRect.width - boundedDelta;
+    }
+    if (resizeNorth) {
+      const boundedDelta = clamp(deltaY, -panelRect.top, panelRect.height - minHeight);
+      top = panelRect.top + boundedDelta;
+      height = panelRect.height - boundedDelta;
+    }
+
+    applyPanelRect(panel, snapPanelRect(panel, { left, top, width, height }, {
+      resizeLeft: resizeWest,
+      resizeRight: resizeEast,
+      resizeTop: resizeNorth,
+      resizeBottom: resizeSouth
+    }));
     if (panel.dataset.panel === 'editor') codeView?.requestMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
@@ -3259,7 +3459,16 @@ function applyPanelRect(panel: HTMLElement, rect: PanelRect) {
 function snapPanelRect(
   panel: HTMLElement,
   rect: PanelRect,
-  mode: { moveX?: boolean; moveY?: boolean; resizeX?: boolean; resizeY?: boolean }
+  mode: {
+    moveX?: boolean;
+    moveY?: boolean;
+    resizeX?: boolean;
+    resizeY?: boolean;
+    resizeLeft?: boolean;
+    resizeRight?: boolean;
+    resizeTop?: boolean;
+    resizeBottom?: boolean;
+  }
 ) {
   const workspace = panel.parentElement as HTMLElement;
   const guides = collectSnapGuides(panel, workspace);
@@ -3271,11 +3480,23 @@ function snapPanelRect(
   if (mode.moveY) {
     next.top = snapMovingAxis(rect.top, rect.height, guides.y);
   }
-  if (mode.resizeX) {
+  if (mode.resizeLeft) {
+    const snappedLeft = snapEdge(next.left, guides.x);
+    if (snappedLeft !== null) {
+      next.width += next.left - snappedLeft;
+      next.left = snappedLeft;
+    }
+  } else if (mode.resizeX || mode.resizeRight) {
     const snappedRight = snapEdge(next.left + next.width, guides.x);
     if (snappedRight !== null) next.width = snappedRight - next.left;
   }
-  if (mode.resizeY) {
+  if (mode.resizeTop) {
+    const snappedTop = snapEdge(next.top, guides.y);
+    if (snappedTop !== null) {
+      next.height += next.top - snappedTop;
+      next.top = snappedTop;
+    }
+  } else if (mode.resizeY || mode.resizeBottom) {
     const snappedBottom = snapEdge(next.top + next.height, guides.y);
     if (snappedBottom !== null) next.height = snappedBottom - next.top;
   }
@@ -3532,6 +3753,10 @@ function clearWorkspacePanels() {
   state.calculatorResult = '';
   state.calculatorHistory = [];
   renderCalculator();
+  for (const proxy of state.previewProxies) {
+    void api.stopPortForward(proxy.id).catch(() => undefined);
+  }
+  state.previewProxies = [];
   state.previewUrl = '';
   state.forwards = [];
   state.detectedPorts = [];
@@ -4800,46 +5025,14 @@ function renderEditor() {
     banner.className = 'secure-banner';
     banner.textContent = 'Private file: values are hidden by default. Use each eye button to reveal only that item.';
     form.append(banner);
-    for (const line of file.lines) {
+    for (let index = 0; index < file.lines.length; index += 1) {
+      const line = file.lines[index];
       if (line.kind === 'kv') {
-        const row = document.createElement('div');
-        row.className = 'secure-row';
-        const key = document.createElement('code');
-        key.textContent = line.prefix ?? '';
-        const input = document.createElement('input');
-        input.type = line.reveal ? 'text' : 'password';
-        input.value = line.value ?? '';
-        input.spellcheck = false;
-        input.addEventListener('input', () => {
-          line.value = input.value;
-          markDirty();
-        });
-        const reveal = document.createElement('button');
-        reveal.textContent = line.reveal ? '🙈' : '👁';
-        reveal.title = line.reveal ? 'Hide value' : 'Reveal value';
-        reveal.addEventListener('click', () => {
-          line.reveal = !line.reveal;
-          renderEditor();
-        });
-        row.append(key, input, reveal);
-        form.append(row);
+        appendSecureKeyRow(form, line);
       } else {
-        const raw = document.createElement('div');
-        raw.className = 'secure-raw-line';
-        raw.textContent = line.original || ' ';
-        raw.contentEditable = 'true';
-        raw.spellcheck = false;
-        raw.addEventListener('input', () => {
-          line.original = raw.textContent ?? '';
-          markDirty();
-        });
-        raw.addEventListener('keydown', (event) => {
-          if (event.key === 'Enter') {
-            event.preventDefault();
-            raw.blur();
-          }
-        });
-        form.append(raw);
+        const start = index;
+        while (index + 1 < file.lines.length && file.lines[index + 1].kind === 'raw') index += 1;
+        appendSecureRawBlock(form, file, start, index + 1);
       }
     }
     appendSecureAddKeyForm(form, file);
@@ -4851,6 +5044,66 @@ function renderEditor() {
   mount.className = 'code-mount';
   el.editorBody.append(mount);
   void mountCodeEditor(file, mount, renderToken);
+}
+
+function appendSecureKeyRow(form: HTMLElement, line: SecretLine) {
+  const row = document.createElement('div');
+  row.className = 'secure-row';
+  const key = document.createElement('code');
+  key.textContent = line.prefix ?? '';
+  const input = document.createElement('input');
+  input.type = line.reveal ? 'text' : 'password';
+  input.value = line.value ?? '';
+  input.spellcheck = false;
+  input.addEventListener('input', () => {
+    line.value = input.value;
+    markDirty();
+  });
+  const reveal = document.createElement('button');
+  reveal.textContent = line.reveal ? 'Hide' : 'Show';
+  reveal.title = line.reveal ? 'Hide value' : 'Reveal value';
+  reveal.addEventListener('click', () => {
+    line.reveal = !line.reveal;
+    renderEditor();
+  });
+  row.append(key, input, reveal);
+  form.append(row);
+}
+
+function appendSecureRawBlock(form: HTMLElement, file: OpenFileState, start: number, end: number) {
+  const firstId = file.lines[start]?.id ?? crypto.randomUUID();
+  const raw = document.createElement('textarea');
+  raw.className = 'secure-raw-block';
+  raw.spellcheck = false;
+  raw.value = file.lines.slice(start, end).map((line) => line.original).join('\n');
+  raw.rows = Math.max(1, Math.min(10, end - start));
+
+  const syncLines = () => {
+    const currentStart = file.lines.findIndex((line) => line.id === firstId);
+    if (currentStart < 0) return;
+    let currentLength = 0;
+    while (file.lines[currentStart + currentLength]?.kind === 'raw') currentLength += 1;
+    const existing = file.lines.slice(currentStart, currentStart + currentLength);
+    const nextLines = raw.value.split('\n').map((original, index): SecretLine => ({
+      id: existing[index]?.id ?? crypto.randomUUID(),
+      kind: 'raw',
+      original
+    }));
+    file.lines.splice(currentStart, currentLength, ...nextLines);
+    markDirty();
+  };
+
+  raw.addEventListener('input', () => {
+    syncLines();
+    resizeSecureRawBlock(raw);
+  });
+  requestAnimationFrame(() => resizeSecureRawBlock(raw));
+  form.append(raw);
+}
+
+function resizeSecureRawBlock(raw: HTMLTextAreaElement) {
+  raw.style.height = 'auto';
+  raw.style.height = `${Math.max(24, raw.scrollHeight)}px`;
 }
 
 function appendSecureAddKeyForm(form: HTMLElement, file: OpenFileState) {
@@ -4954,7 +5207,8 @@ function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
     runtime.lineNumbers(),
     runtime.highlightActiveLine(),
     runtime.highlightSelectionMatches(),
-    runtime.syntaxHighlighting(runtime.defaultHighlightStyle, { fallback: true }),
+    editorCodeMirrorTheme(runtime),
+    runtime.syntaxHighlighting(editorHighlightStyle(runtime)),
     runtime.history(),
     runtime.keymap.of([
       { key: 'Mod-s', preventDefault: true, run: () => { void saveOpenFile(); return true; } },
@@ -4973,14 +5227,74 @@ function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
   ];
 }
 
+function editorCodeMirrorTheme(runtime: EditorRuntime): Extension {
+  return runtime.EditorView.theme({
+    '&': {
+      backgroundColor: 'var(--cm-bg)',
+      color: 'var(--cm-text)'
+    },
+    '.cm-content': {
+      caretColor: 'var(--cm-caret)'
+    },
+    '.cm-scroller': {
+      fontFamily: 'var(--mono-font)',
+      fontSize: 'var(--editor-font-size)'
+    },
+    '.cm-gutters': {
+      backgroundColor: 'var(--cm-gutter-bg)',
+      borderRightColor: 'var(--cm-border)',
+      color: 'var(--cm-gutter-text)'
+    },
+    '.cm-activeLineGutter': {
+      backgroundColor: 'var(--cm-active-gutter-bg)',
+      color: 'var(--cm-active-gutter-text)'
+    },
+    '.cm-activeLine': {
+      backgroundColor: 'var(--cm-active-line)'
+    },
+    '.cm-cursor': {
+      borderLeftColor: 'var(--cm-caret)',
+      borderLeftWidth: '2px'
+    },
+    '&.cm-focused': {
+      outline: '1px solid var(--cm-focus)'
+    },
+    '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': {
+      backgroundColor: 'var(--cm-selection)'
+    },
+    '.cm-matchingBracket, .cm-nonmatchingBracket': {
+      backgroundColor: 'rgba(255, 209, 102, 0.22)',
+      outline: '1px solid rgba(255, 209, 102, 0.48)'
+    }
+  }, { dark: true });
+}
+
+function editorHighlightStyle(runtime: EditorRuntime) {
+  const tags = runtime.tags;
+  return runtime.HighlightStyle.define([
+    { tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment], color: 'var(--cm-comment)' },
+    { tag: [tags.keyword, tags.atom, tags.bool, tags.null, tags.controlKeyword, tags.definitionKeyword, tags.moduleKeyword], color: 'var(--cm-keyword)' },
+    { tag: [tags.string, tags.docString, tags.character, tags.attributeValue], color: 'var(--cm-string)' },
+    { tag: [tags.number, tags.integer, tags.float], color: 'var(--cm-number)' },
+    { tag: [tags.variableName, tags.name, tags.labelName], color: 'var(--cm-variable)' },
+    { tag: [tags.definition(tags.variableName), tags.function(tags.variableName), tags.className], color: 'var(--cm-definition)' },
+    { tag: [tags.typeName, tags.namespace, tags.macroName], color: 'var(--cm-type)' },
+    { tag: [tags.propertyName, tags.attributeName, tags.tagName], color: 'var(--cm-property)' },
+    { tag: [tags.operator, tags.operatorKeyword, tags.arithmeticOperator, tags.logicOperator, tags.compareOperator, tags.definitionOperator], color: 'var(--cm-operator)' },
+    { tag: [tags.punctuation, tags.separator, tags.bracket], color: 'var(--cm-punctuation)' },
+    { tag: tags.invalid, color: 'var(--cm-invalid)' }
+  ], { themeType: 'dark' });
+}
+
 async function ensureEditorRuntime() {
   editorRuntimePromise ??= Promise.all([
     import('@codemirror/state'),
     import('@codemirror/view'),
     import('@codemirror/commands'),
     import('@codemirror/search'),
-    import('@codemirror/language')
-  ]).then(([stateModule, viewModule, commandsModule, searchModule, languageModule]) => ({
+    import('@codemirror/language'),
+    import('@lezer/highlight')
+  ]).then(([stateModule, viewModule, commandsModule, searchModule, languageModule, highlightModule]) => ({
     EditorState: stateModule.EditorState,
     EditorView: viewModule.EditorView,
     lineNumbers: viewModule.lineNumbers,
@@ -4994,6 +5308,8 @@ async function ensureEditorRuntime() {
     searchKeymap: searchModule.searchKeymap,
     syntaxHighlighting: languageModule.syntaxHighlighting,
     defaultHighlightStyle: languageModule.defaultHighlightStyle,
+    HighlightStyle: languageModule.HighlightStyle,
+    tags: highlightModule.tags,
     languageCompartment: new stateModule.Compartment()
   }));
   return editorRuntimePromise;
@@ -5172,7 +5488,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     <div class="terminal-host-stack"></div>
   `;
   el.mainGrid.append(card);
-  const grip = ensureTerminalResizeGrip(card);
+  const grips = ensureResizeGrips(card, 'terminal');
   if (options.rect) applyLayoutRatio(card, options.rect);
   else placeTerminalCard(card, options);
 
@@ -5195,9 +5511,11 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   });
   card.querySelector<HTMLElement>('.terminal-title')!
     .addEventListener('pointerdown', (event) => startPanelDrag(event, card));
-  grip.addEventListener('pointerdown', (event) => {
-    startPanelResize(event, card, grip);
-    scheduleFitTerminalWidget(widget);
+  grips.forEach((grip) => {
+    grip.addEventListener('pointerdown', (event) => {
+      startPanelResize(event, card, grip);
+      scheduleFitTerminalWidget(widget);
+    });
   });
   card.querySelector<HTMLButtonElement>('.close-pane')!.addEventListener('click', () => void closeTerminalWidget(widget.widgetId));
   card.querySelector<HTMLButtonElement>('.terminal-new-tab')!.addEventListener('click', (event) => {
@@ -5475,7 +5793,7 @@ function handleTerminalPaste(event: ClipboardEvent, pane: TerminalPane) {
 
 async function pasteTerminalText(pane: TerminalPane, text?: string) {
   try {
-    const value = text ?? await readText();
+    const value = normalizeTerminalPasteText(text ?? await readText());
     if (!value || !pane.backendId) return;
     await api.writeTerminal(pane.backendId, terminalPastePayload(value));
   } catch (error) {
@@ -5485,6 +5803,10 @@ async function pasteTerminalText(pane: TerminalPane, text?: string) {
 
 function terminalPastePayload(value: string) {
   return /\r|\n/.test(value) ? `\x1b[200~${value}\x1b[201~` : value;
+}
+
+function normalizeTerminalPasteText(value: string) {
+  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
 function placeTerminalCard(card: HTMLElement, options: CreateTerminalOptions = {}) {
@@ -5879,7 +6201,7 @@ async function startForward() {
     state.forwards.push(forward);
     state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(state.activeProfile!.id, remotePort));
     renderForwards();
-    openBrowserTab(forward.url, portTabLabel(forward.localPort));
+    await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
     setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
   } catch (error) {
     setStatus(String(error), true);
@@ -5906,13 +6228,13 @@ async function openLocalPreviewUrl(url: URL) {
   if (!isPreviewPort(port)) return;
   const suffix = `${url.pathname}${url.search}${url.hash}`;
   if (!state.activeProfile || state.activeProfile.kind === 'windows') {
-    openBrowserTab(`http://127.0.0.1:${port}${suffix}`, browserTabLabel(url.toString()));
+    await openLocalBrowserTab(`http://127.0.0.1:${port}${suffix}`, browserTabLabel(url.toString()));
     return;
   }
 
   const existing = state.forwards.find((forward) => forward.remotePort === port);
   if (existing) {
-    openBrowserTab(`${existing.url}${suffix}`, browserTabLabel(url.toString()));
+    await openLocalBrowserTab(`${existing.url}${suffix}`, browserTabLabel(url.toString()));
     return;
   }
 
@@ -5920,7 +6242,7 @@ async function openLocalPreviewUrl(url: URL) {
   state.forwards.push(forward);
   state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(state.activeProfile!.id, port));
   renderForwards();
-  openBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
+  await openLocalBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
   setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
 }
 
@@ -5943,7 +6265,7 @@ async function openPort(port: number, source: 'manual' | 'auto') {
   if (existing) {
     state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
     renderForwards();
-    openBrowserTab(existing.url, portTabLabel(existing.localPort));
+    await openLocalBrowserTab(existing.url, portTabLabel(existing.localPort));
     if (source === 'auto') setStatus(`Detected port ${port}; using ${existing.url}`);
     return;
   }
@@ -5952,7 +6274,7 @@ async function openPort(port: number, source: 'manual' | 'auto') {
     const url = `http://127.0.0.1:${port}`;
     state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
     renderForwards();
-    openBrowserTab(url, portTabLabel(port));
+    await openLocalBrowserTab(url, portTabLabel(port));
     setStatus(source === 'auto' ? `Detected local server on ${url}` : `Previewing ${url}`);
     return;
   }
@@ -5964,7 +6286,7 @@ async function openPort(port: number, source: 'manual' | 'auto') {
     state.forwards.push(forward);
     state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
     renderForwards();
-    openBrowserTab(forward.url, portTabLabel(forward.localPort));
+    await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
     setStatus(source === 'auto'
       ? `Detected port ${port}; forwarding ${forward.url}`
       : `Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
@@ -6028,7 +6350,7 @@ function renderForwards() {
     const row = document.createElement('div');
     row.className = 'forward-row';
     row.innerHTML = `<button class="load">${escapeHtml(forward.url)}</button><span>-> ${escapeHtml(forward.targetHost)}:${forward.remotePort}</span><button class="stop">Stop</button>`;
-    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => openBrowserTab(forward.url, portTabLabel(forward.localPort)));
+    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => void openLocalBrowserTab(forward.url, portTabLabel(forward.localPort)));
     row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', async () => {
       await api.stopPortForward(forward.id).catch((error) => setStatus(String(error), true));
       state.forwards = state.forwards.filter((item) => item.id !== forward.id);
@@ -6043,15 +6365,60 @@ function loadPreview(url: string) {
   openBrowserTab(url);
 }
 
-function openBrowserTab(url: string, label = browserTabLabel(url)) {
+async function openLocalBrowserTab(url: string, label = browserTabLabel(url)) {
+  try {
+    openBrowserTab(url, label, await previewFrameUrl(url));
+  } catch (error) {
+    setStatus(`Preview proxy failed: ${String(error)}`, true);
+    openBrowserTab(url, label);
+  }
+}
+
+async function previewFrameUrl(url: string) {
+  const parsed = localHttpPreviewUrl(url);
+  if (!parsed) return url;
+  const origin = normalizedLocalPreviewOrigin(parsed);
+  const proxy = await ensurePreviewProxy(origin);
+  return `${proxy.url}${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+async function ensurePreviewProxy(targetOrigin: string) {
+  const existing = state.previewProxies.find((proxy) => proxy.targetHost === targetOrigin);
+  if (existing) return existing;
+  const proxy = await api.startPreviewProxy(targetOrigin);
+  state.previewProxies.push(proxy);
+  logBrowserConsole('info', `Preview proxy ${proxy.url} -> ${targetOrigin}`);
+  return proxy;
+}
+
+function localHttpPreviewUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' || !parsed.port) return null;
+    return isLocalPreviewHost(parsed.hostname) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedLocalPreviewOrigin(url: URL) {
+  const host = url.hostname === 'localhost' || url.hostname === '0.0.0.0' || url.hostname === '[::1]'
+    ? '127.0.0.1'
+    : url.hostname;
+  return `http://${host}:${url.port}`;
+}
+
+function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = url) {
   if (!url) return;
   const existing = state.browserTabs.find((tab) => tab.url === url);
   if (existing) {
+    existing.frameUrl = frameUrl;
+    existing.label = label;
     activateBrowserTab(existing.id);
     return;
   }
 
-  const tab = { id: makeBrowserTabId(), url, label };
+  const tab = { id: makeBrowserTabId(), url, label, frameUrl };
   state.browserTabs.push(tab);
   logBrowserConsole('info', `Opened preview tab ${url}`);
   activateBrowserTab(tab.id);
@@ -6066,7 +6433,13 @@ function activateBrowserTab(id: string) {
   el.previewUrl.value = tab.url;
   el.browserShell.classList.add('has-preview');
   el.previewFrame.classList.remove('hidden');
-  el.previewFrame.src = tab.url;
+  el.previewFrame.src = tab.frameUrl ?? tab.url;
+  if (!tab.frameUrl && localHttpPreviewUrl(tab.url)) {
+    void previewFrameUrl(tab.url).then((frameUrl) => {
+      tab.frameUrl = frameUrl;
+      if (state.activeBrowserTabId === tab.id) el.previewFrame.src = frameUrl;
+    }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+  }
   renderBrowserTabs();
   logBrowserConsole('info', `Activated tab ${tab.url}`);
   saveActiveWorkspaceSnapshot();
@@ -6202,7 +6575,8 @@ function refreshPreview(hard: boolean) {
 
   el.browserShell.classList.add('has-preview');
   el.previewFrame.classList.remove('hidden');
-  el.previewFrame.src = hard ? withPreviewCacheBuster(tab.url) : tab.url;
+  const frameUrl = tab.frameUrl ?? tab.url;
+  el.previewFrame.src = hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
   state.previewUrl = tab.url;
   el.previewUrl.value = tab.url;
   logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
@@ -6254,11 +6628,15 @@ function parseLocalPreviewUrl(value: string) {
   if (!/[/?#]/.test(trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ''))) return null;
   try {
     const url = new URL(normalizePreviewUrl(trimmed));
-    if (!['localhost', '127.0.0.1', '0.0.0.0', '[::1]'].includes(url.hostname)) return null;
+    if (!isLocalPreviewHost(url.hostname)) return null;
     return url.port ? url : null;
   } catch {
     return null;
   }
+}
+
+function isLocalPreviewHost(hostname: string) {
+  return ['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1'].includes(hostname);
 }
 
 function parsePreviewPort(value: string) {

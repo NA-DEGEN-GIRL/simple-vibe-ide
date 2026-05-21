@@ -31,6 +31,8 @@ export interface PortForwardResult {
   url: string;
 }
 
+export type PreviewProxyResult = PortForwardResult;
+
 export interface TerminalDataEvent {
   id: string;
   data: string;

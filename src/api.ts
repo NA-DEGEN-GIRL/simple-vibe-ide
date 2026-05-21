@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AttachmentResult, ConnectionProfile, ExportStartResult, FileEntry, PortForwardResult } from './types';
+import type { AttachmentResult, ConnectionProfile, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -68,5 +68,7 @@ export const api = {
   killTerminal: (id: string) => invoke<void>('kill_terminal', { id }),
   startPortForward: (profileId: string, remotePort: number, localPort: number) =>
     invoke<PortForwardResult>('start_port_forward', { profileId, remotePort, localPort }),
+  startPreviewProxy: (targetUrl: string) =>
+    invoke<PreviewProxyResult>('start_preview_proxy', { targetUrl }),
   stopPortForward: (id: string) => invoke<void>('stop_port_forward', { id })
 };

@@ -16,6 +16,28 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Editor theme and widget resize polish
+
+#### Added
+
+- IDE Settings now includes an Editor theme selector with multiple dark themes.
+- Floating widgets and terminal widgets can be resized from every edge and
+  corner, while keeping the existing snap behavior.
+
+#### Changed
+
+- Secure env editor raw/comment blocks now edit as multiline plain text blocks
+  instead of one editable control per line.
+- Editor and secure editor caret colors now stay bright on dark themes.
+- Terminal paste normalizes CRLF/CR newlines before bracketed paste, preventing
+  doubled blank lines in LLM TUIs.
+- Hovering into the Browser preview area brings the Browser widget to the front,
+  so iframe content no longer feels stuck behind other widgets.
+- Local preview URLs now open through a lightweight loopback preview proxy that
+  strips iframe-blocking headers, so paths such as `/test.html` and `/admin`
+  can render inside the IDE even when they work in Chrome but reject iframes.
+
+
 ### 2026-05-22 - Secure editor plain comment lines
 
 #### Changed

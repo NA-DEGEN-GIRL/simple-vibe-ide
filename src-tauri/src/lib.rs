@@ -252,6 +252,12 @@ struct PortForwardResult {
     url: String,
 }
 
+struct HttpTarget {
+    host: String,
+    port: u16,
+    origin: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportStartResult {
@@ -1220,6 +1226,62 @@ fn start_port_forward(
         local_port: actual_local,
         target_host,
         remote_port,
+        url: format!("http://127.0.0.1:{actual_local}"),
+    })
+}
+
+#[tauri::command]
+fn start_preview_proxy(
+    state: State<IdeState>,
+    target_url: String,
+) -> Result<PortForwardResult, String> {
+    let target = parse_http_preview_target(&target_url)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|err| format!("failed to bind preview proxy: {err}"))?;
+    let actual_local = listener.local_addr().map_err(|err| err.to_string())?.port();
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| err.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread_host = target.host.clone();
+    let thread_port = target.port;
+
+    thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((incoming, _)) => {
+                    let host = thread_host.clone();
+                    thread::spawn(move || {
+                        let _ = proxy_http_preview(incoming, host, thread_port);
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(80));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    state
+        .forwards
+        .lock()
+        .map_err(|_| "forward state poisoned".to_string())?
+        .insert(
+            id.clone(),
+            ForwardSession {
+                stop: Some(stop),
+                child: None,
+            },
+        );
+
+    Ok(PortForwardResult {
+        id,
+        local_port: actual_local,
+        target_host: target.origin,
+        remote_port: target.port,
         url: format!("http://127.0.0.1:{actual_local}"),
     })
 }
@@ -2380,6 +2442,192 @@ fn proxy_stream(
     Ok(())
 }
 
+fn proxy_http_preview(
+    mut incoming: TcpStream,
+    target_host: String,
+    target_port: u16,
+) -> std::io::Result<()> {
+    incoming.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let request = read_http_headers(&mut incoming, 128 * 1024)?;
+    let Some(header_end) = find_http_header_end(&request) else {
+        return Ok(());
+    };
+    let (request_headers, request_body) = request.split_at(header_end + 4);
+    let request_text = String::from_utf8_lossy(request_headers);
+    let content_length = http_content_length(&request_text).unwrap_or(0);
+    let rewritten_request = rewrite_preview_request_headers(&request_text, &target_host, target_port);
+
+    let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
+    remote.set_read_timeout(Some(Duration::from_secs(20)))?;
+    remote.write_all(rewritten_request.as_bytes())?;
+    if !request_body.is_empty() {
+        remote.write_all(request_body)?;
+    }
+    if content_length > request_body.len() {
+        copy_exact_bytes(&mut incoming, &mut remote, content_length - request_body.len())?;
+    }
+
+    let response = read_http_headers(&mut remote, 256 * 1024)?;
+    let Some(response_header_end) = find_http_header_end(&response) else {
+        return Ok(());
+    };
+    let (response_headers, response_body) = response.split_at(response_header_end + 4);
+    let response_text = String::from_utf8_lossy(response_headers);
+    let rewritten_response = strip_preview_blocking_headers(&response_text);
+    incoming.write_all(rewritten_response.as_bytes())?;
+    if !response_body.is_empty() {
+        incoming.write_all(response_body)?;
+    }
+    std::io::copy(&mut remote, &mut incoming)?;
+    Ok(())
+}
+
+fn parse_http_preview_target(target_url: &str) -> Result<HttpTarget, String> {
+    let trimmed = target_url.trim();
+    let rest = trimmed
+        .strip_prefix("http://")
+        .ok_or_else(|| "preview proxy only supports http:// local URLs".to_string())?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(|| "invalid preview URL".to_string())?;
+    let (raw_host, raw_port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "preview URL must include a port".to_string())?;
+    let mut host = raw_host.trim().trim_matches(['[', ']']).to_string();
+    if host.eq_ignore_ascii_case("localhost") || host == "0.0.0.0" || host == "::1" {
+        host = "127.0.0.1".to_string();
+    }
+    if host != "127.0.0.1" {
+        return Err("preview proxy only supports local loopback URLs".to_string());
+    }
+    let port = raw_port
+        .parse::<u16>()
+        .map_err(|_| "invalid preview port".to_string())?;
+    if port == 0 {
+        return Err("invalid preview port".to_string());
+    }
+    Ok(HttpTarget {
+        origin: format!("http://{host}:{port}"),
+        host,
+        port,
+    })
+}
+
+fn read_http_headers(stream: &mut TcpStream, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if find_http_header_end(&buffer).is_some() {
+            break;
+        }
+        if buffer.len() > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers too large",
+            ));
+        }
+    }
+    Ok(buffer)
+}
+
+fn find_http_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn http_content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn rewrite_preview_request_headers(headers: &str, target_host: &str, target_port: u16) -> String {
+    let mut lines = headers.lines();
+    let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
+    let mut rewritten = String::new();
+    rewritten.push_str(request_line);
+    rewritten.push_str("\r\n");
+    let mut saw_host = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lower = line
+            .split_once(':')
+            .map(|(name, _)| name.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if lower == "host" {
+            saw_host = true;
+            rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+        } else if lower == "connection" || lower == "proxy-connection" {
+            continue;
+        } else {
+            rewritten.push_str(line.trim_end());
+            rewritten.push_str("\r\n");
+        }
+    }
+    if !saw_host {
+        rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+    }
+    rewritten.push_str("Connection: close\r\n\r\n");
+    rewritten
+}
+
+fn strip_preview_blocking_headers(headers: &str) -> String {
+    let mut lines = headers.lines();
+    let status_line = lines.next().unwrap_or("HTTP/1.1 502 Bad Gateway").trim_end();
+    let mut rewritten = String::new();
+    rewritten.push_str(status_line);
+    rewritten.push_str("\r\n");
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lower = line
+            .split_once(':')
+            .map(|(name, _)| name.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(
+            lower.as_str(),
+            "x-frame-options" | "content-security-policy" | "content-security-policy-report-only"
+        ) {
+            continue;
+        }
+        rewritten.push_str(line.trim_end());
+        rewritten.push_str("\r\n");
+    }
+    rewritten.push_str("\r\n");
+    rewritten
+}
+
+fn copy_exact_bytes(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    mut remaining: usize,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    while remaining > 0 {
+        let chunk_len = remaining.min(buffer.len());
+        let read = reader.read(&mut buffer[..chunk_len])?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        remaining -= read;
+    }
+    Ok(())
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -2511,6 +2759,7 @@ pub fn run() {
             resize_terminal,
             kill_terminal,
             start_port_forward,
+            start_preview_proxy,
             stop_port_forward
         ])
         .setup(|app| {
