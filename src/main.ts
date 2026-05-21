@@ -319,6 +319,15 @@ type ContextMenuItem = {
   danger?: boolean;
   separator?: boolean;
 };
+type WorkspaceDropTarget = { targetId: string; position: 'before' | 'after' };
+type WorkspaceDragState = {
+  id: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  dragging: boolean;
+  target: WorkspaceDropTarget | null;
+};
 type CreateTerminalOptions = {
   rect?: LayoutRatio;
   focus?: boolean;
@@ -732,7 +741,8 @@ let marketTickerReconnectTimer = 0;
 let marketTickerFallbackTimer = 0;
 let marketTickerRenderFrame = 0;
 let marketTickerReconnectAttempt = 0;
-let draggedWorkspaceId = '';
+let workspaceDragState: WorkspaceDragState | null = null;
+let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
 let activeExplorerRename: {
   path: string;
@@ -1580,7 +1590,7 @@ function renderWorkspaceTabs() {
     const tab = document.createElement('div');
     const protectedWorkspace = Boolean(workspace.captureProtected);
     tab.className = `workspace-tab${workspace.id === state.activeWorkspaceId ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
-    tab.draggable = true;
+    tab.draggable = false;
     tab.dataset.workspaceId = workspace.id;
     tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
     const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
@@ -1603,7 +1613,13 @@ function renderWorkspaceTabs() {
     tab.querySelectorAll<HTMLButtonElement>('button').forEach((button) => {
       button.draggable = false;
     });
-    tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!.addEventListener('click', () => void activateWorkspaceTab(workspace.id));
+    tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!.addEventListener('click', (event) => {
+      if (suppressWorkspaceTabClick) {
+        event.preventDefault();
+        return;
+      }
+      void activateWorkspaceTab(workspace.id);
+    });
     tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!.addEventListener('click', (event) => {
       event.stopPropagation();
       void toggleWorkspaceCaptureProtection(workspace.id);
@@ -1616,39 +1632,92 @@ function renderWorkspaceTabs() {
       event.stopPropagation();
       void closeWorkspaceTab(workspace.id);
     });
-    tab.addEventListener('dragstart', (event) => {
-      draggedWorkspaceId = workspace.id;
-      tab.classList.add('dragging');
-      event.dataTransfer?.setData('text/plain', workspace.id);
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
-    });
-    tab.addEventListener('dragend', () => {
-      draggedWorkspaceId = '';
-      tab.classList.remove('dragging');
-    });
-    tab.addEventListener('dragover', (event) => {
-      if (draggedWorkspaceId && draggedWorkspaceId !== workspace.id) {
-        event.preventDefault();
-        const position = workspaceDropPosition(event, tab);
-        tab.classList.toggle('drop-before', position === 'before');
-        tab.classList.toggle('drop-after', position === 'after');
-      }
-    });
-    tab.addEventListener('dragleave', () => clearWorkspaceDropMarkers());
-    tab.addEventListener('drop', (event) => {
-      event.preventDefault();
-      const position = workspaceDropPosition(event, tab);
-      clearWorkspaceDropMarkers();
-      reorderWorkspaceTab(draggedWorkspaceId || event.dataTransfer?.getData('text/plain') || '', workspace.id, position);
-    });
+    tab.addEventListener('pointerdown', (event) => startWorkspaceTabPointerDrag(event, workspace.id, tab));
+    tab.addEventListener('pointermove', (event) => updateWorkspaceTabPointerDrag(event, tab));
+    tab.addEventListener('pointerup', (event) => finishWorkspaceTabPointerDrag(event, tab, true));
+    tab.addEventListener('pointercancel', (event) => finishWorkspaceTabPointerDrag(event, tab, false));
     fragment.append(tab);
   }
   el.workspaceTabs.append(fragment);
 }
 
-function workspaceDropPosition(event: DragEvent, tab: HTMLElement): 'before' | 'after' {
+function startWorkspaceTabPointerDrag(event: PointerEvent, id: string, tab: HTMLElement) {
+  if (event.button !== 0) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest('.workspace-tab-security, .workspace-tab-copy, .workspace-tab-close')) return;
+  workspaceDragState = {
+    id,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    dragging: false,
+    target: null
+  };
+  tab.setPointerCapture(event.pointerId);
+}
+
+function updateWorkspaceTabPointerDrag(event: PointerEvent, tab: HTMLElement) {
+  const drag = workspaceDragState;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  const moved = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+  if (!drag.dragging && moved < 6) return;
+  drag.dragging = true;
+  suppressWorkspaceTabClick = true;
+  tab.classList.add('dragging');
+  setWorkspaceDropTarget(workspaceDropTargetAt(event.clientX, event.clientY, drag.id));
+}
+
+function finishWorkspaceTabPointerDrag(event: PointerEvent, tab: HTMLElement, commit: boolean) {
+  const drag = workspaceDragState;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  if (tab.hasPointerCapture(event.pointerId)) tab.releasePointerCapture(event.pointerId);
+  if (commit && drag.dragging && drag.target) {
+    reorderWorkspaceTab(drag.id, drag.target.targetId, drag.target.position);
+  }
+  tab.classList.remove('dragging');
+  workspaceDragState = null;
+  clearWorkspaceDropMarkers();
+  window.setTimeout(() => {
+    suppressWorkspaceTabClick = false;
+  }, 0);
+}
+
+function workspaceDropTargetAt(x: number, y: number, sourceId: string): WorkspaceDropTarget | null {
+  const direct = document.elementFromPoint(x, y)?.closest<HTMLElement>('.workspace-tab');
+  if (direct?.dataset.workspaceId && direct.dataset.workspaceId !== sourceId) {
+    return { targetId: direct.dataset.workspaceId, position: workspaceDropPosition(x, direct) };
+  }
+
+  const tabs = Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab'))
+    .filter((tab) => tab.dataset.workspaceId && tab.dataset.workspaceId !== sourceId);
+  if (!tabs.length) return null;
+
+  let best: { tab: HTMLElement; score: number } | null = null;
+  for (const tab of tabs) {
+    const rect = tab.getBoundingClientRect();
+    const verticalPenalty = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
+    const horizontalPenalty = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
+    const score = verticalPenalty * 3 + horizontalPenalty;
+    if (!best || score < best.score) best = { tab, score };
+  }
+  if (!best?.tab.dataset.workspaceId) return null;
+  return { targetId: best.tab.dataset.workspaceId, position: workspaceDropPosition(x, best.tab) };
+}
+
+function workspaceDropPosition(clientX: number, tab: HTMLElement): 'before' | 'after' {
   const rect = tab.getBoundingClientRect();
-  return event.clientX < rect.left + rect.width / 2 ? 'before' : 'after';
+  return clientX < rect.left + rect.width / 2 ? 'before' : 'after';
+}
+
+function setWorkspaceDropTarget(target: WorkspaceDropTarget | null) {
+  if (!workspaceDragState) return;
+  workspaceDragState.target = target;
+  clearWorkspaceDropMarkers();
+  if (!target) return;
+  const tab = Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab'))
+    .find((item) => item.dataset.workspaceId === target.targetId);
+  tab?.classList.toggle('drop-before', target.position === 'before');
+  tab?.classList.toggle('drop-after', target.position === 'after');
 }
 
 function clearWorkspaceDropMarkers() {
@@ -3047,6 +3116,8 @@ function bindEvents() {
   window.addEventListener('blur', hideContextMenu);
   window.addEventListener('beforeunload', () => {
     if (marketTickerSocket) marketTickerSocket.close();
+    hideCaptureFreezeFrame();
+    if (state.captureProtectionApplied) void api.setCaptureProtection(false);
   });
 }
 

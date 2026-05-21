@@ -345,9 +345,7 @@ fn show_capture_cover<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     main: &tauri::WebviewWindow<R>,
 ) -> Result<(), String> {
-    let cover = app
-        .get_webview_window("capture-cover")
-        .ok_or_else(|| "capture cover window is not available".to_string())?;
+    let cover = create_capture_cover(app)?;
     sync_capture_cover(main, &cover)?;
     Ok(())
 }
@@ -377,6 +375,12 @@ fn create_capture_cover<R: tauri::Runtime>(
 fn hide_capture_cover<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(cover) = app.get_webview_window("capture-cover") {
         let _ = cover.hide();
+    }
+}
+
+fn close_capture_cover<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(cover) = app.get_webview_window("capture-cover") {
+        let _ = cover.close();
     }
 }
 
@@ -3065,11 +3069,11 @@ pub fn run() {
         .setup(|app| {
             let window = app.get_webview_window("main").expect("main window");
             let app_handle = app.handle().clone();
-            let _ = create_capture_cover(&app_handle);
             show_window_on_primary_monitor(&window);
             let app_for_events = app_handle.clone();
             let main_for_events = window.clone();
             window.on_window_event(move |event| match event {
+                WindowEvent::CloseRequested { .. } => close_capture_cover(&app_for_events),
                 WindowEvent::Moved(_)
                 | WindowEvent::Resized(_)
                 | WindowEvent::ScaleFactorChanged { .. } => {
@@ -3079,7 +3083,7 @@ pub fn run() {
                         }
                     }
                 }
-                WindowEvent::Destroyed => hide_capture_cover(&app_for_events),
+                WindowEvent::Destroyed => close_capture_cover(&app_for_events),
                 _ => {}
             });
             let delayed_window = window.clone();

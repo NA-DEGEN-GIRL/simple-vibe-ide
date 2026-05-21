@@ -274,14 +274,18 @@ body.capture-freeze-visible .capture-freeze-frame {
   background: #0c121d;
   min-height: 27px;
 }
-.workspace-tab { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+.workspace-tab {
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  user-select: none;
+  touch-action: none;
+}
 .workspace-tab.active, .widget-tab.active {
   border-color: #4d8dff;
   border-bottom-color: #16243a;
   background: #16243a;
   box-shadow: inset 0 2px 0 #7fb0ff;
 }
-.workspace-tab.dragging { opacity: 0.62; }
+.workspace-tab.dragging { opacity: 0.62; cursor: grabbing; }
 .workspace-tab.drop-before { box-shadow: inset 3px 0 0 #7fb0ff; }
 .workspace-tab.drop-after { box-shadow: inset -3px 0 0 #7fb0ff; }
 .workspace-tab.protected { border-color: #8a6b26; }
@@ -292,6 +296,8 @@ body.capture-freeze-visible .capture-freeze-frame {
 }
 .workspace-tab button, .widget-tab button { min-width: 0; border: 0; background: transparent; padding: 4px 7px; }
 .workspace-tab-label, .widget-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.workspace-tab-label { cursor: grab; }
+.workspace-tab.dragging .workspace-tab-label { cursor: grabbing; }
 .workspace-tab-copy {
   display: grid;
   place-items: center;
