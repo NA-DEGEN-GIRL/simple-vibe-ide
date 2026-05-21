@@ -25,6 +25,9 @@ export const api = {
     invoke<void>('rename_path', { profileId, oldPath, newPath }),
   openPath: (profileId: string, path: string) =>
     invoke<void>('open_path', { profileId, path }),
+  readClipboardFilePaths: () => invoke<string[]>('read_clipboard_file_paths'),
+  saveClipboardImageFile: (profileId: string, targetDir: string, fileName: string, base64Data: string) =>
+    invoke<string>('save_clipboard_image_file', { profileId, targetDir, fileName, base64Data }),
   copyDroppedFiles: (profileId: string, targetDir: string, sourcePaths: string[]) =>
     invoke<number>('copy_dropped_files', { profileId, targetDir, sourcePaths }),
   startExportPath: (profileId: string, path: string) =>

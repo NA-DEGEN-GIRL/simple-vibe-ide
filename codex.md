@@ -16,6 +16,19 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-21 - Explorer clipboard paste
+
+#### Added
+
+- Explorer now handles Ctrl+V as file paste when Explorer has focus.
+- Windows clipboard file lists copied from File Explorer are copied into the
+  current Explorer folder using the same safe copy path as drag-in.
+- Image files copied from File Explorer stay file operations; they no longer fall
+  through to the image preview paste workflow while Explorer is focused.
+- If Explorer is focused and the clipboard contains a raw image instead of a file
+  path, the image is saved as a normal image file in the current Explorer folder.
+
+
 ### 2026-05-21 - Async export and drag-out
 
 #### Added

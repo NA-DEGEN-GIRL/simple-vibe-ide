@@ -21,6 +21,17 @@ use uuid::Uuid;
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+};
+
+#[cfg(windows)]
+use windows::Win32::System::Ole::CF_HDROP;
+
+#[cfg(windows)]
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowDisplayAffinity, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, WDA_EXCLUDEFROMCAPTURE,
     WDA_NONE,
@@ -716,6 +727,42 @@ fn open_path(profile_id: String, path: String) -> Result<(), String> {
         .spawn()
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+    clipboard_file_paths()
+}
+
+#[tauri::command]
+fn save_clipboard_image_file(
+    profile_id: String,
+    target_dir: String,
+    file_name: String,
+    base64_data: String,
+) -> Result<String, String> {
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(strip_data_url_prefix(&base64_data))
+        .map_err(|err| format!("invalid base64 image data: {err}"))?;
+    let safe_file = sanitize_file_name(&file_name);
+    let profile = profile_from_id(&profile_id);
+    let target_dir = normalize_profile_path(&profile, &target_dir);
+
+    match profile.kind.as_str() {
+        "windows" => save_clipboard_image_to_local(Path::new(&target_dir), &safe_file, data)
+            .map(|path| path.to_string_lossy().to_string()),
+        "wsl" => {
+            if let Some(windows_dir) = wsl_posix_path_to_windows_path(&profile, &target_dir) {
+                let target = save_clipboard_image_to_local(&windows_dir, &safe_file, data)?;
+                let name = local_file_name(&target)?;
+                Ok(join_posix(&target_dir, &name))
+            } else {
+                save_clipboard_image_to_remote(&profile, &target_dir, &safe_file, data)
+            }
+        }
+        "ssh" => save_clipboard_image_to_remote(&profile, &target_dir, &safe_file, data),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
 }
 
 #[tauri::command]
@@ -2010,6 +2057,74 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[cfg(windows)]
+struct ClipboardGuard;
+
+#[cfg(windows)]
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clipboard_file_paths() -> Result<Vec<String>, String> {
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_err() {
+            return Ok(Vec::new());
+        }
+        OpenClipboard(None).map_err(|err| err.to_string())?;
+        let _guard = ClipboardGuard;
+        let handle = GetClipboardData(CF_HDROP.0 as u32).map_err(|err| err.to_string())?;
+        let hdrop = HDROP(handle.0);
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        let mut paths = Vec::new();
+        for index in 0..count {
+            let len = DragQueryFileW(hdrop, index, None);
+            if len == 0 {
+                continue;
+            }
+            let mut buffer = vec![0_u16; len as usize + 1];
+            let written = DragQueryFileW(hdrop, index, Some(&mut buffer));
+            if written == 0 {
+                continue;
+            }
+            paths.push(String::from_utf16_lossy(&buffer[..written as usize]));
+        }
+        Ok(paths)
+    }
+}
+
+#[cfg(not(windows))]
+fn clipboard_file_paths() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+fn save_clipboard_image_to_local(
+    target_dir: &Path,
+    file_name: &str,
+    data: Vec<u8>,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(target_dir).map_err(|err| err.to_string())?;
+    let target = unique_local_child_path(target_dir, file_name);
+    fs::write(&target, data).map_err(|err| err.to_string())?;
+    Ok(target)
+}
+
+fn save_clipboard_image_to_remote(
+    profile: &ConnectionProfile,
+    target_dir: &str,
+    file_name: &str,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    create_remote_directory(profile, target_dir)?;
+    let target = unique_remote_child_path(profile, target_dir, file_name)?;
+    write_remote_file(profile, &target, data)?;
+    Ok(target)
+}
+
 fn copy_dropped_files_to_local(
     target_dir: &Path,
     source_paths: &[String],
@@ -2384,6 +2499,8 @@ pub fn run() {
             create_file,
             rename_path,
             open_path,
+            read_clipboard_file_paths,
+            save_clipboard_image_file,
             copy_dropped_files,
             start_export_path,
             cancel_export_path,

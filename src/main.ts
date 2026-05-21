@@ -3911,6 +3911,13 @@ function syncActivePaneClass() {
 
 async function handlePaste(event: ClipboardEvent) {
   if (!state.activeProfile || !state.workspaceOpen) return;
+  if (isExplorerClipboardTarget(event.target)) {
+    event.preventDefault();
+    event.stopPropagation();
+    await pasteClipboardIntoExplorer(event);
+    return;
+  }
+
   const eventDataUrl = await imageDataUrlFromClipboardEvent(event);
   const shouldTryNativeImage = !eventDataUrl && clipboardEventMayContainImage(event);
   if (!eventDataUrl && !shouldTryNativeImage) return;
@@ -3923,6 +3930,51 @@ async function handlePaste(event: ClipboardEvent) {
   } catch (error) {
     setStatus(`Failed to paste image: ${String(error)}`, true);
   }
+}
+
+async function pasteClipboardIntoExplorer(event: ClipboardEvent) {
+  if (!state.activeProfile || !state.currentDir) return;
+
+  try {
+    const sourcePaths = await api.readClipboardFilePaths();
+    if (sourcePaths.length > 0) {
+      setStatus(`Pasting ${sourcePaths.length} file${sourcePaths.length === 1 ? '' : 's'} into Explorer...`);
+      const copied = await api.copyDroppedFiles(state.activeProfile.id, state.currentDir, sourcePaths);
+      await reloadExplorerDirectory(state.currentDir);
+      setStatus(`Pasted ${copied} file${copied === 1 ? '' : 's'} into Explorer`);
+      return;
+    }
+
+    const eventDataUrl = await imageDataUrlFromClipboardEvent(event);
+    const shouldTryNativeImage = !eventDataUrl && clipboardEventMayContainImage(event);
+    if (!eventDataUrl && !shouldTryNativeImage) {
+      setStatus('Clipboard has no files to paste into Explorer', true);
+      return;
+    }
+
+    const dataUrl = eventDataUrl ?? await nativeClipboardImageToDataUrl();
+    const savedPath = await api.saveClipboardImageFile(
+      state.activeProfile.id,
+      state.currentDir,
+      nextImageName(),
+      dataUrl
+    );
+    await reloadExplorerDirectory(state.currentDir);
+    selectExplorerEntry(savedPath);
+    setStatus(`Pasted image file into Explorer`);
+  } catch (error) {
+    setStatus(`Failed to paste into Explorer: ${String(error)}`, true);
+  }
+}
+
+function isExplorerClipboardTarget(target: EventTarget | null) {
+  const explorer = getPanel('explorer');
+  if (explorer.classList.contains('hidden')) return false;
+  if (target instanceof Element && target.closest('input, textarea, select, .terminal-card, .cm-editor')) {
+    return false;
+  }
+  return keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'explorer'
+    || target instanceof Node && explorer.contains(target);
 }
 
 function handleImageClipboardShortcut(event: KeyboardEvent) {
