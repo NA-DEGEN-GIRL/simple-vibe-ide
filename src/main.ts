@@ -1340,7 +1340,7 @@ function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
     `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
     'if [ -n "$__svi_path" ] && [ -f "$__svi_path" ] && [ -r "$__svi_path" ]; then',
     '  __svi_source="$__svi_source',
-    "$(head -c 4096 \"$__svi_path\" 2>/dev/null | tr -cd '\\011\\012\\015\\040-\\176')\"",
+    "$(head -c 65536 \"$__svi_path\" 2>/dev/null | tr -cd '\\011\\012\\015\\040-\\176')\"",
     'fi',
     '__svi_args=()',
     ...launcher.flags.map((flag) =>
@@ -1355,7 +1355,7 @@ function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
   return [
     `$sviSource = (Get-Command ${executable} -All -ErrorAction SilentlyContinue | Format-List * | Out-String)`,
     `$sviPath = (Get-Command ${executable} -ErrorAction SilentlyContinue).Source`,
-    'if ($sviPath -and (Test-Path -LiteralPath $sviPath -PathType Leaf)) { $sviSource += "`n" + ((Get-Content -LiteralPath $sviPath -TotalCount 80 -ErrorAction SilentlyContinue) -join "`n") }',
+    'if ($sviPath -and (Test-Path -LiteralPath $sviPath -PathType Leaf)) { $sviSource += "`n" + ((Get-Content -LiteralPath $sviPath -TotalCount 400 -ErrorAction SilentlyContinue) -join "`n") }',
     '$sviArgs = @()',
     ...launcher.flags.map((flag) =>
       `if ($sviSource -notmatch ${powershellQuote(flag.powershellPattern)}) { $sviArgs += @(${flag.args.map(powershellQuote).join(', ')}) }`

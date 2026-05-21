@@ -106,6 +106,8 @@ kept with the repository.
 - LLM launchers inspect aliases, functions, and readable wrapper scripts before
   appending approval-bypass flags, so wrapped commands do not receive duplicate
   flags.
+- Bash launchers inspect a larger readable prefix of CLI wrapper files, covering
+  npm-style wrappers that keep default flags below the first few KB.
 - New LLM terminal sessions open taller, and terminal widgets keep a larger
   minimum height so Codex, Claude, Grok, and Antigravity panes do not start in a
   cramped broken-looking state.
