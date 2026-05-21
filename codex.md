@@ -15,6 +15,23 @@ kept with the repository.
 
 ## Patch Notes
 
+### 2026-05-21 - Public README refresh
+
+#### Changed
+
+- Reworked README into a user-first guide with overview, requirements, quick
+  start, WSL checkout notes, feature tour, safety/privacy notes,
+  troubleshooting, limitations, and project layout.
+- Added a safe demo screenshot that shows an SSH demo workspace, image preview,
+  terminal server detection, and browser preview without private user data.
+
+#### Verification
+
+- Created a disposable SSH demo folder under a temp path.
+- Verified a temporary localhost preview server on port 48125 with curl before
+  stopping it.
+- Checked the screenshot manually for private paths, secrets, and user data.
+
 ### 2026-05-21 - Windows IDE usability pass
 
 #### Added
