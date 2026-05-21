@@ -27,6 +27,8 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - 기본 Windows titlebar 없는 frameless UI와 앱 내부 최소화/최대화/닫기 버튼
 - 처음 실행 시 빈 workspace로 시작해서 사용자가 명시적으로 폴더/profile을 열기 전에는 아무 것도 열지 않음
 - workspace tab 저장/복원: profile, root, panel 위치, 크기, 열린 editor/image/browser/shell context 저장
+- workspace tab 전환 시 shell/LLM terminal process 유지
+- IDE Settings에서 UI font, mono font, 추가 secret-mask file pattern 설정 가능
 - 상단 market ticker: Binance USD-M WebSocket 기반 BTC와 NAS100 proxy 표시, custom Binance symbol 1개 추가 가능
 - Explorer, Editor, Image Preview, Browser, Terminal widget 이동/리사이즈/스냅 지원
 - Terminal widget 내부 shell tab 지원
@@ -133,6 +135,8 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 ### Workspace와 layout
 
 - workspace tab은 profile, root, panel 위치/크기, 열린 context를 저장합니다.
+- workspace tab을 바꿔도 해당 workspace의 shell/LLM terminal process는 계속 살아 있고 다시 돌아오면 같은 terminal로 복귀합니다.
+- workspace tab은 drag로 순서를 바꿀 수 있습니다.
 - Explorer, Editor, Image Preview, Browser, Terminal widget은 title bar로 이동할 수 있고 grip으로 resize할 수 있습니다.
 - 가까운 edge는 자석처럼 붙도록 snap됩니다.
 - `Ctrl` + `+`, `Ctrl` + `-`는 포커스된 editor/terminal의 font size를 조절합니다.
@@ -140,6 +144,13 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - 전체 IDE scale을 바꾸고 싶으면 상단 titlebar 쪽을 focus target으로 둔 상태에서 조절합니다.
 - 새 shell widget이나 shell tab은 다른 widget 아래에 묻히지 않도록 앞으로 올라옵니다.
 - `+shell`, Windows shell, Codex/Claude/Grok/Antigravity 버튼으로 새 terminal widget을 열 때는 workspace별 마지막 terminal 크기를 기억해서 다시 사용합니다.
+- 새 shell/LLM terminal은 기본적으로 현재 workspace root에서 시작합니다.
+
+### Settings
+
+- `Set` 버튼으로 IDE Settings 패널을 열 수 있습니다.
+- UI font와 mono font를 선택할 수 있습니다. Mono font는 editor, terminal, secure editor, calculator, console 등에 적용됩니다.
+- 추가 mask file pattern을 줄 단위로 설정할 수 있습니다. 기본적으로 `.env`, `*.env`, `*.env.*`, secret/private/token/password/key 계열 파일을 masked editor로 엽니다.
 
 ### Market ticker
 
@@ -182,6 +193,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - env류 private file은 masked key-value editor로 열립니다.
 - 각 row에 reveal button이 있고, raw reveal toggle도 있습니다.
 - `.env.example`, sample/example 파일은 기본 masking 대상에서 제외됩니다.
+- `api.env`, `prod.env.local` 같은 `*.env` 계열 파일도 기본 masking 대상입니다.
 - 기존 값은 masked 상태로 유지하면서 새 env key를 추가할 수 있습니다.
 
 ### Terminal과 LLM launcher
@@ -235,6 +247,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - terminal output에서 `http://localhost:3000` 같은 local server URL을 감지합니다.
 - 감지된 server는 Browser tab으로 열 수 있고, WSL profile은 가능한 경우 local forwarding/proxy를 자동 설정합니다.
 - Browser URL box에는 full URL 또는 `3000` 같은 port 번호만 입력할 수 있습니다.
+- full local URL은 path/query/hash를 유지하므로 `/test.html`, `/admin` 같은 route도 forwarded preview에서 그대로 열립니다.
 - desktop, phone, tablet viewport preset이 device menu에 포함되어 있습니다.
 - stale local preview를 위한 hard refresh가 있습니다.
 - manual remote/local forwarding은 fallback으로 남아 있습니다.
@@ -332,6 +345,8 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Frameless window with in-app minimize, maximize/restore, and close controls
 - Empty first launch until the user explicitly opens a local, WSL, or SSH workspace
 - Workspace tabs that restore profile, root, panel positions, sizes, and open context
+- Workspace tab switching keeps shell/LLM terminal processes alive
+- IDE Settings for UI font, mono font, and extra secret-mask file patterns
 - Top market ticker for BTC and a NAS100 proxy via Binance USD-M WebSocket, plus one custom Binance symbol
 - Movable, resizable, snapping Explorer, Editor, Image Preview, Browser, and Terminal widgets
 - Shell tabs inside each terminal widget
@@ -438,6 +453,8 @@ WSL profiles are loaded in the background after the first screen is interactive.
 ### Workspaces And Layout
 
 - Workspace tabs save and restore profile, root, panel positions, sizes, and open context.
+- Switching workspace tabs keeps that workspace's shell/LLM terminal processes alive and returns to the same terminals.
+- Workspace tabs can be reordered by drag and drop.
 - Explorer, Editor, Image Preview, Browser, and Terminal widgets can be moved by their title bars and resized from their grips.
 - Nearby edges snap to each other.
 - `Ctrl` + `+` and `Ctrl` + `-` resize the focused editor or terminal font.
@@ -445,6 +462,13 @@ WSL profiles are loaded in the background after the first screen is interactive.
 - To scale the whole IDE, focus the top titlebar area first.
 - New shell widgets and shell tabs are brought to the front automatically.
 - New terminal widgets opened from `+shell`, Windows shell, or Codex/Claude/Grok/Antigravity buttons reuse the last terminal size saved for that workspace.
+- New shell/LLM terminals start from the current workspace root by default.
+
+### Settings
+
+- The `Set` button opens IDE Settings.
+- UI font and mono font can be selected. Mono font applies to the editor, terminal, secure editor, calculator, and console surfaces.
+- Extra mask file patterns can be configured line by line. By default, `.env`, `*.env`, `*.env.*`, and secret/private/token/password/key-style files open in the masked editor.
 
 ### Market Ticker
 
@@ -487,6 +511,7 @@ WSL profiles are loaded in the background after the first screen is interactive.
 - Private env-style files open in a masked key-value editor.
 - Each row has a reveal button, and there is a raw reveal toggle.
 - `.env.example`, sample, and example files are excluded from default masking.
+- `api.env`, `prod.env.local`, and similar `*.env` files are masked by default.
 - New env keys can be added while existing values stay masked.
 
 ### Terminals And LLM Launchers
@@ -520,6 +545,7 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 
 - The Notes panel is a quick scratchpad separate from the code editor.
 - Each workspace can have multiple note tabs, and note text autosaves while you type.
+- Notes autosave is debounced so typing stays responsive, with immediate save on blur/manual save.
 - Pin keeps the Notes panel above other IDE widgets.
 - Each note tab can use its own Default, Sticky, Mint, Rose, or Paper theme.
 - Theme colors are previewed on each note tab, while the selected theme only applies below the tab bar.
@@ -540,6 +566,7 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 - Terminal output is scanned for local server URLs such as `http://localhost:3000`.
 - Detected servers can be opened in Browser tabs, and WSL profiles get automatic local forwarding where possible.
 - The Browser URL box accepts a full URL or just a port number like `3000`.
+- Full local URLs keep their path/query/hash, so forwarded previews such as `/test.html` and `/admin` open at the intended route.
 - Desktop, phone, and tablet viewport presets are included in the device menu.
 - Hard refresh is available for stale local previews.
 - Manual remote/local forwarding remains available as a fallback.

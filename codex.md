@@ -16,6 +16,34 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Workspace terminals, settings, and editor polish
+
+#### Added
+
+- Added IDE Settings with UI font, mono font, and extra secret-mask file
+  patterns.
+- Workspace tabs can now be reordered by drag and drop.
+
+#### Changed
+
+- Workspace tab switching now hides inactive workspace terminals instead of
+  killing them, so Codex sessions and dev servers can keep running.
+- New shell and LLM terminals now start from the workspace root by default.
+- Editor cursor, active line, active gutter, selection, and matching bracket
+  colors were strengthened for the dark theme.
+- Notes autosave debounce was increased and tab rerendering while typing was
+  reduced.
+- Multiline terminal paste now uses bracketed paste wrappers so LLM TUIs receive
+  the paste as one text block when supported.
+- Browser preview preserves path/query/hash for full local URLs when forwarding
+  WSL/SSH ports.
+
+#### Fixed
+
+- `*.env` and `*.env.*` files such as `api.env` and `prod.env.local` now open in
+  the masked editor by default, while example/sample files remain excluded.
+
+
 ### 2026-05-22 - Explorer refresh and shell change detection
 
 #### Added

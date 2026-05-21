@@ -10,11 +10,12 @@ import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
 import type { ConnectionProfile, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
-import { parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
+import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 interface TerminalPane {
   paneId: string;
   widgetId: string;
+  workspaceId: string;
   backendId?: string;
   title: string;
   command: string | null;
@@ -34,6 +35,7 @@ interface TerminalPane {
 
 interface TerminalWidget {
   widgetId: string;
+  workspaceId: string;
   element: HTMLElement;
   title: HTMLElement;
   cwd: HTMLElement;
@@ -94,6 +96,18 @@ interface MarketTickerQuote {
   updatedAt: number;
   status: 'loading' | 'live' | 'stale' | 'error';
   message?: string;
+}
+
+interface FontChoice {
+  id: string;
+  label: string;
+  stack: string;
+}
+
+interface IdeSettings {
+  uiFont: string;
+  monoFont: string;
+  extraMaskPatterns: string[];
 }
 
 interface CalculatorHistoryItem {
@@ -251,7 +265,7 @@ interface EditorRuntime {
   languageCompartment: import('@codemirror/state').Compartment;
 }
 
-type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'calculator';
+type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'calculator' | 'settings';
 type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
@@ -330,17 +344,19 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   }
 };
 
-const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'calculator'];
+const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'calculator', 'settings'];
 const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   explorer: true,
   editor: true,
   image: true,
   browser: true,
   notes: false,
-  calculator: false
+  calculator: false,
+  settings: false
 };
 const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
 const MARKET_TICKER_STORE_KEY = 'simple-vibe-ide.marketTicker.v1';
+const IDE_SETTINGS_KEY = 'simple-vibe-ide.settings.v1';
 const NOTES_DIR = '.vibe-ide-temp/notes';
 const NOTE_THEMES: Array<{ id: NoteThemeId; label: string }> = [
   { id: 'default', label: 'Default' },
@@ -357,6 +373,7 @@ const EXPLORER_WATCH_LOCAL_MS = 2500;
 const EXPLORER_WATCH_WSL_MS = 3500;
 const EXPLORER_WATCH_SSH_MS = 7000;
 const EXPLORER_WATCH_MAX_DIRS = 12;
+const NOTES_AUTOSAVE_DELAY_MS = 1800;
 const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
@@ -382,6 +399,23 @@ const MARKET_TICKER_BOOT_DELAY_MS = 1200;
 const MARKET_TICKER_FALLBACK_MS = 30000;
 const MARKET_TICKER_STALE_MS = 45000;
 const MARKET_TICKER_MAX_CUSTOM = 1;
+const UI_FONT_CHOICES: FontChoice[] = [
+  { id: 'system', label: 'System KR/EN', stack: 'Inter, "Segoe UI", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif' },
+  { id: 'malgun', label: 'Malgun Gothic', stack: '"Malgun Gothic", "Segoe UI", system-ui, sans-serif' },
+  { id: 'pretendard', label: 'Pretendard', stack: 'Pretendard, "Noto Sans KR", "Segoe UI", system-ui, sans-serif' },
+  { id: 'arial', label: 'Arial', stack: 'Arial, "Noto Sans KR", sans-serif' }
+];
+const MONO_FONT_CHOICES: FontChoice[] = [
+  { id: 'cascadia', label: 'Cascadia Mono (mono)', stack: '"Cascadia Mono", Consolas, "D2Coding", monospace' },
+  { id: 'd2coding', label: 'D2Coding (mono)', stack: 'D2Coding, "Cascadia Mono", Consolas, monospace' },
+  { id: 'jetbrains', label: 'JetBrains Mono (mono)', stack: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace' },
+  { id: 'consolas', label: 'Consolas (mono)', stack: 'Consolas, "Cascadia Mono", monospace' }
+];
+const DEFAULT_IDE_SETTINGS: IdeSettings = {
+  uiFont: 'system',
+  monoFont: 'cascadia',
+  extraMaskPatterns: ['*.env', '*.env.*', '*.secret', '*.private', '*.credentials']
+};
 
 const state = {
   profiles: [] as ConnectionProfile[],
@@ -442,6 +476,7 @@ const state = {
   marketTickers: [] as MarketTickerConfig[],
   marketQuotes: new Map<string, MarketTickerQuote>(),
   marketTickerConnected: false,
+  ideSettings: { ...DEFAULT_IDE_SETTINGS } as IdeSettings,
   showFileSizes: true
 };
 
@@ -470,6 +505,7 @@ let marketTickerReconnectTimer = 0;
 let marketTickerFallbackTimer = 0;
 let marketTickerRenderFrame = 0;
 let marketTickerReconnectAttempt = 0;
+let draggedWorkspaceId = '';
 let fileOpenToken = 0;
 let activeExplorerRename: {
   path: string;
@@ -533,6 +569,7 @@ app.innerHTML = `
       <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
       <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
       <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
+      <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
       <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
       <div id="market-ticker" class="market-ticker" title="Binance USD-M Futures ticker">
         <div id="market-ticker-list" class="market-ticker-list" aria-live="polite"></div>
@@ -671,6 +708,23 @@ app.innerHTML = `
         <div id="calculator-keys" class="calculator-keys" aria-label="Calculator keys"></div>
         <div id="calculator-history" class="calculator-history"></div>
       </section>
+      <section class="panel settings-panel floating-panel hidden" data-panel="settings">
+        <div class="panel-title panel-drag-handle">
+          <span>IDE Settings</span>
+          <span class="spacer"></span>
+          <button id="settings-save" class="panel-mode" title="Apply settings">Save</button>
+          <button class="panel-close" data-close-panel="settings" title="Close Settings" aria-label="Close Settings">x</button>
+        </div>
+        <div class="settings-body">
+          <label>UI font <select id="settings-ui-font"></select></label>
+          <label>Mono font <select id="settings-mono-font"></select></label>
+          <label class="settings-textarea-label">
+            Mask file patterns
+            <textarea id="settings-mask-patterns" spellcheck="false" placeholder="*.env&#10;*.secret"></textarea>
+          </label>
+          <p class="hint">Patterns are app-wide. Example/sample files stay excluded from default masking.</p>
+        </div>
+      </section>
     </main>
   </div>
   <div class="window-controls" aria-label="Window controls" data-no-window-drag>
@@ -762,7 +816,11 @@ const el = {
   calculatorResult: document.querySelector<HTMLDivElement>('#calculator-result')!,
   calculatorKeys: document.querySelector<HTMLDivElement>('#calculator-keys')!,
   calculatorHistory: document.querySelector<HTMLDivElement>('#calculator-history')!,
-  calculatorClear: document.querySelector<HTMLButtonElement>('#calculator-clear')!
+  calculatorClear: document.querySelector<HTMLButtonElement>('#calculator-clear')!,
+  settingsUiFont: document.querySelector<HTMLSelectElement>('#settings-ui-font')!,
+  settingsMonoFont: document.querySelector<HTMLSelectElement>('#settings-mono-font')!,
+  settingsMaskPatterns: document.querySelector<HTMLTextAreaElement>('#settings-mask-patterns')!,
+  settingsSave: document.querySelector<HTMLButtonElement>('#settings-save')!
 };
 
 const currentWindow = getCurrentWindow();
@@ -825,6 +883,7 @@ async function init() {
   });
 
   state.profiles = await api.listProfiles();
+  loadIdeSettings();
   loadWorkspaceStore();
   loadMarketTickerConfig();
   ensureEditorTab();
@@ -841,6 +900,7 @@ async function init() {
   renderBrowserDeviceOptions();
   renderCalculatorKeys();
   renderCalculator();
+  renderSettings();
   renderMarketTicker();
   setBrowserMode('desktop');
   setBrowserConsolePosition(state.browserConsolePosition);
@@ -908,6 +968,73 @@ function persistWorkspaceStore() {
   };
   localStorage.setItem(WORKSPACE_STORE_KEY, JSON.stringify(store));
   renderWorkspaceTabs();
+}
+
+function loadIdeSettings() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(IDE_SETTINGS_KEY) ?? '') as Partial<IdeSettings>;
+    state.ideSettings = {
+      ...DEFAULT_IDE_SETTINGS,
+      ...parsed,
+      extraMaskPatterns: Array.isArray(parsed.extraMaskPatterns)
+        ? parsed.extraMaskPatterns.map(String).filter(Boolean)
+        : DEFAULT_IDE_SETTINGS.extraMaskPatterns
+    };
+  } catch {
+    state.ideSettings = { ...DEFAULT_IDE_SETTINGS };
+  }
+  applyIdeSettings();
+}
+
+function persistIdeSettings() {
+  localStorage.setItem(IDE_SETTINGS_KEY, JSON.stringify(state.ideSettings));
+}
+
+function renderSettings() {
+  renderFontOptions(el.settingsUiFont, UI_FONT_CHOICES, state.ideSettings.uiFont);
+  renderFontOptions(el.settingsMonoFont, MONO_FONT_CHOICES, state.ideSettings.monoFont);
+  el.settingsMaskPatterns.value = state.ideSettings.extraMaskPatterns.join('\n');
+}
+
+function renderFontOptions(select: HTMLSelectElement, choices: FontChoice[], activeId: string) {
+  select.innerHTML = '';
+  for (const choice of choices) {
+    const option = document.createElement('option');
+    option.value = choice.id;
+    option.textContent = choice.label;
+    select.append(option);
+  }
+  select.value = choices.some((choice) => choice.id === activeId) ? activeId : choices[0].id;
+}
+
+function saveSettingsFromForm() {
+  state.ideSettings = {
+    uiFont: el.settingsUiFont.value,
+    monoFont: el.settingsMonoFont.value,
+    extraMaskPatterns: el.settingsMaskPatterns.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  };
+  persistIdeSettings();
+  applyIdeSettings();
+  renderSettings();
+  setStatus('Settings saved');
+}
+
+function applyIdeSettings() {
+  const uiFont = fontChoice(UI_FONT_CHOICES, state.ideSettings.uiFont).stack;
+  const monoFont = fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack;
+  document.documentElement.style.setProperty('--ui-font', uiFont);
+  document.documentElement.style.setProperty('--mono-font', monoFont);
+  configurePrivacyPolicy(state.ideSettings.extraMaskPatterns);
+  for (const pane of state.terminals) {
+    pane.term.options.fontFamily = monoFont;
+    pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
+    scheduleFitTerminal(pane);
+  }
+  codeView?.requestMeasure();
+}
+
+function fontChoice(choices: FontChoice[], id: string) {
+  return choices.find((choice) => choice.id === id) ?? choices[0];
 }
 
 function loadMarketTickerConfig() {
@@ -1191,6 +1318,8 @@ function renderWorkspaceTabs() {
     const tab = document.createElement('div');
     const protectedWorkspace = Boolean(workspace.captureProtected);
     tab.className = `workspace-tab${workspace.id === state.activeWorkspaceId ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
+    tab.draggable = true;
+    tab.dataset.workspaceId = workspace.id;
     tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
     const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
     tab.innerHTML = `
@@ -1212,9 +1341,41 @@ function renderWorkspaceTabs() {
       event.stopPropagation();
       void closeWorkspaceTab(workspace.id);
     });
+    tab.addEventListener('dragstart', (event) => {
+      draggedWorkspaceId = workspace.id;
+      tab.classList.add('dragging');
+      event.dataTransfer?.setData('text/plain', workspace.id);
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+    });
+    tab.addEventListener('dragend', () => {
+      draggedWorkspaceId = '';
+      tab.classList.remove('dragging');
+    });
+    tab.addEventListener('dragover', (event) => {
+      if (draggedWorkspaceId && draggedWorkspaceId !== workspace.id) {
+        event.preventDefault();
+        tab.classList.add('drop-before');
+      }
+    });
+    tab.addEventListener('dragleave', () => tab.classList.remove('drop-before'));
+    tab.addEventListener('drop', (event) => {
+      event.preventDefault();
+      tab.classList.remove('drop-before');
+      reorderWorkspaceTab(draggedWorkspaceId || event.dataTransfer?.getData('text/plain') || '', workspace.id);
+    });
     fragment.append(tab);
   }
   el.workspaceTabs.append(fragment);
+}
+
+function reorderWorkspaceTab(sourceId: string, targetId: string) {
+  if (!sourceId || !targetId || sourceId === targetId) return;
+  const sourceIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === sourceId);
+  const targetIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === targetId);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  const [item] = state.workspaceSnapshots.splice(sourceIndex, 1);
+  state.workspaceSnapshots.splice(targetIndex, 0, item);
+  persistWorkspaceStore();
 }
 
 async function toggleWorkspaceCaptureProtection(id: string) {
@@ -1289,6 +1450,7 @@ async function createBlankWorkspaceTab() {
 
 async function closeWorkspaceTab(id: string) {
   const wasActive = state.activeWorkspaceId === id;
+  await closeTerminalsForWorkspace(id);
   state.workspaceSnapshots = state.workspaceSnapshots.filter((workspace) => workspace.id !== id);
   if (wasActive) {
     const next = state.workspaceSnapshots[0];
@@ -1306,7 +1468,7 @@ async function closeWorkspaceTab(id: string) {
       return;
     }
     state.activeWorkspaceId = '';
-    await closeWorkspace();
+    await closeWorkspace({ killTerminals: true });
   }
   persistWorkspaceStore();
 }
@@ -1391,7 +1553,8 @@ function saveActiveWorkspaceSnapshot() {
 
 function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): WorkspaceSnapshot {
   const profile = state.activeProfile!;
-  const activeTerminalIndex = Math.max(0, state.terminals.findIndex((pane) => pane.paneId === state.activePaneId));
+  const workspaceTerminals = activeWorkspaceTerminalPanes();
+  const activeTerminalIndex = Math.max(0, workspaceTerminals.findIndex((pane) => pane.paneId === state.activePaneId));
   return {
     id,
     label: workspaceLabel(profile, state.workspaceRoot || state.currentDir || profile.root),
@@ -1403,7 +1566,7 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
     updatedAt: new Date().toISOString(),
     panels: snapshotPanels(),
     terminalSpawnRect: currentTerminalSpawnRect(),
-    terminals: state.terminals.map((pane) => ({
+    terminals: workspaceTerminals.map((pane) => ({
       title: pane.title.replace(/\s+\(exited\)$/i, ''),
       command: pane.command,
       widgetId: pane.widgetId,
@@ -1482,7 +1645,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
 
   restoringWorkspace = true;
   try {
-    await closeAllTerminals();
+    hideAllTerminalWidgets();
     clearWorkspacePanels();
     state.activeProfile = profile;
     state.workspaceRoot = snapshot.root || profile.root;
@@ -1528,35 +1691,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     restoreBrowserState(snapshot);
     renderCalculator();
 
-    const terminalSnapshots = (snapshot.terminals ?? []).length
-      ? snapshot.terminals
-      : [{ title: 'shell', command: null, rect: undefined }];
-    const widgetsBySnapshotId = new Map<string, TerminalWidget>();
-    for (const terminal of terminalSnapshots) {
-      const terminalProfile = state.profiles.find((item) => item.id === terminal.profileId) ?? profile;
-      const widgetKey = terminal.widgetId || crypto.randomUUID();
-      const existingWidget = widgetsBySnapshotId.get(widgetKey);
-      if (existingWidget) {
-        await createTerminalTab(existingWidget, terminal.command, terminal.title || 'shell', {
-          focus: false,
-          profile: terminalProfile,
-          cwd: terminal.cwd || state.currentDir
-        });
-      } else {
-        const widget = await createTerminal(terminal.command, terminal.title || 'shell', {
-          rect: terminal.rect,
-          focus: false,
-          profile: terminalProfile,
-          cwd: terminal.cwd || state.currentDir
-        });
-        if (widget) widgetsBySnapshotId.set(widgetKey, widget);
-      }
-    }
-    const active = state.terminals[clamp(snapshot.activeTerminalIndex || 0, 0, Math.max(0, state.terminals.length - 1))];
-    if (active) {
-      setActivePane(active.paneId);
-      bringPanelToFront(active.element);
-    }
+    await restoreWorkspaceTerminals(snapshot, profile);
     refreshTitle();
     setStatus(`Workspace loaded: ${snapshot.label}`);
   } finally {
@@ -1570,7 +1705,48 @@ function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
     const panel = getPanel(id);
     const snapshot = panels?.[id];
     if (snapshot?.rect) applyLayoutRatio(panel, snapshot.rect);
-    setPanelVisible(id, snapshot?.visible ?? true, { skipSave: true });
+    setPanelVisible(id, snapshot?.visible ?? DEFAULT_PANEL_VISIBILITY[id], { skipSave: true });
+  }
+}
+
+async function restoreWorkspaceTerminals(snapshot: WorkspaceSnapshot, profile: ConnectionProfile) {
+  showTerminalWidgetsForWorkspace(snapshot.id);
+  const livePanes = activeWorkspaceTerminalPanes();
+  if (!livePanes.length) {
+    const terminalSnapshots = (snapshot.terminals ?? []).length
+      ? snapshot.terminals
+      : [{ title: 'shell', command: null, rect: undefined }];
+    const widgetsBySnapshotId = new Map<string, TerminalWidget>();
+    for (const terminal of terminalSnapshots) {
+      const terminalProfile = state.profiles.find((item) => item.id === terminal.profileId) ?? profile;
+      const widgetKey = terminal.widgetId || crypto.randomUUID();
+      const existingWidget = widgetsBySnapshotId.get(widgetKey);
+      if (existingWidget) {
+        await createTerminalTab(existingWidget, terminal.command, terminal.title || 'shell', {
+          focus: false,
+          profile: terminalProfile,
+          cwd: terminal.cwd || workspaceShellCwd()
+        });
+      } else {
+        const widget = await createTerminal(terminal.command, terminal.title || 'shell', {
+          rect: terminal.rect,
+          focus: false,
+          profile: terminalProfile,
+          cwd: terminal.cwd || workspaceShellCwd()
+        });
+        if (widget) widgetsBySnapshotId.set(widgetKey, widget);
+      }
+    }
+  }
+
+  const panes = activeWorkspaceTerminalPanes();
+  const active = panes[clamp(snapshot.activeTerminalIndex || 0, 0, Math.max(0, panes.length - 1))];
+  if (active) {
+    setActivePane(active.paneId);
+    bringPanelToFront(active.element);
+  } else {
+    state.activePaneId = '';
+    syncActivePaneClass();
   }
 }
 
@@ -1793,12 +1969,13 @@ function renderNotePin() {
 function handleNoteInput() {
   const tab = activeNoteTab();
   if (!tab) return;
+  const previousTitle = tab.title;
   tab.content = el.notesBody.value;
   tab.dirty = true;
   tab.title = noteTabLabel(tab);
-  renderNoteTabs();
+  if (tab.title !== previousTitle) renderNoteTabs();
   renderNoteStatus();
-  scheduleNoteSave(tab, 650);
+  scheduleNoteSave(tab, NOTES_AUTOSAVE_DELAY_MS);
 }
 
 function scheduleNoteSave(tab: NoteTabState, delayMs: number) {
@@ -2341,6 +2518,7 @@ function bindEvents() {
   });
   el.calculatorExpression.addEventListener('keydown', handleCalculatorKey);
   el.calculatorClear.addEventListener('click', clearCalculator);
+  el.settingsSave.addEventListener('click', saveSettingsFromForm);
   el.previewFrame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${el.previewFrame.src || state.previewUrl}`));
   el.previewFrame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${el.previewFrame.src || state.previewUrl}`));
   window.addEventListener('message', handleBrowserConsoleMessage);
@@ -2766,7 +2944,7 @@ function cycleWidgetFocus(direction: number, fromPaneId = '') {
 function focusableWidgets(): WidgetFocusItem[] {
   const items: WidgetFocusItem[] = [];
   addPanelFocusItem(items, 'explorer');
-  for (const widget of state.terminalWidgets) {
+  for (const widget of activeWorkspaceTerminalWidgets()) {
     const pane = activePaneForWidget(widget);
     if (pane && widget.element.isConnected) items.push({ kind: 'terminal', pane, element: widget.element });
   }
@@ -2775,6 +2953,7 @@ function focusableWidgets(): WidgetFocusItem[] {
   addPanelFocusItem(items, 'image');
   addPanelFocusItem(items, 'browser');
   addPanelFocusItem(items, 'calculator');
+  addPanelFocusItem(items, 'settings');
   return items;
 }
 
@@ -3237,17 +3416,18 @@ async function switchWorkspace(path: string) {
   state.workspaceRoot = path;
   state.currentDir = path;
   el.rootInput.value = path;
-  await closeAllTerminals();
+  if (!state.activeWorkspaceId) state.activeWorkspaceId = crypto.randomUUID();
+  await closeTerminalsForWorkspace(state.activeWorkspaceId);
   clearWorkspacePanels();
   await openWorkspace(path);
   setWorkspaceOpen(true);
   await createTerminal(null, 'shell');
-  if (!state.activeWorkspaceId) state.activeWorkspaceId = crypto.randomUUID();
   saveActiveWorkspaceSnapshot();
 }
 
-async function closeWorkspace() {
+async function closeWorkspace(options: { killTerminals?: boolean } = {}) {
   await saveAllDirtyNotes();
+  const workspaceId = state.activeWorkspaceId;
   state.workspaceCaptureProtected = false;
   await applyWorkspaceCaptureProtection(false, { quiet: true });
   state.activeProfile = null;
@@ -3258,7 +3438,8 @@ async function closeWorkspace() {
   el.profileSelect.value = '';
   el.rootInput.value = '';
   el.rootInput.placeholder = 'select a profile first';
-  await closeAllTerminals();
+  if (options.killTerminals && workspaceId) await closeTerminalsForWorkspace(workspaceId);
+  hideAllTerminalWidgets();
   clearWorkspacePanels();
   renderExplorer();
   refreshTitle();
@@ -3281,6 +3462,35 @@ async function closeAllTerminals() {
   for (const widget of widgets) widget.element.remove();
   syncActivePaneClass();
   renderShellTabs();
+}
+
+async function closeTerminalsForWorkspace(workspaceId: string) {
+  const widgets = state.terminalWidgets.filter((widget) => widget.workspaceId === workspaceId);
+  for (const widget of widgets) {
+    await closeTerminalWidget(widget.widgetId);
+  }
+  if (state.activePaneId && !activeWorkspaceTerminalPanes().some((pane) => pane.paneId === state.activePaneId)) {
+    state.activePaneId = '';
+  }
+  syncActivePaneClass();
+  renderShellTabs();
+}
+
+function hideAllTerminalWidgets() {
+  for (const widget of state.terminalWidgets) widget.element.classList.add('hidden');
+  state.activePaneId = '';
+  syncActivePaneClass();
+  renderShellTabs();
+}
+
+function showTerminalWidgetsForWorkspace(workspaceId: string) {
+  for (const widget of state.terminalWidgets) {
+    widget.element.classList.toggle('hidden', widget.workspaceId !== workspaceId);
+    if (widget.workspaceId === workspaceId) {
+      applyStoredLayoutRatio(widget.element);
+      scheduleFitTerminalWidget(widget);
+    }
+  }
 }
 
 function clearWorkspacePanels() {
@@ -3352,7 +3562,7 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
     button.disabled = !open;
   });
   document.querySelectorAll<HTMLButtonElement>('[data-toggle-panel]').forEach((button) => {
-    button.disabled = !open;
+    button.disabled = !open && button.dataset.togglePanel !== 'settings';
   });
   el.newFile.disabled = !open;
   el.newFolder.disabled = !open;
@@ -4925,7 +5135,7 @@ async function createTerminal(
 ): Promise<TerminalWidget | null> {
   const terminalProfile = options.profile ?? state.activeProfile;
   if (!terminalProfile) return null;
-  const terminalCwd = options.cwd ?? state.currentDir;
+  const terminalCwd = options.cwd ?? workspaceShellCwd();
   const widget = createTerminalWidget(title, terminalCwd, options);
   await createTerminalTab(widget, command, title, {
     ...options,
@@ -4937,6 +5147,7 @@ async function createTerminal(
 
 function createTerminalWidget(title: string, cwd: string, options: CreateTerminalOptions = {}) {
   const widgetId = crypto.randomUUID();
+  const workspaceId = state.activeWorkspaceId || 'workspace';
   const card = document.createElement('section');
   card.className = 'terminal-card panel';
   card.dataset.widgetId = widgetId;
@@ -4961,6 +5172,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
 
   const widget: TerminalWidget = {
     widgetId,
+    workspaceId,
     element: card,
     title: card.querySelector<HTMLElement>('.terminal-widget-title')!,
     cwd: card.querySelector<HTMLElement>('.terminal-widget-cwd')!,
@@ -4998,7 +5210,7 @@ async function createTerminalTab(
 ) {
   const terminalProfile = options.profile ?? profileForTerminalWidget(widget) ?? state.activeProfile;
   if (!terminalProfile) return null;
-  const terminalCwd = options.cwd ?? activePaneForWidget(widget)?.cwd ?? state.currentDir;
+  const terminalCwd = options.cwd ?? activePaneForWidget(widget)?.cwd ?? workspaceShellCwd();
   const paneId = crypto.randomUUID();
   const host = document.createElement('div');
   host.className = 'terminal-host hidden';
@@ -5008,7 +5220,7 @@ async function createTerminalTab(
   const term = new Terminal({
     cursorBlink: true,
     convertEol: true,
-    fontFamily: 'Cascadia Mono, Consolas, monospace',
+    fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
     fontSize: terminalFontSize,
     theme: { background: '#080b10', foreground: '#d8e0ea' }
   });
@@ -5019,6 +5231,7 @@ async function createTerminalTab(
   const pane: TerminalPane = {
     paneId,
     widgetId: widget.widgetId,
+    workspaceId: widget.workspaceId,
     title,
     command,
     profileId: terminalProfile.id,
@@ -5088,7 +5301,7 @@ async function closeTerminalPane(paneId: string) {
   }
 
   if (state.activePaneId === paneId) {
-    const next = remainingInWidget[0] ?? state.terminals[0];
+    const next = remainingInWidget[0] ?? activeWorkspaceTerminalPanes()[0];
     state.activePaneId = '';
     if (next) setActivePane(next.paneId);
     else setKeyboardResizeTarget({ kind: 'ide' });
@@ -5110,7 +5323,7 @@ async function closeTerminalWidget(widgetId: string) {
 function renderShellTabs() {
   el.shellTabs.classList.add('hidden');
   el.shellTabList.innerHTML = '';
-  for (const widget of state.terminalWidgets) renderTerminalWidgetTabs(widget);
+  for (const widget of activeWorkspaceTerminalWidgets()) renderTerminalWidgetTabs(widget);
 }
 
 function renderTerminalWidgetTabs(widget: TerminalWidget) {
@@ -5141,6 +5354,14 @@ function terminalPanesForWidget(widget: TerminalWidget) {
   return state.terminals.filter((pane) => pane.widgetId === widget.widgetId);
 }
 
+function activeWorkspaceTerminalWidgets() {
+  return state.terminalWidgets.filter((widget) => widget.workspaceId === state.activeWorkspaceId);
+}
+
+function activeWorkspaceTerminalPanes() {
+  return state.terminals.filter((pane) => pane.workspaceId === state.activeWorkspaceId);
+}
+
 function terminalWidgetForPane(pane: TerminalPane) {
   return state.terminalWidgets.find((widget) => widget.widgetId === pane.widgetId) ?? null;
 }
@@ -5156,8 +5377,8 @@ function activePaneForWidget(widget: TerminalWidget) {
 }
 
 function activeTerminalWidget() {
-  const pane = state.terminals.find((item) => item.paneId === state.activePaneId);
-  return pane ? terminalWidgetForPane(pane) : state.terminalWidgets[0] ?? null;
+  const pane = activeWorkspaceTerminalPanes().find((item) => item.paneId === state.activePaneId);
+  return pane ? terminalWidgetForPane(pane) : activeWorkspaceTerminalWidgets()[0] ?? null;
 }
 
 function activePaneForElement(element: HTMLElement) {
@@ -5185,8 +5406,12 @@ function windowsLocalProfileFallback(): ConnectionProfile {
 async function createShellTabInWidget(widget: TerminalWidget) {
   const active = activePaneForWidget(widget);
   const profile = profileForTerminalWidget(widget) ?? state.activeProfile;
-  const cwd = active?.cwd ?? state.currentDir;
+  const cwd = active?.cwd ?? workspaceShellCwd();
   await createTerminalTab(widget, null, 'shell', { profile: profile ?? undefined, cwd });
+}
+
+function workspaceShellCwd() {
+  return state.workspaceRoot || state.currentDir || state.activeProfile?.root || '.';
 }
 
 function updateTerminalWidgetTitle(widget: TerminalWidget) {
@@ -5246,10 +5471,14 @@ async function pasteTerminalText(pane: TerminalPane, text?: string) {
   try {
     const value = text ?? await readText();
     if (!value || !pane.backendId) return;
-    await api.writeTerminal(pane.backendId, value);
+    await api.writeTerminal(pane.backendId, terminalPastePayload(value));
   } catch (error) {
     setStatus(`Failed to paste terminal text: ${String(error)}`, true);
   }
+}
+
+function terminalPastePayload(value: string) {
+  return /\r|\n/.test(value) ? `\x1b[200~${value}\x1b[201~` : value;
 }
 
 function placeTerminalCard(card: HTMLElement, options: CreateTerminalOptions = {}) {
@@ -5318,6 +5547,7 @@ function fitTerminal(pane: TerminalPane) {
 function setActivePane(paneId: string) {
   const pane = state.terminals.find((item) => item.paneId === paneId);
   if (!pane) return;
+  if (pane.workspaceId !== state.activeWorkspaceId) return;
   const widget = terminalWidgetForPane(pane);
   if (widget) widget.activePaneId = paneId;
   state.activePaneId = paneId;
@@ -5652,6 +5882,11 @@ async function startForward() {
 
 async function openPreviewValue(value: string) {
   if (!value) return;
+  const localUrl = parseLocalPreviewUrl(value);
+  if (localUrl) {
+    await openLocalPreviewUrl(localUrl);
+    return;
+  }
   const port = parsePreviewPort(value);
   if (port) {
     await openPort(port, 'manual');
@@ -5660,7 +5895,31 @@ async function openPreviewValue(value: string) {
   openBrowserTab(normalizePreviewUrl(value));
 }
 
+async function openLocalPreviewUrl(url: URL) {
+  const port = Number(url.port);
+  if (!isPreviewPort(port)) return;
+  const suffix = `${url.pathname}${url.search}${url.hash}`;
+  if (!state.activeProfile || state.activeProfile.kind === 'windows') {
+    openBrowserTab(`http://127.0.0.1:${port}${suffix}`, browserTabLabel(url.toString()));
+    return;
+  }
+
+  const existing = state.forwards.find((forward) => forward.remotePort === port);
+  if (existing) {
+    openBrowserTab(`${existing.url}${suffix}`, browserTabLabel(url.toString()));
+    return;
+  }
+
+  const forward = await startForwardForPort(port, 'manual');
+  state.forwards.push(forward);
+  state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(state.activeProfile!.id, port));
+  renderForwards();
+  openBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
+  setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
+}
+
 async function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
+  if (pane.workspaceId !== state.activeWorkspaceId) return;
   if (!state.activeProfile) return;
   pane.outputBuffer = trimPortScanBuffer(`${pane.outputBuffer}${stripAnsi(data)}`);
   const ports = detectLocalServerPorts(pane.outputBuffer).filter((port) => !pane.seenPorts.has(port));
@@ -5982,6 +6241,18 @@ function withPreviewCacheBuster(url: string) {
 function normalizePreviewUrl(value: string) {
   if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return value;
   return `http://${value}`;
+}
+
+function parseLocalPreviewUrl(value: string) {
+  const trimmed = value.trim();
+  if (!/[/?#]/.test(trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ''))) return null;
+  try {
+    const url = new URL(normalizePreviewUrl(trimmed));
+    if (!['localhost', '127.0.0.1', '0.0.0.0', '[::1]'].includes(url.hostname)) return null;
+    return url.port ? url : null;
+  } catch {
+    return null;
+  }
 }
 
 function parsePreviewPort(value: string) {

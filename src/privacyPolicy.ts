@@ -11,7 +11,9 @@ const PRIVATE_TERMS = [
   'id_rsa$',
   'id_ed25519$'
 ].join('|');
-const PRIVATE_PATH = new RegExp('(^|[/\\\\])\\.' + 'env' + '($|\\.)|' + PRIVATE_TERMS, 'i');
+const ENV_FILE = '(^|[/\\\\])[^/\\\\]*\\.' + 'env' + '(?:\\.[^/\\\\]+)?$';
+const PRIVATE_PATH = new RegExp(ENV_FILE + '|(^|[/\\\\])\\.' + 'env' + '($|\\.)|' + PRIVATE_TERMS, 'i');
+let extraMaskPatterns: RegExp[] = [];
 export interface SecretLine {
   id: string;
   kind: 'kv' | 'raw';
@@ -25,7 +27,23 @@ export interface SecretLine {
 export function shouldMaskFile(path: string): boolean {
   const normalized = path.replace(/\\/g, '/');
   if (EXCLUDED.test(normalized)) return false;
-  return PRIVATE_PATH.test(normalized);
+  return PRIVATE_PATH.test(normalized) || extraMaskPatterns.some((pattern) => pattern.test(normalized));
+}
+
+export function configurePrivacyPolicy(patterns: string[] = []) {
+  extraMaskPatterns = patterns
+    .map((pattern) => pattern.trim())
+    .filter(Boolean)
+    .map(globToRegExp);
+}
+
+function globToRegExp(pattern: string) {
+  const normalized = pattern.replace(/\\/g, '/');
+  const escaped = normalized
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(escaped, 'i');
 }
 
 export function parseSecretLines(content: string): SecretLine[] {
