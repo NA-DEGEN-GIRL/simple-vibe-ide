@@ -157,6 +157,7 @@ interface WorkspaceSnapshot {
   captureProtected: boolean;
   updatedAt: string;
   panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>>;
+  terminalSpawnRect?: LayoutRatio;
   terminals: WorkspaceTerminalSnapshot[];
   activeTerminalIndex: number;
   editorTabs: EditorTabSnapshot[];
@@ -879,6 +880,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     captureProtected: false,
     updatedAt: new Date().toISOString(),
     panels: {},
+    terminalSpawnRect: undefined,
     terminals: [],
     activeTerminalIndex: 0,
     editorTabs: [],
@@ -930,6 +932,7 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
     captureProtected: state.workspaceCaptureProtected,
     updatedAt: new Date().toISOString(),
     panels: snapshotPanels(),
+    terminalSpawnRect: currentTerminalSpawnRect(),
     terminals: state.terminals.map((pane) => ({
       title: pane.title.replace(/\s+\(exited\)$/i, ''),
       command: pane.command,
@@ -980,6 +983,15 @@ function snapshotPanels() {
     };
   }
   return panels;
+}
+
+function currentTerminalSpawnRect() {
+  const widget = activeTerminalWidget();
+  return widget ? elementLayoutRatio(widget.element) : activeWorkspaceSnapshot()?.terminalSpawnRect;
+}
+
+function activeWorkspaceSnapshot() {
+  return state.workspaceSnapshots.find((workspace) => workspace.id === state.activeWorkspaceId);
 }
 
 async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
@@ -3948,8 +3960,9 @@ function placeTerminalCard(card: HTMLElement, options: CreateTerminalOptions = {
   const workspaceRect = el.mainGrid.getBoundingClientRect();
   const guideRect = el.terminalGrid.getBoundingClientRect();
   const index = state.terminalWidgets.length;
-  const width = clamp(guideRect.width || 620, terminalMinWidth(), Math.max(terminalMinWidth(), el.mainGrid.clientWidth - 16));
-  const preferredHeight = options.initialHeight ?? 340;
+  const rememberedSize = rememberedTerminalSpawnSize();
+  const width = clamp((rememberedSize?.width ?? guideRect.width) || 620, terminalMinWidth(), Math.max(terminalMinWidth(), el.mainGrid.clientWidth - 16));
+  const preferredHeight = rememberedSize?.height ?? options.initialHeight ?? 340;
   const height = clamp(preferredHeight, terminalMinHeight(), Math.max(terminalMinHeight(), el.mainGrid.clientHeight - 16));
   const offset = index * 22;
   const rect = clampPanelRect(card, {
@@ -3959,6 +3972,15 @@ function placeTerminalCard(card: HTMLElement, options: CreateTerminalOptions = {
     height
   });
   applyPanelRect(card, rect);
+}
+
+function rememberedTerminalSpawnSize() {
+  const ratio = activeWorkspaceSnapshot()?.terminalSpawnRect;
+  if (!ratio || !el.mainGrid.clientWidth || !el.mainGrid.clientHeight) return null;
+  return {
+    width: ratio.width * el.mainGrid.clientWidth,
+    height: ratio.height * el.mainGrid.clientHeight
+  };
 }
 
 function scheduleFitTerminal(pane: TerminalPane) {

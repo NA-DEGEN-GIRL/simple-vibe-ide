@@ -111,6 +111,8 @@ kept with the repository.
 - Terminal tabs wait for the first visible xterm fit before spawning the PTY, so
   full-screen LLM TUIs start with the correct column width instead of needing a
   manual widget resize to rerender.
+- New terminal widgets opened from shell or LLM buttons reuse the last terminal
+  widget size saved for the active workspace.
 - New LLM terminal sessions open taller, and terminal widgets keep a larger
   minimum height so Codex, Claude, Grok, and Antigravity panes do not start in a
   cramped broken-looking state.

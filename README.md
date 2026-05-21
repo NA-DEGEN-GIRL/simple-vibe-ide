@@ -133,6 +133,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - `Ctrl` + `+`, `Ctrl` + `-`는 포커스된 editor/terminal의 font size를 조절합니다.
 - 전체 IDE scale을 바꾸고 싶으면 상단 titlebar 쪽을 focus target으로 둔 상태에서 조절합니다.
 - 새 shell widget이나 shell tab은 다른 widget 아래에 묻히지 않도록 앞으로 올라옵니다.
+- `+shell`, Windows shell, Codex/Claude/Grok/Antigravity 버튼으로 새 terminal widget을 열 때는 workspace별 마지막 terminal 크기를 기억해서 다시 사용합니다.
 
 ### Explorer
 
@@ -403,6 +404,7 @@ WSL profiles are loaded in the background after the first screen is interactive.
 - `Ctrl` + `+` and `Ctrl` + `-` resize the focused editor or terminal font.
 - To scale the whole IDE, focus the top titlebar area first.
 - New shell widgets and shell tabs are brought to the front automatically.
+- New terminal widgets opened from `+shell`, Windows shell, or Codex/Claude/Grok/Antigravity buttons reuse the last terminal size saved for that workspace.
 
 ### Explorer
 
