@@ -3,22 +3,38 @@ import type { AttachmentResult, ConnectionProfile, FileEntry, PortForwardResult 
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
+  listWslProfiles: () => invoke<ConnectionProfile[]>('list_wsl_profiles'),
+  windowsShellRoot: () => invoke<string>('windows_shell_root'),
+  setCaptureProtection: (enabled: boolean) =>
+    invoke<void>('set_capture_protection', { enabled }),
+  resolveProfilePath: (profileId: string, path: string) =>
+    invoke<string>('resolve_profile_path', { profileId, path }),
   listDirectory: (profileId: string, path: string) =>
     invoke<FileEntry[]>('list_directory', { profileId, path }),
   readTextFile: (profileId: string, path: string) =>
     invoke<string>('read_text_file', { profileId, path }),
+  readFileDataUrl: (profileId: string, path: string) =>
+    invoke<string>('read_file_data_url', { profileId, path }),
   writeTextFile: (profileId: string, path: string, content: string) =>
     invoke<void>('write_text_file', { profileId, path, content }),
+  createDirectory: (profileId: string, path: string) =>
+    invoke<void>('create_directory', { profileId, path }),
+  createFile: (profileId: string, path: string) =>
+    invoke<void>('create_file', { profileId, path }),
+  renamePath: (profileId: string, oldPath: string, newPath: string) =>
+    invoke<void>('rename_path', { profileId, oldPath, newPath }),
+  openPath: (profileId: string, path: string) =>
+    invoke<void>('open_path', { profileId, path }),
   saveAttachment: (
     profileId: string,
-    workspaceRoot: string,
+    currentDir: string,
     sessionId: string,
     fileName: string,
     base64Data: string
   ) =>
     invoke<AttachmentResult>('save_attachment', {
       profileId,
-      workspaceRoot,
+      currentDir,
       sessionId,
       fileName,
       base64Data

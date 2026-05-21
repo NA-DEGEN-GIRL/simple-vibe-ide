@@ -12,21 +12,6 @@ const PRIVATE_TERMS = [
   'id_ed25519$'
 ].join('|');
 const PRIVATE_PATH = new RegExp('(^|[/\\\\])\\.' + 'env' + '($|\\.)|' + PRIVATE_TERMS, 'i');
-const SENSITIVE_KEY = new RegExp(
-  [
-    'se' + 'cret',
-    'to' + 'ken',
-    'pass' + 'word',
-    'pass' + 'wd',
-    'api[_-]?key',
-    'pri' + 'vate',
-    'cre' + 'dential',
-    'client[_-]?' + 'se' + 'cret',
-    'bot[_-]?' + 'to' + 'ken'
-  ].join('|'),
-  'i'
-);
-
 export interface SecretLine {
   id: string;
   kind: 'kv' | 'raw';
@@ -50,10 +35,6 @@ export function parseSecretLines(content: string): SecretLine[] {
       return { id: String(index), kind: 'raw', original: line };
     }
     const [, key, sep, value] = match;
-    const sensitive = SENSITIVE_KEY.test(key) || value.length > 0;
-    if (!sensitive) {
-      return { id: String(index), kind: 'raw', original: line };
-    }
     return {
       id: String(index),
       kind: 'kv',

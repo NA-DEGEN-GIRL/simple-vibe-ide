@@ -1,17 +1,8 @@
 import { listen } from '@tauri-apps/api/event';
-import { EditorState, Extension } from '@codemirror/state';
-import { EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view';
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
-import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
-import { css } from '@codemirror/lang-css';
-import { html } from '@codemirror/lang-html';
-import { javascript } from '@codemirror/lang-javascript';
-import { json } from '@codemirror/lang-json';
-import { markdown } from '@codemirror/lang-markdown';
-import { python } from '@codemirror/lang-python';
-import { rust } from '@codemirror/lang-rust';
-import { yaml } from '@codemirror/lang-yaml';
+import { Image as TauriImage } from '@tauri-apps/api/image';
+import type { Extension } from '@codemirror/state';
+import type { EditorView as CodeMirrorView } from '@codemirror/view';
+import { readImage, readText, writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -22,48 +13,320 @@ import { parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine
 
 interface TerminalPane {
   paneId: string;
+  widgetId: string;
   backendId?: string;
   title: string;
   command: string | null;
+  profileId: string;
+  cwd: string;
   term: Terminal;
   fit: FitAddon;
   element: HTMLElement;
+  host: HTMLElement;
+  outputBuffer: string;
+  seenPorts: Set<number>;
+  fitFrame?: number;
+  lastRows?: number;
+  lastCols?: number;
   resizeObserver?: ResizeObserver;
+}
+
+interface TerminalWidget {
+  widgetId: string;
+  element: HTMLElement;
+  title: HTMLElement;
+  cwd: HTMLElement;
+  tabList: HTMLElement;
+  hostStack: HTMLElement;
+  activePaneId: string;
 }
 
 interface OpenFileState {
   path: string;
   content: string;
+  draftContent?: string;
   masked: boolean;
   rawMode: boolean;
   lines: SecretLine[];
   dirty: boolean;
 }
 
+interface PastedImageItem {
+  id: string;
+  path: string;
+  tag: string;
+  dataUrl: string;
+  createdAt: string;
+}
+
+interface DetectedPortItem {
+  id: string;
+  profileId: string;
+  port: number;
+  url: string;
+}
+
+interface BrowserTab {
+  id: string;
+  url: string;
+  label: string;
+}
+
+interface BrowserConsoleLog {
+  id: string;
+  time: string;
+  level: 'info' | 'warn' | 'error';
+  message: string;
+}
+
+interface TextFileCacheEntry {
+  content: string;
+  cachedAt: number;
+}
+
+interface EditorTabState {
+  id: string;
+  file: OpenFileState | null;
+}
+
+interface ImageTabState {
+  id: string;
+  sourcePath?: string;
+  dataUrl: string;
+  label: string;
+  history: PastedImageItem[];
+  historyVisible: boolean;
+}
+
+interface LayoutRatio {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+interface WorkspacePanelSnapshot {
+  visible: boolean;
+  rect?: LayoutRatio;
+}
+
+interface WorkspaceTerminalSnapshot {
+  title: string;
+  command: string | null;
+  widgetId?: string;
+  profileId?: string;
+  cwd?: string;
+  rect?: LayoutRatio;
+}
+
+interface EditorTabSnapshot {
+  id: string;
+  path: string;
+  rawMode: boolean;
+}
+
+interface ImageTabSnapshot {
+  id: string;
+  sourcePath?: string;
+  dataUrl: string;
+  label: string;
+  history: PastedImageItem[];
+  historyVisible: boolean;
+}
+
+interface WorkspaceSnapshot {
+  id: string;
+  label: string;
+  profileId: string;
+  root: string;
+  currentDir: string;
+  workspaceOpen: boolean;
+  captureProtected: boolean;
+  updatedAt: string;
+  panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>>;
+  terminals: WorkspaceTerminalSnapshot[];
+  activeTerminalIndex: number;
+  editorTabs: EditorTabSnapshot[];
+  activeEditorTabId: string;
+  editorOpenInNewTab: boolean;
+  imageTabs: ImageTabSnapshot[];
+  activeImageTabId: string;
+  imageOpenInNewTab: boolean;
+  browserTabs: BrowserTab[];
+  activeBrowserTabId: string;
+  browserDeviceId: string;
+  browserOrientation: BrowserOrientation;
+  browserConsoleVisible: boolean;
+  browserConsolePosition: BrowserConsolePosition;
+  explorerOpenMode: ExplorerOpenMode;
+  showFileSizes: boolean;
+  editorFontSize: number;
+  terminalFontSize: number;
+  ideScale: number;
+}
+
+interface WorkspaceStore {
+  version: 1;
+  activeId: string;
+  workspaces: WorkspaceSnapshot[];
+}
+
+interface EditorRuntime {
+  EditorState: typeof import('@codemirror/state').EditorState;
+  EditorView: typeof import('@codemirror/view').EditorView;
+  lineNumbers: typeof import('@codemirror/view').lineNumbers;
+  highlightActiveLine: typeof import('@codemirror/view').highlightActiveLine;
+  keymap: typeof import('@codemirror/view').keymap;
+  defaultKeymap: typeof import('@codemirror/commands').defaultKeymap;
+  history: typeof import('@codemirror/commands').history;
+  historyKeymap: typeof import('@codemirror/commands').historyKeymap;
+  indentWithTab: typeof import('@codemirror/commands').indentWithTab;
+  highlightSelectionMatches: typeof import('@codemirror/search').highlightSelectionMatches;
+  searchKeymap: typeof import('@codemirror/search').searchKeymap;
+  syntaxHighlighting: typeof import('@codemirror/language').syntaxHighlighting;
+  defaultHighlightStyle: typeof import('@codemirror/language').defaultHighlightStyle;
+  languageCompartment: import('@codemirror/state').Compartment;
+}
+
+type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser';
+type PanelRect = { left: number; top: number; width: number; height: number };
+type ExplorerOpenMode = 'single' | 'double';
+type BrowserOrientation = 'portrait' | 'landscape';
+type BrowserConsolePosition = 'bottom' | 'right' | 'top' | 'left';
+type BrowserDevicePreset = {
+  id: string;
+  label: string;
+  width: number;
+  height: number;
+  kind: 'phone' | 'tablet';
+};
+type ResizeTarget =
+  | { kind: 'ide' }
+  | { kind: 'panel'; id: FloatingPanelId }
+  | { kind: 'terminal'; paneId: string };
+type CreateTerminalOptions = {
+  rect?: LayoutRatio;
+  focus?: boolean;
+  profile?: ConnectionProfile;
+  cwd?: string;
+};
+
+const LLM_LAUNCHERS: Record<string, string> = {
+  codex: 'codex --dangerously-bypass-approvals-and-sandbox --enable goals',
+  claude: 'claude --dangerously-skip-permissions',
+  grok: 'grok --permission-mode bypassPermissions',
+  antigravity: 'antigravity'
+};
+
+const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser'];
+const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
+const PANEL_SNAP_DISTANCE = 14;
+const WIDGET_KEYBOARD_SCALE = 1.1;
+const TERMINAL_PORT_SCAN_LIMIT = 4000;
+const EXPLORER_TYPEAHEAD_TIMEOUT_MS = 900;
+const TEXT_FILE_CACHE_LIMIT = 64;
+const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
+const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
+const BROWSER_DEVICE_PRESETS: BrowserDevicePreset[] = [
+  { id: 'iphone-se', label: 'iPhone SE', width: 375, height: 667, kind: 'phone' },
+  { id: 'iphone-15', label: 'iPhone 15', width: 393, height: 852, kind: 'phone' },
+  { id: 'iphone-15-pro-max', label: 'iPhone 15 Pro Max', width: 430, height: 932, kind: 'phone' },
+  { id: 'pixel-7', label: 'Pixel 7', width: 412, height: 915, kind: 'phone' },
+  { id: 'galaxy-s23', label: 'Galaxy S23', width: 360, height: 780, kind: 'phone' },
+  { id: 'galaxy-fold', label: 'Galaxy Fold', width: 280, height: 653, kind: 'phone' },
+  { id: 'ipad-mini', label: 'iPad Mini', width: 768, height: 1024, kind: 'tablet' },
+  { id: 'ipad-air', label: 'iPad Air', width: 820, height: 1180, kind: 'tablet' },
+  { id: 'ipad-pro-11', label: 'iPad Pro 11', width: 834, height: 1194, kind: 'tablet' },
+  { id: 'surface-pro-7', label: 'Surface Pro 7', width: 912, height: 1368, kind: 'tablet' }
+];
+
 const state = {
   profiles: [] as ConnectionProfile[],
   activeProfile: null as ConnectionProfile | null,
+  workspaceOpen: false,
   workspaceRoot: '',
   currentDir: '',
   entries: [] as FileEntry[],
+  explorerOpenMode: 'single' as ExplorerOpenMode,
+  explorerSelectedPath: '',
+  explorerTypeahead: '',
+  explorerTypeaheadAt: 0,
+  explorerExpanded: new Set<string>(),
+  explorerChildren: new Map<string, FileEntry[]>(),
+  explorerLoading: new Set<string>(),
+  workspaceSnapshots: [] as WorkspaceSnapshot[],
+  activeWorkspaceId: '',
+  workspaceCaptureProtected: false,
+  captureProtectionApplied: false,
   openFile: null as OpenFileState | null,
+  editorTabs: [] as EditorTabState[],
+  activeEditorTabId: '',
+  editorOpenInNewTab: false,
+  terminalWidgets: [] as TerminalWidget[],
   terminals: [] as TerminalPane[],
   activePaneId: '',
   attachmentSession: new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14),
   imageCounter: 0,
   imagePreviewDataUrl: '',
   imagePreviewLabel: 'No image selected',
+  autoPasteImageTagToShell: true,
+  imageHistoryVisible: false,
+  imageHistory: [] as PastedImageItem[],
+  imageTabs: [] as ImageTabState[],
+  activeImageTabId: '',
+  imageOpenInNewTab: false,
   forwards: [] as PortForwardResult[],
-  previewUrl: ''
+  detectedPorts: [] as DetectedPortItem[],
+  browserTabs: [] as BrowserTab[],
+  activeBrowserTabId: '',
+  previewUrl: '',
+  browserDeviceId: DEFAULT_BROWSER_DEVICE_ID,
+  browserOrientation: 'portrait' as BrowserOrientation,
+  browserConsoleVisible: false,
+  browserConsolePosition: 'bottom' as BrowserConsolePosition,
+  browserConsoleLogs: [] as BrowserConsoleLog[],
+  showFileSizes: true
 };
 
-let codeView: EditorView | null = null;
+let codeView: CodeMirrorView | null = null;
+let editorRenderToken = 0;
+let editorRuntimePromise: Promise<EditorRuntime> | null = null;
+let panelZ = 20;
+let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
+let ideScale = 1;
+let editorFontSize = 13;
+let terminalFontSize = 13;
+let restoringWorkspace = false;
+const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
+const autoForwardingPorts = new Set<string>();
+const textFileCache = new Map<string, TextFileCacheEntry>();
+const textFileReads = new Map<string, Promise<string>>();
+const textFilePrefetchTimers = new Map<string, number>();
+let fileOpenToken = 0;
+let activeExplorerRename: {
+  path: string;
+  originalName: string;
+  kind: FileEntry['kind'];
+  created: boolean;
+} | null = null;
 
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('missing app root');
 
 app.innerHTML = `
   <div class="shell">
+    <div id="capture-freeze-frame" class="capture-freeze-frame" aria-hidden="true">
+      <div class="capture-freeze-card">
+        <div class="capture-freeze-lock">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
+            <rect x="5" y="11" width="14" height="10" rx="2"></rect>
+          </svg>
+        </div>
+        <strong>방송 송출 보호 중</strong>
+        <span>이 작업공간은 방송 송출에서 가려져 있습니다.</span>
+      </div>
+    </div>
     <header class="titlebar">
       <div>
         <strong>Simple Vibe IDE</strong>
@@ -71,88 +334,185 @@ app.innerHTML = `
       </div>
       <div id="status" class="status">Ready</div>
     </header>
+    <section class="workspace-tabs-bar">
+      <div id="workspace-tabs" class="workspace-tabs" aria-label="Workspaces"></div>
+      <button id="new-workspace-tab" class="tab-add" title="New workspace">+</button>
+    </section>
     <section class="workspace-bar">
       <label>Profile <select id="profile-select"></select></label>
-      <label>Root <input id="root-input" spellcheck="false" /></label>
-      <button id="open-root">Open</button>
-      <button id="new-shell">+ Shell</button>
+      <label>Root <input id="root-input" spellcheck="false" placeholder="select a profile first" /></label>
+      <button id="open-root">Open / Connect</button>
+      <button id="new-shell" disabled>+ Shell</button>
+      <button id="new-windows-shell" title="Open local Windows PowerShell at a non-user path">Win Shell</button>
       <button data-llm="codex">Codex</button>
       <button data-llm="claude">Claude</button>
       <button data-llm="grok">Grok</button>
       <button data-llm="antigravity">Antigravity</button>
+      <button class="panel-toggle" data-toggle-panel="explorer" title="Toggle Explorer" aria-pressed="false">Exp</button>
+      <button class="panel-toggle" data-toggle-panel="editor" title="Toggle Editor" aria-pressed="false">Edit</button>
+      <button class="panel-toggle" data-toggle-panel="image" title="Toggle Image Preview" aria-pressed="false">Img</button>
+      <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
+      <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
     </section>
     <main class="main-grid">
-      <aside class="explorer panel">
-        <div class="panel-title">Explorer</div>
+      <aside class="explorer panel floating-panel hidden" data-panel="explorer">
+        <div class="panel-title panel-drag-handle">
+          <span>Explorer</span>
+          <span class="spacer"></span>
+          <button id="new-file" class="panel-mode" title="New file">File</button>
+          <button id="new-folder" class="panel-mode" title="New folder">Folder</button>
+          <button id="toggle-explorer-open-mode" class="panel-mode" title="Toggle single/double click open">Open: 1x</button>
+          <button id="toggle-file-sizes" class="panel-mode active" title="Toggle file sizes" aria-pressed="true">Size</button>
+          <button class="panel-close" data-close-panel="explorer" title="Close Explorer" aria-label="Close Explorer">x</button>
+        </div>
         <div id="path-row" class="path-row"></div>
-        <div id="file-list" class="file-list"></div>
+        <div id="file-list" class="file-list" tabindex="0" role="listbox" aria-label="Explorer files"></div>
       </aside>
-      <section class="work-area">
-        <div id="terminal-grid" class="terminal-grid"></div>
-        <section class="editor panel">
-          <div class="panel-title editor-title">
-            <span id="editor-label">Editor</span>
-            <span class="spacer"></span>
-            <button id="toggle-raw" class="hidden">Raw</button>
-            <button id="save-file" disabled>Save</button>
-          </div>
-          <div id="editor-body" class="editor-body empty">Open a file from Explorer.</div>
-        </section>
+      <div id="shell-tabs" class="shell-tabs hidden" aria-label="Shell tabs">
+        <div id="shell-tab-list" class="widget-tabs"></div>
+        <button id="shell-new-tab" class="tab-add" title="New shell">+</button>
+      </div>
+      <section id="terminal-grid" class="terminal-grid"></section>
+      <section class="editor panel floating-panel hidden" data-panel="editor">
+        <div class="panel-title editor-title panel-drag-handle">
+          <span id="editor-label">Editor</span>
+          <span class="spacer"></span>
+          <label class="tab-option" title="Open unknown files in a new editor tab"><input id="editor-open-new-tab" type="checkbox" /> New tab</label>
+          <button id="editor-new-tab" class="panel-mode" title="New editor tab">+</button>
+          <button id="toggle-raw" class="hidden">Raw</button>
+          <button id="save-file" disabled>Save</button>
+          <button class="panel-close" data-close-panel="editor" title="Close Editor" aria-label="Close Editor">x</button>
+        </div>
+        <div id="editor-tabs" class="widget-tabs"></div>
+        <div id="editor-body" class="editor-body empty">Open a file from Explorer.</div>
       </section>
-      <aside class="side-stack">
-        <section class="panel image-panel">
-          <div class="panel-title">Image Preview / Paste Target</div>
-          <div id="image-label" class="image-label">No image selected</div>
-          <img id="image-preview" alt="pasted preview" />
-          <p class="hint">Paste a screenshot while a terminal pane is active. The file is saved under .vibe-ide/attachments and @tag text is inserted into the active LLM prompt.</p>
-        </section>
-        <section class="panel browser-panel">
-          <div class="panel-title">Browser / Ports</div>
+      <section class="panel image-panel floating-panel hidden" data-panel="image">
+        <div class="panel-title panel-drag-handle">
+          <span>Image Preview / Paste Target</span>
+          <span class="spacer"></span>
+          <label class="tab-option" title="Open unknown images in a new image tab"><input id="image-open-new-tab" type="checkbox" /> New tab</label>
+          <button id="image-new-tab" class="panel-mode" title="New image tab">+</button>
+          <button class="panel-close" data-close-panel="image" title="Close Image Preview" aria-label="Close Image Preview">x</button>
+        </div>
+        <div id="image-tabs" class="widget-tabs"></div>
+        <div id="image-label" class="image-label">No image selected</div>
+        <div class="image-tools">
+          <label class="image-option" title="External image paste only"><input id="auto-paste-image-tag" type="checkbox" checked /> Auto paste to shell</label>
+          <button id="toggle-image-history" class="panel-mode" title="Toggle pasted image history" aria-pressed="false">History</button>
+          <button id="clear-image-history" class="panel-mode" title="Clear pasted image history">Clear</button>
+        </div>
+        <div id="image-history" class="image-history hidden"></div>
+        <img id="image-preview" alt="pasted preview" />
+        <p class="hint">Pasted images are saved in the current folder under .vibe-ide-temp/attachments. Auto paste applies to images pasted from outside the preview.</p>
+      </section>
+      <section class="panel browser-panel floating-panel hidden" data-panel="browser">
+        <div class="panel-title panel-drag-handle">
+          <span>Browser / Ports</span>
+          <span class="spacer"></span>
+          <button class="panel-close" data-close-panel="browser" title="Close Browser" aria-label="Close Browser">x</button>
+        </div>
+        <details class="manual-forward">
+          <summary>Manual forward</summary>
           <div class="port-form">
             <input id="remote-port" type="number" min="1" max="65535" placeholder="remote port" />
             <input id="local-port" type="number" min="0" max="65535" placeholder="local=remote" />
             <button id="start-forward">Forward</button>
           </div>
-          <div class="browser-form">
-            <input id="preview-url" placeholder="http://127.0.0.1:3000" />
-            <button id="load-preview">Load</button>
-            <button id="desktop-size">Desktop</button>
-            <button id="mobile-size">Mobile</button>
-          </div>
-          <div id="forward-list" class="forward-list"></div>
-          <div id="browser-shell" class="browser-shell desktop"><iframe id="preview-frame" title="local preview"></iframe></div>
-          <div class="console-note">Console: iframe preview is lightweight; use app/devtools for full browser console when cross-origin pages block injection.</div>
-        </section>
-      </aside>
+        </details>
+        <div class="browser-form">
+          <input id="preview-url" placeholder="3000 or http://127.0.0.1:3000" />
+          <button id="load-preview">Load</button>
+          <button id="reload-preview" title="Reload preview">Reload</button>
+          <button id="hard-refresh-preview" title="Reload with a cache-busting local URL">Hard</button>
+        </div>
+        <div id="browser-tabs" class="browser-tabs"></div>
+        <div class="device-form">
+          <select id="device-select" title="Device viewport"></select>
+          <button id="rotate-device" title="Rotate device">Rotate</button>
+          <button id="toggle-browser-console" title="Toggle preview console" aria-pressed="false">Console</button>
+          <select id="browser-console-position" title="Console position">
+            <option value="bottom">Bottom</option>
+            <option value="right">Right</option>
+            <option value="top">Top</option>
+            <option value="left">Left</option>
+          </select>
+        </div>
+        <div id="forward-list" class="forward-list"></div>
+        <div id="browser-workspace" class="browser-workspace console-bottom">
+          <div id="browser-shell" class="browser-shell desktop"><iframe id="preview-frame" class="hidden" title="local preview"></iframe></div>
+          <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
+            <div class="browser-console-toolbar">
+              <span>Console</span>
+              <button id="clear-browser-console" title="Clear console">Clear</button>
+            </div>
+            <div id="browser-console-log" class="browser-console-log"></div>
+          </section>
+        </div>
+        <div class="console-note">Local and live URLs can open here. Some public sites block iframe embedding; open those in a full browser when their own policy rejects preview.</div>
+      </section>
     </main>
   </div>
 `;
 
 const el = {
+  titlebar: document.querySelector<HTMLElement>('.titlebar')!,
   titleContext: document.querySelector<HTMLSpanElement>('#title-context')!,
   status: document.querySelector<HTMLDivElement>('#status')!,
+  captureFreezeFrame: document.querySelector<HTMLDivElement>('#capture-freeze-frame')!,
+  workspaceTabs: document.querySelector<HTMLDivElement>('#workspace-tabs')!,
+  newWorkspaceTab: document.querySelector<HTMLButtonElement>('#new-workspace-tab')!,
   profileSelect: document.querySelector<HTMLSelectElement>('#profile-select')!,
   rootInput: document.querySelector<HTMLInputElement>('#root-input')!,
   openRoot: document.querySelector<HTMLButtonElement>('#open-root')!,
   newShell: document.querySelector<HTMLButtonElement>('#new-shell')!,
+  newWindowsShell: document.querySelector<HTMLButtonElement>('#new-windows-shell')!,
+  resetLayout: document.querySelector<HTMLButtonElement>('#reset-layout')!,
+  mainGrid: document.querySelector<HTMLElement>('.main-grid')!,
+  newFile: document.querySelector<HTMLButtonElement>('#new-file')!,
+  newFolder: document.querySelector<HTMLButtonElement>('#new-folder')!,
+  explorerOpenModeToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-open-mode')!,
+  fileSizeToggle: document.querySelector<HTMLButtonElement>('#toggle-file-sizes')!,
   fileList: document.querySelector<HTMLDivElement>('#file-list')!,
   pathRow: document.querySelector<HTMLDivElement>('#path-row')!,
+  shellTabs: document.querySelector<HTMLDivElement>('#shell-tabs')!,
+  shellTabList: document.querySelector<HTMLDivElement>('#shell-tab-list')!,
+  shellNewTab: document.querySelector<HTMLButtonElement>('#shell-new-tab')!,
   terminalGrid: document.querySelector<HTMLDivElement>('#terminal-grid')!,
+  editorTabs: document.querySelector<HTMLDivElement>('#editor-tabs')!,
+  editorNewTab: document.querySelector<HTMLButtonElement>('#editor-new-tab')!,
+  editorOpenNewTab: document.querySelector<HTMLInputElement>('#editor-open-new-tab')!,
   editorLabel: document.querySelector<HTMLSpanElement>('#editor-label')!,
   editorBody: document.querySelector<HTMLDivElement>('#editor-body')!,
   saveFile: document.querySelector<HTMLButtonElement>('#save-file')!,
   toggleRaw: document.querySelector<HTMLButtonElement>('#toggle-raw')!,
+  imageTabs: document.querySelector<HTMLDivElement>('#image-tabs')!,
+  imageNewTab: document.querySelector<HTMLButtonElement>('#image-new-tab')!,
+  imageOpenNewTab: document.querySelector<HTMLInputElement>('#image-open-new-tab')!,
   imagePreview: document.querySelector<HTMLImageElement>('#image-preview')!,
   imageLabel: document.querySelector<HTMLDivElement>('#image-label')!,
+  autoPasteImageTag: document.querySelector<HTMLInputElement>('#auto-paste-image-tag')!,
+  imageHistoryToggle: document.querySelector<HTMLButtonElement>('#toggle-image-history')!,
+  imageHistoryClear: document.querySelector<HTMLButtonElement>('#clear-image-history')!,
+  imageHistory: document.querySelector<HTMLDivElement>('#image-history')!,
   remotePort: document.querySelector<HTMLInputElement>('#remote-port')!,
   localPort: document.querySelector<HTMLInputElement>('#local-port')!,
   startForward: document.querySelector<HTMLButtonElement>('#start-forward')!,
   previewUrl: document.querySelector<HTMLInputElement>('#preview-url')!,
   loadPreview: document.querySelector<HTMLButtonElement>('#load-preview')!,
-  desktopSize: document.querySelector<HTMLButtonElement>('#desktop-size')!,
-  mobileSize: document.querySelector<HTMLButtonElement>('#mobile-size')!,
+  reloadPreview: document.querySelector<HTMLButtonElement>('#reload-preview')!,
+  hardRefreshPreview: document.querySelector<HTMLButtonElement>('#hard-refresh-preview')!,
+  browserTabs: document.querySelector<HTMLDivElement>('#browser-tabs')!,
+  desktopSize: document.querySelector<HTMLButtonElement>('#desktop-size'),
+  deviceSelect: document.querySelector<HTMLSelectElement>('#device-select')!,
+  rotateDevice: document.querySelector<HTMLButtonElement>('#rotate-device')!,
+  browserConsoleToggle: document.querySelector<HTMLButtonElement>('#toggle-browser-console')!,
+  browserConsolePosition: document.querySelector<HTMLSelectElement>('#browser-console-position')!,
   forwardList: document.querySelector<HTMLDivElement>('#forward-list')!,
+  browserWorkspace: document.querySelector<HTMLDivElement>('#browser-workspace')!,
   browserShell: document.querySelector<HTMLDivElement>('#browser-shell')!,
+  browserConsole: document.querySelector<HTMLElement>('#browser-console')!,
+  browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
+  browserConsoleLog: document.querySelector<HTMLDivElement>('#browser-console-log')!,
   previewFrame: document.querySelector<HTMLIFrameElement>('#preview-frame')!
 };
 
@@ -171,26 +531,46 @@ function refreshTitle() {
 async function init() {
   await listen<TerminalDataEvent>('terminal-data', (event) => {
     const pane = state.terminals.find((item) => item.backendId === event.payload.id);
-    pane?.term.write(event.payload.data);
+    if (!pane) return;
+    pane.term.write(event.payload.data);
+    void scanTerminalOutputForPorts(pane, event.payload.data);
   });
   await listen<TerminalExitEvent>('terminal-exit', (event) => {
     const pane = state.terminals.find((item) => item.backendId === event.payload.id);
-    if (pane) pane.title = `${pane.title} (exited)`;
+    if (pane) {
+      pane.title = `${pane.title} (exited)`;
+      const widget = terminalWidgetForPane(pane);
+      if (widget) renderTerminalWidgetTabs(widget);
+    }
   });
 
   state.profiles = await api.listProfiles();
+  loadWorkspaceStore();
+  ensureEditorTab();
+  ensureImageTab();
   renderProfiles();
-  const first = state.profiles[0];
-  if (!first) throw new Error('no connection profiles available');
-  selectProfile(first.id);
-  await openWorkspace(state.workspaceRoot);
-  await createTerminal(null, 'shell');
+  renderWorkspaceTabs();
+  renderEditorTabs();
+  renderImageTabs();
+  renderShellTabs();
+  renderBrowserDeviceOptions();
+  setBrowserMode('desktop');
+  setBrowserConsolePosition(state.browserConsolePosition);
+  setBrowserConsoleVisible(false);
+  scheduleEditorRuntimeWarmup();
   bindEvents();
+  selectProfile('');
+  setWorkspaceOpen(false);
   setStatus('Ready');
+  void loadWslProfilesInBackground();
 }
 
 function renderProfiles() {
   el.profileSelect.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Select profile...';
+  el.profileSelect.append(placeholder);
   for (const profile of state.profiles) {
     const option = document.createElement('option');
     option.value = profile.id;
@@ -199,37 +579,1290 @@ function renderProfiles() {
   }
 }
 
-function selectProfile(profileId: string) {
-  const profile = state.profiles.find((item) => item.id === profileId) ?? state.profiles[0];
+async function loadWslProfilesInBackground() {
+  setStatus('Ready - loading WSL profiles...');
+  try {
+    const wslProfiles = await api.listWslProfiles();
+    const existing = new Map(state.profiles.map((profile) => [profile.id, profile]));
+    for (const profile of wslProfiles) existing.set(profile.id, profile);
+    state.profiles = [...existing.values()];
+    const selected = el.profileSelect.value;
+    renderProfiles();
+    el.profileSelect.value = selected;
+    setStatus('Ready');
+  } catch (error) {
+    setStatus(`Ready - WSL profile scan failed: ${String(error)}`, true);
+  }
+}
+
+function loadWorkspaceStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(WORKSPACE_STORE_KEY) ?? '') as Partial<WorkspaceStore>;
+    state.workspaceSnapshots = Array.isArray(parsed.workspaces) ? parsed.workspaces.filter(isWorkspaceSnapshot) : [];
+    state.activeWorkspaceId = '';
+  } catch {
+    state.workspaceSnapshots = [];
+    state.activeWorkspaceId = '';
+  }
+}
+
+function persistWorkspaceStore() {
+  const store: WorkspaceStore = {
+    version: 1,
+    activeId: state.activeWorkspaceId,
+    workspaces: state.workspaceSnapshots.slice(0, 24)
+  };
+  localStorage.setItem(WORKSPACE_STORE_KEY, JSON.stringify(store));
+  renderWorkspaceTabs();
+}
+
+function isWorkspaceSnapshot(value: unknown): value is WorkspaceSnapshot {
+  const item = value as WorkspaceSnapshot;
+  return Boolean(item && typeof item.id === 'string' && typeof item.profileId === 'string');
+}
+
+function renderWorkspaceTabs() {
+  el.workspaceTabs.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (const workspace of state.workspaceSnapshots) {
+    const tab = document.createElement('div');
+    const protectedWorkspace = Boolean(workspace.captureProtected);
+    tab.className = `workspace-tab${workspace.id === state.activeWorkspaceId ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
+    tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
+    const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
+    tab.innerHTML = `
+      <button class="workspace-tab-label">${escapeHtml(workspace.label)}</button>
+      <button class="workspace-tab-security${protectedWorkspace ? ' active' : ''}" title="${securityTitle}" aria-label="${securityTitle}" aria-pressed="${String(protectedWorkspace)}">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5 7V5a3 3 0 0 1 6 0v2"></path>
+          <rect x="3.5" y="7" width="9" height="7" rx="1.5"></rect>
+        </svg>
+      </button>
+      <button class="workspace-tab-close" title="Close workspace" aria-label="Close workspace">x</button>
+    `;
+    tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!.addEventListener('click', () => void activateWorkspaceTab(workspace.id));
+    tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void toggleWorkspaceCaptureProtection(workspace.id);
+    });
+    tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void closeWorkspaceTab(workspace.id);
+    });
+    fragment.append(tab);
+  }
+  el.workspaceTabs.append(fragment);
+}
+
+async function toggleWorkspaceCaptureProtection(id: string) {
+  const snapshot = state.workspaceSnapshots.find((workspace) => workspace.id === id);
+  if (!snapshot) return;
+
+  const enabled = !snapshot.captureProtected;
+  snapshot.captureProtected = enabled;
+  if (id === state.activeWorkspaceId) {
+    state.workspaceCaptureProtected = enabled;
+    await applyWorkspaceCaptureProtection(enabled);
+  }
+  persistWorkspaceStore();
+  setStatus(enabled
+    ? 'Capture blocked while this workspace is active'
+    : 'Capture block disabled for this workspace');
+}
+
+async function applyWorkspaceCaptureProtection(enabled: boolean, options: { quiet?: boolean } = {}) {
+  document.body.classList.toggle('capture-protected', enabled);
+  if (state.captureProtectionApplied === enabled) return;
+
+  try {
+    if (enabled) await primeCaptureFreezeFrame();
+    await api.setCaptureProtection(enabled);
+    state.captureProtectionApplied = enabled;
+    if (enabled) hideCaptureFreezeFrameSoon();
+    else hideCaptureFreezeFrame();
+  } catch (error) {
+    document.body.classList.toggle('capture-protected', state.captureProtectionApplied);
+    hideCaptureFreezeFrame();
+    if (!options.quiet) setStatus(`Capture protection failed: ${String(error)}`, true);
+  }
+}
+
+async function primeCaptureFreezeFrame() {
+  document.body.classList.add('capture-freeze-visible');
+  el.captureFreezeFrame.setAttribute('aria-hidden', 'false');
+  await nextAnimationFrame();
+  await nextAnimationFrame();
+  await delay(520);
+}
+
+function hideCaptureFreezeFrameSoon() {
+  window.setTimeout(hideCaptureFreezeFrame, 260);
+}
+
+function hideCaptureFreezeFrame() {
+  document.body.classList.remove('capture-freeze-visible');
+  el.captureFreezeFrame.setAttribute('aria-hidden', 'true');
+}
+
+function nextAnimationFrame() {
+  return new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function createBlankWorkspaceTab() {
+  saveActiveWorkspaceSnapshot();
+  const id = crypto.randomUUID();
+  state.activeWorkspaceId = id;
+  state.workspaceCaptureProtected = false;
+  state.workspaceSnapshots.unshift(blankWorkspaceSnapshot(id));
+  await closeWorkspace();
+  persistWorkspaceStore();
+  setStatus('New empty workspace');
+}
+
+async function closeWorkspaceTab(id: string) {
+  const wasActive = state.activeWorkspaceId === id;
+  state.workspaceSnapshots = state.workspaceSnapshots.filter((workspace) => workspace.id !== id);
+  if (wasActive) {
+    const next = state.workspaceSnapshots[0];
+    if (next) {
+      state.activeWorkspaceId = next.id;
+      persistWorkspaceStore();
+      if (!next.profileId) {
+        await closeWorkspace();
+        state.workspaceCaptureProtected = Boolean(next.captureProtected);
+        await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+        renderWorkspaceTabs();
+        return;
+      }
+      await restoreWorkspaceSnapshot(next);
+      return;
+    }
+    state.activeWorkspaceId = '';
+    await closeWorkspace();
+  }
+  persistWorkspaceStore();
+}
+
+async function activateWorkspaceTab(id: string) {
+  if (id === state.activeWorkspaceId && state.workspaceOpen) return;
+  saveActiveWorkspaceSnapshot();
+  const snapshot = state.workspaceSnapshots.find((workspace) => workspace.id === id);
+  if (!snapshot) return;
+  state.activeWorkspaceId = id;
+  persistWorkspaceStore();
+  if (!snapshot.profileId) {
+    await closeWorkspace();
+    state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
+    await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+    renderWorkspaceTabs();
+    setStatus('Empty workspace');
+    return;
+  }
+  await restoreWorkspaceSnapshot(snapshot);
+}
+
+function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
+  return {
+    id,
+    label: 'New Workspace',
+    profileId: '',
+    root: '',
+    currentDir: '',
+    workspaceOpen: false,
+    captureProtected: false,
+    updatedAt: new Date().toISOString(),
+    panels: {},
+    terminals: [],
+    activeTerminalIndex: 0,
+    editorTabs: [],
+    activeEditorTabId: '',
+    editorOpenInNewTab: false,
+    imageTabs: [],
+    activeImageTabId: '',
+    imageOpenInNewTab: false,
+    browserTabs: [],
+    activeBrowserTabId: '',
+    browserDeviceId: 'desktop',
+    browserOrientation: 'portrait',
+    browserConsoleVisible: false,
+    browserConsolePosition: 'bottom',
+    explorerOpenMode: 'single',
+    showFileSizes: true,
+    editorFontSize: 13,
+    terminalFontSize: 13,
+    ideScale: 1
+  };
+}
+
+function saveActiveWorkspaceSnapshot() {
+  if (restoringWorkspace) return;
+  if (!state.activeWorkspaceId || !state.activeProfile || !state.workspaceOpen) {
+    persistWorkspaceStore();
+    return;
+  }
+
+  syncActiveEditorTabFromView();
+  syncActiveImageTabFromState();
+  const snapshot = createCurrentWorkspaceSnapshot(state.activeWorkspaceId);
+  const index = state.workspaceSnapshots.findIndex((workspace) => workspace.id === snapshot.id);
+  if (index >= 0) state.workspaceSnapshots[index] = snapshot;
+  else state.workspaceSnapshots.unshift(snapshot);
+  persistWorkspaceStore();
+}
+
+function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): WorkspaceSnapshot {
+  const profile = state.activeProfile!;
+  const activeTerminalIndex = Math.max(0, state.terminals.findIndex((pane) => pane.paneId === state.activePaneId));
+  return {
+    id,
+    label: workspaceLabel(profile, state.workspaceRoot || state.currentDir || profile.root),
+    profileId: profile.id,
+    root: state.workspaceRoot,
+    currentDir: state.currentDir || state.workspaceRoot,
+    workspaceOpen: state.workspaceOpen,
+    captureProtected: state.workspaceCaptureProtected,
+    updatedAt: new Date().toISOString(),
+    panels: snapshotPanels(),
+    terminals: state.terminals.map((pane) => ({
+      title: pane.title.replace(/\s+\(exited\)$/i, ''),
+      command: pane.command,
+      widgetId: pane.widgetId,
+      profileId: pane.profileId,
+      cwd: pane.cwd,
+      rect: elementLayoutRatio(pane.element)
+    })),
+    activeTerminalIndex,
+    editorTabs: state.editorTabs
+      .filter((tab) => tab.file)
+      .map((tab) => ({ id: tab.id, path: tab.file!.path, rawMode: tab.file!.rawMode })),
+    activeEditorTabId: state.activeEditorTabId,
+    editorOpenInNewTab: state.editorOpenInNewTab,
+    imageTabs: state.imageTabs
+      .filter((tab) => tab.dataUrl || tab.sourcePath)
+      .map((tab) => ({
+        id: tab.id,
+        sourcePath: tab.sourcePath,
+        dataUrl: tab.dataUrl,
+        label: tab.label,
+        history: tab.history.slice(0, 24),
+        historyVisible: tab.historyVisible
+      })),
+    activeImageTabId: state.activeImageTabId,
+    imageOpenInNewTab: state.imageOpenInNewTab,
+    browserTabs: state.browserTabs,
+    activeBrowserTabId: state.activeBrowserTabId,
+    browserDeviceId: el.browserShell.classList.contains('desktop') ? 'desktop' : state.browserDeviceId,
+    browserOrientation: state.browserOrientation,
+    browserConsoleVisible: state.browserConsoleVisible,
+    browserConsolePosition: state.browserConsolePosition,
+    explorerOpenMode: state.explorerOpenMode,
+    showFileSizes: state.showFileSizes,
+    editorFontSize,
+    terminalFontSize,
+    ideScale
+  };
+}
+
+function snapshotPanels() {
+  const panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>> = {};
+  for (const id of FLOATING_PANELS) {
+    const panel = getPanel(id);
+    panels[id] = {
+      visible: !panel.classList.contains('hidden'),
+      rect: elementLayoutRatio(panel)
+    };
+  }
+  return panels;
+}
+
+async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
+  const profile = state.profiles.find((item) => item.id === snapshot.profileId) ?? null;
+  if (!profile) {
+    setStatus(`Workspace profile is unavailable: ${snapshot.label}`, true);
+    return;
+  }
+
+  restoringWorkspace = true;
+  try {
+    await closeAllTerminals();
+    clearWorkspacePanels();
+    state.activeProfile = profile;
+    state.workspaceRoot = snapshot.root || profile.root;
+    state.currentDir = snapshot.currentDir || state.workspaceRoot;
+    state.workspaceOpen = true;
+    state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
+    state.explorerOpenMode = snapshot.explorerOpenMode ?? 'single';
+    state.showFileSizes = snapshot.showFileSizes ?? true;
+    state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
+    state.imageOpenInNewTab = Boolean(snapshot.imageOpenInNewTab);
+    editorFontSize = clamp(snapshot.editorFontSize || 13, 10, 24);
+    terminalFontSize = clamp(snapshot.terminalFontSize || 13, 9, 24);
+    ideScale = clamp(snapshot.ideScale || 1, 0.72, 1.45);
+    document.documentElement.style.setProperty('--editor-font-size', `${editorFontSize}px`);
+    document.documentElement.style.setProperty('--ide-scale', ideScale.toFixed(3));
+    el.profileSelect.value = profile.id;
+    el.rootInput.value = state.workspaceRoot;
+    el.rootInput.placeholder = profile.kind === 'ssh' ? 'remote working directory' : 'working directory';
+    el.editorOpenNewTab.checked = state.editorOpenInNewTab;
+    el.imageOpenNewTab.checked = state.imageOpenInNewTab;
+    updateExplorerOpenMode();
+    updateExplorerFileSizeMode();
+    await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+
+    await openWorkspace(state.currentDir);
+    setWorkspaceOpen(true, { preserveVisibility: true });
+    restorePanelSnapshots(snapshot.panels);
+    await restoreEditorTabs(snapshot);
+    restoreImageTabs(snapshot);
+    restoreBrowserState(snapshot);
+
+    const terminalSnapshots = (snapshot.terminals ?? []).length
+      ? snapshot.terminals
+      : [{ title: 'shell', command: null, rect: undefined }];
+    const widgetsBySnapshotId = new Map<string, TerminalWidget>();
+    for (const terminal of terminalSnapshots) {
+      const terminalProfile = state.profiles.find((item) => item.id === terminal.profileId) ?? profile;
+      const widgetKey = terminal.widgetId || crypto.randomUUID();
+      const existingWidget = widgetsBySnapshotId.get(widgetKey);
+      if (existingWidget) {
+        await createTerminalTab(existingWidget, terminal.command, terminal.title || 'shell', {
+          focus: false,
+          profile: terminalProfile,
+          cwd: terminal.cwd || state.currentDir
+        });
+      } else {
+        const widget = await createTerminal(terminal.command, terminal.title || 'shell', {
+          rect: terminal.rect,
+          focus: false,
+          profile: terminalProfile,
+          cwd: terminal.cwd || state.currentDir
+        });
+        if (widget) widgetsBySnapshotId.set(widgetKey, widget);
+      }
+    }
+    const active = state.terminals[clamp(snapshot.activeTerminalIndex || 0, 0, Math.max(0, state.terminals.length - 1))];
+    if (active) {
+      setActivePane(active.paneId);
+      bringPanelToFront(active.element);
+    }
+    refreshTitle();
+    setStatus(`Workspace loaded: ${snapshot.label}`);
+  } finally {
+    restoringWorkspace = false;
+    saveActiveWorkspaceSnapshot();
+  }
+}
+
+function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
+  for (const id of FLOATING_PANELS) {
+    const panel = getPanel(id);
+    const snapshot = panels?.[id];
+    if (snapshot?.rect) applyLayoutRatio(panel, snapshot.rect);
+    setPanelVisible(id, snapshot?.visible ?? true, { skipSave: true });
+  }
+}
+
+async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
+  state.editorTabs = [];
+  for (const tab of snapshot.editorTabs ?? []) {
+    const editorTab = createEditorTab(null, false, tab.id);
+    try {
+      const content = await api.readTextFile(snapshot.profileId, tab.path);
+      const masked = shouldMaskFile(tab.path);
+      editorTab.file = {
+        path: tab.path,
+        content,
+        masked,
+        rawMode: tab.rawMode,
+        lines: masked ? parseSecretLines(content) : [],
+        dirty: false
+      };
+    } catch {
+      editorTab.file = null;
+    }
+  }
+  if (!state.editorTabs.length) createEditorTab(null, false);
+  state.activeEditorTabId = state.editorTabs.some((tab) => tab.id === snapshot.activeEditorTabId)
+    ? snapshot.activeEditorTabId
+    : state.editorTabs[0].id;
+  state.openFile = activeEditorTab().file;
+  renderEditorTabs();
+  renderEditor();
+}
+
+function restoreImageTabs(snapshot: WorkspaceSnapshot) {
+  state.imageTabs = (snapshot.imageTabs ?? []).map((tab) => ({
+    id: tab.id || crypto.randomUUID(),
+    sourcePath: tab.sourcePath,
+    dataUrl: tab.dataUrl || '',
+    label: tab.label || 'No image selected',
+    history: Array.isArray(tab.history) ? tab.history : [],
+    historyVisible: Boolean(tab.historyVisible)
+  }));
+  if (!state.imageTabs.length) createImageTab(undefined, false);
+  state.activeImageTabId = state.imageTabs.some((tab) => tab.id === snapshot.activeImageTabId)
+    ? snapshot.activeImageTabId
+    : state.imageTabs[0].id;
+  syncImageStateFromActiveTab();
+  renderImageTabs();
+  renderImagePreview();
+  renderImageHistory();
+}
+
+function restoreBrowserState(snapshot: WorkspaceSnapshot) {
+  state.browserTabs = Array.isArray(snapshot.browserTabs) ? snapshot.browserTabs : [];
+  state.activeBrowserTabId = '';
+  state.browserDeviceId = snapshot.browserDeviceId || DEFAULT_BROWSER_DEVICE_ID;
+  state.browserOrientation = snapshot.browserOrientation || 'portrait';
+  setBrowserConsolePosition(snapshot.browserConsolePosition || 'bottom');
+  setBrowserConsoleVisible(Boolean(snapshot.browserConsoleVisible));
+  renderBrowserTabs();
+  if (state.browserTabs.length) {
+    const active = state.browserTabs.find((tab) => tab.id === snapshot.activeBrowserTabId) ?? state.browserTabs[0];
+    activateBrowserTab(active.id);
+  }
+  if (state.browserDeviceId === 'desktop') setBrowserMode('desktop');
+  else if (state.browserDeviceId) setBrowserDevice(state.browserDeviceId);
+}
+
+function workspaceLabel(profile: ConnectionProfile, root: string) {
+  const tail = root.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || root || 'workspace';
+  return `${profile.label}: ${tail}`;
+}
+
+function selectProfile(profileId: string): boolean {
+  const profile = state.profiles.find((item) => item.id === profileId) ?? null;
   state.activeProfile = profile;
+  if (!profile) {
+    state.workspaceRoot = '';
+    state.currentDir = '';
+    el.profileSelect.value = '';
+    el.rootInput.value = '';
+    el.rootInput.placeholder = 'select a profile first';
+    refreshTitle();
+    return false;
+  }
+
   state.workspaceRoot = profile.root;
-  state.currentDir = profile.root;
+  state.currentDir = state.workspaceOpen ? state.currentDir : '';
   el.profileSelect.value = profile.id;
   el.rootInput.value = profile.root;
+  el.rootInput.placeholder = profile.kind === 'ssh' ? 'remote working directory' : 'working directory';
   refreshTitle();
+  return true;
 }
 
 function bindEvents() {
+  el.newWorkspaceTab.addEventListener('click', () => void createBlankWorkspaceTab());
   el.profileSelect.addEventListener('change', async () => {
+    saveActiveWorkspaceSnapshot();
+    if (state.workspaceOpen) await closeWorkspace();
+    state.activeWorkspaceId = '';
+    renderWorkspaceTabs();
     selectProfile(el.profileSelect.value);
-    await openWorkspace(state.workspaceRoot);
   });
   el.openRoot.addEventListener('click', async () => {
-    state.workspaceRoot = el.rootInput.value.trim() || state.activeProfile?.root || '.';
-    await openWorkspace(state.workspaceRoot);
+    if (!state.activeProfile && !selectProfile(el.profileSelect.value)) {
+      setStatus('Select a profile first', true);
+      return;
+    }
+    state.workspaceRoot = await resolveSelectedRoot();
+    await switchWorkspace(state.workspaceRoot);
   });
   el.newShell.addEventListener('click', () => createTerminal(null, 'shell'));
-  document.querySelectorAll<HTMLButtonElement>('[data-llm]').forEach((button) => {
-    button.addEventListener('click', () => createTerminal(button.dataset.llm ?? null, button.dataset.llm ?? 'llm'));
+  el.shellNewTab.addEventListener('click', () => {
+    const widget = activeTerminalWidget();
+    if (widget) void createShellTabInWidget(widget);
+    else void createTerminal(null, 'shell');
   });
+  el.newWindowsShell.addEventListener('click', () => void createWindowsShell());
+  el.editorNewTab.addEventListener('click', () => {
+    createEditorTab(null, true);
+    renderEditor();
+  });
+  el.editorOpenNewTab.addEventListener('change', () => {
+    state.editorOpenInNewTab = el.editorOpenNewTab.checked;
+    saveActiveWorkspaceSnapshot();
+  });
+  el.imageNewTab.addEventListener('click', () => {
+    createImageTab(undefined, true);
+    renderImagePreview();
+    renderImageHistory();
+  });
+  el.imageOpenNewTab.addEventListener('change', () => {
+    state.imageOpenInNewTab = el.imageOpenNewTab.checked;
+    saveActiveWorkspaceSnapshot();
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-llm]').forEach((button) => {
+    button.addEventListener('click', () => launchLlm(button.dataset.llm ?? 'llm'));
+  });
+  bindFloatingPanels();
+  el.titlebar.addEventListener('pointerdown', () => setKeyboardResizeTarget({ kind: 'ide' }));
   el.saveFile.addEventListener('click', saveOpenFile);
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
-  el.loadPreview.addEventListener('click', () => loadPreview(el.previewUrl.value.trim()));
-  el.desktopSize.addEventListener('click', () => setBrowserMode('desktop'));
-  el.mobileSize.addEventListener('click', () => setBrowserMode('mobile'));
+  el.loadPreview.addEventListener('click', () => void openPreviewValue(el.previewUrl.value.trim()));
+  el.reloadPreview.addEventListener('click', () => refreshPreview(false));
+  el.hardRefreshPreview.addEventListener('click', () => refreshPreview(true));
+  el.newFile.addEventListener('click', () => void createExplorerItem('file'));
+  el.newFolder.addEventListener('click', () => void createExplorerItem('dir'));
+  el.explorerOpenModeToggle.addEventListener('click', () => {
+    state.explorerOpenMode = state.explorerOpenMode === 'single' ? 'double' : 'single';
+    updateExplorerOpenMode();
+  });
+  el.fileSizeToggle.addEventListener('click', () => {
+    state.showFileSizes = !state.showFileSizes;
+    updateExplorerFileSizeMode();
+  });
+  el.autoPasteImageTag.addEventListener('change', () => {
+    state.autoPasteImageTagToShell = el.autoPasteImageTag.checked;
+  });
+  el.imageHistoryToggle.addEventListener('click', () => {
+    state.imageHistoryVisible = !state.imageHistoryVisible;
+    syncActiveImageTabFromState();
+    renderImageHistory();
+    saveActiveWorkspaceSnapshot();
+  });
+  el.imageHistoryClear.addEventListener('click', () => {
+    state.imageHistory = [];
+    syncActiveImageTabFromState();
+    renderImageHistory();
+    setStatus('Image history cleared');
+    saveActiveWorkspaceSnapshot();
+  });
+  el.desktopSize?.addEventListener('click', () => setBrowserMode('desktop'));
+  el.deviceSelect.addEventListener('change', () => {
+    if (el.deviceSelect.value === 'desktop') setBrowserMode('desktop');
+    else setBrowserDevice(el.deviceSelect.value);
+  });
+  el.rotateDevice.addEventListener('click', rotateBrowserDevice);
+  el.browserConsoleToggle.addEventListener('click', () => setBrowserConsoleVisible(!state.browserConsoleVisible));
+  el.browserConsolePosition.addEventListener('change', () => setBrowserConsolePosition(el.browserConsolePosition.value as BrowserConsolePosition));
+  el.browserConsoleClear.addEventListener('click', () => {
+    state.browserConsoleLogs = [];
+    renderBrowserConsole();
+  });
+  el.previewFrame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${el.previewFrame.src || state.previewUrl}`));
+  el.previewFrame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${el.previewFrame.src || state.previewUrl}`));
+  window.addEventListener('message', handleBrowserConsoleMessage);
   document.addEventListener('paste', handlePaste);
-  window.addEventListener('resize', () => state.terminals.forEach(fitTerminal));
+  document.addEventListener('keydown', handleImageClipboardShortcut, true);
+  document.addEventListener('keydown', handleEditorSaveShortcut, true);
+  document.addEventListener('keydown', handleResizeShortcut, true);
+  document.addEventListener('keydown', handleWidgetFocusShortcut, true);
+  document.addEventListener('keydown', handleExplorerKeyboard, true);
+  document.addEventListener('mousedown', handleExplorerMouseNavigation, true);
+  window.addEventListener('resize', () => {
+    FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));
+    state.terminalWidgets.forEach((widget) => {
+      applyStoredLayoutRatio(widget.element);
+      scheduleFitTerminalWidget(widget);
+    });
+    codeView?.requestMeasure();
+  });
+}
+
+async function resolveSelectedRoot() {
+  if (!state.activeProfile) return '.';
+  const requested = el.rootInput.value.trim() || state.activeProfile.root || '.';
+  setStatus(`Resolving ${state.activeProfile.label} root...`);
+  const resolved = await api.resolveProfilePath(state.activeProfile.id, requested);
+  el.rootInput.value = resolved;
+  return resolved;
+}
+
+function launchLlm(id: string) {
+  createTerminal(LLM_LAUNCHERS[id] ?? id, id);
+}
+
+async function createWindowsShell() {
+  const profile = state.profiles.find((item) => item.id === 'windows-local') ?? {
+    id: 'windows-local',
+    label: 'Windows Local',
+    kind: 'windows' as const,
+    root: 'C:\\Windows\\Temp\\simple-vibe-ide-shell',
+    shell: 'powershell.exe -NoLogo -NoProfile'
+  };
+  const cwd = await api.windowsShellRoot().catch(() => 'C:\\Windows\\Temp\\simple-vibe-ide-shell');
+  await createTerminal(null, 'Windows PowerShell', { profile, cwd });
+}
+
+function handleEditorSaveShortcut(event: KeyboardEvent) {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+  if (event.key.toLowerCase() !== 's') return;
+  if (!state.openFile) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  void saveOpenFile();
+}
+
+function handleResizeShortcut(event: KeyboardEvent) {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+  const direction = shortcutResizeDirection(event);
+  if (!direction) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  resizeKeyboardTarget(direction);
+}
+
+function handleWidgetFocusShortcut(event: KeyboardEvent) {
+  if (!isWidgetFocusShortcut(event)) return;
+  if (event.target instanceof Element && event.target.closest('.terminal-host .xterm')) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  cycleWidgetFocus(event.shiftKey ? -1 : 1);
+}
+
+function isWidgetFocusShortcut(event: KeyboardEvent) {
+  return event.type === 'keydown'
+    && event.key === 'F6'
+    && !event.ctrlKey
+    && !event.altKey
+    && !event.metaKey;
+}
+
+function shortcutResizeDirection(event: KeyboardEvent) {
+  if (event.code === 'NumpadAdd' || event.key === '+' || event.key === '=') return 1;
+  if (event.code === 'NumpadSubtract' || event.key === '-' || event.key === '_') return -1;
+  return 0;
+}
+
+function handleExplorerMouseNavigation(event: MouseEvent) {
+  if (event.button !== 3) return;
+  const explorer = getPanel('explorer');
+  if (explorer.classList.contains('hidden')) return;
+  if (!(event.target instanceof Node) || !explorer.contains(event.target)) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  void goToParentDirectory();
+}
+
+function handleExplorerKeyboard(event: KeyboardEvent) {
+  if (!shouldHandleExplorerKeyboard(event)) return;
+
+  if (event.key === 'F2') {
+    event.preventDefault();
+    event.stopPropagation();
+    void renameSelectedExplorerEntry();
+    return;
+  }
+
+  if (event.key === 'Enter') {
+    if (openSelectedExplorerEntry()) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    return;
+  }
+
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    moveExplorerSelection(event.key === 'ArrowDown' ? 1 : -1);
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+
+  if (event.key.length !== 1 || event.ctrlKey || event.metaKey || event.altKey) return;
+  selectExplorerByTypeahead(event.key);
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function shouldHandleExplorerKeyboard(event: KeyboardEvent) {
+  const explorer = getPanel('explorer');
+  if (explorer.classList.contains('hidden')) return false;
+  if (event.target instanceof Element && event.target.closest('input, textarea, select, .terminal-card, .cm-editor')) {
+    return false;
+  }
+  return keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'explorer'
+    || event.target instanceof Node && explorer.contains(event.target);
+}
+
+function resizeKeyboardTarget(direction: number) {
+  const target = keyboardResizeTarget;
+  if (target.kind === 'ide') {
+    resizeIde(direction);
+    return;
+  }
+
+  if (target.kind === 'panel') {
+    if (target.id === 'editor') {
+      resizeEditorFont(direction);
+      return;
+    }
+    const panel = getPanel(target.id);
+    if (!panel.classList.contains('hidden')) resizeFloatingPanelByKeyboard(panel, direction);
+    return;
+  }
+
+  const pane = state.terminals.find((item) => item.paneId === target.paneId);
+  if (pane) resizeTerminalFont(direction);
+}
+
+function resizeIde(direction: number) {
+  const factor = direction > 0 ? 1.05 : 1 / 1.05;
+  ideScale = clamp(ideScale * factor, 0.72, 1.45);
+  document.documentElement.style.setProperty('--ide-scale', ideScale.toFixed(3));
+  requestAnimationFrame(() => {
+    FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));
+    state.terminalWidgets.forEach((widget) => {
+      applyStoredLayoutRatio(widget.element);
+      scheduleFitTerminalWidget(widget);
+    });
+    codeView?.requestMeasure();
+  });
+  saveActiveWorkspaceSnapshot();
+}
+
+function resizeFloatingPanelByKeyboard(panel: HTMLElement, direction: number) {
+  const workspace = panel.parentElement as HTMLElement;
+  const factor = direction > 0 ? WIDGET_KEYBOARD_SCALE : 1 / WIDGET_KEYBOARD_SCALE;
+  bringPanelToFront(panel);
+  commitPanelRect(panel);
+  const rect = currentPanelRect(panel, workspace);
+  const rawRect = {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width * factor,
+    height: rect.height * factor
+  };
+  const next = direction > 0
+    ? snapPanelRect(panel, rawRect, { resizeX: true, resizeY: true })
+    : clampPanelRect(panel, rawRect);
+  applyPanelRect(panel, next);
+  if (panel.dataset.panel === 'editor') codeView?.requestMeasure();
+  saveActiveWorkspaceSnapshot();
+}
+
+function resizeTerminalByKeyboard(pane: TerminalPane, direction: number) {
+  const factor = direction > 0 ? WIDGET_KEYBOARD_SCALE : 1 / WIDGET_KEYBOARD_SCALE;
+  const workspace = pane.element.parentElement as HTMLElement;
+  commitPanelRect(pane.element);
+  const rect = currentPanelRect(pane.element, workspace);
+  const rawRect = {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width * factor,
+    height: rect.height * factor
+  };
+  const next = direction > 0
+    ? snapPanelRect(pane.element, rawRect, { resizeX: true, resizeY: true })
+    : clampPanelRect(pane.element, rawRect);
+  applyPanelRect(pane.element, next);
+  scheduleFitTerminal(pane);
+  saveActiveWorkspaceSnapshot();
+}
+
+function resizeEditorFont(direction: number) {
+  editorFontSize = clamp(editorFontSize + direction, 10, 24);
+  document.documentElement.style.setProperty('--editor-font-size', `${editorFontSize}px`);
+  codeView?.requestMeasure();
+  saveActiveWorkspaceSnapshot();
+}
+
+function resizeTerminalFont(direction: number) {
+  terminalFontSize = clamp(terminalFontSize + direction, 9, 24);
+  for (const pane of state.terminals) {
+    pane.term.options.fontSize = terminalFontSize;
+    pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
+    scheduleFitTerminal(pane);
+  }
+  saveActiveWorkspaceSnapshot();
+}
+
+function terminalMinWidth() {
+  return window.matchMedia('(max-width: 900px)').matches ? 220 : 300;
+}
+
+function terminalMinHeight() {
+  return window.matchMedia('(max-width: 900px)').matches ? 180 : 220;
+}
+
+function setKeyboardResizeTarget(target: ResizeTarget) {
+  keyboardResizeTarget = target;
+  el.titlebar.classList.toggle('keyboard-target', target.kind === 'ide');
+  document.querySelectorAll<HTMLElement>('.floating-panel.keyboard-target, .terminal-card.keyboard-target')
+    .forEach((element) => element.classList.remove('keyboard-target'));
+
+  if (target.kind === 'panel') {
+    getPanel(target.id).classList.add('keyboard-target');
+  } else if (target.kind === 'terminal') {
+    const pane = state.terminals.find((item) => item.paneId === target.paneId);
+    pane?.element.classList.add('keyboard-target');
+  }
+}
+
+type WidgetFocusItem =
+  | { kind: 'panel'; id: FloatingPanelId; element: HTMLElement }
+  | { kind: 'terminal'; pane: TerminalPane; element: HTMLElement };
+
+function cycleWidgetFocus(direction: number, fromPaneId = '') {
+  const items = focusableWidgets();
+  if (!items.length) {
+    setKeyboardResizeTarget({ kind: 'ide' });
+    return;
+  }
+
+  const currentIndex = currentWidgetFocusIndex(items, fromPaneId);
+  const nextIndex = currentIndex < 0
+    ? (direction > 0 ? 0 : items.length - 1)
+    : (currentIndex + direction + items.length) % items.length;
+  focusWidget(items[nextIndex]);
+}
+
+function focusableWidgets(): WidgetFocusItem[] {
+  const items: WidgetFocusItem[] = [];
+  addPanelFocusItem(items, 'explorer');
+  for (const widget of state.terminalWidgets) {
+    const pane = activePaneForWidget(widget);
+    if (pane && widget.element.isConnected) items.push({ kind: 'terminal', pane, element: widget.element });
+  }
+  addPanelFocusItem(items, 'editor');
+  addPanelFocusItem(items, 'image');
+  addPanelFocusItem(items, 'browser');
+  return items;
+}
+
+function addPanelFocusItem(items: WidgetFocusItem[], id: FloatingPanelId) {
+  const panel = getPanel(id);
+  if (!panel.classList.contains('hidden')) items.push({ kind: 'panel', id, element: panel });
+}
+
+function currentWidgetFocusIndex(items: WidgetFocusItem[], fromPaneId: string) {
+  if (fromPaneId) {
+    const index = items.findIndex((item) => item.kind === 'terminal' && item.pane.paneId === fromPaneId);
+    if (index >= 0) return index;
+  }
+
+  const target = keyboardResizeTarget;
+  if (target.kind === 'panel') {
+    const index = items.findIndex((item) => item.kind === 'panel' && item.id === target.id);
+    if (index >= 0) return index;
+  }
+  if (target.kind === 'terminal') {
+    const index = items.findIndex((item) => item.kind === 'terminal' && item.pane.paneId === target.paneId);
+    if (index >= 0) return index;
+  }
+
+  const active = document.activeElement;
+  if (active) {
+    const index = items.findIndex((item) => item.element.contains(active));
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
+function focusWidget(item: WidgetFocusItem) {
+  bringPanelToFront(item.element);
+  if (item.kind === 'terminal') {
+    setActivePane(item.pane.paneId);
+    item.pane.term.focus();
+    setStatus(`Focused ${item.pane.title}`);
+    return;
+  }
+
+  setKeyboardResizeTarget({ kind: 'panel', id: item.id });
+  if (item.id === 'explorer') {
+    el.fileList.focus();
+  } else if (item.id === 'editor' && codeView) {
+    codeView.focus();
+  } else if (item.id === 'browser') {
+    el.previewUrl.focus();
+  } else {
+    focusPanelElement(item.element);
+  }
+  setStatus(`Focused ${panelFocusLabel(item.id)}`);
+}
+
+function focusPanelElement(panel: HTMLElement) {
+  if (panel.tabIndex < 0) panel.tabIndex = -1;
+  panel.focus({ preventScroll: true });
+}
+
+function panelFocusLabel(id: FloatingPanelId) {
+  return id === 'image' ? 'Image Preview' : id[0].toUpperCase() + id.slice(1);
+}
+
+function bindFloatingPanels() {
+  for (const id of FLOATING_PANELS) {
+    const panel = getPanel(id);
+    const handle = panel.querySelector<HTMLElement>('.panel-drag-handle');
+    const grip = ensureResizeGrip(panel, id);
+    panel.addEventListener('pointerdown', () => {
+      bringPanelToFront(panel);
+      setKeyboardResizeTarget({ kind: 'panel', id });
+    });
+    handle?.addEventListener('pointerdown', (event) => startPanelDrag(event, panel));
+    grip.addEventListener('pointerdown', (event) => startPanelResize(event, panel, grip));
+
+    if (id === 'editor') {
+      new ResizeObserver(() => codeView?.requestMeasure()).observe(panel);
+    }
+  }
+
+  document.querySelectorAll<HTMLButtonElement>('[data-close-panel]').forEach((button) => {
+    button.addEventListener('click', () => setPanelVisible(button.dataset.closePanel as FloatingPanelId, false));
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-toggle-panel]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const id = button.dataset.togglePanel as FloatingPanelId;
+      setPanelVisible(id, getPanel(id).classList.contains('hidden'));
+    });
+  });
+  el.resetLayout.addEventListener('click', resetFloatingLayout);
+}
+
+function getPanel(id: FloatingPanelId) {
+  return document.querySelector<HTMLElement>(`[data-panel="${id}"]`)!;
+}
+
+function getPanelToggle(id: FloatingPanelId) {
+  return document.querySelector<HTMLButtonElement>(`[data-toggle-panel="${id}"]`);
+}
+
+function ensureResizeGrip(panel: HTMLElement, id: FloatingPanelId) {
+  const existing = panel.querySelector<HTMLElement>('.panel-resize-grip');
+  if (existing) return existing;
+  const grip = document.createElement('div');
+  grip.className = 'panel-resize-grip';
+  grip.title = `Resize ${id}`;
+  grip.setAttribute('aria-hidden', 'true');
+  panel.append(grip);
+  return grip;
+}
+
+function ensureTerminalResizeGrip(card: HTMLElement) {
+  const existing = card.querySelector<HTMLElement>('.panel-resize-grip');
+  if (existing) return existing;
+  const grip = document.createElement('div');
+  grip.className = 'panel-resize-grip';
+  grip.title = 'Resize terminal';
+  grip.setAttribute('aria-hidden', 'true');
+  card.append(grip);
+  return grip;
+}
+
+function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipSave?: boolean } = {}) {
+  const panel = getPanel(id);
+  panel.classList.toggle('hidden', !visible);
+  getPanelToggle(id)?.classList.toggle('active', visible);
+  getPanelToggle(id)?.setAttribute('aria-pressed', String(visible));
+  if (visible) {
+    bringPanelToFront(panel);
+    pinPanelToWorkspace(panel);
+    setKeyboardResizeTarget({ kind: 'panel', id });
+    codeView?.requestMeasure();
+  } else if (keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
+    setKeyboardResizeTarget({ kind: 'ide' });
+  }
+  if (!options.skipSave) saveActiveWorkspaceSnapshot();
+}
+
+function resetFloatingLayout() {
+  for (const id of FLOATING_PANELS) {
+    const panel = getPanel(id);
+    panel.style.left = '';
+    panel.style.top = '';
+    panel.style.width = '';
+    panel.style.height = '';
+    panel.style.zIndex = '';
+    setPanelVisible(id, true);
+  }
+  codeView?.requestMeasure();
+  saveActiveWorkspaceSnapshot();
+}
+
+function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
+  if (event.button !== 0) return;
+  if (event.target instanceof Element && event.target.closest('button, input, select, textarea, a')) return;
+
+  event.preventDefault();
+  bringPanelToFront(panel);
+  if (panel.classList.contains('terminal-card')) {
+    const pane = activePaneForElement(panel);
+    if (pane) setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
+  } else {
+    setKeyboardResizeTarget({ kind: 'panel', id: panel.dataset.panel as FloatingPanelId });
+  }
+  commitPanelRect(panel);
+
+  const workspace = panel.parentElement as HTMLElement;
+  const workspaceRect = workspace.getBoundingClientRect();
+  const panelRect = panel.getBoundingClientRect();
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const startLeft = panelRect.left - workspaceRect.left;
+  const startTop = panelRect.top - workspaceRect.top;
+
+  panel.setPointerCapture(event.pointerId);
+  panel.classList.add('dragging');
+
+  const move = (moveEvent: PointerEvent) => {
+    const maxLeft = Math.max(0, workspace.clientWidth - panel.offsetWidth);
+    const maxTop = Math.max(0, workspace.clientHeight - panel.offsetHeight);
+    const rawRect = {
+      left: clamp(startLeft + moveEvent.clientX - startX, 0, maxLeft),
+      top: clamp(startTop + moveEvent.clientY - startY, 0, maxTop),
+      width: panel.offsetWidth,
+      height: panel.offsetHeight
+    };
+    applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }));
+  };
+
+  const up = (upEvent: PointerEvent) => {
+    panel.classList.remove('dragging');
+    panel.releasePointerCapture(upEvent.pointerId);
+    panel.removeEventListener('pointermove', move);
+    panel.removeEventListener('pointerup', up);
+    panel.removeEventListener('pointercancel', up);
+    saveActiveWorkspaceSnapshot();
+  };
+
+  panel.addEventListener('pointermove', move);
+  panel.addEventListener('pointerup', up);
+  panel.addEventListener('pointercancel', up);
+}
+
+function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLElement) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  bringPanelToFront(panel);
+  if (panel.classList.contains('terminal-card')) {
+    const pane = activePaneForElement(panel);
+    if (pane) setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
+  } else {
+    setKeyboardResizeTarget({ kind: 'panel', id: panel.dataset.panel as FloatingPanelId });
+  }
+  commitPanelRect(panel);
+
+  const workspace = panel.parentElement as HTMLElement;
+  const panelRect = currentPanelRect(panel, workspace);
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const minWidth = panelMinWidth(panel);
+  const minHeight = panelMinHeight(panel);
+
+  grip.setPointerCapture(event.pointerId);
+  panel.classList.add('resizing');
+
+  const move = (moveEvent: PointerEvent) => {
+    const rawRect = {
+      left: panelRect.left,
+      top: panelRect.top,
+      width: clamp(panelRect.width + moveEvent.clientX - startX, minWidth, workspace.clientWidth - panelRect.left),
+      height: clamp(panelRect.height + moveEvent.clientY - startY, minHeight, workspace.clientHeight - panelRect.top)
+    };
+    applyPanelRect(panel, snapPanelRect(panel, rawRect, { resizeX: true, resizeY: true }));
+    if (panel.dataset.panel === 'editor') codeView?.requestMeasure();
+    const widget = terminalWidgetForElement(panel);
+    if (widget) scheduleFitTerminalWidget(widget);
+  };
+
+  const up = (upEvent: PointerEvent) => {
+    panel.classList.remove('resizing');
+    grip.releasePointerCapture(upEvent.pointerId);
+    grip.removeEventListener('pointermove', move);
+    grip.removeEventListener('pointerup', up);
+    grip.removeEventListener('pointercancel', up);
+    codeView?.requestMeasure();
+    const widget = terminalWidgetForElement(panel);
+    if (widget) scheduleFitTerminalWidget(widget);
+    saveActiveWorkspaceSnapshot();
+  };
+
+  grip.addEventListener('pointermove', move);
+  grip.addEventListener('pointerup', up);
+  grip.addEventListener('pointercancel', up);
+}
+
+function bringPanelToFront(panel: HTMLElement) {
+  panel.style.zIndex = String(++panelZ);
+}
+
+function commitPanelRect(panel: HTMLElement) {
+  const workspace = panel.parentElement as HTMLElement;
+  const workspaceRect = workspace.getBoundingClientRect();
+  const panelRect = panel.getBoundingClientRect();
+  applyPanelRect(panel, {
+    left: Math.round(panelRect.left - workspaceRect.left),
+    top: Math.round(panelRect.top - workspaceRect.top),
+    width: Math.round(panelRect.width),
+    height: Math.round(panelRect.height)
+  });
+}
+
+function pinPanelToWorkspace(panel: HTMLElement) {
+  if (panel.classList.contains('hidden') || !panel.style.left || !panel.style.top) return;
+  applyPanelRect(panel, clampPanelRect(panel, {
+    left: parseFloat(panel.style.left),
+    top: parseFloat(panel.style.top),
+    width: panel.offsetWidth,
+    height: panel.offsetHeight
+  }));
+}
+
+function applyPanelRect(panel: HTMLElement, rect: PanelRect) {
+  panel.style.left = `${Math.round(rect.left)}px`;
+  panel.style.top = `${Math.round(rect.top)}px`;
+  panel.style.width = `${Math.round(rect.width)}px`;
+  panel.style.height = `${Math.round(rect.height)}px`;
+  const workspace = panel.parentElement as HTMLElement | null;
+  if (workspace?.clientWidth && workspace.clientHeight) {
+    layoutRatios.set(panel, rectToLayoutRatio(rect, workspace));
+  }
+}
+
+function snapPanelRect(
+  panel: HTMLElement,
+  rect: PanelRect,
+  mode: { moveX?: boolean; moveY?: boolean; resizeX?: boolean; resizeY?: boolean }
+) {
+  const workspace = panel.parentElement as HTMLElement;
+  const guides = collectSnapGuides(panel, workspace);
+  const next = { ...rect };
+
+  if (mode.moveX) {
+    next.left = snapMovingAxis(rect.left, rect.width, guides.x);
+  }
+  if (mode.moveY) {
+    next.top = snapMovingAxis(rect.top, rect.height, guides.y);
+  }
+  if (mode.resizeX) {
+    const snappedRight = snapEdge(next.left + next.width, guides.x);
+    if (snappedRight !== null) next.width = snappedRight - next.left;
+  }
+  if (mode.resizeY) {
+    const snappedBottom = snapEdge(next.top + next.height, guides.y);
+    if (snappedBottom !== null) next.height = snappedBottom - next.top;
+  }
+
+  return clampPanelRect(panel, next);
+}
+
+function collectSnapGuides(panel: HTMLElement, workspace: HTMLElement) {
+  const x = [0, workspace.clientWidth];
+  const y = [0, workspace.clientHeight];
+  const guideElements = [
+    ...document.querySelectorAll<HTMLElement>('.floating-panel:not(.hidden)'),
+    ...document.querySelectorAll<HTMLElement>('.terminal-card'),
+    document.querySelector<HTMLElement>('#terminal-grid')
+  ].filter((element): element is HTMLElement => Boolean(element) && element !== panel);
+
+  for (const element of guideElements) {
+    const rect = currentPanelRect(element, workspace);
+    x.push(rect.left, rect.left + rect.width);
+    y.push(rect.top, rect.top + rect.height);
+  }
+
+  return { x, y };
+}
+
+function snapMovingAxis(start: number, size: number, guides: number[]) {
+  const leading = nearestSnap(start, guides);
+  const trailing = nearestSnap(start + size, guides);
+  if (!leading && !trailing) return start;
+  if (leading && (!trailing || leading.distance <= trailing.distance)) return leading.guide;
+  return trailing!.guide - size;
+}
+
+function snapEdge(edge: number, guides: number[]) {
+  return nearestSnap(edge, guides)?.guide ?? null;
+}
+
+function nearestSnap(edge: number, guides: number[]) {
+  let best: number | null = null;
+  let bestDistance = PANEL_SNAP_DISTANCE + 1;
+  for (const guide of guides) {
+    const distance = Math.abs(edge - guide);
+    if (distance <= PANEL_SNAP_DISTANCE && distance < bestDistance) {
+      best = guide;
+      bestDistance = distance;
+    }
+  }
+  return best === null ? null : { guide: best, distance: bestDistance };
+}
+
+function clampPanelRect(panel: HTMLElement, rect: PanelRect) {
+  const workspace = panel.parentElement as HTMLElement;
+  const minWidth = panelMinWidth(panel);
+  const minHeight = panelMinHeight(panel);
+  const width = clamp(rect.width, minWidth, workspace.clientWidth);
+  const height = clamp(rect.height, minHeight, workspace.clientHeight);
+  const left = clamp(rect.left, 0, Math.max(0, workspace.clientWidth - width));
+  const top = clamp(rect.top, 0, Math.max(0, workspace.clientHeight - height));
+  return { left, top, width, height };
+}
+
+function currentPanelRect(element: HTMLElement, workspace: HTMLElement): PanelRect {
+  const workspaceRect = workspace.getBoundingClientRect();
+  const rect = element.getBoundingClientRect();
+  return {
+    left: rect.left - workspaceRect.left,
+    top: rect.top - workspaceRect.top,
+    width: rect.width,
+    height: rect.height
+  };
+}
+
+function elementLayoutRatio(element: HTMLElement): LayoutRatio | undefined {
+  const workspace = element.parentElement as HTMLElement | null;
+  if (!workspace?.clientWidth || !workspace.clientHeight) return layoutRatios.get(element);
+  if (element.classList.contains('hidden')) return layoutRatios.get(element);
+  const ratio = rectToLayoutRatio(currentPanelRect(element, workspace), workspace);
+  layoutRatios.set(element, ratio);
+  return ratio;
+}
+
+function rectToLayoutRatio(rect: PanelRect, workspace: HTMLElement): LayoutRatio {
+  return {
+    left: rect.left / workspace.clientWidth,
+    top: rect.top / workspace.clientHeight,
+    width: rect.width / workspace.clientWidth,
+    height: rect.height / workspace.clientHeight
+  };
+}
+
+function applyLayoutRatio(element: HTMLElement, ratio: LayoutRatio) {
+  const workspace = element.parentElement as HTMLElement | null;
+  if (!workspace?.clientWidth || !workspace.clientHeight) {
+    layoutRatios.set(element, ratio);
+    return;
+  }
+  const rect = {
+    left: ratio.left * workspace.clientWidth,
+    top: ratio.top * workspace.clientHeight,
+    width: ratio.width * workspace.clientWidth,
+    height: ratio.height * workspace.clientHeight
+  };
+  applyPanelRect(element, clampPanelRect(element, rect));
+  layoutRatios.set(element, ratio);
+}
+
+function applyStoredLayoutRatio(element: HTMLElement) {
+  const ratio = layoutRatios.get(element);
+  if (ratio) applyLayoutRatio(element, ratio);
+  else pinPanelToWorkspace(element);
+}
+
+function panelMinWidth(panel: HTMLElement) {
+  return parseFloat(getComputedStyle(panel).minWidth) || 180;
+}
+
+function panelMinHeight(panel: HTMLElement) {
+  return parseFloat(getComputedStyle(panel).minHeight) || 120;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 async function openWorkspace(path: string) {
@@ -238,15 +1871,141 @@ async function openWorkspace(path: string) {
   refreshTitle();
 }
 
+async function switchWorkspace(path: string) {
+  if (!state.activeProfile) {
+    setStatus('Select a profile first', true);
+    return;
+  }
+  saveActiveWorkspaceSnapshot();
+  state.workspaceRoot = path;
+  state.currentDir = path;
+  el.rootInput.value = path;
+  await closeAllTerminals();
+  clearWorkspacePanels();
+  await openWorkspace(path);
+  setWorkspaceOpen(true);
+  await createTerminal(null, 'shell');
+  if (!state.activeWorkspaceId) state.activeWorkspaceId = crypto.randomUUID();
+  saveActiveWorkspaceSnapshot();
+}
+
+async function closeWorkspace() {
+  state.workspaceCaptureProtected = false;
+  await applyWorkspaceCaptureProtection(false, { quiet: true });
+  state.activeProfile = null;
+  state.workspaceOpen = false;
+  state.workspaceRoot = '';
+  state.currentDir = '';
+  state.entries = [];
+  el.profileSelect.value = '';
+  el.rootInput.value = '';
+  el.rootInput.placeholder = 'select a profile first';
+  await closeAllTerminals();
+  clearWorkspacePanels();
+  renderExplorer();
+  refreshTitle();
+  setWorkspaceOpen(false);
+}
+
+async function closeAllTerminals() {
+  const terminals = [...state.terminals];
+  const widgets = [...state.terminalWidgets];
+  state.terminals = [];
+  state.terminalWidgets = [];
+  state.activePaneId = '';
+  for (const pane of terminals) {
+    if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
+    if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
+    pane.resizeObserver?.disconnect();
+    pane.term.dispose();
+    pane.host.remove();
+  }
+  for (const widget of widgets) widget.element.remove();
+  syncActivePaneClass();
+  renderShellTabs();
+}
+
+function clearWorkspacePanels() {
+  codeView?.destroy();
+  codeView = null;
+  state.entries = [];
+  state.explorerExpanded = new Set();
+  state.explorerChildren = new Map();
+  state.explorerLoading = new Set();
+  state.explorerSelectedPath = '';
+  state.explorerTypeahead = '';
+  state.explorerTypeaheadAt = 0;
+  state.openFile = null;
+  state.editorTabs = [];
+  state.activeEditorTabId = '';
+  ensureEditorTab();
+  state.imagePreviewDataUrl = '';
+  state.imagePreviewLabel = 'No image selected';
+  state.imageHistory = [];
+  state.imageHistoryVisible = false;
+  state.imageTabs = [];
+  state.activeImageTabId = '';
+  ensureImageTab();
+  state.previewUrl = '';
+  state.forwards = [];
+  state.detectedPorts = [];
+  state.browserTabs = [];
+  state.activeBrowserTabId = '';
+  state.browserConsoleLogs = [];
+  el.previewUrl.value = '';
+  el.previewFrame.removeAttribute('src');
+  el.previewFrame.classList.add('hidden');
+  el.browserShell.classList.remove('has-preview');
+  renderEditorTabs();
+  renderImageTabs();
+  renderImagePreview();
+  renderImageHistory();
+  renderForwards();
+  renderBrowserTabs();
+  renderBrowserConsole();
+  renderEditor();
+}
+
+function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean } = {}) {
+  state.workspaceOpen = open;
+  el.newShell.disabled = !open;
+  el.shellNewTab.disabled = !open;
+  el.shellTabs.classList.add('hidden');
+  el.resetLayout.disabled = !open;
+  document.querySelectorAll<HTMLButtonElement>('[data-llm]').forEach((button) => {
+    button.disabled = !open;
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-toggle-panel]').forEach((button) => {
+    button.disabled = !open;
+  });
+  el.newFile.disabled = !open;
+  el.newFolder.disabled = !open;
+
+  if (!options.preserveVisibility) {
+    for (const id of FLOATING_PANELS) {
+      setPanelVisible(id, open, { skipSave: true });
+    }
+  }
+  if (!open) setKeyboardResizeTarget({ kind: 'ide' });
+  renderShellTabs();
+}
+
 async function loadDirectory(path: string) {
   if (!state.activeProfile) return;
   setStatus(`Loading ${path}...`);
   try {
     state.entries = await api.listDirectory(state.activeProfile.id, path);
     state.currentDir = path;
+    state.explorerExpanded = new Set([path]);
+    state.explorerChildren = new Map();
+    state.explorerLoading = new Set();
+    state.explorerSelectedPath = '';
+    state.explorerTypeahead = '';
+    state.explorerTypeaheadAt = 0;
     renderExplorer();
     refreshTitle();
     setStatus('Directory loaded');
+    saveActiveWorkspaceSnapshot();
   } catch (error) {
     setStatus(String(error), true);
   }
@@ -254,23 +2013,499 @@ async function loadDirectory(path: string) {
 
 function renderExplorer() {
   el.pathRow.innerHTML = '';
+  updateExplorerFileSizeMode();
+  updateExplorerOpenMode();
   const up = document.createElement('button');
   up.textContent = '..';
   up.title = 'Parent directory';
-  up.addEventListener('click', () => loadDirectory(parentPath(state.currentDir)));
-  el.pathRow.append(up, pathBadge(state.currentDir));
+  up.addEventListener('click', () => void goToParentDirectory());
+  const useFolder = document.createElement('button');
+  useFolder.textContent = 'Use This Folder';
+  useFolder.title = 'Restart workspace from this directory';
+  useFolder.addEventListener('click', () => {
+    const selected = findExplorerEntry(state.explorerSelectedPath);
+    void switchWorkspace(selected?.kind === 'dir' ? selected.path : state.currentDir);
+  });
+  el.pathRow.append(up, pathBadge(state.currentDir), useFolder);
 
   el.fileList.innerHTML = '';
-  for (const entry of state.entries) {
-    const row = document.createElement('button');
-    row.className = `file-row ${entry.kind}`;
-    row.innerHTML = `<span>${entry.kind === 'dir' ? '📁' : entry.kind === 'file' ? '📄' : '•'}</span><span>${escapeHtml(entry.name)}</span><small>${entry.kind === 'file' ? formatBytes(entry.size) : ''}</small>`;
-    row.addEventListener('click', () => {
-      if (entry.kind === 'dir') loadDirectory(entry.path);
-      else openFile(entry.path);
-    });
-    el.fileList.append(row);
+  const fragment = document.createDocumentFragment();
+  renderExplorerRows(fragment, state.entries, 0);
+  el.fileList.append(fragment);
+  updateExplorerSelection(false);
+}
+
+function openExplorerEntry(entry: FileEntry) {
+  selectExplorerEntry(entry.path, false);
+  if (entry.kind === 'dir') {
+    void toggleExplorerDirectory(entry);
+  } else if (isWindowsExecutablePath(entry.path)) {
+    void openExecutablePath(entry.path);
+  } else {
+    void openFile(entry.path);
   }
+}
+
+function openSelectedExplorerEntry() {
+  const entry = findExplorerEntry(state.explorerSelectedPath);
+  if (!entry) return false;
+  openExplorerEntry(entry);
+  return true;
+}
+
+function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], depth: number) {
+  for (const entry of entries) {
+    const row = document.createElement('div');
+    row.className = `file-row ${entry.kind}`;
+    row.dataset.path = entry.path;
+    row.tabIndex = 0;
+    row.style.setProperty('--depth', String(depth));
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(sameExplorerPath(entry.path, state.explorerSelectedPath)));
+
+    const disclosure = document.createElement('span');
+    disclosure.className = 'file-disclosure';
+    disclosure.textContent = entry.kind === 'dir'
+      ? state.explorerExpanded.has(entry.path) ? 'v' : '>'
+      : '';
+
+    const name = document.createElement('span');
+    name.className = 'file-name';
+    if (activeExplorerRename && sameExplorerPath(activeExplorerRename.path, entry.path)) {
+      attachExplorerRenameInput(name, entry);
+    } else {
+      name.textContent = entry.name;
+    }
+
+    const size = document.createElement('small');
+    size.textContent = entry.kind === 'file' ? formatBytes(entry.size) : '';
+
+    row.append(disclosure, name, size);
+    row.addEventListener('pointerenter', () => scheduleTextFilePrefetch(entry));
+    row.addEventListener('pointerdown', () => {
+      selectExplorerEntry(entry.path, false);
+      scheduleTextFilePrefetch(entry, 0);
+    });
+    row.addEventListener('focus', () => {
+      selectExplorerEntry(entry.path, false);
+      scheduleTextFilePrefetch(entry, 0);
+    });
+    row.addEventListener('click', () => {
+      if (state.explorerOpenMode === 'single') openExplorerEntry(entry);
+      else selectExplorerEntry(entry.path, false);
+    });
+    row.addEventListener('dblclick', () => openExplorerEntry(entry));
+    fragment.append(row);
+
+    if (entry.kind === 'dir' && state.explorerExpanded.has(entry.path)) {
+      renderExplorerRows(fragment, state.explorerChildren.get(entry.path) ?? [], depth + 1);
+    }
+  }
+}
+
+async function toggleExplorerDirectory(entry: FileEntry) {
+  if (!state.activeProfile || entry.kind !== 'dir') return;
+  if (state.explorerExpanded.has(entry.path)) {
+    state.explorerExpanded.delete(entry.path);
+    renderExplorer();
+    saveActiveWorkspaceSnapshot();
+    return;
+  }
+
+  try {
+    state.explorerLoading.add(entry.path);
+    const children = await api.listDirectory(state.activeProfile.id, entry.path);
+    state.explorerChildren.set(entry.path, children);
+    state.explorerExpanded.add(entry.path);
+    setStatus(`Expanded ${entry.name}`);
+  } catch (error) {
+    setStatus(String(error), true);
+  } finally {
+    state.explorerLoading.delete(entry.path);
+    renderExplorer();
+    saveActiveWorkspaceSnapshot();
+  }
+}
+
+async function openExecutablePath(path: string) {
+  if (!state.activeProfile) return;
+  try {
+    await api.openPath(state.activeProfile.id, path);
+    setStatus(`Launched ${path}`);
+  } catch (error) {
+    setStatus(String(error), true);
+  }
+}
+
+function isWindowsExecutablePath(path: string) {
+  return path.toLowerCase().endsWith('.exe');
+}
+
+async function createExplorerItem(kind: 'file' | 'dir') {
+  if (!state.activeProfile || !state.currentDir) return;
+  const targetDir = await explorerCreateTargetDirectory();
+  const siblings = await ensureExplorerDirectoryChildren(targetDir);
+  const name = uniqueExplorerName(kind === 'file' ? 'new-file.txt' : 'New Folder', siblings);
+  const path = joinExplorerPath(targetDir, name);
+
+  try {
+    if (kind === 'file') await api.createFile(state.activeProfile.id, path);
+    else await api.createDirectory(state.activeProfile.id, path);
+    if (kind === 'file' && !shouldMaskFile(path)) cacheTextFile(state.activeProfile.id, path, '');
+    await reloadExplorerDirectory(targetDir);
+    selectExplorerEntry(path);
+    startInlineExplorerRename(path, { created: true });
+    setStatus(`${kind === 'file' ? 'Created file' : 'Created folder'} - name it in Explorer`);
+  } catch (error) {
+    setStatus(String(error), true);
+  }
+}
+
+function renameSelectedExplorerEntry() {
+  const entry = findExplorerEntry(state.explorerSelectedPath);
+  if (!entry) {
+    setStatus('Select an item to rename', true);
+    return;
+  }
+
+  startInlineExplorerRename(entry.path);
+}
+
+async function finishInlineExplorerRename(input: HTMLInputElement, commit: boolean) {
+  const active = activeExplorerRename;
+  if (!active || input.dataset.finishing === 'true') return;
+  input.dataset.finishing = 'true';
+  const entry = findExplorerEntry(active.path);
+  if (!entry || !state.activeProfile) {
+    activeExplorerRename = null;
+    renderExplorer();
+    return;
+  }
+
+  const name = normalizeExplorerName(input.value);
+  if (!commit || !name || name === active.originalName) {
+    activeExplorerRename = null;
+    renderExplorer();
+    selectExplorerEntry(active.path);
+    return;
+  }
+
+  const newPath = joinExplorerPath(parentPath(entry.path), name);
+  try {
+    await api.renamePath(state.activeProfile.id, entry.path, newPath);
+    invalidateTextFileCache(state.activeProfile.id, entry.path);
+    invalidateTextFileCache(state.activeProfile.id, newPath);
+    moveExplorerChildCache(entry.path, newPath);
+    renameOpenReferences(entry.path, newPath);
+    renderEditorTabs();
+    renderEditor();
+    activeExplorerRename = null;
+    await reloadExplorerDirectory(parentPath(entry.path));
+    selectExplorerEntry(newPath);
+    if (active.created && active.kind === 'file') await openFile(newPath);
+    setStatus(`Renamed ${entry.name} to ${name}`);
+  } catch (error) {
+    setStatus(String(error), true);
+    input.dataset.finishing = '';
+    input.focus();
+    input.select();
+  }
+}
+
+function startInlineExplorerRename(path: string, options: { created?: boolean } = {}) {
+  const entry = findExplorerEntry(path);
+  if (!entry) return;
+
+  activeExplorerRename = {
+    path,
+    originalName: entry.name,
+    kind: entry.kind,
+    created: Boolean(options.created)
+  };
+  selectExplorerEntry(path, false);
+  renderExplorer();
+}
+
+function attachExplorerRenameInput(nameCell: HTMLElement, entry: FileEntry) {
+  const input = document.createElement('input');
+  input.className = 'file-rename-input';
+  input.value = entry.name;
+  input.spellcheck = false;
+  input.addEventListener('pointerdown', (event) => event.stopPropagation());
+  input.addEventListener('click', (event) => event.stopPropagation());
+  input.addEventListener('dblclick', (event) => event.stopPropagation());
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      event.stopPropagation();
+      void finishInlineExplorerRename(input, true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      void finishInlineExplorerRename(input, false);
+    }
+  });
+  input.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (input.isConnected && activeExplorerRename?.path === entry.path) input.focus();
+    }, 0);
+  });
+  nameCell.append(input);
+  window.setTimeout(() => {
+    if (input.isConnected && activeExplorerRename?.path === entry.path) {
+      input.focus();
+      selectRenameText(input, entry.name, entry.kind);
+    }
+  }, 0);
+}
+
+function selectRenameText(input: HTMLInputElement, name: string, kind: FileEntry['kind']) {
+  if (kind !== 'file') {
+    input.select();
+    return;
+  }
+  const dot = name.lastIndexOf('.');
+  if (dot > 0) input.setSelectionRange(0, dot);
+  else input.select();
+}
+
+function explorerRowForPath(path: string) {
+  return Array.from(el.fileList.querySelectorAll<HTMLElement>('.file-row'))
+    .find((row) => sameExplorerPath(row.dataset.path ?? '', path)) ?? null;
+}
+
+function findExplorerEntry(path: string) {
+  if (!path) return null;
+  return findExplorerEntryIn(path, state.entries);
+}
+
+function findExplorerEntryIn(path: string, entries: FileEntry[]): FileEntry | null {
+  for (const entry of entries) {
+    if (sameExplorerPath(entry.path, path)) return entry;
+    const found = findExplorerEntryIn(path, state.explorerChildren.get(entry.path) ?? []);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function explorerCreateTargetDirectory() {
+  const selected = findExplorerEntry(state.explorerSelectedPath);
+  if (selected?.kind === 'dir') return selected.path;
+  if (selected) return parentPath(selected.path);
+  return state.currentDir;
+}
+
+async function ensureExplorerDirectoryChildren(path: string) {
+  if (!state.activeProfile) return [];
+  if (path === state.currentDir) return state.entries;
+  const cached = state.explorerChildren.get(path);
+  if (cached) return cached;
+  const children = await api.listDirectory(state.activeProfile.id, path);
+  state.explorerChildren.set(path, children);
+  state.explorerExpanded.add(path);
+  return children;
+}
+
+async function reloadExplorerDirectory(path: string) {
+  if (!state.activeProfile) return;
+  if (path === state.currentDir) {
+    const selected = state.explorerSelectedPath;
+    state.entries = await api.listDirectory(state.activeProfile.id, path);
+    state.explorerSelectedPath = selected;
+    renderExplorer();
+    return;
+  }
+
+  const children = await api.listDirectory(state.activeProfile.id, path);
+  state.explorerChildren.set(path, children);
+  state.explorerExpanded.add(path);
+  renderExplorer();
+}
+
+function moveExplorerChildCache(oldPath: string, newPath: string) {
+  const children = state.explorerChildren.get(oldPath);
+  if (children) {
+    state.explorerChildren.delete(oldPath);
+    state.explorerChildren.set(newPath, children);
+  }
+  if (state.explorerExpanded.delete(oldPath)) state.explorerExpanded.add(newPath);
+}
+
+function renameOpenReferences(oldPath: string, newPath: string) {
+  for (const tab of state.editorTabs) {
+    if (tab.file?.path === oldPath) tab.file.path = newPath;
+  }
+  if (state.openFile?.path === oldPath) state.openFile.path = newPath;
+  for (const tab of state.imageTabs) {
+    if (tab.sourcePath === oldPath) {
+      tab.sourcePath = newPath;
+      tab.label = tab.label.replace(oldPath, newPath);
+    }
+  }
+}
+
+function normalizeExplorerName(value: string | null) {
+  const name = value?.trim() ?? '';
+  if (!name || name === '.' || name === '..') return '';
+  if (/[\\/]/.test(name) || name.includes('\0')) {
+    setStatus('Name cannot contain path separators', true);
+    return '';
+  }
+  return name;
+}
+
+function uniqueExplorerName(baseName: string, entries: FileEntry[] = state.entries) {
+  const existing = new Set(entries.map((entry) => entry.name.toLocaleLowerCase()));
+  if (!existing.has(baseName.toLocaleLowerCase())) return baseName;
+  const dot = baseName.lastIndexOf('.');
+  const stem = dot > 0 ? baseName.slice(0, dot) : baseName;
+  const ext = dot > 0 ? baseName.slice(dot) : '';
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${stem} ${index}${ext}`;
+    if (!existing.has(candidate.toLocaleLowerCase())) return candidate;
+  }
+  return baseName;
+}
+
+function selectExplorerEntry(path: string, scrollIntoView = true) {
+  if (state.explorerSelectedPath === path) {
+    updateExplorerSelection(scrollIntoView);
+    return;
+  }
+  state.explorerSelectedPath = path;
+  updateExplorerSelection(scrollIntoView);
+}
+
+function updateExplorerSelection(scrollIntoView = true) {
+  let selectedRow: HTMLElement | null = null;
+  el.fileList.querySelectorAll<HTMLElement>('.file-row').forEach((row) => {
+    const selected = sameExplorerPath(row.dataset.path ?? '', state.explorerSelectedPath);
+    row.classList.toggle('selected', selected);
+    row.setAttribute('aria-selected', String(selected));
+    if (selected) selectedRow = row;
+  });
+  const rowToReveal = selectedRow as HTMLElement | null;
+  if (scrollIntoView && rowToReveal) rowToReveal.scrollIntoView({ block: 'nearest' });
+}
+
+function scheduleTextFilePrefetch(entry: FileEntry, delay = 80) {
+  if (!state.activeProfile || !shouldPrefetchTextFile(entry)) return;
+  const profileId = state.activeProfile.id;
+  const key = textFileCacheKey(profileId, entry.path);
+  if (textFileCache.has(key) || textFileReads.has(key)) return;
+  const existing = textFilePrefetchTimers.get(key);
+  if (existing) window.clearTimeout(existing);
+
+  const timer = window.setTimeout(() => {
+    textFilePrefetchTimers.delete(key);
+    if (state.activeProfile?.id !== profileId) return;
+    warmEditorForPath(entry.path);
+    void readTextFileCached(profileId, entry.path).catch(() => undefined);
+  }, delay);
+  textFilePrefetchTimers.set(key, timer);
+}
+
+function shouldPrefetchTextFile(entry: FileEntry) {
+  if (entry.kind !== 'file') return false;
+  if (entry.size > TEXT_FILE_PREFETCH_MAX_BYTES) return false;
+  if (isImagePath(entry.path)) return false;
+  if (shouldMaskFile(entry.path)) return false;
+  return isLikelyTextPath(entry.path);
+}
+
+function isLikelyTextPath(path: string) {
+  const name = path.split(/[\\/]/).filter(Boolean).pop()?.toLowerCase() ?? path.toLowerCase();
+  if (/^(readme|license|dockerfile|makefile|gemfile|rakefile|procfile|cargo\.toml|package\.json|tsconfig\.json)$/i.test(name)) return true;
+  const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
+  if (!extension) return true;
+  const textExtensions = new Set([
+    'bash', 'bat', 'cmd', 'conf', 'config', 'cpp', 'cs', 'css', 'csv', 'c', 'env', 'go',
+    'h', 'hpp', 'htm', 'html', 'ini', 'java', 'js', 'json', 'jsx', 'lock', 'log', 'lua',
+    'md', 'mjs', 'ps1', 'py', 'rs', 'scss', 'sh', 'sql', 'svelte', 'toml', 'ts', 'tsx',
+    'txt', 'vue', 'xml', 'yaml', 'yml'
+  ]);
+  return textExtensions.has(extension);
+}
+
+function selectExplorerByTypeahead(key: string) {
+  const now = Date.now();
+  const previous = now - state.explorerTypeaheadAt <= EXPLORER_TYPEAHEAD_TIMEOUT_MS
+    ? state.explorerTypeahead
+    : '';
+  let query = `${previous}${key}`.toLocaleLowerCase();
+  let entry = findExplorerTypeaheadMatch(query);
+
+  if (!entry && previous) {
+    query = key.toLocaleLowerCase();
+    entry = findExplorerTypeaheadMatch(query);
+  }
+
+  state.explorerTypeahead = query;
+  state.explorerTypeaheadAt = now;
+  if (entry) selectExplorerEntry(entry.path);
+}
+
+function findExplorerTypeaheadMatch(query: string) {
+  const visible = visibleExplorerEntries();
+  const candidates = [
+    ...visible.filter((entry) => entry.kind === 'dir'),
+    ...visible.filter((entry) => entry.kind !== 'dir')
+  ];
+  if (!candidates.length) return null;
+
+  const selectedIndex = candidates.findIndex((entry) => entry.path === state.explorerSelectedPath);
+  const start = query.length === 1 && selectedIndex >= 0 ? selectedIndex + 1 : 0;
+  for (let offset = 0; offset < candidates.length; offset += 1) {
+    const entry = candidates[(start + offset) % candidates.length];
+    if (entry.name.toLocaleLowerCase().startsWith(query)) return entry;
+  }
+  return null;
+}
+
+function moveExplorerSelection(direction: number) {
+  const entries = visibleExplorerEntries();
+  if (!entries.length) return;
+  const current = entries.findIndex((entry) => entry.path === state.explorerSelectedPath);
+  const next = current < 0
+    ? direction > 0 ? 0 : entries.length - 1
+    : (current + direction + entries.length) % entries.length;
+  selectExplorerEntry(entries[next].path);
+}
+
+function visibleExplorerEntries() {
+  const result: FileEntry[] = [];
+  appendVisibleExplorerEntries(result, state.entries);
+  return result;
+}
+
+function appendVisibleExplorerEntries(result: FileEntry[], entries: FileEntry[]) {
+  for (const entry of entries) {
+    result.push(entry);
+    if (entry.kind === 'dir' && state.explorerExpanded.has(entry.path)) {
+      appendVisibleExplorerEntries(result, state.explorerChildren.get(entry.path) ?? []);
+    }
+  }
+}
+
+function updateExplorerFileSizeMode() {
+  const explorer = getPanel('explorer');
+  explorer.classList.toggle('hide-file-sizes', !state.showFileSizes);
+  el.fileSizeToggle.classList.toggle('active', state.showFileSizes);
+  el.fileSizeToggle.setAttribute('aria-pressed', String(state.showFileSizes));
+}
+
+function updateExplorerOpenMode() {
+  const single = state.explorerOpenMode === 'single';
+  el.explorerOpenModeToggle.textContent = single ? 'Open: 1x' : 'Open: 2x';
+  el.explorerOpenModeToggle.title = single ? 'Single click opens items' : 'Double click opens items';
+  el.explorerOpenModeToggle.classList.toggle('active', !single);
+  el.explorerOpenModeToggle.setAttribute('aria-pressed', String(!single));
+}
+
+async function goToParentDirectory() {
+  const parent = parentPath(state.currentDir);
+  if (parent === state.currentDir) return;
+  await loadDirectory(parent);
 }
 
 function pathBadge(path: string): HTMLElement {
@@ -280,13 +2515,116 @@ function pathBadge(path: string): HTMLElement {
   return span;
 }
 
+function ensureEditorTab() {
+  return activeEditorTab();
+}
+
+function activeEditorTab() {
+  let tab = state.editorTabs.find((item) => item.id === state.activeEditorTabId);
+  if (!tab) tab = createEditorTab(null, false);
+  return tab;
+}
+
+function createEditorTab(file: OpenFileState | null, activate = true, id: string = crypto.randomUUID()) {
+  const tab = { id, file };
+  state.editorTabs.push(tab);
+  if (!state.activeEditorTabId) state.activeEditorTabId = tab.id;
+  if (activate) {
+    syncActiveEditorTabFromView();
+    state.activeEditorTabId = tab.id;
+    state.openFile = tab.file;
+    renderEditorTabs();
+    renderEditor();
+  }
+  return tab;
+}
+
+function activateEditorTab(id: string) {
+  syncActiveEditorTabFromView();
+  const tab = state.editorTabs.find((item) => item.id === id);
+  if (!tab) return;
+  state.activeEditorTabId = tab.id;
+  state.openFile = tab.file;
+  renderEditorTabs();
+  renderEditor();
+  saveActiveWorkspaceSnapshot();
+}
+
+function closeEditorTab(id: string) {
+  syncActiveEditorTabFromView();
+  const index = state.editorTabs.findIndex((tab) => tab.id === id);
+  if (index < 0) return;
+  state.editorTabs.splice(index, 1);
+  if (!state.editorTabs.length) createEditorTab(null, false);
+  if (state.activeEditorTabId === id) {
+    const next = state.editorTabs[index] ?? state.editorTabs[index - 1] ?? state.editorTabs[0];
+    state.activeEditorTabId = next.id;
+    state.openFile = next.file;
+  }
+  renderEditorTabs();
+  renderEditor();
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderEditorTabs() {
+  el.editorTabs.innerHTML = '';
+  el.editorOpenNewTab.checked = state.editorOpenInNewTab;
+  const fragment = document.createDocumentFragment();
+  for (const tab of state.editorTabs) {
+    const item = document.createElement('div');
+    item.className = `widget-tab${tab.id === state.activeEditorTabId ? ' active' : ''}`;
+    item.title = tab.file?.path ?? 'Empty editor';
+    item.innerHTML = `<button class="widget-tab-label">${escapeHtml(editorTabLabel(tab))}</button><button class="widget-tab-close" title="Close editor tab" aria-label="Close editor tab">x</button>`;
+    item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => activateEditorTab(tab.id));
+    item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeEditorTab(tab.id);
+    });
+    fragment.append(item);
+  }
+  el.editorTabs.append(fragment);
+}
+
+function editorTabLabel(tab: EditorTabState) {
+  if (!tab.file) return 'Empty';
+  const name = tab.file.path.split(/[\\/]/).filter(Boolean).pop() ?? tab.file.path;
+  return `${name}${tab.file.dirty ? ' *' : ''}`;
+}
+
+function syncActiveEditorTabFromView() {
+  const tab = state.editorTabs.find((item) => item.id === state.activeEditorTabId);
+  if (!tab?.file) return;
+  if (codeView && state.openFile === tab.file && !(tab.file.masked && !tab.file.rawMode)) {
+    tab.file.draftContent = codeView.state.doc.toString();
+    tab.file.dirty = !sameEditorContent(tab.file.draftContent, tab.file.content);
+  }
+}
+
 async function openFile(path: string) {
-  if (!state.activeProfile) return;
+  const profile = state.activeProfile;
+  if (!profile) return;
+  const openToken = ++fileOpenToken;
+  if (isImagePath(path)) {
+    await openImageFile(path);
+    return;
+  }
+
   setStatus(`Opening ${path}...`);
   try {
-    const content = await api.readTextFile(state.activeProfile.id, path);
+    syncActiveEditorTabFromView();
+    const existing = state.editorTabs.find((tab) => tab.file?.path === path);
+    if (existing) {
+      activateEditorTab(existing.id);
+      setStatus('File opened');
+      return;
+    }
+
+    showEditorLoading(path);
+    warmEditorForPath(path);
+    const content = await readTextFileCached(profile.id, path);
+    if (openToken !== fileOpenToken || state.activeProfile?.id !== profile.id) return;
     const masked = shouldMaskFile(path);
-    state.openFile = {
+    const file = {
       path,
       content,
       masked,
@@ -294,21 +2632,224 @@ async function openFile(path: string) {
       lines: masked ? parseSecretLines(content) : [],
       dirty: false
     };
+    const tab = state.editorOpenInNewTab && activeEditorTab().file
+      ? createEditorTab(file, true)
+      : activeEditorTab();
+    tab.file = file;
+    state.activeEditorTabId = tab.id;
+    state.openFile = file;
+    renderEditorTabs();
     renderEditor();
-    if (isImagePath(path)) {
-      state.imagePreviewDataUrl = '';
-      state.imagePreviewLabel = `Image selected: ${path}`;
-      renderImagePreview();
-    }
+    setPanelVisible('editor', true);
     setStatus('File opened');
+    saveActiveWorkspaceSnapshot();
+  } catch (error) {
+    if (openToken !== fileOpenToken) return;
+    setStatus(String(error), true);
+  }
+}
+
+function showEditorLoading(path: string) {
+  setPanelVisible('editor', true, { skipSave: true });
+  el.editorLabel.textContent = path;
+  el.toggleRaw.classList.add('hidden');
+  el.saveFile.disabled = true;
+  el.editorBody.innerHTML = '';
+  el.editorBody.classList.add('empty');
+  el.editorBody.textContent = 'Opening file...';
+}
+
+function textFileCacheKey(profileId: string, path: string) {
+  return `${profileId}\0${path}`;
+}
+
+async function readTextFileCached(profileId: string, path: string) {
+  if (shouldMaskFile(path)) return api.readTextFile(profileId, path);
+  const key = textFileCacheKey(profileId, path);
+  const cached = textFileCache.get(key);
+  if (cached) {
+    textFileCache.delete(key);
+    textFileCache.set(key, cached);
+    return cached.content;
+  }
+
+  const pending = textFileReads.get(key);
+  if (pending) return pending;
+
+  const read = api.readTextFile(profileId, path)
+    .then((content) => {
+      cacheTextFile(profileId, path, content);
+      return content;
+    })
+    .finally(() => {
+      textFileReads.delete(key);
+    });
+  textFileReads.set(key, read);
+  return read;
+}
+
+function cacheTextFile(profileId: string, path: string, content: string) {
+  if (shouldMaskFile(path)) return;
+  if (content.length > TEXT_FILE_PREFETCH_MAX_BYTES) return;
+  const key = textFileCacheKey(profileId, path);
+  textFileCache.delete(key);
+  textFileCache.set(key, { content, cachedAt: Date.now() });
+  while (textFileCache.size > TEXT_FILE_CACHE_LIMIT) {
+    const oldest = textFileCache.keys().next().value;
+    if (!oldest) break;
+    textFileCache.delete(oldest);
+  }
+}
+
+function invalidateTextFileCache(profileId: string, path: string) {
+  const key = textFileCacheKey(profileId, path);
+  textFileCache.delete(key);
+  textFileReads.delete(key);
+  const timer = textFilePrefetchTimers.get(key);
+  if (timer) window.clearTimeout(timer);
+  textFilePrefetchTimers.delete(key);
+}
+
+function ensureImageTab() {
+  return activeImageTab();
+}
+
+function activeImageTab() {
+  let tab = state.imageTabs.find((item) => item.id === state.activeImageTabId);
+  if (!tab) tab = createImageTab(undefined, false);
+  return tab;
+}
+
+function createImageTab(seed?: Partial<ImageTabState>, activate = true, id: string = crypto.randomUUID()) {
+  syncActiveImageTabFromState();
+  const tab: ImageTabState = {
+    id,
+    sourcePath: seed?.sourcePath,
+    dataUrl: seed?.dataUrl ?? '',
+    label: seed?.label ?? 'No image selected',
+    history: seed?.history ?? [],
+    historyVisible: seed?.historyVisible ?? false
+  };
+  state.imageTabs.push(tab);
+  if (!state.activeImageTabId) state.activeImageTabId = tab.id;
+  if (activate) {
+    state.activeImageTabId = tab.id;
+    syncImageStateFromActiveTab();
+    renderImageTabs();
+    renderImagePreview();
+    renderImageHistory();
+    saveActiveWorkspaceSnapshot();
+  }
+  return tab;
+}
+
+function activateImageTab(id: string) {
+  syncActiveImageTabFromState();
+  const tab = state.imageTabs.find((item) => item.id === id);
+  if (!tab) return;
+  state.activeImageTabId = tab.id;
+  syncImageStateFromActiveTab();
+  renderImageTabs();
+  renderImagePreview();
+  renderImageHistory();
+  saveActiveWorkspaceSnapshot();
+}
+
+function closeImageTab(id: string) {
+  syncActiveImageTabFromState();
+  const index = state.imageTabs.findIndex((tab) => tab.id === id);
+  if (index < 0) return;
+  state.imageTabs.splice(index, 1);
+  if (!state.imageTabs.length) createImageTab(undefined, false);
+  if (state.activeImageTabId === id) {
+    const next = state.imageTabs[index] ?? state.imageTabs[index - 1] ?? state.imageTabs[0];
+    state.activeImageTabId = next.id;
+  }
+  syncImageStateFromActiveTab();
+  renderImageTabs();
+  renderImagePreview();
+  renderImageHistory();
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderImageTabs() {
+  el.imageTabs.innerHTML = '';
+  el.imageOpenNewTab.checked = state.imageOpenInNewTab;
+  const fragment = document.createDocumentFragment();
+  for (const tab of state.imageTabs) {
+    const item = document.createElement('div');
+    item.className = `widget-tab${tab.id === state.activeImageTabId ? ' active' : ''}`;
+    item.title = tab.sourcePath ?? tab.label;
+    item.innerHTML = `<button class="widget-tab-label">${escapeHtml(imageTabLabel(tab))}</button><button class="widget-tab-close" title="Close image tab" aria-label="Close image tab">x</button>`;
+    item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => activateImageTab(tab.id));
+    item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeImageTab(tab.id);
+    });
+    fragment.append(item);
+  }
+  el.imageTabs.append(fragment);
+}
+
+function imageTabLabel(tab: ImageTabState) {
+  if (tab.sourcePath) return tab.sourcePath.split(/[\\/]/).filter(Boolean).pop() ?? tab.sourcePath;
+  if (tab.dataUrl) return 'Pasted image';
+  return 'Empty';
+}
+
+function syncImageStateFromActiveTab() {
+  const tab = activeImageTab();
+  state.imagePreviewDataUrl = tab.dataUrl;
+  state.imagePreviewLabel = tab.label;
+  state.imageHistory = tab.history;
+  state.imageHistoryVisible = tab.historyVisible;
+}
+
+function syncActiveImageTabFromState() {
+  const tab = state.imageTabs.find((item) => item.id === state.activeImageTabId);
+  if (!tab) return;
+  tab.dataUrl = state.imagePreviewDataUrl;
+  tab.label = state.imagePreviewLabel;
+  tab.history = state.imageHistory;
+  tab.historyVisible = state.imageHistoryVisible;
+}
+
+async function openImageFile(path: string) {
+  if (!state.activeProfile) return;
+  setStatus(`Opening image ${path}...`);
+  try {
+    const existing = state.imageTabs.find((tab) => tab.sourcePath === path);
+    if (existing) {
+      activateImageTab(existing.id);
+      setPanelVisible('image', true);
+      setStatus('Image opened');
+      return;
+    }
+
+    const dataUrl = await api.readFileDataUrl(state.activeProfile.id, path);
+    const tab = state.imageOpenInNewTab && activeImageTab().dataUrl
+      ? createImageTab(undefined, true)
+      : activeImageTab();
+    tab.sourcePath = path;
+    tab.dataUrl = dataUrl;
+    tab.label = `Image selected: ${path}`;
+    state.activeImageTabId = tab.id;
+    syncImageStateFromActiveTab();
+    renderImageTabs();
+    renderImagePreview();
+    setPanelVisible('image', true);
+    setStatus('Image opened');
+    saveActiveWorkspaceSnapshot();
   } catch (error) {
     setStatus(String(error), true);
   }
 }
 
 function renderEditor() {
+  const renderToken = ++editorRenderToken;
   codeView?.destroy();
   codeView = null;
+  state.openFile = activeEditorTab().file;
   const file = state.openFile;
   el.editorBody.innerHTML = '';
   el.editorBody.classList.remove('empty');
@@ -319,11 +2860,13 @@ function renderEditor() {
     el.editorLabel.textContent = 'Editor';
     el.editorBody.textContent = 'Open a file from Explorer.';
     el.editorBody.classList.add('empty');
+    renderEditorTabs();
     return;
   }
 
   el.editorLabel.textContent = `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`;
   el.toggleRaw.textContent = file.rawMode ? 'Secure form' : 'Raw reveal';
+  renderEditorTabs();
 
   if (file.masked && !file.rawMode) {
     const form = document.createElement('div');
@@ -368,6 +2911,7 @@ function renderEditor() {
         form.append(raw);
       }
     }
+    appendSecureAddKeyForm(form, file);
     el.editorBody.append(form);
     return;
   }
@@ -375,62 +2919,272 @@ function renderEditor() {
   const mount = document.createElement('div');
   mount.className = 'code-mount';
   el.editorBody.append(mount);
-  codeView = new EditorView({
-    state: EditorState.create({
-      doc: file.rawMode && file.masked ? serializeSecretLines(file.lines) : file.content,
-      extensions: editorExtensions(file.path)
+  void mountCodeEditor(file, mount, renderToken);
+}
+
+function appendSecureAddKeyForm(form: HTMLElement, file: OpenFileState) {
+  const add = document.createElement('form');
+  add.className = 'secure-add-row';
+
+  const keyInput = document.createElement('input');
+  keyInput.className = 'secure-add-key';
+  keyInput.placeholder = 'NEW_KEY';
+  keyInput.spellcheck = false;
+  keyInput.autocomplete = 'off';
+
+  const valueInput = document.createElement('input');
+  valueInput.className = 'secure-add-value';
+  valueInput.type = 'password';
+  valueInput.placeholder = 'value';
+  valueInput.spellcheck = false;
+  valueInput.autocomplete = 'new-password';
+
+  const addButton = document.createElement('button');
+  addButton.type = 'submit';
+  addButton.textContent = 'Add key';
+
+  add.append(keyInput, valueInput, addButton);
+  add.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const key = normalizeEnvKey(keyInput.value);
+    if (!key) {
+      setStatus('Use a valid env key name', true);
+      keyInput.focus();
+      return;
+    }
+    if (secureKeyExists(file, key)) {
+      setStatus(`Key already exists: ${key}`, true);
+      keyInput.focus();
+      keyInput.select();
+      return;
+    }
+
+    insertSecureKey(file, key, valueInput.value);
+    markDirty();
+    setStatus(`Added ${key}`);
+    renderEditor();
+  });
+
+  form.append(add);
+}
+
+function normalizeEnvKey(value: string) {
+  const key = value.trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(key)) return '';
+  return key;
+}
+
+function secureKeyExists(file: OpenFileState, key: string) {
+  return file.lines.some((line) => line.kind === 'kv' && line.key?.toLocaleLowerCase() === key.toLocaleLowerCase());
+}
+
+function insertSecureKey(file: OpenFileState, key: string, value: string) {
+  const line: SecretLine = {
+    id: crypto.randomUUID(),
+    kind: 'kv',
+    original: `${key}=`,
+    prefix: `${key}=`,
+    key,
+    value,
+    reveal: false
+  };
+  const trailingEmpty = file.lines.length - 1;
+  if (trailingEmpty >= 0) {
+    const last = file.lines[trailingEmpty];
+    if (last.kind === 'raw' && last.original === '') {
+      file.lines.splice(trailingEmpty, 0, line);
+      return;
+    }
+  }
+  file.lines.push(line);
+}
+
+async function mountCodeEditor(file: OpenFileState, mount: HTMLElement, renderToken: number) {
+  const runtime = await ensureEditorRuntime();
+  if (renderToken !== editorRenderToken || state.openFile !== file) return;
+
+  codeView = new runtime.EditorView({
+    state: runtime.EditorState.create({
+      doc: editorDocumentText(file),
+      extensions: editorExtensions(file.path, runtime)
     }),
     parent: mount
   });
+  void hydrateEditorLanguage(file.path, renderToken, runtime);
 }
 
-function editorExtensions(path: string): Extension[] {
+function editorDocumentText(file: OpenFileState) {
+  if (file.masked && !file.rawMode) return serializeSecretLines(file.lines);
+  return file.draftContent ?? file.content;
+}
+
+function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
   return [
-    lineNumbers(),
-    highlightActiveLine(),
-    highlightSelectionMatches(),
-    syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    history(),
-    keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap, ...searchKeymap]),
-    languageFor(path),
-    EditorView.updateListener.of((update) => {
-      if (update.docChanged) markDirty();
+    runtime.lineNumbers(),
+    runtime.highlightActiveLine(),
+    runtime.highlightSelectionMatches(),
+    runtime.syntaxHighlighting(runtime.defaultHighlightStyle, { fallback: true }),
+    runtime.history(),
+    runtime.keymap.of([
+      { key: 'Mod-s', preventDefault: true, run: () => { void saveOpenFile(); return true; } },
+      runtime.indentWithTab,
+      ...runtime.historyKeymap,
+      ...runtime.defaultKeymap,
+      ...runtime.searchKeymap
+    ]),
+    runtime.languageCompartment.of([]),
+    runtime.EditorView.updateListener.of((update) => {
+      if (update.docChanged && state.openFile) {
+        state.openFile.draftContent = update.state.doc.toString();
+        setEditorDirtyFromContent(state.openFile.draftContent);
+      }
     })
   ];
 }
 
-function languageFor(path: string): Extension {
+async function ensureEditorRuntime() {
+  editorRuntimePromise ??= Promise.all([
+    import('@codemirror/state'),
+    import('@codemirror/view'),
+    import('@codemirror/commands'),
+    import('@codemirror/search'),
+    import('@codemirror/language')
+  ]).then(([stateModule, viewModule, commandsModule, searchModule, languageModule]) => ({
+    EditorState: stateModule.EditorState,
+    EditorView: viewModule.EditorView,
+    lineNumbers: viewModule.lineNumbers,
+    highlightActiveLine: viewModule.highlightActiveLine,
+    keymap: viewModule.keymap,
+    defaultKeymap: commandsModule.defaultKeymap,
+    history: commandsModule.history,
+    historyKeymap: commandsModule.historyKeymap,
+    indentWithTab: commandsModule.indentWithTab,
+    highlightSelectionMatches: searchModule.highlightSelectionMatches,
+    searchKeymap: searchModule.searchKeymap,
+    syntaxHighlighting: languageModule.syntaxHighlighting,
+    defaultHighlightStyle: languageModule.defaultHighlightStyle,
+    languageCompartment: new stateModule.Compartment()
+  }));
+  return editorRuntimePromise;
+}
+
+function scheduleEditorRuntimeWarmup() {
+  const warm = () => {
+    void ensureEditorRuntime().catch(() => undefined);
+  };
+  const idleWindow = window as Window & {
+    requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+  };
+  if (idleWindow.requestIdleCallback) idleWindow.requestIdleCallback(warm, { timeout: 1500 });
+  else window.setTimeout(warm, 350);
+}
+
+function warmEditorForPath(path: string) {
+  void ensureEditorRuntime()
+    .then(() => languageFor(path))
+    .catch(() => undefined);
+}
+
+async function hydrateEditorLanguage(path: string, renderToken: number, runtime: EditorRuntime) {
+  const language = await languageFor(path);
+  if (renderToken !== editorRenderToken || !codeView) return;
+  codeView.dispatch({
+    effects: runtime.languageCompartment.reconfigure(language)
+  });
+}
+
+async function languageFor(path: string): Promise<Extension> {
   const lower = path.toLowerCase();
-  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) return javascript({ typescript: true, jsx: lower.endsWith('.tsx') });
-  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs')) return javascript({ jsx: lower.endsWith('.jsx') });
-  if (lower.endsWith('.json')) return json();
-  if (lower.endsWith('.css')) return css();
-  if (lower.endsWith('.html') || lower.endsWith('.htm')) return html();
-  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return markdown();
-  if (lower.endsWith('.py')) return python();
-  if (lower.endsWith('.rs')) return rust();
-  if (lower.endsWith('.yml') || lower.endsWith('.yaml')) return yaml();
+  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) {
+    const { javascript } = await import('@codemirror/lang-javascript');
+    return javascript({ typescript: true, jsx: lower.endsWith('.tsx') });
+  }
+  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs')) {
+    const { javascript } = await import('@codemirror/lang-javascript');
+    return javascript({ jsx: lower.endsWith('.jsx') });
+  }
+  if (lower.endsWith('.json')) {
+    const { json } = await import('@codemirror/lang-json');
+    return json();
+  }
+  if (lower.endsWith('.css')) {
+    const { css } = await import('@codemirror/lang-css');
+    return css();
+  }
+  if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+    const { html } = await import('@codemirror/lang-html');
+    return html();
+  }
+  if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+    const { markdown } = await import('@codemirror/lang-markdown');
+    return markdown();
+  }
+  if (lower.endsWith('.py')) {
+    const { python } = await import('@codemirror/lang-python');
+    return python();
+  }
+  if (lower.endsWith('.rs')) {
+    const { rust } = await import('@codemirror/lang-rust');
+    return rust();
+  }
+  if (lower.endsWith('.yml') || lower.endsWith('.yaml')) {
+    const { yaml } = await import('@codemirror/lang-yaml');
+    return yaml();
+  }
   return [];
 }
 
 function markDirty() {
   if (!state.openFile) return;
-  state.openFile.dirty = true;
-  el.editorLabel.textContent = `${state.openFile.masked ? '🔒 ' : ''}${state.openFile.path} *`;
+  const current = state.openFile.masked && !state.openFile.rawMode
+    ? serializeSecretLines(state.openFile.lines)
+    : codeView?.state.doc.toString() ?? state.openFile.draftContent ?? state.openFile.content;
+  setEditorDirtyFromContent(current);
+}
+
+function setEditorDirtyFromContent(currentContent: string) {
+  if (!state.openFile) return;
+  state.openFile.dirty = !sameEditorContent(currentContent, state.openFile.content);
+  updateEditorLabel();
+  renderEditorTabs();
   el.saveFile.disabled = false;
+}
+
+function sameEditorContent(left: string, right: string) {
+  return normalizeEditorContent(left) === normalizeEditorContent(right);
+}
+
+function normalizeEditorContent(value: string) {
+  return value.replace(/\r\n?/g, '\n');
+}
+
+function updateEditorLabel() {
+  const file = state.openFile;
+  if (!file) {
+    el.editorLabel.textContent = 'Editor';
+    return;
+  }
+  el.editorLabel.textContent = `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`;
 }
 
 async function saveOpenFile() {
   const file = state.openFile;
-  if (!file || !state.activeProfile) return;
-  const content = file.masked && !file.rawMode ? serializeSecretLines(file.lines) : codeView?.state.doc.toString() ?? file.content;
+  const profile = state.activeProfile;
+  if (!file || !profile) return;
+  const content = file.masked && !file.rawMode
+    ? serializeSecretLines(file.lines)
+    : codeView?.state.doc.toString() ?? file.draftContent ?? file.content;
   try {
-    await api.writeTextFile(state.activeProfile.id, file.path, content);
+    await api.writeTextFile(profile.id, file.path, content);
+    if (shouldMaskFile(file.path)) invalidateTextFileCache(profile.id, file.path);
+    else cacheTextFile(profile.id, file.path, content);
     file.content = content;
+    file.draftContent = undefined;
     file.lines = file.masked ? parseSecretLines(content) : [];
     file.dirty = false;
     setStatus('Saved');
     renderEditor();
+    saveActiveWorkspaceSnapshot();
   } catch (error) {
     setStatus(String(error), true);
   }
@@ -438,78 +3192,379 @@ async function saveOpenFile() {
 
 function toggleRawMode() {
   if (!state.openFile?.masked) return;
-  if (state.openFile.rawMode && codeView) {
-    state.openFile.content = codeView.state.doc.toString();
-    state.openFile.lines = parseSecretLines(state.openFile.content);
+  if (!state.openFile.rawMode) {
+    state.openFile.draftContent = serializeSecretLines(state.openFile.lines);
+  } else if (codeView) {
+    state.openFile.draftContent = codeView.state.doc.toString();
+    state.openFile.lines = parseSecretLines(state.openFile.draftContent);
+    state.openFile.dirty = !sameEditorContent(state.openFile.draftContent, state.openFile.content);
   }
   state.openFile.rawMode = !state.openFile.rawMode;
   renderEditor();
 }
 
-async function createTerminal(command: string | null, title: string) {
-  if (!state.activeProfile) return;
-  const paneId = crypto.randomUUID();
+async function createTerminal(
+  command: string | null,
+  title: string,
+  options: CreateTerminalOptions = {}
+): Promise<TerminalWidget | null> {
+  const terminalProfile = options.profile ?? state.activeProfile;
+  if (!terminalProfile) return null;
+  const terminalCwd = options.cwd ?? state.currentDir;
+  const widget = createTerminalWidget(title, terminalCwd, options);
+  await createTerminalTab(widget, command, title, {
+    ...options,
+    profile: terminalProfile,
+    cwd: terminalCwd
+  });
+  return widget;
+}
+
+function createTerminalWidget(title: string, cwd: string, options: CreateTerminalOptions = {}) {
+  const widgetId = crypto.randomUUID();
   const card = document.createElement('section');
   card.className = 'terminal-card panel';
-  card.dataset.paneId = paneId;
+  card.dataset.widgetId = widgetId;
   card.innerHTML = `
-    <div class="terminal-title">
+    <div class="terminal-title panel-drag-handle">
       <button class="focus-dot" title="Active prompt target"></button>
-      <strong>${escapeHtml(title)}</strong>
-      <span class="muted">${escapeHtml(state.currentDir)}</span>
+      <strong class="terminal-widget-title">${escapeHtml(title)}</strong>
+      <span class="muted terminal-widget-cwd">${escapeHtml(cwd)}</span>
       <span class="spacer"></span>
-      <button class="close-pane">×</button>
+      <button class="close-pane" title="Close shell widget" aria-label="Close shell widget">x</button>
     </div>
-    <div class="terminal-host"></div>
+    <div class="terminal-widget-tabbar">
+      <div class="terminal-tab-list widget-tabs"></div>
+      <button class="terminal-new-tab tab-add" title="New tab in this shell" aria-label="New tab in this shell">+</button>
+    </div>
+    <div class="terminal-host-stack"></div>
   `;
-  el.terminalGrid.append(card);
-  const host = card.querySelector<HTMLDivElement>('.terminal-host')!;
+  el.mainGrid.append(card);
+  const grip = ensureTerminalResizeGrip(card);
+  if (options.rect) applyLayoutRatio(card, options.rect);
+  else placeTerminalCard(card);
+
+  const widget: TerminalWidget = {
+    widgetId,
+    element: card,
+    title: card.querySelector<HTMLElement>('.terminal-widget-title')!,
+    cwd: card.querySelector<HTMLElement>('.terminal-widget-cwd')!,
+    tabList: card.querySelector<HTMLElement>('.terminal-tab-list')!,
+    hostStack: card.querySelector<HTMLElement>('.terminal-host-stack')!,
+    activePaneId: ''
+  };
+  state.terminalWidgets.push(widget);
+
+  card.addEventListener('pointerdown', () => {
+    const pane = activePaneForWidget(widget);
+    if (pane) setActivePane(pane.paneId);
+    bringPanelToFront(card);
+  });
+  card.querySelector<HTMLElement>('.terminal-title')!
+    .addEventListener('pointerdown', (event) => startPanelDrag(event, card));
+  grip.addEventListener('pointerdown', (event) => {
+    startPanelResize(event, card, grip);
+    scheduleFitTerminalWidget(widget);
+  });
+  card.querySelector<HTMLButtonElement>('.close-pane')!.addEventListener('click', () => void closeTerminalWidget(widget.widgetId));
+  card.querySelector<HTMLButtonElement>('.terminal-new-tab')!.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void createShellTabInWidget(widget);
+  });
+
+  return widget;
+}
+
+async function createTerminalTab(
+  widget: TerminalWidget,
+  command: string | null,
+  title: string,
+  options: CreateTerminalOptions = {}
+) {
+  const terminalProfile = options.profile ?? profileForTerminalWidget(widget) ?? state.activeProfile;
+  if (!terminalProfile) return null;
+  const terminalCwd = options.cwd ?? activePaneForWidget(widget)?.cwd ?? state.currentDir;
+  const paneId = crypto.randomUUID();
+  const host = document.createElement('div');
+  host.className = 'terminal-host hidden';
+  host.dataset.paneId = paneId;
+  widget.hostStack.append(host);
+
   const term = new Terminal({
     cursorBlink: true,
     convertEol: true,
     fontFamily: 'Cascadia Mono, Consolas, monospace',
-    fontSize: 13,
+    fontSize: terminalFontSize,
     theme: { background: '#080b10', foreground: '#d8e0ea' }
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(host);
-  fit.fit();
 
-  const pane: TerminalPane = { paneId, title, command, term, fit, element: card };
+  const pane: TerminalPane = {
+    paneId,
+    widgetId: widget.widgetId,
+    title,
+    command,
+    profileId: terminalProfile.id,
+    cwd: terminalCwd,
+    term,
+    fit,
+    element: widget.element,
+    host,
+    outputBuffer: '',
+    seenPorts: new Set(),
+    lastRows: term.rows,
+    lastCols: term.cols
+  };
   state.terminals.push(pane);
-  setActivePane(paneId);
+  if (options.focus !== false) {
+    setActivePane(paneId);
+    bringPanelToFront(widget.element);
+  } else {
+    if (!widget.activePaneId) widget.activePaneId = paneId;
+    syncActivePaneClass();
+  }
+  renderTerminalWidgetTabs(widget);
+  if (pane.paneId === widget.activePaneId) scheduleFitTerminal(pane);
 
+  term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
     if (pane.backendId) void api.writeTerminal(pane.backendId, data);
   });
-  card.addEventListener('pointerdown', () => setActivePane(paneId));
-  card.querySelector<HTMLButtonElement>('.close-pane')!.addEventListener('click', async () => {
-    if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
-    pane.resizeObserver?.disconnect();
-    pane.term.dispose();
-    state.terminals = state.terminals.filter((item) => item.paneId !== paneId);
-    card.remove();
-    state.activePaneId = state.terminals[0]?.paneId ?? '';
-    syncActivePaneClass();
-  });
+  host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
 
-  pane.resizeObserver = new ResizeObserver(() => fitTerminal(pane));
+  pane.resizeObserver = new ResizeObserver(() => scheduleFitTerminal(pane));
   pane.resizeObserver.observe(host);
 
   try {
-    pane.backendId = await api.spawnTerminal(state.activeProfile.id, state.currentDir, command, term.rows, term.cols);
-    term.focus();
+    pane.backendId = await api.spawnTerminal(terminalProfile.id, terminalCwd, command, term.rows, term.cols);
+    if (options.focus !== false) {
+      bringPanelToFront(widget.element);
+      term.focus();
+    }
     setStatus(`Terminal started: ${title}`);
+    saveActiveWorkspaceSnapshot();
   } catch (error) {
     term.write(`\r\nFailed to start terminal: ${String(error)}\r\n`);
     setStatus(String(error), true);
   }
+  return pane;
+}
+
+async function closeTerminalPane(paneId: string) {
+  const pane = state.terminals.find((item) => item.paneId === paneId);
+  if (!pane) return;
+  const widget = terminalWidgetForPane(pane);
+  if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
+  if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
+  pane.resizeObserver?.disconnect();
+  pane.term.dispose();
+  state.terminals = state.terminals.filter((item) => item.paneId !== paneId);
+  pane.host.remove();
+  const remainingInWidget = widget ? terminalPanesForWidget(widget) : [];
+  if (widget && !remainingInWidget.length) {
+    state.terminalWidgets = state.terminalWidgets.filter((item) => item.widgetId !== widget.widgetId);
+    widget.element.remove();
+  } else if (widget && widget.activePaneId === paneId) {
+    widget.activePaneId = remainingInWidget[0]?.paneId ?? '';
+  }
+
+  if (state.activePaneId === paneId) {
+    const next = remainingInWidget[0] ?? state.terminals[0];
+    state.activePaneId = '';
+    if (next) setActivePane(next.paneId);
+    else setKeyboardResizeTarget({ kind: 'ide' });
+  }
+  syncActivePaneClass();
+  renderShellTabs();
+  saveActiveWorkspaceSnapshot();
+}
+
+async function closeTerminalWidget(widgetId: string) {
+  const paneIds = state.terminals
+    .filter((pane) => pane.widgetId === widgetId)
+    .map((pane) => pane.paneId);
+  for (const paneId of paneIds) {
+    await closeTerminalPane(paneId);
+  }
+}
+
+function renderShellTabs() {
+  el.shellTabs.classList.add('hidden');
+  el.shellTabList.innerHTML = '';
+  for (const widget of state.terminalWidgets) renderTerminalWidgetTabs(widget);
+}
+
+function renderTerminalWidgetTabs(widget: TerminalWidget) {
+  widget.tabList.innerHTML = '';
+  const panes = terminalPanesForWidget(widget);
+  const fragment = document.createDocumentFragment();
+  for (const pane of panes) {
+    const item = document.createElement('div');
+    item.className = `widget-tab${pane.paneId === widget.activePaneId ? ' active' : ''}`;
+    item.title = pane.command || pane.title;
+    item.innerHTML = `<button class="widget-tab-label">${escapeHtml(pane.title)}</button><button class="widget-tab-close" title="Close shell" aria-label="Close shell">x</button>`;
+    item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => {
+      setActivePane(pane.paneId);
+      bringPanelToFront(pane.element);
+      pane.term.focus();
+    });
+    item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void closeTerminalPane(pane.paneId);
+    });
+    fragment.append(item);
+  }
+  widget.tabList.append(fragment);
+  updateTerminalWidgetTitle(widget);
+}
+
+function terminalPanesForWidget(widget: TerminalWidget) {
+  return state.terminals.filter((pane) => pane.widgetId === widget.widgetId);
+}
+
+function terminalWidgetForPane(pane: TerminalPane) {
+  return state.terminalWidgets.find((widget) => widget.widgetId === pane.widgetId) ?? null;
+}
+
+function terminalWidgetForElement(element: HTMLElement) {
+  return state.terminalWidgets.find((widget) => widget.element === element) ?? null;
+}
+
+function activePaneForWidget(widget: TerminalWidget) {
+  return state.terminals.find((pane) => pane.paneId === widget.activePaneId)
+    ?? terminalPanesForWidget(widget)[0]
+    ?? null;
+}
+
+function activeTerminalWidget() {
+  const pane = state.terminals.find((item) => item.paneId === state.activePaneId);
+  return pane ? terminalWidgetForPane(pane) : state.terminalWidgets[0] ?? null;
+}
+
+function activePaneForElement(element: HTMLElement) {
+  const widget = terminalWidgetForElement(element);
+  return widget ? activePaneForWidget(widget) : null;
+}
+
+function profileForTerminalWidget(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return null;
+  return state.profiles.find((profile) => profile.id === pane.profileId)
+    ?? (pane.profileId === 'windows-local' ? windowsLocalProfileFallback() : null);
+}
+
+function windowsLocalProfileFallback(): ConnectionProfile {
+  return {
+    id: 'windows-local',
+    label: 'Windows Local',
+    kind: 'windows',
+    root: 'C:\\Windows\\Temp\\simple-vibe-ide-shell',
+    shell: 'powershell.exe -NoLogo -NoProfile'
+  };
+}
+
+async function createShellTabInWidget(widget: TerminalWidget) {
+  const active = activePaneForWidget(widget);
+  const profile = profileForTerminalWidget(widget) ?? state.activeProfile;
+  const cwd = active?.cwd ?? state.currentDir;
+  await createTerminalTab(widget, null, 'shell', { profile: profile ?? undefined, cwd });
+}
+
+function updateTerminalWidgetTitle(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  widget.activePaneId = pane?.paneId ?? '';
+  widget.title.textContent = pane?.title ?? 'shell';
+  widget.cwd.textContent = pane?.cwd ?? '';
+}
+
+function scheduleFitTerminalWidget(widget: TerminalWidget) {
+  for (const pane of terminalPanesForWidget(widget)) scheduleFitTerminal(pane);
+}
+
+function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
+  if (isWidgetFocusShortcut(event)) {
+    if (terminalUsesAlternateBuffer(pane)) return true;
+    event.preventDefault();
+    event.stopPropagation();
+    cycleWidgetFocus(event.shiftKey ? -1 : 1, pane.paneId);
+    return false;
+  }
+
+  if (event.type !== 'keydown' || !(event.ctrlKey || event.metaKey) || event.altKey) return true;
+  if (event.key.toLowerCase() !== 'c') return true;
+  if (!pane.term.hasSelection()) return true;
+
+  void copyTerminalSelection(pane);
+  return false;
+}
+
+function terminalUsesAlternateBuffer(pane: TerminalPane) {
+  return (pane.term.buffer.active as { type?: string }).type === 'alternate';
+}
+
+async function copyTerminalSelection(pane: TerminalPane) {
+  const selection = pane.term.getSelection();
+  if (!selection) return;
+  try {
+    await writeText(selection);
+    pane.term.clearSelection();
+    setStatus('Copied terminal selection');
+  } catch (error) {
+    setStatus(`Failed to copy terminal selection: ${String(error)}`, true);
+  }
+}
+
+function handleTerminalPaste(event: ClipboardEvent, pane: TerminalPane) {
+  const text = event.clipboardData?.getData('text/plain') ?? '';
+  if (!text) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  void pasteTerminalText(pane, text);
+}
+
+async function pasteTerminalText(pane: TerminalPane, text?: string) {
+  try {
+    const value = text ?? await readText();
+    if (!value || !pane.backendId) return;
+    await api.writeTerminal(pane.backendId, value);
+  } catch (error) {
+    setStatus(`Failed to paste terminal text: ${String(error)}`, true);
+  }
+}
+
+function placeTerminalCard(card: HTMLElement) {
+  const workspaceRect = el.mainGrid.getBoundingClientRect();
+  const guideRect = el.terminalGrid.getBoundingClientRect();
+  const index = state.terminalWidgets.length;
+  const width = clamp(guideRect.width || 620, terminalMinWidth(), Math.max(terminalMinWidth(), el.mainGrid.clientWidth - 16));
+  const height = clamp(300, terminalMinHeight(), Math.max(terminalMinHeight(), el.mainGrid.clientHeight - 16));
+  const offset = index * 22;
+  const rect = clampPanelRect(card, {
+    left: guideRect.left - workspaceRect.left + offset,
+    top: guideRect.top - workspaceRect.top + offset,
+    width,
+    height
+  });
+  applyPanelRect(card, rect);
+}
+
+function scheduleFitTerminal(pane: TerminalPane) {
+  if (pane.fitFrame) return;
+  pane.fitFrame = requestAnimationFrame(() => {
+    pane.fitFrame = undefined;
+    fitTerminal(pane);
+  });
 }
 
 function fitTerminal(pane: TerminalPane) {
   try {
     pane.fit.fit();
+    if (pane.lastRows === pane.term.rows && pane.lastCols === pane.term.cols) return;
+    pane.lastRows = pane.term.rows;
+    pane.lastCols = pane.term.cols;
     if (pane.backendId) void api.resizeTerminal(pane.backendId, pane.term.rows, pane.term.cols);
   } catch {
     // xterm can throw while hidden or before first layout; safe to ignore.
@@ -517,41 +3572,190 @@ function fitTerminal(pane: TerminalPane) {
 }
 
 function setActivePane(paneId: string) {
+  const pane = state.terminals.find((item) => item.paneId === paneId);
+  if (!pane) return;
+  const widget = terminalWidgetForPane(pane);
+  if (widget) widget.activePaneId = paneId;
   state.activePaneId = paneId;
+  setKeyboardResizeTarget({ kind: 'terminal', paneId });
   syncActivePaneClass();
+  renderShellTabs();
+  scheduleFitTerminal(pane);
+  saveActiveWorkspaceSnapshot();
 }
 
 function syncActivePaneClass() {
-  state.terminals.forEach((pane) => {
-    pane.element.classList.toggle('active', pane.paneId === state.activePaneId);
-  });
+  for (const widget of state.terminalWidgets) {
+    const activePane = activePaneForWidget(widget);
+    widget.activePaneId = activePane?.paneId ?? '';
+    widget.element.classList.toggle('active', widget.activePaneId === state.activePaneId);
+    for (const pane of terminalPanesForWidget(widget)) {
+      pane.host.classList.toggle('hidden', pane.paneId !== widget.activePaneId);
+    }
+    updateTerminalWidgetTitle(widget);
+  }
 }
 
 async function handlePaste(event: ClipboardEvent) {
-  const item = [...(event.clipboardData?.items ?? [])].find((candidate) => candidate.type.startsWith('image/'));
-  if (!item || !state.activeProfile) return;
-  const file = item.getAsFile();
-  if (!file) return;
+  if (!state.activeProfile || !state.workspaceOpen) return;
+  const eventDataUrl = await imageDataUrlFromClipboardEvent(event);
+  const shouldTryNativeImage = !eventDataUrl && clipboardEventMayContainImage(event);
+  if (!eventDataUrl && !shouldTryNativeImage) return;
+
   event.preventDefault();
-  const dataUrl = await blobToDataUrl(file);
-  const fileName = nextImageName();
   try {
-    const result = await api.saveAttachment(
-      state.activeProfile.id,
-      state.workspaceRoot,
-      state.attachmentSession,
-      fileName,
-      dataUrl
-    );
-    state.imagePreviewDataUrl = dataUrl;
-    state.imagePreviewLabel = `${result.tag} copied into active prompt`;
-    renderImagePreview();
-    const active = state.terminals.find((pane) => pane.paneId === state.activePaneId);
-    if (active?.backendId) await api.writeTerminal(active.backendId, result.tag);
-    setStatus(`Saved ${result.path}`);
+    const dataUrl = eventDataUrl ?? await nativeClipboardImageToDataUrl();
+    const pasteToShell = isInsideImagePanel(event.target) || state.autoPasteImageTagToShell;
+    await savePastedImage(dataUrl, pasteToShell);
   } catch (error) {
-    setStatus(String(error), true);
+    setStatus(`Failed to paste image: ${String(error)}`, true);
   }
+}
+
+function handleImageClipboardShortcut(event: KeyboardEvent) {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.defaultPrevented) return;
+  const key = event.key.toLowerCase();
+  if (key !== 'c' && key !== 'v') return;
+  if (!isImagePanelClipboardTarget(event.target)) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  if (key === 'c') void copyCurrentPreviewImage();
+  else void pasteImageFromNativeClipboard();
+}
+
+function isImagePanelClipboardTarget(target: EventTarget | null) {
+  if (target instanceof Element && target.closest('input, textarea, select, .terminal-card, .cm-editor')) {
+    return false;
+  }
+  return keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'image'
+    || isInsideImagePanel(target);
+}
+
+function isInsideImagePanel(target: EventTarget | null) {
+  const imagePanel = getPanel('image');
+  return target instanceof Node && imagePanel.contains(target);
+}
+
+async function copyCurrentPreviewImage() {
+  if (!state.imagePreviewDataUrl) {
+    setStatus('No image preview to copy', true);
+    return;
+  }
+  try {
+    await writePreviewDataUrlToClipboard(state.imagePreviewDataUrl);
+    setStatus('Copied image preview');
+  } catch (error) {
+    setStatus(`Failed to copy image preview: ${String(error)}`, true);
+  }
+}
+
+async function writePreviewDataUrlToClipboard(dataUrl: string) {
+  const image = await dataUrlToTauriImage(dataUrl);
+  try {
+    await writeImage(image);
+  } finally {
+    await image.close().catch(() => undefined);
+  }
+}
+
+async function dataUrlToTauriImage(dataUrl: string) {
+  const image = await loadImageElement(dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = image.naturalWidth || image.width;
+  canvas.height = image.naturalHeight || image.height;
+  const context = canvas.getContext('2d');
+  if (!context || canvas.width <= 0 || canvas.height <= 0) {
+    throw new Error('could not decode image preview');
+  }
+  context.drawImage(image, 0, 0);
+  const rgba = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  return TauriImage.new(new Uint8Array(rgba), canvas.width, canvas.height);
+}
+
+function loadImageElement(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = document.createElement('img');
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('could not load image preview'));
+    image.src = dataUrl;
+  });
+}
+
+async function pasteImageFromNativeClipboard() {
+  if (!state.activeProfile || !state.workspaceOpen) return;
+  try {
+    await savePastedImage(await nativeClipboardImageToDataUrl(), true);
+  } catch (error) {
+    setStatus(`Failed to paste image: ${String(error)}`, true);
+  }
+}
+
+async function imageDataUrlFromClipboardEvent(event: ClipboardEvent) {
+  const item = [...(event.clipboardData?.items ?? [])].find((candidate) => candidate.type.startsWith('image/'));
+  const file = item?.getAsFile()
+    ?? [...(event.clipboardData?.files ?? [])].find((candidate) => candidate.type.startsWith('image/') || isImagePath(candidate.name));
+  return file ? blobToDataUrl(file) : null;
+}
+
+function clipboardEventMayContainImage(event: ClipboardEvent) {
+  const data = event.clipboardData;
+  if (!data) return true;
+  if ([...data.items].some((item) => item.type.startsWith('image/'))) return true;
+  if ([...data.files].some((file) => file.type.startsWith('image/') || isImagePath(file.name))) return true;
+  if ([...data.types].includes('Files')) return true;
+  const html = data.getData('text/html');
+  if (/<img\b|data:image\//i.test(html)) return true;
+  return data.types.length === 0 && !data.getData('text/plain');
+}
+
+async function nativeClipboardImageToDataUrl() {
+  const image = await readImage();
+  try {
+    const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('canvas 2D context is unavailable');
+    context.putImageData(new ImageData(new Uint8ClampedArray(rgba), size.width, size.height), 0, 0);
+    return canvas.toDataURL('image/png');
+  } finally {
+    await image.close().catch(() => undefined);
+  }
+}
+
+async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteImageTagToShell) {
+  if (!state.activeProfile) return;
+  const targetTab = state.imageOpenInNewTab && activeImageTab().dataUrl
+    ? createImageTab(undefined, true)
+    : activeImageTab();
+  state.activeImageTabId = targetTab.id;
+  const result = await api.saveAttachment(
+    state.activeProfile.id,
+    state.currentDir,
+    state.attachmentSession,
+    nextImageName(),
+    dataUrl
+  );
+  const item: PastedImageItem = {
+    id: crypto.randomUUID(),
+    path: result.path,
+    tag: result.tag,
+    dataUrl,
+    createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  };
+  state.imageHistory = [item, ...state.imageHistory].slice(0, 24);
+  state.imagePreviewDataUrl = dataUrl;
+  targetTab.sourcePath = result.path;
+  const pasted = pasteToShell ? await pasteImageTagToActiveTerminal(result.tag) : false;
+  state.imagePreviewLabel = pasted ? `${result.tag} copied into active prompt` : `${result.tag} saved`;
+  syncActiveImageTabFromState();
+  renderImageTabs();
+  renderImagePreview();
+  renderImageHistory();
+  setStatus(pasted ? `Saved and pasted ${result.path}` : `Saved ${result.path}`);
+  saveActiveWorkspaceSnapshot();
 }
 
 function renderImagePreview() {
@@ -565,6 +3769,71 @@ function renderImagePreview() {
   }
 }
 
+function renderImageHistory() {
+  el.imageHistoryToggle.classList.toggle('active', state.imageHistoryVisible);
+  el.imageHistoryToggle.setAttribute('aria-pressed', String(state.imageHistoryVisible));
+  el.imageHistoryClear.disabled = state.imageHistory.length === 0;
+  el.imageHistory.classList.toggle('hidden', !state.imageHistoryVisible);
+  if (!state.imageHistoryVisible) return;
+
+  el.imageHistory.innerHTML = '';
+  if (state.imageHistory.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'image-history-empty';
+    empty.textContent = 'No pasted images yet.';
+    el.imageHistory.append(empty);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const item of state.imageHistory) {
+    const row = document.createElement('div');
+    row.className = 'image-history-row';
+
+    const preview = document.createElement('button');
+    preview.className = 'image-history-preview';
+    preview.title = 'Preview image';
+    preview.innerHTML = `<img alt="" src="${item.dataUrl}" />`;
+    preview.addEventListener('click', () => previewImageHistoryItem(item));
+
+    const meta = document.createElement('button');
+    meta.className = 'image-history-meta';
+    meta.title = 'Preview image';
+    meta.innerHTML = `<span>${escapeHtml(item.path)}</span><small>${escapeHtml(item.createdAt)}</small>`;
+    meta.addEventListener('click', () => previewImageHistoryItem(item));
+
+    const paste = document.createElement('button');
+    paste.className = 'image-history-paste';
+    paste.textContent = 'Paste';
+    paste.title = 'Paste tag to active shell';
+    paste.addEventListener('click', () => void pasteImageTagToActiveTerminal(item.tag));
+
+    row.append(preview, meta, paste);
+    fragment.append(row);
+  }
+  el.imageHistory.append(fragment);
+}
+
+function previewImageHistoryItem(item: PastedImageItem) {
+  state.imagePreviewDataUrl = item.dataUrl;
+  state.imagePreviewLabel = item.tag;
+  syncActiveImageTabFromState();
+  renderImagePreview();
+  renderImageTabs();
+  saveActiveWorkspaceSnapshot();
+}
+
+async function pasteImageTagToActiveTerminal(tag: string) {
+  const active = state.terminals.find((pane) => pane.paneId === state.activePaneId);
+  if (!active?.backendId) {
+    setStatus('No active shell for image tag paste', true);
+    return false;
+  }
+  await api.writeTerminal(active.backendId, tag);
+  setStatus(`Pasted ${tag}`);
+  return true;
+}
+
 async function startForward() {
   if (!state.activeProfile) return;
   const remotePort = Number(el.remotePort.value);
@@ -576,40 +3845,455 @@ async function startForward() {
   try {
     const forward = await api.startPortForward(state.activeProfile.id, remotePort, localPort);
     state.forwards.push(forward);
+    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(state.activeProfile!.id, remotePort));
     renderForwards();
-    loadPreview(forward.url);
-    setStatus(`Forwarding ${forward.localPort} → ${forward.targetHost}:${forward.remotePort}`);
+    openBrowserTab(forward.url, portTabLabel(forward.localPort));
+    setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
   } catch (error) {
     setStatus(String(error), true);
   }
 }
 
+async function openPreviewValue(value: string) {
+  if (!value) return;
+  const port = parsePreviewPort(value);
+  if (port) {
+    await openPort(port, 'manual');
+    return;
+  }
+  openBrowserTab(normalizePreviewUrl(value));
+}
+
+async function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
+  if (!state.activeProfile) return;
+  pane.outputBuffer = trimPortScanBuffer(`${pane.outputBuffer}${stripAnsi(data)}`);
+  const ports = detectLocalServerPorts(pane.outputBuffer).filter((port) => !pane.seenPorts.has(port));
+  for (const port of ports) {
+    pane.seenPorts.add(port);
+    queueDetectedPort(port);
+  }
+}
+
+async function openPort(port: number, source: 'manual' | 'auto') {
+  if (!state.activeProfile || !isPreviewPort(port)) return;
+  const profile = state.activeProfile;
+  const key = `${profile.id}:${port}`;
+  const existing = state.forwards.find((forward) => forward.remotePort === port);
+  if (existing) {
+    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
+    renderForwards();
+    openBrowserTab(existing.url, portTabLabel(existing.localPort));
+    if (source === 'auto') setStatus(`Detected port ${port}; using ${existing.url}`);
+    return;
+  }
+
+  if (profile.kind === 'windows') {
+    const url = `http://127.0.0.1:${port}`;
+    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
+    renderForwards();
+    openBrowserTab(url, portTabLabel(port));
+    setStatus(source === 'auto' ? `Detected local server on ${url}` : `Previewing ${url}`);
+    return;
+  }
+
+  if (autoForwardingPorts.has(key)) return;
+  autoForwardingPorts.add(key);
+  try {
+    const forward = await startForwardForPort(port, source);
+    state.forwards.push(forward);
+    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
+    renderForwards();
+    openBrowserTab(forward.url, portTabLabel(forward.localPort));
+    setStatus(source === 'auto'
+      ? `Detected port ${port}; forwarding ${forward.url}`
+      : `Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
+  } catch (error) {
+    if (source === 'manual') {
+      setStatus(String(error), true);
+    } else {
+      setStatus(`Detected port ${port}, but auto forward failed: ${String(error)}`, true);
+    }
+  } finally {
+    autoForwardingPorts.delete(key);
+  }
+}
+
+function queueDetectedPort(port: number) {
+  if (!state.activeProfile || !isPreviewPort(port)) return;
+  const profile = state.activeProfile;
+  const id = detectedPortId(profile.id, port);
+  const url = `http://127.0.0.1:${port}`;
+  if (state.detectedPorts.some((item) => item.id === id)) return;
+  if (state.browserTabs.some((tab) => tab.url === url)) return;
+
+  state.detectedPorts.push({ id, profileId: profile.id, port, url });
+  renderForwards();
+  setPanelVisible('browser', true);
+  logBrowserConsole('info', `Detected local server on ${url}`);
+  setStatus(`Detected port ${port}; open it from Browser / Ports`);
+}
+
+function detectedPortId(profileId: string, port: number) {
+  return `${profileId}:${port}`;
+}
+
+async function startForwardForPort(port: number, source: 'manual' | 'auto') {
+  if (!state.activeProfile) throw new Error('No active profile');
+  try {
+    return await api.startPortForward(state.activeProfile.id, port, port);
+  } catch (error) {
+    if (source !== 'auto' || state.activeProfile.kind === 'ssh') throw error;
+    return api.startPortForward(state.activeProfile.id, port, 0);
+  }
+}
+
 function renderForwards() {
   el.forwardList.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  const activeProfileId = state.activeProfile?.id;
+  for (const item of state.detectedPorts.filter((port) => port.profileId === activeProfileId)) {
+    const row = document.createElement('div');
+    row.className = 'forward-row pending';
+    row.innerHTML = `<button class="load">Open</button><span>Detected ${item.port} (${escapeHtml(item.url)})</span><button class="stop">Dismiss</button>`;
+    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => void openPort(item.port, 'manual'));
+    row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', () => {
+      state.detectedPorts = state.detectedPorts.filter((port) => port.id !== item.id);
+      renderForwards();
+    });
+    fragment.append(row);
+  }
+
   for (const forward of state.forwards) {
     const row = document.createElement('div');
     row.className = 'forward-row';
-    row.innerHTML = `<button class="load">${escapeHtml(forward.url)}</button><span>→ ${escapeHtml(forward.targetHost)}:${forward.remotePort}</span><button class="stop">Stop</button>`;
-    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => loadPreview(forward.url));
+    row.innerHTML = `<button class="load">${escapeHtml(forward.url)}</button><span>-> ${escapeHtml(forward.targetHost)}:${forward.remotePort}</span><button class="stop">Stop</button>`;
+    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => openBrowserTab(forward.url, portTabLabel(forward.localPort)));
     row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', async () => {
       await api.stopPortForward(forward.id).catch((error) => setStatus(String(error), true));
       state.forwards = state.forwards.filter((item) => item.id !== forward.id);
       renderForwards();
     });
-    el.forwardList.append(row);
+    fragment.append(row);
   }
+  el.forwardList.append(fragment);
 }
 
 function loadPreview(url: string) {
-  if (!url) return;
-  state.previewUrl = url;
-  el.previewUrl.value = url;
-  el.previewFrame.src = url;
+  openBrowserTab(url);
 }
 
-function setBrowserMode(mode: 'desktop' | 'mobile') {
-  el.browserShell.classList.toggle('mobile', mode === 'mobile');
-  el.browserShell.classList.toggle('desktop', mode === 'desktop');
+function openBrowserTab(url: string, label = browserTabLabel(url)) {
+  if (!url) return;
+  const existing = state.browserTabs.find((tab) => tab.url === url);
+  if (existing) {
+    activateBrowserTab(existing.id);
+    return;
+  }
+
+  const tab = { id: makeBrowserTabId(), url, label };
+  state.browserTabs.push(tab);
+  logBrowserConsole('info', `Opened preview tab ${url}`);
+  activateBrowserTab(tab.id);
+  setPanelVisible('browser', true);
+}
+
+function activateBrowserTab(id: string) {
+  const tab = state.browserTabs.find((item) => item.id === id);
+  if (!tab) return;
+  state.activeBrowserTabId = tab.id;
+  state.previewUrl = tab.url;
+  el.previewUrl.value = tab.url;
+  el.browserShell.classList.add('has-preview');
+  el.previewFrame.classList.remove('hidden');
+  el.previewFrame.src = tab.url;
+  renderBrowserTabs();
+  logBrowserConsole('info', `Activated tab ${tab.url}`);
+  saveActiveWorkspaceSnapshot();
+}
+
+function closeBrowserTab(id: string) {
+  const index = state.browserTabs.findIndex((tab) => tab.id === id);
+  if (index < 0) return;
+  const wasActive = state.activeBrowserTabId === id;
+  const closedUrl = state.browserTabs[index].url;
+  state.browserTabs.splice(index, 1);
+  logBrowserConsole('info', `Closed tab ${closedUrl}`);
+  if (wasActive) {
+    const next = state.browserTabs[index] ?? state.browserTabs[index - 1];
+    if (next) {
+      activateBrowserTab(next.id);
+    } else {
+      state.activeBrowserTabId = '';
+      state.previewUrl = '';
+      el.previewUrl.value = '';
+      el.previewFrame.removeAttribute('src');
+      el.previewFrame.classList.add('hidden');
+      el.browserShell.classList.remove('has-preview');
+      renderBrowserTabs();
+    }
+  } else {
+    renderBrowserTabs();
+  }
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderBrowserTabs() {
+  el.browserTabs.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (const tab of state.browserTabs) {
+    const item = document.createElement('div');
+    item.className = `browser-tab${tab.id === state.activeBrowserTabId ? ' active' : ''}`;
+    item.title = tab.url;
+    item.innerHTML = `<button class="tab-label">${escapeHtml(tab.label)}</button><button class="tab-close" title="Close tab" aria-label="Close tab">x</button>`;
+    item.querySelector<HTMLButtonElement>('.tab-label')!.addEventListener('click', () => activateBrowserTab(tab.id));
+    item.querySelector<HTMLButtonElement>('.tab-close')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeBrowserTab(tab.id);
+    });
+    fragment.append(item);
+  }
+  el.browserTabs.append(fragment);
+}
+
+function setBrowserConsoleVisible(visible: boolean) {
+  state.browserConsoleVisible = visible;
+  el.browserWorkspace.classList.toggle('console-visible', visible);
+  el.browserConsole.classList.toggle('hidden', !visible);
+  el.browserConsoleToggle.classList.toggle('active', visible);
+  el.browserConsoleToggle.setAttribute('aria-pressed', String(visible));
+  if (visible) renderBrowserConsole();
+  saveActiveWorkspaceSnapshot();
+}
+
+function setBrowserConsolePosition(position: BrowserConsolePosition) {
+  if (!['bottom', 'right', 'top', 'left'].includes(position)) return;
+  state.browserConsolePosition = position;
+  el.browserConsolePosition.value = position;
+  el.browserWorkspace.classList.remove('console-bottom', 'console-right', 'console-top', 'console-left');
+  el.browserWorkspace.classList.add(`console-${position}`);
+  if (state.browserConsoleVisible) logBrowserConsole('info', `Console moved to ${position}`);
+  saveActiveWorkspaceSnapshot();
+}
+
+function logBrowserConsole(level: BrowserConsoleLog['level'], message: string) {
+  const entry = {
+    id: makeBrowserTabId(),
+    time: new Date().toTimeString().slice(0, 8),
+    level,
+    message
+  };
+  state.browserConsoleLogs.push(entry);
+  if (state.browserConsoleLogs.length > 250) state.browserConsoleLogs.shift();
+  if (state.browserConsoleVisible) renderBrowserConsole();
+}
+
+function renderBrowserConsole() {
+  if (!state.browserConsoleLogs.length) {
+    el.browserConsoleLog.innerHTML = '<div class="browser-console-empty">No console events yet</div>';
+    return;
+  }
+
+  el.browserConsoleLog.innerHTML = state.browserConsoleLogs
+    .map((entry) => `
+      <div class="browser-console-line ${entry.level}">
+        <span class="browser-console-time">${escapeHtml(entry.time)}</span>
+        <span class="browser-console-level">${entry.level}</span>
+        <span class="browser-console-message">${escapeHtml(entry.message)}</span>
+      </div>
+    `)
+    .join('');
+  el.browserConsoleLog.scrollTop = el.browserConsoleLog.scrollHeight;
+}
+
+function handleBrowserConsoleMessage(event: MessageEvent) {
+  const data = event.data;
+  if (!data || typeof data !== 'object') return;
+  const payload = (data as { simpleVibeConsole?: unknown; __simpleVibeConsole?: unknown }).simpleVibeConsole
+    ?? (data as { simpleVibeConsole?: unknown; __simpleVibeConsole?: unknown }).__simpleVibeConsole;
+  if (!payload || typeof payload !== 'object') return;
+
+  const record = payload as { level?: string; message?: unknown; args?: unknown[] };
+  const level = record.level === 'warn' || record.level === 'error' ? record.level : 'info';
+  const message = record.args?.map(formatConsoleValue).join(' ') ?? formatConsoleValue(record.message ?? '');
+  if (message) logBrowserConsole(level, message);
+}
+
+function formatConsoleValue(value: unknown) {
+  if (typeof value === 'string') return value;
+  if (value == null) return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function currentBrowserTab() {
+  return state.browserTabs.find((tab) => tab.id === state.activeBrowserTabId) ?? null;
+}
+
+function refreshPreview(hard: boolean) {
+  const tab = currentBrowserTab();
+  if (!tab) {
+    setStatus('No preview URL to refresh', true);
+    return;
+  }
+
+  el.browserShell.classList.add('has-preview');
+  el.previewFrame.classList.remove('hidden');
+  el.previewFrame.src = hard ? withPreviewCacheBuster(tab.url) : tab.url;
+  state.previewUrl = tab.url;
+  el.previewUrl.value = tab.url;
+  logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
+  setStatus(hard ? `Hard refreshed ${tab.url}` : `Reloaded ${tab.url}`);
+}
+
+function makeBrowserTabId() {
+  return `browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function browserTabLabel(url: string) {
+  try {
+    const parsed = new URL(url);
+    if ((parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') && parsed.port) {
+      return portTabLabel(Number(parsed.port));
+    }
+    return parsed.host || parsed.pathname || 'Preview';
+  } catch {
+    return url;
+  }
+}
+
+function portTabLabel(port: number) {
+  return Number.isInteger(port) ? `:${port}` : 'Preview';
+}
+
+function withPreviewCacheBuster(url: string) {
+  const stamp = Date.now().toString(36);
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set('__svide_hard_reload', stamp);
+    return parsed.toString();
+  } catch {
+    const hashIndex = url.indexOf('#');
+    const beforeHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
+    const hash = hashIndex >= 0 ? url.slice(hashIndex) : '';
+    const separator = beforeHash.includes('?') ? '&' : '?';
+    return `${beforeHash}${separator}__svide_hard_reload=${stamp}${hash}`;
+  }
+}
+
+function normalizePreviewUrl(value: string) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return value;
+  return `http://${value}`;
+}
+
+function parsePreviewPort(value: string) {
+  const trimmed = value.trim();
+  if (/^\d{2,5}$/.test(trimmed)) {
+    const port = Number(trimmed);
+    return isPreviewPort(port) ? port : null;
+  }
+  const match = trimmed.match(/^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:[/?#].*)?$/i);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return isPreviewPort(port) ? port : null;
+}
+
+function detectLocalServerPorts(text: string) {
+  const ports = new Set<number>();
+  const urlPattern = /\b(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b/gi;
+  for (const match of text.matchAll(urlPattern)) {
+    const port = Number(match[1]);
+    if (isPreviewPort(port)) ports.add(port);
+  }
+
+  const listeningPattern = /\b(?:listening|running|available|started|serving|server)\b[^\r\n]{0,80}\b(?:port\s*)?(\d{4,5})\b/gi;
+  for (const match of text.matchAll(listeningPattern)) {
+    const port = Number(match[1]);
+    if (isPreviewPort(port)) ports.add(port);
+  }
+  return [...ports];
+}
+
+function isPreviewPort(port: number) {
+  return Number.isInteger(port) && port >= 1024 && port <= 65535;
+}
+
+function stripAnsi(value: string) {
+  return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+}
+
+function trimPortScanBuffer(value: string) {
+  return value.length > TERMINAL_PORT_SCAN_LIMIT
+    ? value.slice(value.length - TERMINAL_PORT_SCAN_LIMIT)
+    : value;
+}
+
+function renderBrowserDeviceOptions() {
+  el.deviceSelect.innerHTML = '';
+  const desktop = document.createElement('option');
+  desktop.value = 'desktop';
+  desktop.textContent = 'Desktop';
+  el.deviceSelect.append(desktop);
+  for (const kind of ['phone', 'tablet'] as const) {
+    const group = document.createElement('optgroup');
+    group.label = kind === 'phone' ? 'Phones' : 'Tablets';
+    for (const preset of BROWSER_DEVICE_PRESETS.filter((item) => item.kind === kind)) {
+      const option = document.createElement('option');
+      option.value = preset.id;
+      option.textContent = `${preset.label} (${preset.width} x ${preset.height})`;
+      group.append(option);
+    }
+    el.deviceSelect.append(group);
+  }
+  el.deviceSelect.value = 'desktop';
+}
+
+function setBrowserMode(mode: 'desktop' | 'device') {
+  const isDesktop = mode === 'desktop';
+  el.browserShell.classList.toggle('device', !isDesktop);
+  el.browserShell.classList.toggle('desktop', isDesktop);
+  el.desktopSize?.classList.toggle('active', isDesktop);
+  el.deviceSelect.classList.toggle('active', !isDesktop);
+  el.rotateDevice.disabled = isDesktop;
+
+  if (isDesktop) {
+    el.deviceSelect.value = 'desktop';
+    el.previewFrame.style.width = '';
+    el.previewFrame.style.height = '';
+    el.browserShell.dataset.device = 'Desktop';
+    el.rotateDevice.textContent = 'Rotate';
+    saveActiveWorkspaceSnapshot();
+    return;
+  }
+
+  applyBrowserDevice();
+  saveActiveWorkspaceSnapshot();
+}
+
+function setBrowserDevice(id: string) {
+  if (!BROWSER_DEVICE_PRESETS.some((preset) => preset.id === id)) return;
+  state.browserDeviceId = id;
+  el.deviceSelect.value = id;
+  setBrowserMode('device');
+}
+
+function rotateBrowserDevice() {
+  state.browserOrientation = state.browserOrientation === 'portrait' ? 'landscape' : 'portrait';
+  setBrowserMode('device');
+}
+
+function applyBrowserDevice() {
+  const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+  const portrait = state.browserOrientation === 'portrait';
+  const width = portrait ? preset.width : preset.height;
+  const height = portrait ? preset.height : preset.width;
+  el.previewFrame.style.width = `${width}px`;
+  el.previewFrame.style.height = `${height}px`;
+  el.previewFrame.title = `${preset.label} ${width} x ${height}`;
+  el.browserShell.dataset.device = `${preset.label} ${width} x ${height}`;
+  el.rotateDevice.textContent = portrait ? 'Rotate' : 'Portrait';
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {
@@ -628,13 +4312,34 @@ function nextImageName(): string {
 }
 
 function parentPath(path: string): string {
-  const normalized = path.replace(/\\/g, '/').replace(/\/$/, '');
-  if (!normalized || normalized === '/' || /^[A-Za-z]:\/$/.test(normalized)) return path;
-  const idx = normalized.lastIndexOf('/');
-  if (idx <= 0) return '/';
-  const parent = normalized.slice(0, idx);
-  if (/^[A-Za-z]:$/.test(parent)) return `${parent}/`;
-  return parent;
+  const trimmed = path.replace(/[\\/]+$/, '');
+  if (!trimmed || trimmed === '/' || /^[A-Za-z]:$/.test(trimmed)) return path;
+  const idx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  if (idx <= 0) return path.startsWith('/') ? '/' : path;
+  const parent = trimmed.slice(0, idx);
+  if (/^[A-Za-z]:$/.test(parent)) return `${parent}\\`;
+  return parent || (path.startsWith('/') ? '/' : path);
+}
+
+function joinExplorerPath(base: string, name: string): string {
+  const separator = base.includes('\\') ? '\\' : '/';
+  const trimmed = base.replace(/[\\/]+$/, '');
+  if (!trimmed || trimmed === '/') return `/${name}`;
+  if (/^[A-Za-z]:$/.test(trimmed)) return `${trimmed}\\${name}`;
+  return `${trimmed}${separator}${name}`;
+}
+
+function sameExplorerPath(a: string, b: string): boolean {
+  if (!a || !b) return a === b;
+  return explorerPathKey(a) === explorerPathKey(b);
+}
+
+function explorerPathKey(path: string): string {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (/^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//')) {
+    return normalized.toLocaleLowerCase();
+  }
+  return normalized;
 }
 
 function formatBytes(bytes: number): string {

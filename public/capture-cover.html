@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Protected Workspace</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          "Segoe UI",
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #000;
+        color: #d7e5f6;
+      }
+
+      body {
+        display: grid;
+        place-items: center;
+      }
+
+      main {
+        width: min(720px, 86vw);
+        padding: 36px;
+        text-align: center;
+      }
+
+      .lock {
+        width: 54px;
+        height: 54px;
+        margin: 0 auto 20px;
+        display: grid;
+        place-items: center;
+        border: 1px solid #334155;
+        border-radius: 50%;
+        color: #ffd166;
+      }
+
+      svg {
+        width: 28px;
+        height: 28px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 32px;
+        line-height: 1.2;
+        font-weight: 760;
+        letter-spacing: 0;
+      }
+
+      p {
+        margin: 12px 0 0;
+        color: #9fb0c3;
+        font-size: 17px;
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="lock" aria-hidden="true">
+        <svg viewBox="0 0 24 24">
+          <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
+          <rect x="5" y="11" width="14" height="10" rx="2"></rect>
+        </svg>
+      </div>
+      <h1>방송 송출 보호 중</h1>
+      <p>이 작업공간은 방송 송출에서 가려져 있습니다.</p>
+    </main>
+  </body>
+</html>
