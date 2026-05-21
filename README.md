@@ -27,7 +27,8 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, 로컬 Windows shell을 빠르게 오
 - workspace tab 저장/복원: profile, root, panel 위치, 크기, 열린 editor/image/browser/shell context 저장
 - Explorer, Editor, Image Preview, Browser, Terminal widget 이동/리사이즈/스냅 지원
 - Terminal widget 내부 shell tab 지원
-- workspace별 sticky-note 스타일 Notes 패널과 자동 저장되는 메모 탭
+- workspace별 sticky-note 스타일 Notes 패널, always-on-top pin, tab별 테마, 자동 저장되는 메모 탭
+- workspace별 Calculator 위젯과 계산 history
 - Codex, Claude, Grok, Antigravity launcher 버튼
 - secure env editor: env류 파일을 masked key-value editor로 열고, 새 key 추가 가능
 - image paste: workspace temp attachment 폴더에 이미지 저장 후 active shell에 `@...` tag 입력
@@ -132,6 +133,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - Explorer, Editor, Image Preview, Browser, Terminal widget은 title bar로 이동할 수 있고 grip으로 resize할 수 있습니다.
 - 가까운 edge는 자석처럼 붙도록 snap됩니다.
 - `Ctrl` + `+`, `Ctrl` + `-`는 포커스된 editor/terminal의 font size를 조절합니다.
+- Notes에서는 note font size, Browser에서는 preview zoom, Calculator에서는 계산기 글자 크기를 조절합니다.
 - 전체 IDE scale을 바꾸고 싶으면 상단 titlebar 쪽을 focus target으로 둔 상태에서 조절합니다.
 - 새 shell widget이나 shell tab은 다른 widget 아래에 묻히지 않도록 앞으로 올라옵니다.
 - `+shell`, Windows shell, Codex/Claude/Grok/Antigravity 버튼으로 새 terminal widget을 열 때는 workspace별 마지막 terminal 크기를 기억해서 다시 사용합니다.
@@ -201,8 +203,17 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 
 - Notes 패널은 editor와 별도의 빠른 메모장입니다.
 - workspace별로 여러 note tab을 만들 수 있고, 입력 내용은 자동 저장됩니다.
+- Pin을 켜면 Notes 패널이 다른 IDE 위젯 위에 고정됩니다.
+- 각 note tab은 Default, Sticky, Mint, Rose, Paper 테마를 따로 선택할 수 있습니다.
 - 메모는 현재 workspace 아래 `.vibe-ide-temp/notes/*.txt`에 저장됩니다.
 - workspace를 다시 열면 열려 있던 note tab과 Notes 패널 상태가 복원됩니다.
+
+### Calculator
+
+- Calculator 패널은 workspace 안에서 빠르게 계산할 수 있는 간단한 계산기입니다.
+- 사칙연산, 괄호, `%` 연산을 지원합니다.
+- 계산 history는 workspace snapshot에 저장됩니다.
+- Calculator에 포커스가 있을 때 `Ctrl` + `+`, `Ctrl` + `-`는 계산기 글자 크기를 조절합니다.
 
 ### Browser와 port forwarding
 
@@ -306,7 +317,8 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Workspace tabs that restore profile, root, panel positions, sizes, and open context
 - Movable, resizable, snapping Explorer, Editor, Image Preview, Browser, and Terminal widgets
 - Shell tabs inside each terminal widget
-- Workspace-level sticky-note style Notes panel with autosaved note tabs
+- Workspace-level sticky-note style Notes panel with always-on-top pinning, per-tab themes, and autosaved note tabs
+- Workspace-level Calculator widget with calculation history
 - Launcher buttons for Codex, Claude, Grok, and Antigravity
 - Secure env editor for masked env-style files, including adding new keys while values stay masked
 - Image paste into workspace-local temp attachments, with `@...` tags inserted into the active shell
@@ -411,6 +423,7 @@ WSL profiles are loaded in the background after the first screen is interactive.
 - Explorer, Editor, Image Preview, Browser, and Terminal widgets can be moved by their title bars and resized from their grips.
 - Nearby edges snap to each other.
 - `Ctrl` + `+` and `Ctrl` + `-` resize the focused editor or terminal font.
+- In Notes they resize note text, in Browser they change preview zoom, and in Calculator they resize calculator text.
 - To scale the whole IDE, focus the top titlebar area first.
 - New shell widgets and shell tabs are brought to the front automatically.
 - New terminal widgets opened from `+shell`, Windows shell, or Codex/Claude/Grok/Antigravity buttons reuse the last terminal size saved for that workspace.
@@ -480,8 +493,17 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 
 - The Notes panel is a quick scratchpad separate from the code editor.
 - Each workspace can have multiple note tabs, and note text autosaves while you type.
+- Pin keeps the Notes panel above other IDE widgets.
+- Each note tab can use its own Default, Sticky, Mint, Rose, or Paper theme.
 - Notes are stored as `.vibe-ide-temp/notes/*.txt` inside the current workspace.
 - Reopening a workspace restores open note tabs and the Notes panel state.
+
+### Calculator
+
+- The Calculator panel is a small in-workspace calculator for quick arithmetic.
+- It supports basic arithmetic, parentheses, and `%`.
+- Calculation history is stored with the workspace snapshot.
+- When Calculator is focused, `Ctrl` + `+` and `Ctrl` + `-` resize calculator text.
 
 ### Browser And Port Forwarding
 

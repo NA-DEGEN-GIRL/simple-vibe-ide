@@ -130,8 +130,21 @@ kept with the repository.
   code editor.
 - Notes support multiple tabs per workspace and autosave to
   `.vibe-ide-temp/notes/*.txt` inside the active workspace.
+- Notes can be pinned above other IDE widgets, and each note tab can use its own
+  Default, Sticky, Mint, Rose, or Paper theme.
 - Workspace snapshots remember open note tabs, the active note tab, and whether
   the Notes panel was visible.
+- Ctrl+plus/minus now adjusts Notes text size and Browser preview zoom instead
+  of resizing those widget frames.
+
+### 2026-05-21 - Calculator widget
+
+#### Added
+
+- Added a workspace Calculator panel with basic arithmetic, parentheses, `%`,
+  and clickable calculation history.
+- Workspace snapshots remember calculator input, history, and calculator text
+  size.
 
 #### Verification
 

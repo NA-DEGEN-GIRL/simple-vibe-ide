@@ -80,6 +80,12 @@ interface BrowserConsoleLog {
   message: string;
 }
 
+interface CalculatorHistoryItem {
+  id: string;
+  expression: string;
+  result: string;
+}
+
 interface TauriDragDropPayload {
   paths?: string[];
   position?: {
@@ -115,6 +121,7 @@ interface NoteTabState {
   id: string;
   path: string;
   title: string;
+  theme: NoteThemeId;
   content: string;
   dirty: boolean;
   saving: boolean;
@@ -161,6 +168,7 @@ interface NoteTabSnapshot {
   id: string;
   path: string;
   title: string;
+  theme?: NoteThemeId;
 }
 
 interface WorkspaceSnapshot {
@@ -184,16 +192,22 @@ interface WorkspaceSnapshot {
   imageOpenInNewTab: boolean;
   noteTabs: NoteTabSnapshot[];
   activeNoteTabId: string;
+  notePinned: boolean;
   browserTabs: BrowserTab[];
   activeBrowserTabId: string;
   browserDeviceId: string;
   browserOrientation: BrowserOrientation;
   browserConsoleVisible: boolean;
   browserConsolePosition: BrowserConsolePosition;
+  browserZoom?: number;
+  calculatorExpression?: string;
+  calculatorHistory?: CalculatorHistoryItem[];
   explorerOpenMode: ExplorerOpenMode;
   showFileSizes: boolean;
   editorFontSize: number;
   terminalFontSize: number;
+  noteFontSize?: number;
+  calculatorFontSize?: number;
   ideScale: number;
 }
 
@@ -220,11 +234,12 @@ interface EditorRuntime {
   languageCompartment: import('@codemirror/state').Compartment;
 }
 
-type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes';
+type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'calculator';
 type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
 type BrowserConsolePosition = 'bottom' | 'right' | 'top' | 'left';
+type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
 type BrowserDevicePreset = {
   id: string;
@@ -298,16 +313,24 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   }
 };
 
-const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes'];
+const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'calculator'];
 const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   explorer: true,
   editor: true,
   image: true,
   browser: true,
-  notes: false
+  notes: false,
+  calculator: false
 };
 const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
 const NOTES_DIR = '.vibe-ide-temp/notes';
+const NOTE_THEMES: Array<{ id: NoteThemeId; label: string }> = [
+  { id: 'default', label: 'Default' },
+  { id: 'sticky', label: 'Sticky' },
+  { id: 'mint', label: 'Mint' },
+  { id: 'rose', label: 'Rose' },
+  { id: 'paper', label: 'Paper' }
+];
 const PANEL_SNAP_DISTANCE = 14;
 const WIDGET_KEYBOARD_SCALE = 1.1;
 const TERMINAL_PORT_SCAN_LIMIT = 4000;
@@ -367,6 +390,7 @@ const state = {
   imageOpenInNewTab: false,
   noteTabs: [] as NoteTabState[],
   activeNoteTabId: '',
+  notePinned: false,
   forwards: [] as PortForwardResult[],
   detectedPorts: [] as DetectedPortItem[],
   browserTabs: [] as BrowserTab[],
@@ -377,6 +401,10 @@ const state = {
   browserConsoleVisible: false,
   browserConsolePosition: 'bottom' as BrowserConsolePosition,
   browserConsoleLogs: [] as BrowserConsoleLog[],
+  browserZoom: 1,
+  calculatorExpression: '',
+  calculatorResult: '',
+  calculatorHistory: [] as CalculatorHistoryItem[],
   showFileSizes: true
 };
 
@@ -388,6 +416,8 @@ let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
 let ideScale = 1;
 let editorFontSize = 13;
 let terminalFontSize = 13;
+let noteFontSize = 14;
+let calculatorFontSize = 15;
 let restoringWorkspace = false;
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
 const autoForwardingPorts = new Set<string>();
@@ -456,6 +486,7 @@ app.innerHTML = `
       <button class="panel-toggle" data-toggle-panel="image" title="Toggle Image Preview" aria-pressed="false">Img</button>
       <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
       <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
+      <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
       <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
     </section>
     <main class="main-grid">
@@ -497,6 +528,8 @@ app.innerHTML = `
           <span>Notes</span>
           <span id="notes-status" class="muted notes-status">Autosaved</span>
           <span class="spacer"></span>
+          <select id="notes-theme" class="notes-theme-select" title="Note theme"></select>
+          <button id="notes-pin" class="panel-mode" title="Keep Notes above other widgets" aria-pressed="false">Pin</button>
           <button id="notes-new-tab" class="panel-mode" title="New note">+</button>
           <button class="panel-close" data-close-panel="notes" title="Close Notes" aria-label="Close Notes">x</button>
         </div>
@@ -568,6 +601,20 @@ app.innerHTML = `
         </div>
         <div class="console-note">Local and live URLs can open here. Some public sites block iframe embedding; open those in a full browser when their own policy rejects preview.</div>
       </section>
+      <section class="panel calculator-panel floating-panel hidden" data-panel="calculator">
+        <div class="panel-title panel-drag-handle">
+          <span>Calculator</span>
+          <span class="spacer"></span>
+          <button id="calculator-clear" class="panel-mode" title="Clear calculator">Clear</button>
+          <button class="panel-close" data-close-panel="calculator" title="Close Calculator" aria-label="Close Calculator">x</button>
+        </div>
+        <div class="calculator-display">
+          <input id="calculator-expression" spellcheck="false" inputmode="decimal" placeholder="0" />
+          <div id="calculator-result" class="calculator-result">0</div>
+        </div>
+        <div id="calculator-keys" class="calculator-keys" aria-label="Calculator keys"></div>
+        <div id="calculator-history" class="calculator-history"></div>
+      </section>
     </main>
   </div>
   <div class="window-controls" aria-label="Window controls" data-no-window-drag>
@@ -614,6 +661,8 @@ const el = {
   toggleRaw: document.querySelector<HTMLButtonElement>('#toggle-raw')!,
   notesTabs: document.querySelector<HTMLDivElement>('#notes-tabs')!,
   notesNewTab: document.querySelector<HTMLButtonElement>('#notes-new-tab')!,
+  notesPin: document.querySelector<HTMLButtonElement>('#notes-pin')!,
+  notesTheme: document.querySelector<HTMLSelectElement>('#notes-theme')!,
   notesBody: document.querySelector<HTMLTextAreaElement>('#notes-body')!,
   notesStatus: document.querySelector<HTMLSpanElement>('#notes-status')!,
   notesPath: document.querySelector<HTMLDivElement>('#notes-path')!,
@@ -645,7 +694,12 @@ const el = {
   browserConsole: document.querySelector<HTMLElement>('#browser-console')!,
   browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
   browserConsoleLog: document.querySelector<HTMLDivElement>('#browser-console-log')!,
-  previewFrame: document.querySelector<HTMLIFrameElement>('#preview-frame')!
+  previewFrame: document.querySelector<HTMLIFrameElement>('#preview-frame')!,
+  calculatorExpression: document.querySelector<HTMLInputElement>('#calculator-expression')!,
+  calculatorResult: document.querySelector<HTMLDivElement>('#calculator-result')!,
+  calculatorKeys: document.querySelector<HTMLDivElement>('#calculator-keys')!,
+  calculatorHistory: document.querySelector<HTMLDivElement>('#calculator-history')!,
+  calculatorClear: document.querySelector<HTMLButtonElement>('#calculator-clear')!
 };
 
 const currentWindow = getCurrentWindow();
@@ -703,13 +757,20 @@ async function init() {
   renderWorkspaceTabs();
   renderEditorTabs();
   renderImageTabs();
+  renderNoteThemeOptions();
   renderNoteTabs();
   renderNotes();
+  renderNotePin();
   renderShellTabs();
   renderBrowserDeviceOptions();
+  renderCalculatorKeys();
+  renderCalculator();
   setBrowserMode('desktop');
   setBrowserConsolePosition(state.browserConsolePosition);
   setBrowserConsoleVisible(false);
+  applyNoteFontSize();
+  applyCalculatorFontSize();
+  applyBrowserZoom();
   scheduleEditorRuntimeWarmup();
   bindEvents();
   selectProfile('');
@@ -942,16 +1003,22 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     imageOpenInNewTab: false,
     noteTabs: [],
     activeNoteTabId: '',
+    notePinned: false,
     browserTabs: [],
     activeBrowserTabId: '',
     browserDeviceId: 'desktop',
     browserOrientation: 'portrait',
     browserConsoleVisible: false,
     browserConsolePosition: 'bottom',
+    browserZoom: 1,
+    calculatorExpression: '',
+    calculatorHistory: [],
     explorerOpenMode: 'single',
     showFileSizes: true,
     editorFontSize: 13,
     terminalFontSize: 13,
+    noteFontSize: 14,
+    calculatorFontSize: 15,
     ideScale: 1
   };
 }
@@ -1012,18 +1079,24 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
       })),
     activeImageTabId: state.activeImageTabId,
     imageOpenInNewTab: state.imageOpenInNewTab,
-    noteTabs: state.noteTabs.map((tab) => ({ id: tab.id, path: tab.path, title: tab.title })),
+    noteTabs: state.noteTabs.map((tab) => ({ id: tab.id, path: tab.path, title: tab.title, theme: tab.theme })),
     activeNoteTabId: state.activeNoteTabId,
+    notePinned: state.notePinned,
     browserTabs: state.browserTabs,
     activeBrowserTabId: state.activeBrowserTabId,
     browserDeviceId: el.browserShell.classList.contains('desktop') ? 'desktop' : state.browserDeviceId,
     browserOrientation: state.browserOrientation,
     browserConsoleVisible: state.browserConsoleVisible,
     browserConsolePosition: state.browserConsolePosition,
+    browserZoom: state.browserZoom,
+    calculatorExpression: state.calculatorExpression,
+    calculatorHistory: state.calculatorHistory.slice(0, 20),
     explorerOpenMode: state.explorerOpenMode,
     showFileSizes: state.showFileSizes,
     editorFontSize,
     terminalFontSize,
+    noteFontSize,
+    calculatorFontSize,
     ideScale
   };
 }
@@ -1069,11 +1142,21 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.showFileSizes = snapshot.showFileSizes ?? true;
     state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
     state.imageOpenInNewTab = Boolean(snapshot.imageOpenInNewTab);
+    state.notePinned = Boolean(snapshot.notePinned);
+    state.browserZoom = clamp(snapshot.browserZoom || 1, 0.5, 2);
+    state.calculatorExpression = snapshot.calculatorExpression || '';
+    state.calculatorHistory = Array.isArray(snapshot.calculatorHistory) ? snapshot.calculatorHistory.slice(0, 20) : [];
+    state.calculatorResult = '';
     editorFontSize = clamp(snapshot.editorFontSize || 13, 10, 24);
     terminalFontSize = clamp(snapshot.terminalFontSize || 13, 9, 24);
+    noteFontSize = clamp(snapshot.noteFontSize || 14, 10, 28);
+    calculatorFontSize = clamp(snapshot.calculatorFontSize || 15, 10, 28);
     ideScale = clamp(snapshot.ideScale || 1, 0.72, 1.45);
     document.documentElement.style.setProperty('--editor-font-size', `${editorFontSize}px`);
     document.documentElement.style.setProperty('--ide-scale', ideScale.toFixed(3));
+    applyNoteFontSize();
+    applyCalculatorFontSize();
+    applyBrowserZoom();
     el.profileSelect.value = profile.id;
     el.rootInput.value = state.workspaceRoot;
     el.rootInput.placeholder = profile.kind === 'ssh' ? 'remote working directory' : 'working directory';
@@ -1090,6 +1173,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     restoreImageTabs(snapshot);
     await restoreNoteTabs(snapshot);
     restoreBrowserState(snapshot);
+    renderCalculator();
 
     const terminalSnapshots = (snapshot.terminals ?? []).length
       ? snapshot.terminals
@@ -1198,6 +1282,7 @@ async function restoreNoteTabs(snapshot: WorkspaceSnapshot) {
       id: tab.id || crypto.randomUUID(),
       path: tab.path,
       title: tab.title || noteTitleFromPath(tab.path),
+      theme: normalizeNoteTheme(tab.theme),
       content,
       dirty: false,
       saving: false,
@@ -1230,6 +1315,7 @@ async function createNoteTab(options: { focus?: boolean } = {}) {
     id: crypto.randomUUID(),
     path: newNotePath(),
     title: 'Quick note',
+    theme: activeNoteTab()?.theme ?? 'default',
     content: '',
     dirty: true,
     saving: false
@@ -1299,8 +1385,56 @@ function renderNotes() {
   const tab = activeNoteTab();
   el.notesBody.disabled = !tab;
   el.notesBody.value = tab?.content ?? '';
+  el.notesTheme.disabled = !tab;
+  el.notesTheme.value = tab?.theme ?? 'default';
   el.notesPath.textContent = tab ? noteRelativePath(tab.path) : 'Notes are saved under .vibe-ide-temp/notes in this workspace.';
+  applyNoteTheme(tab?.theme ?? 'default');
+  renderNotePin();
   renderNoteStatus();
+}
+
+function renderNoteThemeOptions() {
+  el.notesTheme.innerHTML = '';
+  for (const theme of NOTE_THEMES) {
+    const option = document.createElement('option');
+    option.value = theme.id;
+    option.textContent = theme.label;
+    el.notesTheme.append(option);
+  }
+}
+
+function setActiveNoteTheme(theme: NoteThemeId) {
+  const tab = activeNoteTab();
+  if (!tab) return;
+  tab.theme = normalizeNoteTheme(theme);
+  applyNoteTheme(tab.theme);
+  renderNoteTabs();
+  saveActiveWorkspaceSnapshot();
+}
+
+function normalizeNoteTheme(theme: unknown): NoteThemeId {
+  return NOTE_THEMES.some((item) => item.id === theme) ? theme as NoteThemeId : 'default';
+}
+
+function applyNoteTheme(theme: NoteThemeId) {
+  const panel = getPanel('notes');
+  for (const item of NOTE_THEMES) panel.classList.remove(`note-theme-${item.id}`);
+  panel.classList.add(`note-theme-${normalizeNoteTheme(theme)}`);
+}
+
+function toggleNotePin() {
+  state.notePinned = !state.notePinned;
+  renderNotePin();
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderNotePin() {
+  const panel = getPanel('notes');
+  panel.classList.toggle('pinned', state.notePinned);
+  el.notesPin.classList.toggle('active', state.notePinned);
+  el.notesPin.setAttribute('aria-pressed', String(state.notePinned));
+  el.notesPin.title = state.notePinned ? 'Unpin Notes' : 'Keep Notes above other widgets';
+  if (state.notePinned && !panel.classList.contains('hidden')) bringPanelToFront(panel);
 }
 
 function handleNoteInput() {
@@ -1407,6 +1541,191 @@ function noteRelativePath(path: string) {
   return index >= 0 ? normalized.slice(index) : noteTitleFromPath(path);
 }
 
+function renderCalculatorKeys() {
+  const keys = [
+    '(', ')', '%', '⌫',
+    '7', '8', '9', '/',
+    '4', '5', '6', '*',
+    '1', '2', '3', '-',
+    '0', '.', '=', '+'
+  ];
+  el.calculatorKeys.innerHTML = '';
+  for (const key of keys) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = key;
+    button.dataset.key = key;
+    if (['/', '*', '-', '+', '=', '%'].includes(key)) button.classList.add('operator');
+    if (key === '=') button.classList.add('equals');
+    button.addEventListener('click', () => handleCalculatorButton(key));
+    el.calculatorKeys.append(button);
+  }
+}
+
+function renderCalculator() {
+  el.calculatorExpression.value = state.calculatorExpression;
+  updateCalculatorPreview();
+  renderCalculatorHistory();
+}
+
+function handleCalculatorButton(key: string) {
+  if (key === '⌫') {
+    state.calculatorExpression = state.calculatorExpression.slice(0, -1);
+  } else if (key === '=') {
+    evaluateCalculator({ commit: true });
+    return;
+  } else {
+    state.calculatorExpression += key;
+  }
+  renderCalculator();
+  saveActiveWorkspaceSnapshot();
+  el.calculatorExpression.focus();
+}
+
+function handleCalculatorKey(event: KeyboardEvent) {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    evaluateCalculator({ commit: true });
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    clearCalculator();
+  }
+}
+
+function clearCalculator() {
+  state.calculatorExpression = '';
+  state.calculatorResult = '';
+  renderCalculator();
+  saveActiveWorkspaceSnapshot();
+  el.calculatorExpression.focus();
+}
+
+function updateCalculatorPreview() {
+  const expression = state.calculatorExpression.trim();
+  if (!expression) {
+    state.calculatorResult = '0';
+    el.calculatorResult.textContent = '0';
+    return;
+  }
+  try {
+    const result = formatCalculatorResult(evaluateExpression(expression));
+    state.calculatorResult = result;
+    el.calculatorResult.textContent = result;
+    el.calculatorResult.classList.remove('error');
+  } catch {
+    state.calculatorResult = '';
+    el.calculatorResult.textContent = '...';
+    el.calculatorResult.classList.remove('error');
+  }
+}
+
+function evaluateCalculator(options: { commit: boolean }) {
+  const expression = state.calculatorExpression.trim();
+  if (!expression) return;
+  try {
+    const result = formatCalculatorResult(evaluateExpression(expression));
+    state.calculatorResult = result;
+    el.calculatorResult.textContent = result;
+    el.calculatorResult.classList.remove('error');
+    if (options.commit) {
+      state.calculatorHistory.unshift({
+        id: crypto.randomUUID(),
+        expression,
+        result
+      });
+      state.calculatorHistory = state.calculatorHistory.slice(0, 20);
+      state.calculatorExpression = result;
+      el.calculatorExpression.value = result;
+      renderCalculatorHistory();
+      saveActiveWorkspaceSnapshot();
+    }
+  } catch (error) {
+    state.calculatorResult = 'Error';
+    el.calculatorResult.textContent = 'Error';
+    el.calculatorResult.classList.add('error');
+    setStatus(`Calculator: ${String(error)}`, true);
+  }
+}
+
+function renderCalculatorHistory() {
+  if (!state.calculatorHistory.length) {
+    el.calculatorHistory.innerHTML = '<div class="calculator-empty">No calculations yet</div>';
+    return;
+  }
+  el.calculatorHistory.innerHTML = '';
+  for (const item of state.calculatorHistory) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'calculator-history-row';
+    row.innerHTML = `<span>${escapeHtml(item.expression)}</span><strong>${escapeHtml(item.result)}</strong>`;
+    row.addEventListener('click', () => {
+      state.calculatorExpression = item.result;
+      renderCalculator();
+      saveActiveWorkspaceSnapshot();
+      el.calculatorExpression.focus();
+    });
+    el.calculatorHistory.append(row);
+  }
+}
+
+function evaluateExpression(expression: string) {
+  const tokens = tokenizeExpression(expression);
+  let position = 0;
+
+  const parseExpression = (): number => {
+    let value = parseTerm();
+    while (tokens[position] === '+' || tokens[position] === '-') {
+      const operator = tokens[position++];
+      const right = parseTerm();
+      value = operator === '+' ? value + right : value - right;
+    }
+    return value;
+  };
+
+  const parseTerm = (): number => {
+    let value = parseFactor();
+    while (tokens[position] === '*' || tokens[position] === '/' || tokens[position] === '%') {
+      const operator = tokens[position++];
+      const right = parseFactor();
+      if ((operator === '/' || operator === '%') && right === 0) throw new Error('division by zero');
+      if (operator === '*') value *= right;
+      else if (operator === '/') value /= right;
+      else value %= right;
+    }
+    return value;
+  };
+
+  const parseFactor = (): number => {
+    const token = tokens[position++];
+    if (token === '+') return parseFactor();
+    if (token === '-') return -parseFactor();
+    if (token === '(') {
+      const value = parseExpression();
+      if (tokens[position++] !== ')') throw new Error('missing closing parenthesis');
+      return value;
+    }
+    if (!token || !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(token)) throw new Error('invalid expression');
+    return Number(token);
+  };
+
+  const value = parseExpression();
+  if (position !== tokens.length) throw new Error('invalid expression');
+  if (!Number.isFinite(value)) throw new Error('invalid result');
+  return value;
+}
+
+function tokenizeExpression(expression: string) {
+  const normalized = expression.replace(/[×]/g, '*').replace(/[÷]/g, '/').replace(/\s+/g, '');
+  const tokens = normalized.match(/\d+(?:\.\d*)?|\.\d+|[()+\-*/%]/g) ?? [];
+  if (tokens.join('') !== normalized) throw new Error('invalid character');
+  return tokens;
+}
+
+function formatCalculatorResult(value: number) {
+  if (Number.isInteger(value)) return String(value);
+  return Number(value.toPrecision(12)).toString();
+}
+
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   state.browserTabs = Array.isArray(snapshot.browserTabs) ? snapshot.browserTabs : [];
   state.activeBrowserTabId = '';
@@ -1485,6 +1804,10 @@ function bindEvents() {
   el.notesNewTab.addEventListener('click', () => {
     void createNoteTab({ focus: true });
   });
+  el.notesPin.addEventListener('click', toggleNotePin);
+  el.notesTheme.addEventListener('change', () => {
+    setActiveNoteTheme(el.notesTheme.value as NoteThemeId);
+  });
   el.notesBody.addEventListener('input', handleNoteInput);
   el.notesBody.addEventListener('blur', () => void saveActiveNoteNow());
   el.notesBody.addEventListener('keydown', (event) => {
@@ -1552,6 +1875,13 @@ function bindEvents() {
     state.browserConsoleLogs = [];
     renderBrowserConsole();
   });
+  el.calculatorExpression.addEventListener('input', () => {
+    state.calculatorExpression = el.calculatorExpression.value;
+    updateCalculatorPreview();
+    saveActiveWorkspaceSnapshot();
+  });
+  el.calculatorExpression.addEventListener('keydown', handleCalculatorKey);
+  el.calculatorClear.addEventListener('click', clearCalculator);
   el.previewFrame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${el.previewFrame.src || state.previewUrl}`));
   el.previewFrame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${el.previewFrame.src || state.previewUrl}`));
   window.addEventListener('message', handleBrowserConsoleMessage);
@@ -1794,6 +2124,18 @@ function resizeKeyboardTarget(direction: number) {
       resizeEditorFont(direction);
       return;
     }
+    if (target.id === 'notes') {
+      resizeNoteFont(direction);
+      return;
+    }
+    if (target.id === 'browser') {
+      resizeBrowserZoom(direction);
+      return;
+    }
+    if (target.id === 'calculator') {
+      resizeCalculatorFont(direction);
+      return;
+    }
     const panel = getPanel(target.id);
     if (!panel.classList.contains('hidden')) resizeFloatingPanelByKeyboard(panel, direction);
     return;
@@ -1874,6 +2216,37 @@ function resizeTerminalFont(direction: number) {
   saveActiveWorkspaceSnapshot();
 }
 
+function resizeNoteFont(direction: number) {
+  noteFontSize = clamp(noteFontSize + direction, 10, 28);
+  applyNoteFontSize();
+  saveActiveWorkspaceSnapshot();
+}
+
+function applyNoteFontSize() {
+  document.documentElement.style.setProperty('--notes-font-size', `${noteFontSize}px`);
+}
+
+function resizeBrowserZoom(direction: number) {
+  state.browserZoom = clamp(state.browserZoom + direction * 0.1, 0.5, 2);
+  applyBrowserZoom();
+  setStatus(`Browser zoom ${Math.round(state.browserZoom * 100)}%`);
+  saveActiveWorkspaceSnapshot();
+}
+
+function applyBrowserZoom() {
+  document.documentElement.style.setProperty('--browser-preview-zoom', state.browserZoom.toFixed(2));
+}
+
+function resizeCalculatorFont(direction: number) {
+  calculatorFontSize = clamp(calculatorFontSize + direction, 10, 28);
+  applyCalculatorFontSize();
+  saveActiveWorkspaceSnapshot();
+}
+
+function applyCalculatorFontSize() {
+  document.documentElement.style.setProperty('--calculator-font-size', `${calculatorFontSize}px`);
+}
+
 function terminalMinWidth() {
   return window.matchMedia('(max-width: 900px)').matches ? 220 : 300;
 }
@@ -1925,6 +2298,7 @@ function focusableWidgets(): WidgetFocusItem[] {
   addPanelFocusItem(items, 'notes');
   addPanelFocusItem(items, 'image');
   addPanelFocusItem(items, 'browser');
+  addPanelFocusItem(items, 'calculator');
   return items;
 }
 
@@ -1975,6 +2349,8 @@ function focusWidget(item: WidgetFocusItem) {
     el.notesBody.focus();
   } else if (item.id === 'browser') {
     el.previewUrl.focus();
+  } else if (item.id === 'calculator') {
+    el.calculatorExpression.focus();
   } else {
     focusPanelElement(item.element);
   }
@@ -2455,8 +2831,14 @@ function clearWorkspacePanels() {
   noteSaveTimers.clear();
   state.noteTabs = [];
   state.activeNoteTabId = '';
+  state.notePinned = false;
   renderNoteTabs();
   renderNotes();
+  renderNotePin();
+  state.calculatorExpression = '';
+  state.calculatorResult = '';
+  state.calculatorHistory = [];
+  renderCalculator();
   state.previewUrl = '';
   state.forwards = [];
   state.detectedPorts = [];
