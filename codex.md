@@ -23,6 +23,8 @@ kept with the repository.
 - IDE Settings now includes an Editor theme selector with multiple dark themes.
 - Floating widgets and terminal widgets can be resized from every edge and
   corner, while keeping the existing snap behavior.
+- Browser tabs now keep their own iframe alive while switching tabs, preventing
+  tab clicks from reloading the preview page.
 
 #### Changed
 

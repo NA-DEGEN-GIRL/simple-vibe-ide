@@ -812,7 +812,7 @@ app.innerHTML = `
         </div>
         <div id="forward-list" class="forward-list"></div>
         <div id="browser-workspace" class="browser-workspace console-bottom">
-          <div id="browser-shell" class="browser-shell desktop"><iframe id="preview-frame" class="hidden" title="local preview"></iframe></div>
+          <div id="browser-shell" class="browser-shell desktop"><iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe></div>
           <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
             <div class="browser-console-toolbar">
               <span>Console</span>
@@ -2675,8 +2675,7 @@ function bindEvents() {
     renderBrowserConsole();
   });
   el.browserShell.addEventListener('pointerenter', activateBrowserPanel);
-  el.previewFrame.addEventListener('pointerenter', activateBrowserPanel);
-  el.previewFrame.addEventListener('focus', activateBrowserPanel);
+  bindBrowserFrameEvents(el.previewFrame);
   el.calculatorExpression.addEventListener('input', () => {
     state.calculatorExpression = el.calculatorExpression.value;
     updateCalculatorPreview();
@@ -2685,8 +2684,6 @@ function bindEvents() {
   el.calculatorExpression.addEventListener('keydown', handleCalculatorKey);
   el.calculatorClear.addEventListener('click', clearCalculator);
   el.settingsSave.addEventListener('click', saveSettingsFromForm);
-  el.previewFrame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${el.previewFrame.src || state.previewUrl}`));
-  el.previewFrame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${el.previewFrame.src || state.previewUrl}`));
   window.addEventListener('message', handleBrowserConsoleMessage);
   document.addEventListener('paste', handlePaste);
   document.addEventListener('keydown', handleImageClipboardShortcut, true);
@@ -3764,8 +3761,7 @@ function clearWorkspacePanels() {
   state.activeBrowserTabId = '';
   state.browserConsoleLogs = [];
   el.previewUrl.value = '';
-  el.previewFrame.removeAttribute('src');
-  el.previewFrame.classList.add('hidden');
+  clearBrowserFrames();
   el.browserShell.classList.remove('has-preview');
   renderEditorTabs();
   renderImageTabs();
@@ -6365,6 +6361,89 @@ function loadPreview(url: string) {
   openBrowserTab(url);
 }
 
+function previewFrames() {
+  return Array.from(el.browserShell.querySelectorAll<HTMLIFrameElement>('iframe.preview-frame'));
+}
+
+function browserFrameForTab(id: string) {
+  return previewFrames().find((frame) => frame.dataset.browserTabId === id) ?? null;
+}
+
+function activeBrowserFrame() {
+  return browserFrameForTab(state.activeBrowserTabId);
+}
+
+function ensureBrowserFrame(tab: BrowserTab) {
+  let frame = browserFrameForTab(tab.id);
+  if (frame) return frame;
+
+  frame = el.previewFrame.dataset.browserTabId ? document.createElement('iframe') : el.previewFrame;
+  frame.classList.add('preview-frame', 'hidden');
+  frame.dataset.browserTabId = tab.id;
+  frame.title = tab.label;
+  bindBrowserFrameEvents(frame);
+  if (!frame.parentElement) el.browserShell.append(frame);
+  applyBrowserFrameSizing(frame);
+  return frame;
+}
+
+function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
+  if (frame.dataset.browserFrameBound === 'true') return;
+  frame.dataset.browserFrameBound = 'true';
+  frame.addEventListener('pointerenter', activateBrowserPanel);
+  frame.addEventListener('focus', activateBrowserPanel);
+  frame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${frame.src || state.previewUrl}`));
+  frame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${frame.src || state.previewUrl}`));
+}
+
+function showBrowserFrame(tab: BrowserTab) {
+  const frame = ensureBrowserFrame(tab);
+  for (const item of previewFrames()) {
+    const active = item === frame;
+    item.classList.toggle('hidden', !active);
+    item.classList.toggle('active', active);
+  }
+  el.browserShell.classList.add('has-preview');
+  return frame;
+}
+
+function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean } = {}) {
+  const frame = showBrowserFrame(tab);
+  const frameUrl = tab.frameUrl ?? tab.url;
+  if (!options.hard && frame.dataset.loadedUrl === frameUrl) return frame;
+  frame.src = options.hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
+  frame.dataset.loadedUrl = frameUrl;
+  return frame;
+}
+
+function removeBrowserFrame(id: string) {
+  const frame = browserFrameForTab(id);
+  if (!frame) return;
+  if (frame === el.previewFrame) {
+    frame.removeAttribute('src');
+    delete frame.dataset.browserTabId;
+    delete frame.dataset.loadedUrl;
+    frame.classList.add('hidden');
+    frame.classList.remove('active');
+    return;
+  }
+  frame.remove();
+}
+
+function clearBrowserFrames() {
+  for (const frame of previewFrames()) {
+    if (frame === el.previewFrame) {
+      frame.removeAttribute('src');
+      delete frame.dataset.browserTabId;
+      delete frame.dataset.loadedUrl;
+      frame.classList.add('hidden');
+      frame.classList.remove('active');
+    } else {
+      frame.remove();
+    }
+  }
+}
+
 async function openLocalBrowserTab(url: string, label = browserTabLabel(url)) {
   try {
     openBrowserTab(url, label, await previewFrameUrl(url));
@@ -6428,20 +6507,21 @@ function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = ur
 function activateBrowserTab(id: string) {
   const tab = state.browserTabs.find((item) => item.id === id);
   if (!tab) return;
+  const alreadyActive = state.activeBrowserTabId === tab.id;
   state.activeBrowserTabId = tab.id;
   state.previewUrl = tab.url;
   el.previewUrl.value = tab.url;
-  el.browserShell.classList.add('has-preview');
-  el.previewFrame.classList.remove('hidden');
-  el.previewFrame.src = tab.frameUrl ?? tab.url;
   if (!tab.frameUrl && localHttpPreviewUrl(tab.url)) {
+    showBrowserFrame(tab);
     void previewFrameUrl(tab.url).then((frameUrl) => {
       tab.frameUrl = frameUrl;
-      if (state.activeBrowserTabId === tab.id) el.previewFrame.src = frameUrl;
+      if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab);
     }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+  } else {
+    loadBrowserFrame(tab);
   }
   renderBrowserTabs();
-  logBrowserConsole('info', `Activated tab ${tab.url}`);
+  if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -6451,6 +6531,7 @@ function closeBrowserTab(id: string) {
   const wasActive = state.activeBrowserTabId === id;
   const closedUrl = state.browserTabs[index].url;
   state.browserTabs.splice(index, 1);
+  removeBrowserFrame(id);
   logBrowserConsole('info', `Closed tab ${closedUrl}`);
   if (wasActive) {
     const next = state.browserTabs[index] ?? state.browserTabs[index - 1];
@@ -6460,8 +6541,7 @@ function closeBrowserTab(id: string) {
       state.activeBrowserTabId = '';
       state.previewUrl = '';
       el.previewUrl.value = '';
-      el.previewFrame.removeAttribute('src');
-      el.previewFrame.classList.add('hidden');
+      clearBrowserFrames();
       el.browserShell.classList.remove('has-preview');
       renderBrowserTabs();
     }
@@ -6573,10 +6653,7 @@ function refreshPreview(hard: boolean) {
     return;
   }
 
-  el.browserShell.classList.add('has-preview');
-  el.previewFrame.classList.remove('hidden');
-  const frameUrl = tab.frameUrl ?? tab.url;
-  el.previewFrame.src = hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
+  loadBrowserFrame(tab, { hard });
   state.previewUrl = tab.url;
   el.previewUrl.value = tab.url;
   logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
@@ -6711,8 +6788,11 @@ function setBrowserMode(mode: 'desktop' | 'device') {
 
   if (isDesktop) {
     el.deviceSelect.value = 'desktop';
-    el.previewFrame.style.width = '';
-    el.previewFrame.style.height = '';
+    previewFrames().forEach((frame) => {
+      frame.style.width = '';
+      frame.style.height = '';
+      frame.title = state.browserTabs.find((tab) => tab.id === frame.dataset.browserTabId)?.label ?? 'local preview';
+    });
     el.browserShell.dataset.device = 'Desktop';
     el.rotateDevice.textContent = 'Rotate';
     saveActiveWorkspaceSnapshot();
@@ -6740,11 +6820,25 @@ function applyBrowserDevice() {
   const portrait = state.browserOrientation === 'portrait';
   const width = portrait ? preset.width : preset.height;
   const height = portrait ? preset.height : preset.width;
-  el.previewFrame.style.width = `${width}px`;
-  el.previewFrame.style.height = `${height}px`;
-  el.previewFrame.title = `${preset.label} ${width} x ${height}`;
+  previewFrames().forEach((frame) => {
+    frame.style.width = `${width}px`;
+    frame.style.height = `${height}px`;
+    frame.title = `${preset.label} ${width} x ${height}`;
+  });
   el.browserShell.dataset.device = `${preset.label} ${width} x ${height}`;
   el.rotateDevice.textContent = portrait ? 'Rotate' : 'Portrait';
+}
+
+function applyBrowserFrameSizing(frame: HTMLIFrameElement) {
+  if (el.browserShell.classList.contains('desktop')) {
+    frame.style.width = '';
+    frame.style.height = '';
+    return;
+  }
+  const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+  const portrait = state.browserOrientation === 'portrait';
+  frame.style.width = `${portrait ? preset.width : preset.height}px`;
+  frame.style.height = `${portrait ? preset.height : preset.width}px`;
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {
