@@ -15,6 +15,21 @@ kept with the repository.
 
 ## Patch Notes
 
+### 2026-05-21 - Frameless window chrome
+
+#### Changed
+
+- Removed the native Windows title bar by disabling Tauri window decorations.
+- Added in-app minimize, maximize/restore, and close controls.
+- Added app-titlebar dragging, double-click maximize/restore, and thin edge/corner resize hit zones for frameless windows.
+
+#### Verification
+
+- Frontend type check passed with TypeScript.
+- Frontend production build passed with Vite.
+- Rust backend check passed with cargo check.
+- Tauri release build without bundling passed.
+- WebView2 DOM check confirmed three window control buttons and top-right hit targeting.
 ### 2026-05-21 - Public README refresh
 
 #### Changed

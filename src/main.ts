@@ -1,4 +1,5 @@
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Image as TauriImage } from '@tauri-apps/api/image';
 import type { Extension } from '@codemirror/state';
 import type { EditorView as CodeMirrorView } from '@codemirror/view';
@@ -193,6 +194,7 @@ type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
 type BrowserConsolePosition = 'bottom' | 'right' | 'top' | 'left';
+type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
 type BrowserDevicePreset = {
   id: string;
   label: string;
@@ -315,6 +317,16 @@ if (!app) throw new Error('missing app root');
 
 app.innerHTML = `
   <div class="shell">
+    <div class="window-resize-zones" aria-hidden="true">
+      <div class="window-resize-zone window-resize-n" data-window-resize-direction="North"></div>
+      <div class="window-resize-zone window-resize-e" data-window-resize-direction="East"></div>
+      <div class="window-resize-zone window-resize-s" data-window-resize-direction="South"></div>
+      <div class="window-resize-zone window-resize-w" data-window-resize-direction="West"></div>
+      <div class="window-resize-zone window-resize-ne" data-window-resize-direction="NorthEast"></div>
+      <div class="window-resize-zone window-resize-nw" data-window-resize-direction="NorthWest"></div>
+      <div class="window-resize-zone window-resize-se" data-window-resize-direction="SouthEast"></div>
+      <div class="window-resize-zone window-resize-sw" data-window-resize-direction="SouthWest"></div>
+    </div>
     <div id="capture-freeze-frame" class="capture-freeze-frame" aria-hidden="true">
       <div class="capture-freeze-card">
         <div class="capture-freeze-lock">
@@ -327,12 +339,12 @@ app.innerHTML = `
         <span>이 작업공간은 방송 송출에서 가려져 있습니다.</span>
       </div>
     </div>
-    <header class="titlebar">
-      <div>
+    <header class="titlebar" data-window-drag-region>
+      <div class="titlebar-brand" data-window-drag-region>
         <strong>Simple Vibe IDE</strong>
         <span id="title-context" class="muted">starting...</span>
       </div>
-      <div id="status" class="status">Ready</div>
+      <div id="status" class="status" data-window-drag-region>Ready</div>
     </header>
     <section class="workspace-tabs-bar">
       <div id="workspace-tabs" class="workspace-tabs" aria-label="Workspaces"></div>
@@ -452,10 +464,17 @@ app.innerHTML = `
       </section>
     </main>
   </div>
+  <div class="window-controls" aria-label="Window controls" data-no-window-drag>
+    <button id="window-minimize" class="window-control" type="button" title="Minimize" aria-label="Minimize" data-window-action="minimize"><span class="window-control-icon minimize" aria-hidden="true"></span></button>
+    <button id="window-maximize" class="window-control" type="button" title="Maximize or restore" aria-label="Maximize or restore" data-window-action="toggle-maximize"><span class="window-control-icon maximize" aria-hidden="true"></span></button>
+    <button id="window-close" class="window-control close" type="button" title="Close" aria-label="Close" data-window-action="close"><span class="window-control-icon close" aria-hidden="true"></span></button>
+  </div>
 `;
 
 const el = {
   titlebar: document.querySelector<HTMLElement>('.titlebar')!,
+  windowControlButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-window-action]')),
+  windowResizeZones: Array.from(document.querySelectorAll<HTMLElement>('[data-window-resize-direction]')),
   titleContext: document.querySelector<HTMLSpanElement>('#title-context')!,
   status: document.querySelector<HTMLDivElement>('#status')!,
   captureFreezeFrame: document.querySelector<HTMLDivElement>('#capture-freeze-frame')!,
@@ -515,6 +534,8 @@ const el = {
   browserConsoleLog: document.querySelector<HTMLDivElement>('#browser-console-log')!,
   previewFrame: document.querySelector<HTMLIFrameElement>('#preview-frame')!
 };
+
+const currentWindow = getCurrentWindow();
 
 function setStatus(message: string, danger = false) {
   el.status.textContent = message;
@@ -1100,8 +1121,8 @@ function bindEvents() {
   document.querySelectorAll<HTMLButtonElement>('[data-llm]').forEach((button) => {
     button.addEventListener('click', () => launchLlm(button.dataset.llm ?? 'llm'));
   });
+  bindWindowChrome();
   bindFloatingPanels();
-  el.titlebar.addEventListener('pointerdown', () => setKeyboardResizeTarget({ kind: 'ide' }));
   el.saveFile.addEventListener('click', saveOpenFile);
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
@@ -1166,6 +1187,48 @@ function bindEvents() {
   });
 }
 
+function bindWindowChrome() {
+  el.titlebar.addEventListener('mousedown', handleTitlebarMouseDown);
+  el.windowControlButtons.forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void runWindowAction(button.dataset.windowAction ?? '');
+    });
+  });
+  el.windowResizeZones.forEach((zone) => {
+    zone.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) return;
+      const direction = zone.dataset.windowResizeDirection as WindowResizeDirection | undefined;
+      if (!direction) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void currentWindow.startResizeDragging(direction);
+    });
+  });
+}
+
+function handleTitlebarMouseDown(event: MouseEvent) {
+  setKeyboardResizeTarget({ kind: 'ide' });
+  if (event.button !== 0 || isWindowChromeInteractive(event.target)) return;
+
+  event.preventDefault();
+  if (event.detail >= 2) {
+    void currentWindow.toggleMaximize();
+    return;
+  }
+  void currentWindow.startDragging();
+}
+
+function isWindowChromeInteractive(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest('button, input, select, textarea, a, [data-no-window-drag]'));
+}
+
+async function runWindowAction(action: string) {
+  if (action === 'minimize') await currentWindow.minimize();
+  else if (action === 'toggle-maximize') await currentWindow.toggleMaximize();
+  else if (action === 'close') await currentWindow.close();
+}
 async function resolveSelectedRoot() {
   if (!state.activeProfile) return '.';
   const requested = el.rootInput.value.trim() || state.activeProfile.root || '.';

@@ -29,6 +29,7 @@ textarea { padding: 7px; resize: vertical; }
   height: calc(100vh / var(--ide-scale));
   min-width: 0;
   overflow: hidden;
+  position: relative;
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   zoom: var(--ide-scale);
@@ -88,7 +89,97 @@ body.capture-freeze-visible .capture-freeze-frame {
   display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid #1d2635;
   background: linear-gradient(180deg, #111827, #0c111b);
 }
-.titlebar { min-height: 38px; justify-content: space-between; }
+.titlebar { min-height: 38px; justify-content: flex-start; position: relative; padding: 0 138px 0 14px; user-select: none; }
+.titlebar-brand {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: stretch;
+  overflow: hidden;
+}
+.window-controls {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 38px;
+  z-index: 2147482100;
+  display: flex;
+}
+.window-control {
+  width: 46px;
+  min-width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: #eef6ff;
+}
+.window-control:hover {
+  border-color: transparent;
+  background: #1b2638;
+  color: #ffffff;
+}
+.window-control.close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+.window-control-icon {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+.window-control-icon.minimize::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  bottom: 5px;
+  height: 2px;
+  background: currentColor;
+}
+.window-control-icon.maximize::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 3px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+}
+.window-control-icon.close::before,
+.window-control-icon.close::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 8px;
+  width: 15px;
+  height: 2px;
+  background: currentColor;
+}
+.window-control-icon.close::before { transform: rotate(45deg); }
+.window-control-icon.close::after { transform: rotate(-45deg); }
+.window-resize-zones { display: contents; }
+.window-resize-zone {
+  position: fixed;
+  z-index: 2147482000;
+  pointer-events: auto;
+  background: transparent;
+}
+.window-resize-n { top: 0; left: 8px; right: 8px; height: 5px; cursor: n-resize; }
+.window-resize-s { bottom: 0; left: 8px; right: 8px; height: 6px; cursor: s-resize; }
+.window-resize-e { top: 8px; right: 0; bottom: 8px; width: 6px; cursor: e-resize; }
+.window-resize-w { top: 8px; left: 0; bottom: 8px; width: 6px; cursor: w-resize; }
+.window-resize-ne { top: 0; right: 0; width: 10px; height: 10px; cursor: ne-resize; }
+.window-resize-nw { top: 0; left: 0; width: 10px; height: 10px; cursor: nw-resize; }
+.window-resize-se { right: 0; bottom: 0; width: 12px; height: 12px; cursor: se-resize; }
+.window-resize-sw { left: 0; bottom: 0; width: 12px; height: 12px; cursor: sw-resize; }
 .workspace-tabs-bar { min-height: 34px; gap: 6px; padding: 4px 12px 0; align-items: flex-end; }
 .workspace-tabs { min-width: 0; flex: 1; display: flex; gap: 2px; overflow-x: auto; align-items: flex-end; }
 .workspace-tab, .widget-tab {
@@ -125,8 +216,8 @@ body.capture-freeze-visible .capture-freeze-frame {
   color: #7f8da1;
 }
 .workspace-tab-security svg {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.7;
@@ -146,7 +237,7 @@ body.capture-freeze-visible .capture-freeze-frame {
 .tab-option input { min-width: 13px; width: 13px; height: 13px; }
 .titlebar.keyboard-target { box-shadow: inset 0 -2px 0 #4d8dff; }
 body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
-.titlebar > div:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.titlebar-brand { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #title-context { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-bar { min-height: 46px; flex-wrap: wrap; align-content: center; padding-block: 6px; }
 .workspace-bar label { display: flex; align-items: center; gap: 6px; min-width: 0; }
