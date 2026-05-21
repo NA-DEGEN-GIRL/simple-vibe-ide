@@ -3745,8 +3745,10 @@ async function createTerminalTab(
   pane.resizeObserver.observe(host);
 
   try {
+    await settleTerminalInitialFit(pane);
     pane.backendId = await api.spawnTerminal(terminalProfile.id, terminalCwd, command, term.rows, term.cols);
     if (options.focus !== false) {
+      queueTerminalFitBurst(pane);
       bringPanelToFront(widget.element);
       term.focus();
     }
@@ -3965,6 +3967,22 @@ function scheduleFitTerminal(pane: TerminalPane) {
     pane.fitFrame = undefined;
     fitTerminal(pane);
   });
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+async function settleTerminalInitialFit(pane: TerminalPane) {
+  await nextFrame();
+  await nextFrame();
+  fitTerminal(pane);
+}
+
+function queueTerminalFitBurst(pane: TerminalPane) {
+  scheduleFitTerminal(pane);
+  window.setTimeout(() => scheduleFitTerminal(pane), 50);
+  window.setTimeout(() => scheduleFitTerminal(pane), 160);
 }
 
 function fitTerminal(pane: TerminalPane) {

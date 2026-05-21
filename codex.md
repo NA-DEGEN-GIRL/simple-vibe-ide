@@ -108,6 +108,9 @@ kept with the repository.
   flags.
 - Bash launchers inspect a larger readable prefix of CLI wrapper files, covering
   npm-style wrappers that keep default flags below the first few KB.
+- Terminal tabs wait for the first visible xterm fit before spawning the PTY, so
+  full-screen LLM TUIs start with the correct column width instead of needing a
+  manual widget resize to rerender.
 - New LLM terminal sessions open taller, and terminal widgets keep a larger
   minimum height so Codex, Claude, Grok, and Antigravity panes do not start in a
   cramped broken-looking state.
