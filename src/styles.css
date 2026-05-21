@@ -202,6 +202,49 @@ body.capture-freeze-visible .capture-freeze-frame {
 }
 .window-control-icon.close::before { transform: rotate(45deg); }
 .window-control-icon.close::after { transform: rotate(-45deg); }
+.context-menu {
+  position: fixed;
+  z-index: 2147482200;
+  min-width: 178px;
+  max-width: min(260px, calc(100vw - 16px));
+  padding: 5px;
+  border: 1px solid #2a374a;
+  border-radius: 7px;
+  background: #0b111b;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.45);
+}
+.context-menu.hidden { display: none; }
+.context-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #dce8f7;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+.context-menu-item:hover:not(:disabled),
+.context-menu-item:focus-visible:not(:disabled) {
+  outline: none;
+  background: #16243a;
+  color: #ffffff;
+}
+.context-menu-item:disabled {
+  color: #5f6f84;
+}
+.context-menu-item.danger {
+  color: #ff9a9a;
+}
+.context-menu-separator {
+  height: 1px;
+  margin: 4px 3px;
+  background: #243044;
+}
 .window-resize-zones { display: contents; }
 .window-resize-zone {
   position: fixed;
@@ -249,8 +292,20 @@ body.capture-freeze-visible .capture-freeze-frame {
 }
 .workspace-tab button, .widget-tab button { min-width: 0; border: 0; background: transparent; padding: 4px 7px; }
 .workspace-tab-label, .widget-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
-.workspace-tab-copy { color: #9fb2cc; font-size: 11px; text-transform: uppercase; }
+.workspace-tab-copy {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  color: #9fb2cc;
+}
 .workspace-tab-copy:hover { color: #dce8f7; }
+.workspace-tab-copy svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
 .workspace-tab-security {
   width: 27px;
   display: grid;

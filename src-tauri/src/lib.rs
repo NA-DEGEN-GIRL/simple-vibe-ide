@@ -2866,6 +2866,12 @@ fn preview_console_bridge_script() -> &'static str {
       window.parent.postMessage({ __simpleVibeConsole: { level: level, args: Array.prototype.slice.call(args).map(format) } }, '*');
     } catch (_) {}
   }
+  window.addEventListener('contextmenu', function (event) {
+    try {
+      event.preventDefault();
+      window.parent.postMessage({ __simpleVibeContextMenu: { x: event.clientX, y: event.clientY } }, '*');
+    } catch (_) {}
+  });
   ['log', 'info', 'warn', 'error'].forEach(function (level) {
     var original = console[level];
     console[level] = function () {

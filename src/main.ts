@@ -312,6 +312,13 @@ type ResizeTarget =
   | { kind: 'ide' }
   | { kind: 'panel'; id: FloatingPanelId }
   | { kind: 'terminal'; paneId: string };
+type ContextMenuItem = {
+  label?: string;
+  action?: () => void | Promise<void>;
+  disabled?: boolean;
+  danger?: boolean;
+  separator?: boolean;
+};
 type CreateTerminalOptions = {
   rect?: LayoutRatio;
   focus?: boolean;
@@ -954,6 +961,7 @@ app.innerHTML = `
     <button id="window-maximize" class="window-control" type="button" title="Maximize or restore" aria-label="Maximize or restore" data-window-action="toggle-maximize"><span class="window-control-icon maximize" aria-hidden="true"></span></button>
     <button id="window-close" class="window-control close" type="button" title="Close" aria-label="Close" data-window-action="close"><span class="window-control-icon close" aria-hidden="true"></span></button>
   </div>
+  <div id="context-menu" class="context-menu hidden" role="menu" aria-hidden="true"></div>
 `;
 
 const el = {
@@ -1044,7 +1052,8 @@ const el = {
   settingsMonoFont: document.querySelector<HTMLSelectElement>('#settings-mono-font')!,
   settingsEditorTheme: document.querySelector<HTMLSelectElement>('#settings-editor-theme')!,
   settingsMaskPatterns: document.querySelector<HTMLTextAreaElement>('#settings-mask-patterns')!,
-  settingsSave: document.querySelector<HTMLButtonElement>('#settings-save')!
+  settingsSave: document.querySelector<HTMLButtonElement>('#settings-save')!,
+  contextMenu: document.querySelector<HTMLDivElement>('#context-menu')!
 };
 
 const currentWindow = getCurrentWindow();
@@ -1583,7 +1592,12 @@ function renderWorkspaceTabs() {
           <rect x="3.5" y="7" width="9" height="7" rx="1.5"></rect>
         </svg>
       </button>
-      <button class="workspace-tab-copy" title="Copy workspace" aria-label="Copy workspace">copy</button>
+      <button class="workspace-tab-copy" title="Copy workspace" aria-label="Copy workspace">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="5" y="3" width="8" height="10" rx="1.5"></rect>
+          <path d="M3 11V5.5A1.5 1.5 0 0 1 4.5 4H10"></path>
+        </svg>
+      </button>
       <button class="workspace-tab-close" title="Close workspace" aria-label="Close workspace">x</button>
     `;
     tab.querySelectorAll<HTMLButtonElement>('button').forEach((button) => {
@@ -3018,7 +3032,11 @@ function bindEvents() {
   document.addEventListener('keydown', handleExplorerKeyboard, true);
   document.addEventListener('keydown', handleCalculatorGlobalKey, true);
   document.addEventListener('mousedown', handleExplorerMouseNavigation, true);
+  document.addEventListener('contextmenu', handleContextMenu, true);
+  document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
+  document.addEventListener('keydown', handleContextMenuKeydown, true);
   window.addEventListener('resize', () => {
+    hideContextMenu();
     FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));
     state.terminalWidgets.forEach((widget) => {
       applyStoredLayoutRatio(widget.element);
@@ -3026,9 +3044,280 @@ function bindEvents() {
     });
     codeView?.requestMeasure();
   });
+  window.addEventListener('blur', hideContextMenu);
   window.addEventListener('beforeunload', () => {
     if (marketTickerSocket) marketTickerSocket.close();
   });
+}
+
+function handleContextMenu(event: MouseEvent) {
+  if (!(event.target instanceof Element)) return;
+  const items = contextMenuItemsForEvent(event);
+  event.preventDefault();
+  event.stopPropagation();
+  if (!items.length) {
+    hideContextMenu();
+    return;
+  }
+  showContextMenu(event.clientX, event.clientY, items);
+}
+
+function handleContextMenuPointerDown(event: PointerEvent) {
+  if (event.button === 2) return;
+  if (event.target instanceof Node && el.contextMenu.contains(event.target)) return;
+  hideContextMenu();
+}
+
+function handleContextMenuKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') hideContextMenu();
+}
+
+function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
+  const target = event.target as Element;
+  const workspaceTab = target.closest<HTMLElement>('.workspace-tab');
+  if (workspaceTab?.dataset.workspaceId) return workspaceTabContextMenu(workspaceTab.dataset.workspaceId);
+
+  const codeEditor = target.closest('.cm-editor');
+  if (codeEditor) return editorContextMenuItems();
+
+  const editable = editableTarget(target);
+  if (editable) return textContextMenuItems(editable);
+
+  const terminalCard = target.closest<HTMLElement>('.terminal-card');
+  if (terminalCard) return terminalContextMenuItems(target, terminalCard);
+
+  const fileRow = target.closest<HTMLElement>('.file-row');
+  if (fileRow?.dataset.path) selectExplorerEntry(fileRow.dataset.path, false);
+  if (target.closest('.explorer')) return explorerContextMenuItems();
+
+  if (target.closest('.image')) return imageContextMenuItems();
+  if (target.closest('.notes-panel')) return notesContextMenuItems();
+  if (target.closest('.browser')) return browserContextMenuItems();
+  return [];
+}
+
+function showContextMenu(x: number, y: number, items: ContextMenuItem[]) {
+  el.contextMenu.innerHTML = '';
+  for (const item of items) {
+    if (item.separator) {
+      const separator = document.createElement('div');
+      separator.className = 'context-menu-separator';
+      el.contextMenu.append(separator);
+      continue;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `context-menu-item${item.danger ? ' danger' : ''}`;
+    button.textContent = item.label ?? '';
+    button.disabled = Boolean(item.disabled || !item.action);
+    button.addEventListener('click', () => {
+      hideContextMenu();
+      if (!item.action) return;
+      Promise.resolve(item.action()).catch((error) => setStatus(String(error), true));
+    });
+    el.contextMenu.append(button);
+  }
+  el.contextMenu.classList.remove('hidden');
+  el.contextMenu.setAttribute('aria-hidden', 'false');
+  const rect = el.contextMenu.getBoundingClientRect();
+  const left = clamp(x, 8, Math.max(8, window.innerWidth - rect.width - 8));
+  const top = clamp(y, 8, Math.max(8, window.innerHeight - rect.height - 8));
+  el.contextMenu.style.left = `${Math.round(left)}px`;
+  el.contextMenu.style.top = `${Math.round(top)}px`;
+}
+
+function hideContextMenu() {
+  el.contextMenu.classList.add('hidden');
+  el.contextMenu.setAttribute('aria-hidden', 'true');
+}
+
+function workspaceTabContextMenu(id: string): ContextMenuItem[] {
+  const workspace = state.workspaceSnapshots.find((item) => item.id === id);
+  if (!workspace) return [];
+  return [
+    { label: 'Open workspace', action: () => activateWorkspaceTab(id), disabled: id === state.activeWorkspaceId && state.workspaceOpen },
+    { label: 'Copy workspace', action: () => copyWorkspaceTab(id) },
+    {
+      label: workspace.captureProtected ? 'Disable capture block' : 'Block capture while active',
+      action: () => toggleWorkspaceCaptureProtection(id)
+    },
+    { separator: true },
+    { label: 'Close workspace', action: () => closeWorkspaceTab(id), danger: true }
+  ];
+}
+
+function explorerContextMenuItems(): ContextMenuItem[] {
+  const entry = findExplorerEntry(state.explorerSelectedPath);
+  return [
+    { label: 'Open', action: () => { if (entry) openExplorerEntry(entry); }, disabled: !entry },
+    { label: 'Rename', action: renameSelectedExplorerEntry, disabled: !entry },
+    { label: 'Export', action: startExportSelectedExplorerEntry, disabled: !entry },
+    { separator: true },
+    { label: 'New file', action: () => createExplorerItem('file') },
+    { label: 'New folder', action: () => createExplorerItem('dir') },
+    { label: 'Refresh', action: () => refreshExplorerTree({ manual: true }) }
+  ];
+}
+
+function editorContextMenuItems(): ContextMenuItem[] {
+  const hasSelection = Boolean(codeView && !codeView.state.selection.main.empty);
+  return [
+    { label: 'Cut', action: cutCodeSelection, disabled: !hasSelection },
+    { label: 'Copy', action: copyCodeSelection, disabled: !hasSelection },
+    { label: 'Paste', action: pasteIntoCodeEditor, disabled: !codeView },
+    { label: 'Select all', action: selectAllCodeEditor, disabled: !codeView },
+    { separator: true },
+    { label: 'Save', action: saveOpenFile, disabled: !state.openFile },
+    { label: state.editorWordWrap ? 'Word wrap off' : 'Word wrap on', action: toggleEditorWordWrap }
+  ];
+}
+
+function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMenuItem[] {
+  const host = target.closest<HTMLElement>('.terminal-host');
+  const pane = host?.dataset.paneId
+    ? state.terminals.find((item) => item.paneId === host.dataset.paneId) ?? activePaneForElement(card)
+    : activePaneForElement(card);
+  if (pane) setActivePane(pane.paneId);
+  const widget = terminalWidgetForElement(card);
+  const selected = pane?.term.getSelection() ?? '';
+  return [
+    { label: 'Copy', action: () => copyTextToClipboard(selected, 'Copied terminal selection'), disabled: !selected },
+    { label: 'Paste', action: () => pasteIntoTerminal(pane), disabled: !pane },
+    { label: 'Clear', action: () => pane?.term.clear(), disabled: !pane },
+    { separator: true },
+    { label: 'New shell tab', action: () => { if (widget) void createShellTabInWidget(widget); }, disabled: !widget },
+    { label: 'Close shell tab', action: () => { if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane, danger: true },
+    { label: 'Close shell widget', action: () => { if (widget) void closeTerminalWidget(widget.widgetId); }, disabled: !widget, danger: true }
+  ];
+}
+
+function browserContextMenuItems(): ContextMenuItem[] {
+  const tab = currentBrowserTab();
+  return [
+    { label: 'Reload', action: () => refreshPreview(false), disabled: !tab },
+    { label: 'Hard refresh', action: () => refreshPreview(true), disabled: !tab },
+    { label: 'Copy URL', action: () => { if (tab) void copyTextToClipboard(tab.url, 'Copied browser URL'); }, disabled: !tab },
+    { separator: true },
+    { label: state.browserConsoleVisible ? 'Hide console' : 'Show console', action: () => setBrowserConsoleVisible(!state.browserConsoleVisible) },
+    { label: 'Clear console', action: () => { state.browserConsoleLogs = []; renderBrowserConsole(); } },
+    { separator: true },
+    { label: 'Close browser tab', action: () => { if (tab) closeBrowserTab(tab.id); }, disabled: !tab, danger: true }
+  ];
+}
+
+function imageContextMenuItems(): ContextMenuItem[] {
+  const latest = state.imageHistory[0];
+  return [
+    { label: 'Copy image', action: copyCurrentPreviewImage, disabled: !state.imagePreviewDataUrl },
+    { label: 'Paste image from clipboard', action: pasteImageFromNativeClipboard },
+    { label: 'Paste latest tag to shell', action: async () => { if (latest) await pasteImageTagToActiveTerminal(latest.tag); }, disabled: !latest },
+    { separator: true },
+    { label: state.imageHistoryVisible ? 'Hide history' : 'Show history', action: () => { state.imageHistoryVisible = !state.imageHistoryVisible; syncActiveImageTabFromState(); renderImageHistory(); saveActiveWorkspaceSnapshot(); } },
+    { label: 'Clear history', action: () => { state.imageHistory = []; syncActiveImageTabFromState(); renderImageHistory(); saveActiveWorkspaceSnapshot(); }, disabled: !state.imageHistory.length, danger: true }
+  ];
+}
+
+function notesContextMenuItems(): ContextMenuItem[] {
+  return [
+    { label: 'New note', action: () => createNoteTab({ focus: true }) },
+    { label: 'Save note', action: saveActiveNoteNow, disabled: !activeNoteTab() },
+    { label: state.notePinned ? 'Unpin notes' : 'Pin notes', action: toggleNotePin }
+  ];
+}
+
+function textContextMenuItems(target: HTMLInputElement | HTMLTextAreaElement): ContextMenuItem[] {
+  const hasSelection = Boolean(selectedTextFromEditable(target));
+  const readOnly = target.readOnly || target.disabled;
+  return [
+    { label: 'Cut', action: () => cutEditableSelection(target), disabled: !hasSelection || readOnly },
+    { label: 'Copy', action: () => copyEditableSelection(target), disabled: !hasSelection },
+    { label: 'Paste', action: () => pasteIntoEditable(target), disabled: readOnly },
+    { label: 'Select all', action: () => target.select() }
+  ];
+}
+
+function editableTarget(target: Element) {
+  const editable = target.closest<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
+  if (!editable) return null;
+  if (editable instanceof HTMLTextAreaElement) return editable;
+  const blocked = ['button', 'checkbox', 'file', 'image', 'radio', 'range', 'reset', 'submit'];
+  return blocked.includes(editable.type) ? null : editable;
+}
+
+function selectedTextFromEditable(target: HTMLInputElement | HTMLTextAreaElement) {
+  const start = target.selectionStart ?? 0;
+  const end = target.selectionEnd ?? 0;
+  return start === end ? '' : target.value.slice(start, end);
+}
+
+async function copyEditableSelection(target: HTMLInputElement | HTMLTextAreaElement) {
+  const text = selectedTextFromEditable(target);
+  if (!text) return;
+  await copyTextToClipboard(text, 'Copied selection');
+}
+
+async function cutEditableSelection(target: HTMLInputElement | HTMLTextAreaElement) {
+  const text = selectedTextFromEditable(target);
+  if (!text) return;
+  await writeText(text);
+  replaceEditableSelection(target, '');
+}
+
+async function pasteIntoEditable(target: HTMLInputElement | HTMLTextAreaElement) {
+  replaceEditableSelection(target, await readText());
+}
+
+function replaceEditableSelection(target: HTMLInputElement | HTMLTextAreaElement, text: string) {
+  const start = target.selectionStart ?? target.value.length;
+  const end = target.selectionEnd ?? target.value.length;
+  target.setRangeText(text, start, end, 'end');
+  target.dispatchEvent(new Event('input', { bubbles: true }));
+  target.focus();
+}
+
+async function copyCodeSelection() {
+  if (!codeView) return;
+  const text = codeView.state.selection.ranges
+    .map((range) => codeView!.state.doc.sliceString(range.from, range.to))
+    .join('\n');
+  if (text) await copyTextToClipboard(text, 'Copied editor selection');
+}
+
+async function cutCodeSelection() {
+  if (!codeView || codeView.state.selection.main.empty) return;
+  await copyCodeSelection();
+  codeView.dispatch(codeView.state.replaceSelection(''));
+  codeView.focus();
+}
+
+async function pasteIntoCodeEditor() {
+  if (!codeView) return;
+  codeView.dispatch(codeView.state.replaceSelection(await readText()));
+  codeView.focus();
+}
+
+function selectAllCodeEditor() {
+  if (!codeView) return;
+  codeView.dispatch({ selection: { anchor: 0, head: codeView.state.doc.length }, scrollIntoView: true });
+  codeView.focus();
+}
+
+function toggleEditorWordWrap() {
+  state.editorWordWrap = !state.editorWordWrap;
+  el.editorWordWrap.checked = state.editorWordWrap;
+  renderEditor();
+  saveActiveWorkspaceSnapshot();
+}
+
+async function pasteIntoTerminal(pane: TerminalPane | null | undefined) {
+  if (!pane) return;
+  pane.term.paste(await readText());
+  pane.term.focus();
+}
+
+async function copyTextToClipboard(text: string, message: string) {
+  await writeText(text);
+  setStatus(message);
 }
 
 function bindWindowChrome() {
@@ -7227,6 +7516,12 @@ function renderBrowserConsole() {
 function handleBrowserConsoleMessage(event: MessageEvent) {
   const data = event.data;
   if (!data || typeof data !== 'object') return;
+  const contextMenu = (data as { __simpleVibeContextMenu?: unknown }).__simpleVibeContextMenu;
+  if (contextMenu && typeof contextMenu === 'object') {
+    const payload = contextMenu as { x?: unknown; y?: unknown };
+    showBrowserContextMenuFromFrame(Number(payload.x), Number(payload.y));
+    return;
+  }
   const payload = (data as { simpleVibeConsole?: unknown; __simpleVibeConsole?: unknown }).simpleVibeConsole
     ?? (data as { simpleVibeConsole?: unknown; __simpleVibeConsole?: unknown }).__simpleVibeConsole;
   if (!payload || typeof payload !== 'object') return;
@@ -7235,6 +7530,15 @@ function handleBrowserConsoleMessage(event: MessageEvent) {
   const level = record.level === 'warn' || record.level === 'error' ? record.level : 'info';
   const message = record.args?.map(formatConsoleValue).join(' ') ?? formatConsoleValue(record.message ?? '');
   if (message) logBrowserConsole(level, message);
+}
+
+function showBrowserContextMenuFromFrame(x: number, y: number) {
+  const frame = activeBrowserFrame();
+  if (!frame) return;
+  const rect = frame.getBoundingClientRect();
+  const clientX = Number.isFinite(x) ? rect.left + x : rect.left + 16;
+  const clientY = Number.isFinite(y) ? rect.top + y : rect.top + 16;
+  showContextMenu(clientX, clientY, browserContextMenuItems());
 }
 
 function formatConsoleValue(value: unknown) {
