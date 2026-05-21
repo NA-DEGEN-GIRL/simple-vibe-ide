@@ -1595,20 +1595,20 @@ function renderWorkspaceTabs() {
     tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
     const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
     tab.innerHTML = `
-      <button class="workspace-tab-label">${escapeHtml(workspace.label)}</button>
-      <button class="workspace-tab-security${protectedWorkspace ? ' active' : ''}" title="${securityTitle}" aria-label="${securityTitle}" aria-pressed="${String(protectedWorkspace)}">
+      <button class="workspace-tab-label" type="button">${escapeHtml(workspace.label)}</button>
+      <button class="workspace-tab-security${protectedWorkspace ? ' active' : ''}" type="button" title="${securityTitle}" aria-label="${securityTitle}" aria-pressed="${String(protectedWorkspace)}">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M5 7V5a3 3 0 0 1 6 0v2"></path>
           <rect x="3.5" y="7" width="9" height="7" rx="1.5"></rect>
         </svg>
       </button>
-      <button class="workspace-tab-copy" title="Copy workspace" aria-label="Copy workspace">
+      <button class="workspace-tab-copy" type="button" title="Copy workspace" aria-label="Copy workspace">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <rect x="5" y="3" width="8" height="10" rx="1.5"></rect>
           <path d="M3 11V5.5A1.5 1.5 0 0 1 4.5 4H10"></path>
         </svg>
       </button>
-      <button class="workspace-tab-close" title="Close workspace" aria-label="Close workspace">x</button>
+      <button class="workspace-tab-close" type="button" title="Close workspace" aria-label="Close workspace">x</button>
     `;
     tab.querySelectorAll<HTMLButtonElement>('button').forEach((button) => {
       button.draggable = false;
@@ -1661,6 +1661,7 @@ function updateWorkspaceTabPointerDrag(event: PointerEvent, tab: HTMLElement) {
   if (!drag || drag.pointerId !== event.pointerId) return;
   const moved = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
   if (!drag.dragging && moved < 6) return;
+  event.preventDefault();
   drag.dragging = true;
   suppressWorkspaceTabClick = true;
   tab.classList.add('dragging');
@@ -1671,8 +1672,13 @@ function finishWorkspaceTabPointerDrag(event: PointerEvent, tab: HTMLElement, co
   const drag = workspaceDragState;
   if (!drag || drag.pointerId !== event.pointerId) return;
   if (tab.hasPointerCapture(event.pointerId)) tab.releasePointerCapture(event.pointerId);
-  if (commit && drag.dragging && drag.target) {
+  const wasDragging = drag.dragging;
+  const shouldActivate = commit && !wasDragging;
+  suppressWorkspaceTabClick = commit;
+  if (commit && wasDragging && drag.target) {
     reorderWorkspaceTab(drag.id, drag.target.targetId, drag.target.position);
+  } else if (shouldActivate) {
+    void activateWorkspaceTab(drag.id);
   }
   tab.classList.remove('dragging');
   workspaceDragState = null;
