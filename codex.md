@@ -16,6 +16,15 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - LLM build guide
+
+#### Added
+
+- Added `docs/LLM_INSTALL_GUIDE.md` with agent-focused Windows install, build,
+  release, verification, troubleshooting, privacy, and reporting instructions.
+- Linked the LLM/agent guide from README in both Korean and English sections.
+
+
 ### 2026-05-22 - Notes opacity
 
 #### Added

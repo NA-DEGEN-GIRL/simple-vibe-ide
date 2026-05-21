@@ -1,7 +1,7 @@
 # Simple Vibe IDE
 
 <p>
-  <a href="#korean-version">한국어 버전</a> · <a href="#english-version">English version</a>
+  <a href="#korean-version">한국어 버전</a> · <a href="#english-version">English version</a> · <a href="docs/LLM_INSTALL_GUIDE.md">LLM build guide</a>
 </p>
 
 <details id="korean-version" open>
@@ -14,6 +14,8 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, 로컬 Windows shell을 빠르게 오
 목표는 거창한 범용 IDE가 아니라, 바이브 코딩 중 자주 반복되는 흐름을 빠릿빠릿하게 만드는 것입니다. 작업공간을 열고, shell을 여러 개 띄우고, Codex/Claude/Grok/Antigravity를 바로 실행하고, 이미지나 스크린샷을 붙여넣고, 로컬 서버를 브라우저 탭으로 확인하는 과정을 한 화면 안에서 짧게 이어가도록 설계했습니다.
 
 현재 상태: Windows-only, Tauri v2, pre-1.0, experimental.
+
+LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent Build Guide](docs/LLM_INSTALL_GUIDE.md)를 함께 넘기면 됩니다.
 
 ![Simple Vibe IDE safe demo screenshot](docs/simple-vibe-ide-demo.png)
 
@@ -296,7 +298,7 @@ Windows OpenSSH config의 literal `Host` alias만 자동 import됩니다. wildca
 - `src/`: TypeScript UI
 - `src-tauri/`: Rust backend와 Tauri config
 - `public/`: capture cover 같은 static WebView asset
-- `docs/`: README용 안전한 demo screenshot
+- `docs/`: README용 안전한 demo screenshot과 LLM/agent build guide
 - `run-built.vbs`, `run-built.cmd`: 빌드된 앱 실행 helper
 - `codex.md`: privacy-safe implementation notes와 patch notes
 
@@ -316,6 +318,8 @@ Simple Vibe IDE is a Windows-only lightweight desktop IDE for LLM-heavy coding s
 It is not trying to be a full general-purpose IDE. The goal is a fast practical loop for vibe coding: open a workspace, split shells, launch Codex/Claude/Grok/Antigravity, paste screenshots, preview local servers, and keep that working state close at hand.
 
 Status: Windows-only, Tauri v2, pre-1.0, experimental.
+
+When asking an LLM or coding agent to install, build, or verify the app, provide the [LLM / Agent Build Guide](docs/LLM_INSTALL_GUIDE.md) with the task.
 
 ![Simple Vibe IDE safe demo screenshot](docs/simple-vibe-ide-demo.png)
 
@@ -598,7 +602,7 @@ Static pages and iframe cache can remain visible. Use hard refresh or open the p
 - `src/`: TypeScript UI
 - `src-tauri/`: Rust backend and Tauri configuration
 - `public/`: static WebView assets such as the capture cover
-- `docs/`: safe demo screenshot for README
+- `docs/`: safe demo screenshot for README and the LLM/agent build guide
 - `run-built.vbs`, `run-built.cmd`: helpers for launching built artifacts
 - `codex.md`: privacy-safe implementation notes and patch notes
 
