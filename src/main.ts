@@ -353,6 +353,10 @@ const PANEL_SNAP_DISTANCE = 14;
 const WIDGET_KEYBOARD_SCALE = 1.1;
 const TERMINAL_PORT_SCAN_LIMIT = 4000;
 const EXPLORER_TYPEAHEAD_TIMEOUT_MS = 900;
+const EXPLORER_WATCH_LOCAL_MS = 2500;
+const EXPLORER_WATCH_WSL_MS = 3500;
+const EXPLORER_WATCH_SSH_MS = 7000;
+const EXPLORER_WATCH_MAX_DIRS = 12;
 const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
@@ -393,6 +397,7 @@ const state = {
   explorerExpanded: new Set<string>(),
   explorerChildren: new Map<string, FileEntry[]>(),
   explorerLoading: new Set<string>(),
+  explorerSignatures: new Map<string, string>(),
   explorerDropTargetDir: '',
   exportJobs: [] as ExportJobState[],
   workspaceSnapshots: [] as WorkspaceSnapshot[],
@@ -458,6 +463,8 @@ const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
 const noteSaveTimers = new Map<string, number>();
+let explorerWatchTimer = 0;
+let explorerWatchInFlight = false;
 let marketTickerSocket: WebSocket | null = null;
 let marketTickerReconnectTimer = 0;
 let marketTickerFallbackTimer = 0;
@@ -540,6 +547,7 @@ app.innerHTML = `
           <span class="spacer"></span>
           <button id="new-file" class="panel-mode" title="New file">File</button>
           <button id="new-folder" class="panel-mode" title="New folder">Folder</button>
+          <button id="refresh-explorer" class="panel-mode" title="Refresh Explorer">Refresh</button>
           <button id="export-selected" class="panel-mode" title="Export selected item for Windows drag-out">Export</button>
           <button id="toggle-explorer-open-mode" class="panel-mode" title="Toggle single/double click open">Open: 1x</button>
           <button id="toggle-file-sizes" class="panel-mode active" title="Toggle file sizes" aria-pressed="true">Size</button>
@@ -694,6 +702,7 @@ const el = {
   mainGrid: document.querySelector<HTMLElement>('.main-grid')!,
   newFile: document.querySelector<HTMLButtonElement>('#new-file')!,
   newFolder: document.querySelector<HTMLButtonElement>('#new-folder')!,
+  refreshExplorer: document.querySelector<HTMLButtonElement>('#refresh-explorer')!,
   exportSelected: document.querySelector<HTMLButtonElement>('#export-selected')!,
   exportList: document.querySelector<HTMLDivElement>('#export-list')!,
   explorerOpenModeToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-open-mode')!,
@@ -2287,6 +2296,7 @@ function bindEvents() {
   el.hardRefreshPreview.addEventListener('click', () => refreshPreview(true));
   el.newFile.addEventListener('click', () => void createExplorerItem('file'));
   el.newFolder.addEventListener('click', () => void createExplorerItem('dir'));
+  el.refreshExplorer.addEventListener('click', () => void refreshExplorerTree({ manual: true }));
   el.exportSelected.addEventListener('click', () => void startExportSelectedExplorerEntry());
   el.explorerOpenModeToggle.addEventListener('click', () => {
     state.explorerOpenMode = state.explorerOpenMode === 'single' ? 'double' : 'single';
@@ -2901,6 +2911,10 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     pinPanelToWorkspace(panel);
     setKeyboardResizeTarget({ kind: 'panel', id });
     if (id === 'notes' && !restoringWorkspace) void ensureNotesReady();
+    if (id === 'explorer' && state.workspaceOpen && !restoringWorkspace) {
+      void refreshExplorerTree({ silent: true });
+      scheduleExplorerWatch();
+    }
     codeView?.requestMeasure();
   } else if (keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
     setKeyboardResizeTarget({ kind: 'ide' });
@@ -3276,6 +3290,7 @@ function clearWorkspacePanels() {
   state.explorerExpanded = new Set();
   state.explorerChildren = new Map();
   state.explorerLoading = new Set();
+  state.explorerSignatures = new Map();
   state.explorerSelectedPath = '';
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
@@ -3341,6 +3356,7 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
   });
   el.newFile.disabled = !open;
   el.newFolder.disabled = !open;
+  el.refreshExplorer.disabled = !open;
   el.exportSelected.disabled = !open;
 
   if (!options.preserveVisibility) {
@@ -3349,6 +3365,8 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
     }
   }
   if (!open) setKeyboardResizeTarget({ kind: 'ide' });
+  if (open) scheduleExplorerWatch(1200);
+  else stopExplorerWatch();
   renderShellTabs();
 }
 
@@ -3361,6 +3379,7 @@ async function loadDirectory(path: string) {
     state.explorerExpanded = new Set([path]);
     state.explorerChildren = new Map();
     state.explorerLoading = new Set();
+    state.explorerSignatures = new Map([[path, explorerDirectorySignature(state.entries)]]);
     state.explorerSelectedPath = '';
     state.explorerTypeahead = '';
     state.explorerTypeaheadAt = 0;
@@ -3688,6 +3707,7 @@ async function toggleExplorerDirectory(entry: FileEntry) {
     state.explorerLoading.add(entry.path);
     const children = await api.listDirectory(state.activeProfile.id, entry.path);
     state.explorerChildren.set(entry.path, children);
+    state.explorerSignatures.set(entry.path, explorerDirectorySignature(children));
     state.explorerExpanded.add(entry.path);
     setStatus(`Expanded ${entry.name}`);
   } catch (error) {
@@ -3883,6 +3903,7 @@ async function reloadExplorerDirectory(path: string) {
   if (path === state.currentDir) {
     const selected = state.explorerSelectedPath;
     state.entries = await api.listDirectory(state.activeProfile.id, path);
+    state.explorerSignatures.set(path, explorerDirectorySignature(state.entries));
     state.explorerSelectedPath = selected;
     renderExplorer();
     return;
@@ -3890,8 +3911,125 @@ async function reloadExplorerDirectory(path: string) {
 
   const children = await api.listDirectory(state.activeProfile.id, path);
   state.explorerChildren.set(path, children);
+  state.explorerSignatures.set(path, explorerDirectorySignature(children));
   state.explorerExpanded.add(path);
   renderExplorer();
+}
+
+async function refreshExplorerTree(options: { manual?: boolean; silent?: boolean } = {}) {
+  if (!state.activeProfile || !state.workspaceOpen || !state.currentDir) return;
+  if (explorerWatchInFlight && !options.manual) return;
+
+  const previousLabel = el.refreshExplorer.textContent;
+  if (options.manual) {
+    el.refreshExplorer.disabled = true;
+    el.refreshExplorer.textContent = '...';
+    setStatus('Refreshing Explorer...');
+  }
+
+  try {
+    const changed = await pollExplorerDirectories();
+    if (options.manual) setStatus(changed ? 'Explorer refreshed' : 'Explorer already up to date');
+    else if (changed && !options.silent) setStatus('Explorer updated');
+  } catch (error) {
+    if (options.manual) setStatus(`Explorer refresh failed: ${String(error)}`, true);
+  } finally {
+    if (options.manual) {
+      el.refreshExplorer.textContent = previousLabel;
+      el.refreshExplorer.disabled = !state.workspaceOpen;
+    }
+    scheduleExplorerWatch();
+  }
+}
+
+function scheduleExplorerWatch(delayMs = explorerWatchInterval()) {
+  if (explorerWatchTimer) window.clearTimeout(explorerWatchTimer);
+  if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  explorerWatchTimer = window.setTimeout(() => void runExplorerWatch(), delayMs);
+}
+
+function stopExplorerWatch() {
+  if (explorerWatchTimer) window.clearTimeout(explorerWatchTimer);
+  explorerWatchTimer = 0;
+  explorerWatchInFlight = false;
+}
+
+async function runExplorerWatch() {
+  explorerWatchTimer = 0;
+  if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  if (getPanel('explorer').classList.contains('hidden')) {
+    scheduleExplorerWatch(explorerWatchInterval() * 2);
+    return;
+  }
+  try {
+    await pollExplorerDirectories();
+  } catch {
+    // Background Explorer watching must never interrupt terminal/editor work.
+  } finally {
+    scheduleExplorerWatch();
+  }
+}
+
+async function pollExplorerDirectories() {
+  if (!state.activeProfile || explorerWatchInFlight) return false;
+  explorerWatchInFlight = true;
+  let changed = false;
+  const previousSelection = state.explorerSelectedPath;
+  try {
+    for (const path of explorerWatchPaths()) {
+      try {
+        const entries = await api.listDirectory(state.activeProfile.id, path);
+        const signature = explorerDirectorySignature(entries);
+        const previous = state.explorerSignatures.get(path);
+        if (previous !== signature) {
+          state.explorerSignatures.set(path, signature);
+          if (path === state.currentDir) state.entries = entries;
+          else state.explorerChildren.set(path, entries);
+          changed = true;
+        }
+      } catch (error) {
+        if (sameExplorerPath(path, state.currentDir)) throw error;
+        state.explorerExpanded.delete(path);
+        state.explorerChildren.delete(path);
+        state.explorerSignatures.delete(path);
+        changed = true;
+      }
+    }
+    if (changed) {
+      state.explorerSelectedPath = previousSelection;
+      renderExplorer();
+    }
+  } finally {
+    explorerWatchInFlight = false;
+  }
+  return changed;
+}
+
+function explorerWatchPaths() {
+  const paths: string[] = [];
+  const add = (path: string) => {
+    if (!path || paths.some((item) => sameExplorerPath(item, path))) return;
+    paths.push(path);
+  };
+  add(state.currentDir);
+  for (const path of state.explorerExpanded) {
+    if (paths.length >= EXPLORER_WATCH_MAX_DIRS) break;
+    if (path === state.currentDir || state.explorerChildren.has(path)) add(path);
+  }
+  return paths;
+}
+
+function explorerWatchInterval() {
+  if (state.activeProfile?.kind === 'ssh') return EXPLORER_WATCH_SSH_MS;
+  if (state.activeProfile?.kind === 'wsl') return EXPLORER_WATCH_WSL_MS;
+  return EXPLORER_WATCH_LOCAL_MS;
+}
+
+function explorerDirectorySignature(entries: FileEntry[]) {
+  return entries
+    .map((entry) => `${entry.name}\t${entry.kind}\t${entry.size}\t${entry.hidden ? 1 : 0}`)
+    .sort()
+    .join('\n');
 }
 
 function moveExplorerChildCache(oldPath: string, newPath: string) {
@@ -3899,6 +4037,11 @@ function moveExplorerChildCache(oldPath: string, newPath: string) {
   if (children) {
     state.explorerChildren.delete(oldPath);
     state.explorerChildren.set(newPath, children);
+  }
+  const signature = state.explorerSignatures.get(oldPath);
+  if (signature) {
+    state.explorerSignatures.delete(oldPath);
+    state.explorerSignatures.set(newPath, signature);
   }
   if (state.explorerExpanded.delete(oldPath)) state.explorerExpanded.add(newPath);
 }

@@ -154,6 +154,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - Windows, WSL, SSH workspace를 같은 Explorer UI로 탐색합니다.
 - `Use This Folder`로 선택한 폴더를 새 workspace root처럼 다시 열 수 있습니다.
 - 폴더는 일반 IDE처럼 root 아래에서 expand/collapse됩니다.
+- `Refresh`로 Explorer를 수동 새로고침할 수 있고, 열린 Explorer는 shell에서 생긴 현재 폴더/펼친 폴더 변경을 가볍게 자동 감지합니다.
 - 새 파일/새 폴더를 inline으로 만들고, `F2`로 inline rename할 수 있습니다.
 - 알파벳을 치면 해당 글자로 시작하는 항목이 선택되고, Enter로 열 수 있습니다.
 - 마우스 Back 버튼으로 상위 폴더로 이동할 수 있습니다.
@@ -458,6 +459,7 @@ WSL profiles are loaded in the background after the first screen is interactive.
 - Browse Windows, WSL, or SSH workspaces from one Explorer UI.
 - Use `Use This Folder` to reopen the workspace from a selected folder.
 - Folders expand and collapse under the selected root like a typical IDE tree.
+- `Refresh` manually reloads Explorer, and an open Explorer lightly auto-detects changes in the current and expanded folders made from shells.
 - Create files/folders inline and rename with `F2`.
 - Type letters to select matching entries, then press Enter to open.
 - Use the mouse Back button to move to the parent folder.

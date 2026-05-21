@@ -16,6 +16,18 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Explorer refresh and shell change detection
+
+#### Added
+
+- Added a manual Explorer Refresh button.
+- Added lightweight Explorer polling while a workspace and Explorer panel are
+  open, so shell-created files and folders appear without reopening the
+  workspace.
+- The watcher checks the current folder and a capped set of expanded folders,
+  with a slower interval for SSH profiles.
+
+
 ### 2026-05-22 - LLM build guide
 
 #### Added
