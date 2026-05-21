@@ -122,6 +122,22 @@ kept with the repository.
 - Frontend type check passed with TypeScript.
 - Frontend production build passed with Vite.
 
+### 2026-05-21 - Workspace notes
+
+#### Added
+
+- Added a separate Notes panel for sticky-note style scratch text outside the
+  code editor.
+- Notes support multiple tabs per workspace and autosave to
+  `.vibe-ide-temp/notes/*.txt` inside the active workspace.
+- Workspace snapshots remember open note tabs, the active note tab, and whether
+  the Notes panel was visible.
+
+#### Verification
+
+- Frontend type check passed with TypeScript.
+- Frontend production build passed with Vite.
+
 ### 2026-05-21 - Windows IDE usability pass
 
 #### Added

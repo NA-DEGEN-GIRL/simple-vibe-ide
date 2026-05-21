@@ -111,6 +111,16 @@ interface ImageTabState {
   historyVisible: boolean;
 }
 
+interface NoteTabState {
+  id: string;
+  path: string;
+  title: string;
+  content: string;
+  dirty: boolean;
+  saving: boolean;
+  lastSavedAt?: number;
+}
+
 interface LayoutRatio {
   left: number;
   top: number;
@@ -147,6 +157,12 @@ interface ImageTabSnapshot {
   historyVisible: boolean;
 }
 
+interface NoteTabSnapshot {
+  id: string;
+  path: string;
+  title: string;
+}
+
 interface WorkspaceSnapshot {
   id: string;
   label: string;
@@ -166,6 +182,8 @@ interface WorkspaceSnapshot {
   imageTabs: ImageTabSnapshot[];
   activeImageTabId: string;
   imageOpenInNewTab: boolean;
+  noteTabs: NoteTabSnapshot[];
+  activeNoteTabId: string;
   browserTabs: BrowserTab[];
   activeBrowserTabId: string;
   browserDeviceId: string;
@@ -202,7 +220,7 @@ interface EditorRuntime {
   languageCompartment: import('@codemirror/state').Compartment;
 }
 
-type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser';
+type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes';
 type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
@@ -280,8 +298,16 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   }
 };
 
-const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser'];
+const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes'];
+const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
+  explorer: true,
+  editor: true,
+  image: true,
+  browser: true,
+  notes: false
+};
 const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
+const NOTES_DIR = '.vibe-ide-temp/notes';
 const PANEL_SNAP_DISTANCE = 14;
 const WIDGET_KEYBOARD_SCALE = 1.1;
 const TERMINAL_PORT_SCAN_LIMIT = 4000;
@@ -339,6 +365,8 @@ const state = {
   imageTabs: [] as ImageTabState[],
   activeImageTabId: '',
   imageOpenInNewTab: false,
+  noteTabs: [] as NoteTabState[],
+  activeNoteTabId: '',
   forwards: [] as PortForwardResult[],
   detectedPorts: [] as DetectedPortItem[],
   browserTabs: [] as BrowserTab[],
@@ -366,6 +394,7 @@ const autoForwardingPorts = new Set<string>();
 const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
+const noteSaveTimers = new Map<string, number>();
 let fileOpenToken = 0;
 let activeExplorerRename: {
   path: string;
@@ -426,6 +455,7 @@ app.innerHTML = `
       <button class="panel-toggle" data-toggle-panel="editor" title="Toggle Editor" aria-pressed="false">Edit</button>
       <button class="panel-toggle" data-toggle-panel="image" title="Toggle Image Preview" aria-pressed="false">Img</button>
       <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
+      <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
       <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
     </section>
     <main class="main-grid">
@@ -461,6 +491,18 @@ app.innerHTML = `
         </div>
         <div id="editor-tabs" class="widget-tabs"></div>
         <div id="editor-body" class="editor-body empty">Open a file from Explorer.</div>
+      </section>
+      <section class="panel notes-panel floating-panel hidden" data-panel="notes">
+        <div class="panel-title panel-drag-handle">
+          <span>Notes</span>
+          <span id="notes-status" class="muted notes-status">Autosaved</span>
+          <span class="spacer"></span>
+          <button id="notes-new-tab" class="panel-mode" title="New note">+</button>
+          <button class="panel-close" data-close-panel="notes" title="Close Notes" aria-label="Close Notes">x</button>
+        </div>
+        <div id="notes-tabs" class="widget-tabs"></div>
+        <textarea id="notes-body" class="notes-body" spellcheck="true" placeholder="Quick notes for this workspace..."></textarea>
+        <div id="notes-path" class="notes-path"></div>
       </section>
       <section class="panel image-panel floating-panel hidden" data-panel="image">
         <div class="panel-title panel-drag-handle">
@@ -570,6 +612,11 @@ const el = {
   editorBody: document.querySelector<HTMLDivElement>('#editor-body')!,
   saveFile: document.querySelector<HTMLButtonElement>('#save-file')!,
   toggleRaw: document.querySelector<HTMLButtonElement>('#toggle-raw')!,
+  notesTabs: document.querySelector<HTMLDivElement>('#notes-tabs')!,
+  notesNewTab: document.querySelector<HTMLButtonElement>('#notes-new-tab')!,
+  notesBody: document.querySelector<HTMLTextAreaElement>('#notes-body')!,
+  notesStatus: document.querySelector<HTMLSpanElement>('#notes-status')!,
+  notesPath: document.querySelector<HTMLDivElement>('#notes-path')!,
   imageTabs: document.querySelector<HTMLDivElement>('#image-tabs')!,
   imageNewTab: document.querySelector<HTMLButtonElement>('#image-new-tab')!,
   imageOpenNewTab: document.querySelector<HTMLInputElement>('#image-open-new-tab')!,
@@ -656,6 +703,8 @@ async function init() {
   renderWorkspaceTabs();
   renderEditorTabs();
   renderImageTabs();
+  renderNoteTabs();
+  renderNotes();
   renderShellTabs();
   renderBrowserDeviceOptions();
   setBrowserMode('desktop');
@@ -817,6 +866,7 @@ function delay(ms: number) {
 }
 
 async function createBlankWorkspaceTab() {
+  await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot();
   const id = crypto.randomUUID();
   state.activeWorkspaceId = id;
@@ -853,6 +903,7 @@ async function closeWorkspaceTab(id: string) {
 
 async function activateWorkspaceTab(id: string) {
   if (id === state.activeWorkspaceId && state.workspaceOpen) return;
+  await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot();
   const snapshot = state.workspaceSnapshots.find((workspace) => workspace.id === id);
   if (!snapshot) return;
@@ -889,6 +940,8 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     imageTabs: [],
     activeImageTabId: '',
     imageOpenInNewTab: false,
+    noteTabs: [],
+    activeNoteTabId: '',
     browserTabs: [],
     activeBrowserTabId: '',
     browserDeviceId: 'desktop',
@@ -959,6 +1012,8 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
       })),
     activeImageTabId: state.activeImageTabId,
     imageOpenInNewTab: state.imageOpenInNewTab,
+    noteTabs: state.noteTabs.map((tab) => ({ id: tab.id, path: tab.path, title: tab.title })),
+    activeNoteTabId: state.activeNoteTabId,
     browserTabs: state.browserTabs,
     activeBrowserTabId: state.activeBrowserTabId,
     browserDeviceId: el.browserShell.classList.contains('desktop') ? 'desktop' : state.browserDeviceId,
@@ -1033,6 +1088,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     restorePanelSnapshots(snapshot.panels);
     await restoreEditorTabs(snapshot);
     restoreImageTabs(snapshot);
+    await restoreNoteTabs(snapshot);
     restoreBrowserState(snapshot);
 
     const terminalSnapshots = (snapshot.terminals ?? []).length
@@ -1128,6 +1184,229 @@ function restoreImageTabs(snapshot: WorkspaceSnapshot) {
   renderImageHistory();
 }
 
+async function restoreNoteTabs(snapshot: WorkspaceSnapshot) {
+  state.noteTabs = [];
+  for (const tab of snapshot.noteTabs ?? []) {
+    if (!tab.path) continue;
+    let content = '';
+    try {
+      content = await api.readTextFile(snapshot.profileId, tab.path);
+    } catch {
+      content = '';
+    }
+    state.noteTabs.push({
+      id: tab.id || crypto.randomUUID(),
+      path: tab.path,
+      title: tab.title || noteTitleFromPath(tab.path),
+      content,
+      dirty: false,
+      saving: false,
+      lastSavedAt: Date.now()
+    });
+  }
+  state.activeNoteTabId = state.noteTabs.some((tab) => tab.id === snapshot.activeNoteTabId)
+    ? snapshot.activeNoteTabId
+    : state.noteTabs[0]?.id ?? '';
+  renderNoteTabs();
+  renderNotes();
+  if (!getPanel('notes').classList.contains('hidden') && !state.noteTabs.length) {
+    await createNoteTab({ focus: false });
+  }
+}
+
+async function ensureNotesReady() {
+  if (!state.workspaceOpen || !state.activeProfile) return;
+  if (!state.noteTabs.length) await createNoteTab({ focus: true });
+  else {
+    renderNoteTabs();
+    renderNotes();
+    el.notesBody.focus();
+  }
+}
+
+async function createNoteTab(options: { focus?: boolean } = {}) {
+  if (!state.workspaceOpen || !state.activeProfile) return null;
+  const tab: NoteTabState = {
+    id: crypto.randomUUID(),
+    path: newNotePath(),
+    title: 'Quick note',
+    content: '',
+    dirty: true,
+    saving: false
+  };
+  state.noteTabs.push(tab);
+  state.activeNoteTabId = tab.id;
+  renderNoteTabs();
+  renderNotes();
+  scheduleNoteSave(tab, 0);
+  saveActiveWorkspaceSnapshot();
+  if (options.focus !== false) el.notesBody.focus();
+  return tab;
+}
+
+function activeNoteTab() {
+  return state.noteTabs.find((tab) => tab.id === state.activeNoteTabId) ?? null;
+}
+
+function activateNoteTab(id: string) {
+  void saveActiveNoteNow();
+  state.activeNoteTabId = id;
+  renderNoteTabs();
+  renderNotes();
+  saveActiveWorkspaceSnapshot();
+  el.notesBody.focus();
+}
+
+function closeNoteTab(id: string) {
+  const tab = state.noteTabs.find((item) => item.id === id);
+  if (tab) void saveNoteTabNow(tab);
+  const timer = noteSaveTimers.get(id);
+  if (timer) window.clearTimeout(timer);
+  noteSaveTimers.delete(id);
+  state.noteTabs = state.noteTabs.filter((item) => item.id !== id);
+  if (state.activeNoteTabId === id) state.activeNoteTabId = state.noteTabs[0]?.id ?? '';
+  renderNoteTabs();
+  renderNotes();
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderNoteTabs() {
+  el.notesTabs.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (const tab of state.noteTabs) {
+    const row = document.createElement('div');
+    row.className = `widget-tab${tab.id === state.activeNoteTabId ? ' active' : ''}`;
+    const label = document.createElement('button');
+    label.className = 'widget-tab-label';
+    label.title = tab.path;
+    label.textContent = `${noteTabLabel(tab)}${tab.dirty ? ' *' : ''}`;
+    label.addEventListener('click', () => activateNoteTab(tab.id));
+    const close = document.createElement('button');
+    close.className = 'widget-tab-close';
+    close.textContent = 'x';
+    close.title = 'Close note tab';
+    close.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeNoteTab(tab.id);
+    });
+    row.append(label, close);
+    fragment.append(row);
+  }
+  el.notesTabs.append(fragment);
+}
+
+function renderNotes() {
+  const tab = activeNoteTab();
+  el.notesBody.disabled = !tab;
+  el.notesBody.value = tab?.content ?? '';
+  el.notesPath.textContent = tab ? noteRelativePath(tab.path) : 'Notes are saved under .vibe-ide-temp/notes in this workspace.';
+  renderNoteStatus();
+}
+
+function handleNoteInput() {
+  const tab = activeNoteTab();
+  if (!tab) return;
+  tab.content = el.notesBody.value;
+  tab.dirty = true;
+  tab.title = noteTabLabel(tab);
+  renderNoteTabs();
+  renderNoteStatus();
+  scheduleNoteSave(tab, 650);
+}
+
+function scheduleNoteSave(tab: NoteTabState, delayMs: number) {
+  const existing = noteSaveTimers.get(tab.id);
+  if (existing) window.clearTimeout(existing);
+  noteSaveTimers.set(tab.id, window.setTimeout(() => {
+    noteSaveTimers.delete(tab.id);
+    void saveNoteTabNow(tab);
+  }, delayMs));
+}
+
+async function saveActiveNoteNow() {
+  const tab = activeNoteTab();
+  if (tab) await saveNoteTabNow(tab);
+}
+
+async function saveAllDirtyNotes() {
+  await Promise.all(state.noteTabs.map((tab) => saveNoteTabNow(tab)));
+}
+
+async function saveNoteTabNow(tab: NoteTabState) {
+  const timer = noteSaveTimers.get(tab.id);
+  if (timer) window.clearTimeout(timer);
+  noteSaveTimers.delete(tab.id);
+  if (!state.activeProfile || !tab.dirty && tab.lastSavedAt) return;
+  const content = tab.content;
+  tab.saving = true;
+  renderNoteStatus();
+  try {
+    await api.writeTextFile(state.activeProfile.id, tab.path, content);
+    tab.saving = false;
+    tab.lastSavedAt = Date.now();
+    if (tab.content === content) tab.dirty = false;
+    renderNoteTabs();
+    renderNoteStatus();
+  } catch (error) {
+    tab.saving = false;
+    tab.dirty = true;
+    renderNoteStatus(`Save failed: ${String(error)}`, true);
+  }
+}
+
+function renderNoteStatus(message?: string, danger = false) {
+  const tab = activeNoteTab();
+  el.notesStatus.classList.toggle('danger', danger);
+  if (message) {
+    el.notesStatus.textContent = message;
+  } else if (!tab) {
+    el.notesStatus.textContent = 'No note';
+  } else if (tab.saving) {
+    el.notesStatus.textContent = 'Saving...';
+  } else if (tab.dirty) {
+    el.notesStatus.textContent = 'Unsaved';
+  } else {
+    el.notesStatus.textContent = tab.lastSavedAt ? `Saved ${new Date(tab.lastSavedAt).toLocaleTimeString()}` : 'Autosaved';
+  }
+}
+
+function newNotePath() {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+  return joinProfilePath(workspaceBaseDir(), NOTES_DIR, `note-${stamp}-${state.noteTabs.length + 1}.txt`);
+}
+
+function workspaceBaseDir() {
+  return state.workspaceRoot || state.currentDir || state.activeProfile?.root || '.';
+}
+
+function joinProfilePath(base: string, ...parts: string[]) {
+  const sep = state.activeProfile?.kind === 'windows' ? '\\' : '/';
+  let prefix = base || '.';
+  if (/^[A-Za-z]:[\\/]?$/.test(prefix)) prefix = prefix.slice(0, 2);
+  else prefix = prefix.replace(/[\\/]+$/, '');
+  const cleanParts = parts
+    .flatMap((part) => part.split(/[\\/]+/))
+    .filter(Boolean);
+  return [prefix, ...cleanParts].join(sep);
+}
+
+function noteTabLabel(tab: NoteTabState) {
+  const firstLine = tab.content.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  if (firstLine) return firstLine.slice(0, 40);
+  return tab.title || noteTitleFromPath(tab.path);
+}
+
+function noteTitleFromPath(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop()?.replace(/\.txt$/i, '') || 'Quick note';
+}
+
+function noteRelativePath(path: string) {
+  const marker = `${NOTES_DIR}/`;
+  const normalized = path.replace(/\\/g, '/');
+  const index = normalized.indexOf(marker);
+  return index >= 0 ? normalized.slice(index) : noteTitleFromPath(path);
+}
+
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   state.browserTabs = Array.isArray(snapshot.browserTabs) ? snapshot.browserTabs : [];
   state.activeBrowserTabId = '';
@@ -1202,6 +1481,17 @@ function bindEvents() {
   el.editorOpenNewTab.addEventListener('change', () => {
     state.editorOpenInNewTab = el.editorOpenNewTab.checked;
     saveActiveWorkspaceSnapshot();
+  });
+  el.notesNewTab.addEventListener('click', () => {
+    void createNoteTab({ focus: true });
+  });
+  el.notesBody.addEventListener('input', handleNoteInput);
+  el.notesBody.addEventListener('blur', () => void saveActiveNoteNow());
+  el.notesBody.addEventListener('keydown', (event) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 's') return;
+    event.preventDefault();
+    event.stopPropagation();
+    void saveActiveNoteNow();
   });
   el.imageNewTab.addEventListener('click', () => {
     createImageTab(undefined, true);
@@ -1399,6 +1689,7 @@ async function createWindowsShell() {
 function handleEditorSaveShortcut(event: KeyboardEvent) {
   if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
   if (event.key.toLowerCase() !== 's') return;
+  if (event.target instanceof Element && event.target.closest('.notes-panel')) return;
   if (!state.openFile) return;
 
   event.preventDefault();
@@ -1631,6 +1922,7 @@ function focusableWidgets(): WidgetFocusItem[] {
     if (pane && widget.element.isConnected) items.push({ kind: 'terminal', pane, element: widget.element });
   }
   addPanelFocusItem(items, 'editor');
+  addPanelFocusItem(items, 'notes');
   addPanelFocusItem(items, 'image');
   addPanelFocusItem(items, 'browser');
   return items;
@@ -1679,6 +1971,8 @@ function focusWidget(item: WidgetFocusItem) {
     el.fileList.focus();
   } else if (item.id === 'editor' && codeView) {
     codeView.focus();
+  } else if (item.id === 'notes') {
+    el.notesBody.focus();
   } else if (item.id === 'browser') {
     el.previewUrl.focus();
   } else {
@@ -1764,6 +2058,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     bringPanelToFront(panel);
     pinPanelToWorkspace(panel);
     setKeyboardResizeTarget({ kind: 'panel', id });
+    if (id === 'notes' && !restoringWorkspace) void ensureNotesReady();
     codeView?.requestMeasure();
   } else if (keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
     setKeyboardResizeTarget({ kind: 'ide' });
@@ -1779,7 +2074,7 @@ function resetFloatingLayout() {
     panel.style.width = '';
     panel.style.height = '';
     panel.style.zIndex = '';
-    setPanelVisible(id, true);
+    setPanelVisible(id, DEFAULT_PANEL_VISIBILITY[id]);
   }
   codeView?.requestMeasure();
   saveActiveWorkspaceSnapshot();
@@ -2081,6 +2376,7 @@ async function switchWorkspace(path: string) {
     setStatus('Select a profile first', true);
     return;
   }
+  await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot();
   state.workspaceRoot = path;
   state.currentDir = path;
@@ -2095,6 +2391,7 @@ async function switchWorkspace(path: string) {
 }
 
 async function closeWorkspace() {
+  await saveAllDirtyNotes();
   state.workspaceCaptureProtected = false;
   await applyWorkspaceCaptureProtection(false, { quiet: true });
   state.activeProfile = null;
@@ -2154,6 +2451,12 @@ function clearWorkspacePanels() {
   state.imageTabs = [];
   state.activeImageTabId = '';
   ensureImageTab();
+  for (const timer of noteSaveTimers.values()) window.clearTimeout(timer);
+  noteSaveTimers.clear();
+  state.noteTabs = [];
+  state.activeNoteTabId = '';
+  renderNoteTabs();
+  renderNotes();
   state.previewUrl = '';
   state.forwards = [];
   state.detectedPorts = [];
@@ -2192,7 +2495,7 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
 
   if (!options.preserveVisibility) {
     for (const id of FLOATING_PANELS) {
-      setPanelVisible(id, open, { skipSave: true });
+      setPanelVisible(id, open && DEFAULT_PANEL_VISIBILITY[id], { skipSave: true });
     }
   }
   if (!open) setKeyboardResizeTarget({ kind: 'ide' });

@@ -27,6 +27,7 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, 로컬 Windows shell을 빠르게 오
 - workspace tab 저장/복원: profile, root, panel 위치, 크기, 열린 editor/image/browser/shell context 저장
 - Explorer, Editor, Image Preview, Browser, Terminal widget 이동/리사이즈/스냅 지원
 - Terminal widget 내부 shell tab 지원
+- workspace별 sticky-note 스타일 Notes 패널과 자동 저장되는 메모 탭
 - Codex, Claude, Grok, Antigravity launcher 버튼
 - secure env editor: env류 파일을 masked key-value editor로 열고, 새 key 추가 가능
 - image paste: workspace temp attachment 폴더에 이미지 저장 후 active shell에 `@...` tag 입력
@@ -196,6 +197,13 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - Image Preview에 포커스가 있을 때 `Ctrl+V`는 clipboard image를 새 attachment/history item으로 저장하고 shell에 tag를 붙여넣습니다.
 - `Auto paste to shell`은 외부에서 처음 이미지를 가져올 때 active shell에 tag를 자동 입력할지 결정합니다.
 
+### Notes
+
+- Notes 패널은 editor와 별도의 빠른 메모장입니다.
+- workspace별로 여러 note tab을 만들 수 있고, 입력 내용은 자동 저장됩니다.
+- 메모는 현재 workspace 아래 `.vibe-ide-temp/notes/*.txt`에 저장됩니다.
+- workspace를 다시 열면 열려 있던 note tab과 Notes 패널 상태가 복원됩니다.
+
 ### Browser와 port forwarding
 
 - terminal output에서 `http://localhost:3000` 같은 local server URL을 감지합니다.
@@ -298,6 +306,7 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Workspace tabs that restore profile, root, panel positions, sizes, and open context
 - Movable, resizable, snapping Explorer, Editor, Image Preview, Browser, and Terminal widgets
 - Shell tabs inside each terminal widget
+- Workspace-level sticky-note style Notes panel with autosaved note tabs
 - Launcher buttons for Codex, Claude, Grok, and Antigravity
 - Secure env editor for masked env-style files, including adding new keys while values stay masked
 - Image paste into workspace-local temp attachments, with `@...` tags inserted into the active shell
@@ -466,6 +475,13 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 - When Image Preview is focused, `Ctrl+C` copies the current preview image.
 - When Image Preview is focused, `Ctrl+V` saves the clipboard image as a new attachment/history item and pastes its tag into the shell.
 - `Auto paste to shell` controls whether externally imported images automatically paste their tags into the active shell.
+
+### Notes
+
+- The Notes panel is a quick scratchpad separate from the code editor.
+- Each workspace can have multiple note tabs, and note text autosaves while you type.
+- Notes are stored as `.vibe-ide-temp/notes/*.txt` inside the current workspace.
+- Reopening a workspace restores open note tabs and the Notes panel state.
 
 ### Browser And Port Forwarding
 
