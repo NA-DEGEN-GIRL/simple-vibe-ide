@@ -98,6 +98,23 @@ kept with the repository.
   stopping it.
 - Checked the screenshot manually for private paths, secrets, and user data.
 
+### 2026-05-21 - Launcher polish
+
+#### Changed
+
+- README now includes collapsible Korean and English sections for public users.
+- LLM launchers inspect aliases, functions, and readable wrapper scripts before
+  appending approval-bypass flags, so wrapped commands do not receive duplicate
+  flags.
+- New LLM terminal sessions open taller, and terminal widgets keep a larger
+  minimum height so Codex, Claude, Grok, and Antigravity panes do not start in a
+  cramped broken-looking state.
+
+#### Verification
+
+- Frontend type check passed with TypeScript.
+- Frontend production build passed with Vite.
+
 ### 2026-05-21 - Windows IDE usability pass
 
 #### Added
@@ -120,8 +137,8 @@ kept with the repository.
   widgets or tabs are opened.
 - Separate Windows PowerShell launcher that starts in an app-owned temporary
   folder instead of a user home directory.
-- LLM launch buttons with default unsafe-approval bypass flags for Codex and
-  Claude, plus equivalent bypass mode where supported by Grok.
+- LLM launch buttons with approval-bypass defaults for Codex and Claude, plus
+  equivalent bypass mode where supported by Grok.
 - Browser tabs, hard refresh, local URL loading, port-only loading, device
   presets for desktop/mobile/tablet preview, and an optional console pane.
 - Automatic local/WSL port discovery and proxy setup for detected development

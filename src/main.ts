@@ -223,13 +223,60 @@ type CreateTerminalOptions = {
   focus?: boolean;
   profile?: ConnectionProfile;
   cwd?: string;
+  initialHeight?: number;
 };
 
-const LLM_LAUNCHERS: Record<string, string> = {
-  codex: 'codex --dangerously-bypass-approvals-and-sandbox --enable goals',
-  claude: 'claude --dangerously-skip-permissions',
-  grok: 'grok --permission-mode bypassPermissions',
-  antigravity: 'antigravity'
+type LlmLauncherFlag = {
+  bashPattern: string;
+  powershellPattern: string;
+  args: string[];
+};
+
+type LlmLauncherConfig = {
+  executable: string;
+  flags: LlmLauncherFlag[];
+};
+
+const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
+  codex: {
+    executable: 'codex',
+    flags: [
+      {
+        bashPattern: '*--dangerously-bypass-approvals-and-sandbox*',
+        powershellPattern: '--dangerously-bypass-approvals-and-sandbox',
+        args: ['--dangerously-bypass-approvals-and-sandbox']
+      },
+      {
+        bashPattern: '*--enable[[:space:]]goals*|*--enable=goals*',
+        powershellPattern: '--enable\\s+goals|--enable=goals',
+        args: ['--enable', 'goals']
+      }
+    ]
+  },
+  claude: {
+    executable: 'claude',
+    flags: [
+      {
+        bashPattern: '*--dangerously-skip-permissions*',
+        powershellPattern: '--dangerously-skip-permissions',
+        args: ['--dangerously-skip-permissions']
+      }
+    ]
+  },
+  grok: {
+    executable: 'grok',
+    flags: [
+      {
+        bashPattern: '*--permission-mode*|*bypassPermissions*',
+        powershellPattern: '--permission-mode|bypassPermissions',
+        args: ['--permission-mode', 'bypassPermissions']
+      }
+    ]
+  },
+  antigravity: {
+    executable: 'antigravity',
+    flags: []
+  }
 };
 
 const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser'];
@@ -1275,7 +1322,54 @@ async function resolveSelectedRoot() {
 }
 
 function launchLlm(id: string) {
-  createTerminal(LLM_LAUNCHERS[id] ?? id, id);
+  createTerminal(llmLauncherCommand(id), id, { initialHeight: 420 });
+}
+
+function llmLauncherCommand(id: string) {
+  const launcher = LLM_LAUNCHERS[id];
+  if (!launcher) return id;
+  return state.activeProfile?.kind === 'windows'
+    ? powershellLlmLauncherCommand(launcher)
+    : bashLlmLauncherCommand(launcher);
+}
+
+function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
+  const executable = launcher.executable;
+  return [
+    `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
+    `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
+    'if [ -n "$__svi_path" ] && [ -f "$__svi_path" ] && [ -r "$__svi_path" ]; then',
+    '  __svi_source="$__svi_source',
+    "$(head -c 4096 \"$__svi_path\" 2>/dev/null | tr -cd '\\011\\012\\015\\040-\\176')\"",
+    'fi',
+    '__svi_args=()',
+    ...launcher.flags.map((flag) =>
+      `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`
+    ),
+    `${executable} "\${__svi_args[@]}"`
+  ].join('\n');
+}
+
+function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
+  const executable = launcher.executable;
+  return [
+    `$sviSource = (Get-Command ${executable} -All -ErrorAction SilentlyContinue | Format-List * | Out-String)`,
+    `$sviPath = (Get-Command ${executable} -ErrorAction SilentlyContinue).Source`,
+    'if ($sviPath -and (Test-Path -LiteralPath $sviPath -PathType Leaf)) { $sviSource += "`n" + ((Get-Content -LiteralPath $sviPath -TotalCount 80 -ErrorAction SilentlyContinue) -join "`n") }',
+    '$sviArgs = @()',
+    ...launcher.flags.map((flag) =>
+      `if ($sviSource -notmatch ${powershellQuote(flag.powershellPattern)}) { $sviArgs += @(${flag.args.map(powershellQuote).join(', ')}) }`
+    ),
+    `& ${executable} @sviArgs`
+  ].join('\n');
+}
+
+function bashQuote(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function powershellQuote(value: string) {
+  return `'${value.replace(/'/g, `''`)}'`;
 }
 
 async function createWindowsShell() {
@@ -1482,7 +1576,7 @@ function terminalMinWidth() {
 }
 
 function terminalMinHeight() {
-  return window.matchMedia('(max-width: 900px)').matches ? 180 : 220;
+  return window.matchMedia('(max-width: 900px)').matches ? 220 : 280;
 }
 
 function setKeyboardResizeTarget(target: ResizeTarget) {
@@ -3555,7 +3649,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   el.mainGrid.append(card);
   const grip = ensureTerminalResizeGrip(card);
   if (options.rect) applyLayoutRatio(card, options.rect);
-  else placeTerminalCard(card);
+  else placeTerminalCard(card, options);
 
   const widget: TerminalWidget = {
     widgetId,
@@ -3848,12 +3942,13 @@ async function pasteTerminalText(pane: TerminalPane, text?: string) {
   }
 }
 
-function placeTerminalCard(card: HTMLElement) {
+function placeTerminalCard(card: HTMLElement, options: CreateTerminalOptions = {}) {
   const workspaceRect = el.mainGrid.getBoundingClientRect();
   const guideRect = el.terminalGrid.getBoundingClientRect();
   const index = state.terminalWidgets.length;
   const width = clamp(guideRect.width || 620, terminalMinWidth(), Math.max(terminalMinWidth(), el.mainGrid.clientWidth - 16));
-  const height = clamp(300, terminalMinHeight(), Math.max(terminalMinHeight(), el.mainGrid.clientHeight - 16));
+  const preferredHeight = options.initialHeight ?? 340;
+  const height = clamp(preferredHeight, terminalMinHeight(), Math.max(terminalMinHeight(), el.mainGrid.clientHeight - 16));
   const offset = index * 22;
   const rect = clampPanelRect(card, {
     left: guideRect.left - workspaceRect.left + offset,
