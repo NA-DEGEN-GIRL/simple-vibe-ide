@@ -80,6 +80,22 @@ interface BrowserConsoleLog {
   message: string;
 }
 
+interface MarketTickerConfig {
+  id: string;
+  label: string;
+  symbol: string;
+  removable?: boolean;
+}
+
+interface MarketTickerQuote {
+  symbol: string;
+  price: number | null;
+  changePercent: number | null;
+  updatedAt: number;
+  status: 'loading' | 'live' | 'stale' | 'error';
+  message?: string;
+}
+
 interface CalculatorHistoryItem {
   id: string;
   expression: string;
@@ -323,6 +339,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   calculator: false
 };
 const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
+const MARKET_TICKER_STORE_KEY = 'simple-vibe-ide.marketTicker.v1';
 const NOTES_DIR = '.vibe-ide-temp/notes';
 const NOTE_THEMES: Array<{ id: NoteThemeId; label: string }> = [
   { id: 'default', label: 'Default' },
@@ -350,6 +367,16 @@ const BROWSER_DEVICE_PRESETS: BrowserDevicePreset[] = [
   { id: 'ipad-pro-11', label: 'iPad Pro 11', width: 834, height: 1194, kind: 'tablet' },
   { id: 'surface-pro-7', label: 'Surface Pro 7', width: 912, height: 1368, kind: 'tablet' }
 ];
+const DEFAULT_MARKET_TICKERS: MarketTickerConfig[] = [
+  { id: 'btc', label: 'BTC', symbol: 'BTCUSDT' },
+  { id: 'nas100', label: 'NAS100', symbol: 'QQQUSDT' }
+];
+const MARKET_TICKER_WS_URL = 'wss://fstream.binance.com/market/stream?streams=';
+const MARKET_TICKER_REST_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=';
+const MARKET_TICKER_BOOT_DELAY_MS = 1200;
+const MARKET_TICKER_FALLBACK_MS = 30000;
+const MARKET_TICKER_STALE_MS = 45000;
+const MARKET_TICKER_MAX_CUSTOM = 1;
 
 const state = {
   profiles: [] as ConnectionProfile[],
@@ -405,6 +432,9 @@ const state = {
   calculatorExpression: '',
   calculatorResult: '',
   calculatorHistory: [] as CalculatorHistoryItem[],
+  marketTickers: [] as MarketTickerConfig[],
+  marketQuotes: new Map<string, MarketTickerQuote>(),
+  marketTickerConnected: false,
   showFileSizes: true
 };
 
@@ -425,6 +455,11 @@ const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
 const noteSaveTimers = new Map<string, number>();
+let marketTickerSocket: WebSocket | null = null;
+let marketTickerReconnectTimer = 0;
+let marketTickerFallbackTimer = 0;
+let marketTickerRenderFrame = 0;
+let marketTickerReconnectAttempt = 0;
 let fileOpenToken = 0;
 let activeExplorerRename: {
   path: string;
@@ -488,6 +523,11 @@ app.innerHTML = `
       <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
       <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
       <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
+      <div id="market-ticker" class="market-ticker" title="Binance USD-M Futures ticker">
+        <div id="market-ticker-list" class="market-ticker-list" aria-live="polite"></div>
+        <input id="market-symbol-input" spellcheck="false" placeholder="ETHUSDT" title="Add one Binance USD-M symbol" />
+        <button id="market-add-symbol" title="Add ticker symbol">+</button>
+      </div>
     </section>
     <main class="main-grid">
       <aside class="explorer panel floating-panel hidden" data-panel="explorer">
@@ -639,6 +679,9 @@ const el = {
   newShell: document.querySelector<HTMLButtonElement>('#new-shell')!,
   newWindowsShell: document.querySelector<HTMLButtonElement>('#new-windows-shell')!,
   resetLayout: document.querySelector<HTMLButtonElement>('#reset-layout')!,
+  marketTickerList: document.querySelector<HTMLDivElement>('#market-ticker-list')!,
+  marketSymbolInput: document.querySelector<HTMLInputElement>('#market-symbol-input')!,
+  marketAddSymbol: document.querySelector<HTMLButtonElement>('#market-add-symbol')!,
   mainGrid: document.querySelector<HTMLElement>('.main-grid')!,
   newFile: document.querySelector<HTMLButtonElement>('#new-file')!,
   newFolder: document.querySelector<HTMLButtonElement>('#new-folder')!,
@@ -751,6 +794,7 @@ async function init() {
 
   state.profiles = await api.listProfiles();
   loadWorkspaceStore();
+  loadMarketTickerConfig();
   ensureEditorTab();
   ensureImageTab();
   renderProfiles();
@@ -765,6 +809,7 @@ async function init() {
   renderBrowserDeviceOptions();
   renderCalculatorKeys();
   renderCalculator();
+  renderMarketTicker();
   setBrowserMode('desktop');
   setBrowserConsolePosition(state.browserConsolePosition);
   setBrowserConsoleVisible(false);
@@ -776,6 +821,7 @@ async function init() {
   selectProfile('');
   setWorkspaceOpen(false);
   setStatus('Ready');
+  window.setTimeout(startMarketTicker, MARKET_TICKER_BOOT_DELAY_MS);
   void loadWslProfilesInBackground();
 }
 
@@ -828,6 +874,275 @@ function persistWorkspaceStore() {
   };
   localStorage.setItem(WORKSPACE_STORE_KEY, JSON.stringify(store));
   renderWorkspaceTabs();
+}
+
+function loadMarketTickerConfig() {
+  state.marketTickers = DEFAULT_MARKET_TICKERS.map((item) => ({ ...item }));
+  try {
+    const parsed = JSON.parse(localStorage.getItem(MARKET_TICKER_STORE_KEY) ?? '') as { custom?: unknown };
+    if (!Array.isArray(parsed.custom)) return;
+    const custom = parsed.custom
+      .map((item) => normalizeMarketSymbol(String(item ?? '')))
+      .filter((symbol) => symbol && !state.marketTickers.some((ticker) => ticker.symbol === symbol))
+      .slice(0, MARKET_TICKER_MAX_CUSTOM);
+    for (const symbol of custom) {
+      state.marketTickers.push({ id: `custom-${symbol.toLowerCase()}`, label: displaySymbol(symbol), symbol, removable: true });
+    }
+  } catch {
+    localStorage.removeItem(MARKET_TICKER_STORE_KEY);
+  }
+}
+
+function persistMarketTickerConfig() {
+  const custom = state.marketTickers
+    .filter((ticker) => ticker.removable)
+    .map((ticker) => ticker.symbol)
+    .slice(0, MARKET_TICKER_MAX_CUSTOM);
+  localStorage.setItem(MARKET_TICKER_STORE_KEY, JSON.stringify({ custom }));
+}
+
+function renderMarketTicker() {
+  el.marketTickerList.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (const ticker of state.marketTickers) {
+    const quote = state.marketQuotes.get(ticker.symbol) ?? {
+      symbol: ticker.symbol,
+      price: null,
+      changePercent: null,
+      updatedAt: 0,
+      status: 'loading' as const
+    };
+    const item = document.createElement('div');
+    item.className = `market-chip ${marketTrendClass(quote)}`;
+    item.title = marketTickerTitle(ticker, quote);
+
+    const label = document.createElement('span');
+    label.className = 'market-label';
+    label.textContent = ticker.label;
+
+    const price = document.createElement('span');
+    price.className = 'market-price';
+    price.textContent = formatMarketPrice(quote.price);
+
+    const change = document.createElement('span');
+    change.className = 'market-change';
+    change.textContent = formatMarketChange(quote.changePercent);
+
+    item.append(label, price, change);
+    if (ticker.removable) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'market-remove';
+      remove.title = `Remove ${ticker.symbol}`;
+      remove.textContent = 'x';
+      remove.addEventListener('click', () => removeMarketTicker(ticker.symbol));
+      item.append(remove);
+    }
+    fragment.append(item);
+  }
+  el.marketTickerList.append(fragment);
+
+  const customCount = state.marketTickers.filter((ticker) => ticker.removable).length;
+  const canAdd = customCount < MARKET_TICKER_MAX_CUSTOM;
+  el.marketSymbolInput.classList.toggle('hidden', !canAdd);
+  el.marketAddSymbol.classList.toggle('hidden', !canAdd);
+  el.marketSymbolInput.disabled = !canAdd;
+  el.marketAddSymbol.disabled = !canAdd;
+}
+
+function marketTickerTitle(ticker: MarketTickerConfig, quote: MarketTickerQuote) {
+  const source = ticker.symbol === 'QQQUSDT' && ticker.label === 'NAS100'
+    ? 'Nasdaq-100 proxy via Binance USD-M QQQUSDT'
+    : `Binance USD-M ${ticker.symbol}`;
+  const status = quote.status === 'live'
+    ? `updated ${new Date(quote.updatedAt).toLocaleTimeString()}`
+    : quote.message || quote.status;
+  return `${source} - ${status}`;
+}
+
+function marketTrendClass(quote: MarketTickerQuote) {
+  const stale = quote.status === 'stale' || quote.status === 'error';
+  if (quote.changePercent === null || quote.status === 'loading') return stale ? 'stale' : 'flat';
+  if (quote.changePercent > 0) return stale ? 'up stale' : 'up';
+  if (quote.changePercent < 0) return stale ? 'down stale' : 'down';
+  return stale ? 'flat stale' : 'flat';
+}
+
+function scheduleMarketTickerRender() {
+  if (marketTickerRenderFrame) return;
+  marketTickerRenderFrame = window.requestAnimationFrame(() => {
+    marketTickerRenderFrame = 0;
+    renderMarketTicker();
+  });
+}
+
+function startMarketTicker() {
+  fetchMarketTickerSnapshot();
+  connectMarketTickerSocket();
+}
+
+function restartMarketTicker() {
+  if (marketTickerReconnectTimer) window.clearTimeout(marketTickerReconnectTimer);
+  if (marketTickerSocket) marketTickerSocket.close();
+  marketTickerSocket = null;
+  marketTickerReconnectAttempt = 0;
+  startMarketTicker();
+}
+
+function connectMarketTickerSocket() {
+  const streams = state.marketTickers
+    .map((ticker) => `${ticker.symbol.toLowerCase()}@ticker`)
+    .join('/');
+  if (!streams) return;
+  try {
+    const socket = new WebSocket(`${MARKET_TICKER_WS_URL}${streams}`);
+    marketTickerSocket = socket;
+    socket.addEventListener('open', () => {
+      if (socket !== marketTickerSocket) return;
+      state.marketTickerConnected = true;
+      marketTickerReconnectAttempt = 0;
+      scheduleMarketTickerRender();
+    });
+    socket.addEventListener('message', (event) => {
+      if (socket !== marketTickerSocket) return;
+      handleMarketTickerMessage(event.data);
+    });
+    socket.addEventListener('close', () => {
+      if (socket !== marketTickerSocket) return;
+      state.marketTickerConnected = false;
+      markMarketQuotesStale();
+      scheduleMarketTickerReconnect();
+    });
+    socket.addEventListener('error', () => {
+      if (socket !== marketTickerSocket) return;
+      state.marketTickerConnected = false;
+      socket.close();
+    });
+  } catch {
+    state.marketTickerConnected = false;
+    markMarketQuotesStale();
+    scheduleMarketTickerReconnect();
+  }
+}
+
+function scheduleMarketTickerReconnect() {
+  if (marketTickerReconnectTimer) window.clearTimeout(marketTickerReconnectTimer);
+  const delay = Math.min(60000, 2500 * 2 ** Math.min(marketTickerReconnectAttempt, 5));
+  marketTickerReconnectAttempt += 1;
+  marketTickerReconnectTimer = window.setTimeout(connectMarketTickerSocket, delay);
+}
+
+function handleMarketTickerMessage(raw: unknown) {
+  try {
+    const payload = JSON.parse(String(raw)) as { data?: Record<string, unknown> };
+    const data = payload.data ?? payload as Record<string, unknown>;
+    const symbol = String(data.s ?? '').toUpperCase();
+    if (!symbol || !state.marketTickers.some((ticker) => ticker.symbol === symbol)) return;
+    updateMarketQuote(symbol, Number(data.c), Number(data.P), 'live');
+  } catch {
+    // Ignore malformed market packets; the next ticker update arrives independently.
+  }
+}
+
+function updateMarketQuote(symbol: string, price: number, changePercent: number, status: MarketTickerQuote['status'], message?: string) {
+  state.marketQuotes.set(symbol, {
+    symbol,
+    price: Number.isFinite(price) ? price : null,
+    changePercent: Number.isFinite(changePercent) ? changePercent : null,
+    updatedAt: Date.now(),
+    status,
+    message
+  });
+  scheduleMarketTickerRender();
+}
+
+async function fetchMarketTickerSnapshot() {
+  if (marketTickerFallbackTimer) window.clearTimeout(marketTickerFallbackTimer);
+  const tickers = state.marketTickers.slice();
+  await Promise.allSettled(tickers.map(async (ticker) => {
+    try {
+      const response = await fetch(`${MARKET_TICKER_REST_URL}${encodeURIComponent(ticker.symbol)}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json() as { lastPrice?: string; priceChangePercent?: string };
+      updateMarketQuote(ticker.symbol, Number(data.lastPrice), Number(data.priceChangePercent), state.marketTickerConnected ? 'live' : 'stale');
+    } catch (error) {
+      markMarketQuoteError(ticker.symbol, String(error));
+    }
+  }));
+  marketTickerFallbackTimer = window.setTimeout(fetchMarketTickerSnapshot, MARKET_TICKER_FALLBACK_MS);
+}
+
+function markMarketQuotesStale() {
+  for (const ticker of state.marketTickers) {
+    const quote = state.marketQuotes.get(ticker.symbol);
+    if (!quote) continue;
+    const status = Date.now() - quote.updatedAt > MARKET_TICKER_STALE_MS ? 'stale' : quote.status;
+    state.marketQuotes.set(ticker.symbol, { ...quote, status });
+  }
+  scheduleMarketTickerRender();
+}
+
+function markMarketQuoteError(symbol: string, message: string) {
+  const existing = state.marketQuotes.get(symbol);
+  if (existing && existing.price !== null) {
+    state.marketQuotes.set(symbol, { ...existing, status: 'stale', message });
+  } else {
+    state.marketQuotes.set(symbol, {
+      symbol,
+      price: null,
+      changePercent: null,
+      updatedAt: Date.now(),
+      status: 'error',
+      message
+    });
+  }
+  scheduleMarketTickerRender();
+}
+
+function addMarketTickerFromInput() {
+  const symbol = normalizeMarketSymbol(el.marketSymbolInput.value);
+  if (!symbol) {
+    el.marketSymbolInput.focus();
+    return;
+  }
+  if (state.marketTickers.some((ticker) => ticker.symbol === symbol)) {
+    el.marketSymbolInput.value = '';
+    return;
+  }
+  if (state.marketTickers.filter((ticker) => ticker.removable).length >= MARKET_TICKER_MAX_CUSTOM) return;
+  state.marketTickers.push({ id: `custom-${symbol.toLowerCase()}`, label: displaySymbol(symbol), symbol, removable: true });
+  el.marketSymbolInput.value = '';
+  persistMarketTickerConfig();
+  renderMarketTicker();
+  restartMarketTicker();
+}
+
+function removeMarketTicker(symbol: string) {
+  state.marketTickers = state.marketTickers.filter((ticker) => ticker.symbol !== symbol || !ticker.removable);
+  state.marketQuotes.delete(symbol);
+  persistMarketTickerConfig();
+  renderMarketTicker();
+  restartMarketTicker();
+}
+
+function normalizeMarketSymbol(value: string) {
+  return value.trim().replace(/[^a-z0-9]/gi, '').toUpperCase().slice(0, 24);
+}
+
+function displaySymbol(symbol: string) {
+  return symbol.endsWith('USDT') && symbol.length > 4 ? symbol.slice(0, -4) : symbol;
+}
+
+function formatMarketPrice(price: number | null) {
+  if (price === null) return '--';
+  const maximumFractionDigits = price >= 1000 ? 1 : price >= 100 ? 2 : price >= 1 ? 4 : 8;
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits }).format(price);
+}
+
+function formatMarketChange(change: number | null) {
+  if (change === null) return '--';
+  const sign = change > 0 ? '+' : '';
+  return `${sign}${change.toFixed(2)}%`;
 }
 
 function isWorkspaceSnapshot(value: unknown): value is WorkspaceSnapshot {
@@ -1885,6 +2200,13 @@ function bindEvents() {
     else void createTerminal(null, 'shell');
   });
   el.newWindowsShell.addEventListener('click', () => void createWindowsShell());
+  el.marketAddSymbol.addEventListener('click', addMarketTickerFromInput);
+  el.marketSymbolInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    event.stopPropagation();
+    addMarketTickerFromInput();
+  });
   el.editorNewTab.addEventListener('click', () => {
     createEditorTab(null, true);
     renderEditor();
@@ -1992,6 +2314,9 @@ function bindEvents() {
       scheduleFitTerminalWidget(widget);
     });
     codeView?.requestMeasure();
+  });
+  window.addEventListener('beforeunload', () => {
+    if (marketTickerSocket) marketTickerSocket.close();
   });
 }
 

@@ -16,6 +16,24 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Market ticker
+
+#### Added
+
+- Added a lightweight top-toolbar market ticker for BTC and NAS100.
+- NAS100 is represented by the Binance USD-M `QQQUSDT` symbol because a stable
+  Binance `NAS100USDT` symbol is not available.
+- Users can add one extra Binance USD-M symbol from the toolbar.
+- Market data starts after the app shell is interactive, uses Binance USD-M
+  WebSocket ticker streams, and falls back to slow REST snapshots when the
+  socket is unavailable.
+
+#### Changed
+
+- Tauri CSP now allows only the Binance USD-M REST and WebSocket hosts needed by
+  the ticker.
+
+
 ### 2026-05-21 - Calculator keys and note theme tabs
 
 #### Changed

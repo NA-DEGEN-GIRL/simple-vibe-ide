@@ -25,6 +25,7 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, 로컬 Windows shell을 빠르게 오
 - 기본 Windows titlebar 없는 frameless UI와 앱 내부 최소화/최대화/닫기 버튼
 - 처음 실행 시 빈 workspace로 시작해서 사용자가 명시적으로 폴더/profile을 열기 전에는 아무 것도 열지 않음
 - workspace tab 저장/복원: profile, root, panel 위치, 크기, 열린 editor/image/browser/shell context 저장
+- 상단 market ticker: Binance USD-M WebSocket 기반 BTC와 NAS100 proxy 표시, custom Binance symbol 1개 추가 가능
 - Explorer, Editor, Image Preview, Browser, Terminal widget 이동/리사이즈/스냅 지원
 - Terminal widget 내부 shell tab 지원
 - workspace별 sticky-note 스타일 Notes 패널, always-on-top pin, tab별 테마, 자동 저장되는 메모 탭
@@ -137,6 +138,14 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - 전체 IDE scale을 바꾸고 싶으면 상단 titlebar 쪽을 focus target으로 둔 상태에서 조절합니다.
 - 새 shell widget이나 shell tab은 다른 widget 아래에 묻히지 않도록 앞으로 올라옵니다.
 - `+shell`, Windows shell, Codex/Claude/Grok/Antigravity 버튼으로 새 terminal widget을 열 때는 workspace별 마지막 terminal 크기를 기억해서 다시 사용합니다.
+
+### Market ticker
+
+- 상단 toolbar 오른쪽에 BTC와 NAS100 ticker가 표시됩니다.
+- NAS100은 Binance USD-M의 `QQQUSDT`를 proxy로 사용합니다.
+- 가격과 24시간 등락률은 Binance USD-M Futures WebSocket으로 갱신하고, WebSocket이 끊기면 느린 REST snapshot으로 fallback합니다.
+- 추가로 Binance USD-M symbol 1개를 직접 입력해 볼 수 있습니다.
+- ticker는 앱 초기화 뒤에 늦게 시작되며, 실패해도 editor, terminal, browser 작업을 막지 않습니다.
 
 ### Explorer
 
@@ -317,6 +326,7 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Frameless window with in-app minimize, maximize/restore, and close controls
 - Empty first launch until the user explicitly opens a local, WSL, or SSH workspace
 - Workspace tabs that restore profile, root, panel positions, sizes, and open context
+- Top market ticker for BTC and a NAS100 proxy via Binance USD-M WebSocket, plus one custom Binance symbol
 - Movable, resizable, snapping Explorer, Editor, Image Preview, Browser, and Terminal widgets
 - Shell tabs inside each terminal widget
 - Workspace-level sticky-note style Notes panel with always-on-top pinning, per-tab themes, and autosaved note tabs
@@ -429,6 +439,14 @@ WSL profiles are loaded in the background after the first screen is interactive.
 - To scale the whole IDE, focus the top titlebar area first.
 - New shell widgets and shell tabs are brought to the front automatically.
 - New terminal widgets opened from `+shell`, Windows shell, or Codex/Claude/Grok/Antigravity buttons reuse the last terminal size saved for that workspace.
+
+### Market Ticker
+
+- The top toolbar shows BTC and NAS100 tickers on the right.
+- NAS100 uses Binance USD-M `QQQUSDT` as a proxy.
+- Price and 24h change update through Binance USD-M Futures WebSocket, with a slow REST snapshot fallback when the socket drops.
+- You can add one extra Binance USD-M symbol manually.
+- The ticker starts after the app shell is interactive and does not block editor, terminal, or browser work if it fails.
 
 ### Explorer
 
