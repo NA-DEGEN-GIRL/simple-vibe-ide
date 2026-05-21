@@ -1361,7 +1361,7 @@ function renderNoteTabs() {
   const fragment = document.createDocumentFragment();
   for (const tab of state.noteTabs) {
     const row = document.createElement('div');
-    row.className = `widget-tab${tab.id === state.activeNoteTabId ? ' active' : ''}`;
+    row.className = `widget-tab note-tab note-tab-${tab.theme}${tab.id === state.activeNoteTabId ? ' active' : ''}`;
     const label = document.createElement('button');
     label.className = 'widget-tab-label';
     label.title = tab.path;
@@ -1569,27 +1569,118 @@ function renderCalculator() {
 }
 
 function handleCalculatorButton(key: string) {
-  if (key === '⌫') {
-    state.calculatorExpression = state.calculatorExpression.slice(0, -1);
-  } else if (key === '=') {
-    evaluateCalculator({ commit: true });
-    return;
-  } else {
-    state.calculatorExpression += key;
-  }
-  renderCalculator();
-  saveActiveWorkspaceSnapshot();
+  applyCalculatorInput(key === '⌫' ? 'backspace' : key);
   el.calculatorExpression.focus();
 }
 
 function handleCalculatorKey(event: KeyboardEvent) {
-  if (event.key === 'Enter') {
-    event.preventDefault();
-    evaluateCalculator({ commit: true });
-  } else if (event.key === 'Escape') {
-    event.preventDefault();
-    clearCalculator();
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const action = calculatorKeyAction(event);
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  applyCalculatorInput(action, document.activeElement === el.calculatorExpression);
+}
+
+function handleCalculatorGlobalKey(event: KeyboardEvent) {
+  if (event.target === el.calculatorExpression) return;
+  if (!isCalculatorKeyboardTarget(event.target)) return;
+  handleCalculatorKey(event);
+}
+
+function isCalculatorKeyboardTarget(target: EventTarget | null) {
+  const calculator = getPanel('calculator');
+  if (calculator.classList.contains('hidden')) return false;
+  if (target instanceof Element && target.closest('input, textarea, select, .terminal-card, .cm-editor')
+    && !calculator.contains(target)) {
+    return false;
   }
+  return keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'calculator'
+    || target instanceof Node && calculator.contains(target);
+}
+
+function calculatorKeyAction(event: KeyboardEvent) {
+  if (event.code.startsWith('Numpad')) {
+    if (/^Numpad\d$/.test(event.code)) return event.code.slice(-1);
+    const map: Record<string, string> = {
+      NumpadDecimal: event.key === 'Delete' ? 'delete' : '.',
+      NumpadAdd: '+',
+      NumpadSubtract: '-',
+      NumpadMultiply: '*',
+      NumpadDivide: '/',
+      NumpadEnter: '='
+    };
+    return map[event.code] ?? null;
+  }
+  if (/^[0-9]$/.test(event.key)) return event.key;
+  if (['+', '-', '*', '/', '.', '(', ')', '%'].includes(event.key)) return event.key;
+  if (event.key === 'Enter') return '=';
+  if (event.key === 'Backspace') return 'backspace';
+  if (event.key === 'Delete') return 'delete';
+  if (event.key === 'Escape') return 'clear';
+  return null;
+}
+
+function applyCalculatorInput(action: string, inputFocused = false) {
+  if (action === '=') {
+    evaluateCalculator({ commit: true });
+    return;
+  }
+  if (action === 'clear') {
+    clearCalculator();
+    return;
+  }
+  if (action === 'backspace') {
+    editCalculatorExpression('backspace', inputFocused);
+    return;
+  }
+  if (action === 'delete') {
+    if (inputFocused) editCalculatorExpression('delete', true);
+    else editCalculatorExpression('backspace', false);
+    return;
+  }
+  editCalculatorExpression(action, inputFocused);
+}
+
+function editCalculatorExpression(action: string, inputFocused: boolean) {
+  const value = state.calculatorExpression;
+  const start = inputFocused ? el.calculatorExpression.selectionStart ?? value.length : value.length;
+  const end = inputFocused ? el.calculatorExpression.selectionEnd ?? start : start;
+  let next = value;
+  let caret = start;
+
+  if (action === 'backspace') {
+    if (start !== end) {
+      next = value.slice(0, start) + value.slice(end);
+      caret = start;
+    } else if (start > 0) {
+      next = value.slice(0, start - 1) + value.slice(end);
+      caret = start - 1;
+    }
+  } else if (action === 'delete') {
+    if (start !== end) {
+      next = value.slice(0, start) + value.slice(end);
+    } else {
+      next = value.slice(0, start) + value.slice(start + 1);
+    }
+    caret = start;
+  } else {
+    next = value.slice(0, start) + action + value.slice(end);
+    caret = start + action.length;
+  }
+
+  setCalculatorExpression(next, caret);
+}
+
+function setCalculatorExpression(value: string, caret = value.length) {
+  state.calculatorExpression = value;
+  el.calculatorExpression.value = value;
+  updateCalculatorPreview();
+  saveActiveWorkspaceSnapshot();
+  el.calculatorExpression.focus();
+  requestAnimationFrame(() => {
+    el.calculatorExpression.setSelectionRange(caret, caret);
+  });
 }
 
 function clearCalculator() {
@@ -1605,6 +1696,7 @@ function updateCalculatorPreview() {
   if (!expression) {
     state.calculatorResult = '0';
     el.calculatorResult.textContent = '0';
+    el.calculatorResult.classList.remove('error');
     return;
   }
   try {
@@ -1891,6 +1983,7 @@ function bindEvents() {
   document.addEventListener('keydown', handleResizeShortcut, true);
   document.addEventListener('keydown', handleWidgetFocusShortcut, true);
   document.addEventListener('keydown', handleExplorerKeyboard, true);
+  document.addEventListener('keydown', handleCalculatorGlobalKey, true);
   document.addEventListener('mousedown', handleExplorerMouseNavigation, true);
   window.addEventListener('resize', () => {
     FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));

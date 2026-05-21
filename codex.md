@@ -16,6 +16,20 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-21 - Calculator keys and note theme tabs
+
+#### Changed
+
+- Notes theme colors are now previewed on each note tab.
+- The active Notes theme applies only below the tab bar, leaving the panel title
+  and tab strip in the default IDE chrome.
+
+#### Fixed
+
+- Calculator keyboard input now accepts the number row, numpad digits and
+  operators, `Enter`/`NumpadEnter`, `Backspace`, and `Delete`.
+
+
 ### 2026-05-21 - Explorer clipboard paste
 
 #### Added

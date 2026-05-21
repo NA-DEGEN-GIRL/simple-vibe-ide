@@ -205,6 +205,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - workspace별로 여러 note tab을 만들 수 있고, 입력 내용은 자동 저장됩니다.
 - Pin을 켜면 Notes 패널이 다른 IDE 위젯 위에 고정됩니다.
 - 각 note tab은 Default, Sticky, Mint, Rose, Paper 테마를 따로 선택할 수 있습니다.
+- 테마 색상은 각 note tab에서 미리 보이고, 선택된 테마는 tab bar 아래 메모 영역에만 적용됩니다.
 - 메모는 현재 workspace 아래 `.vibe-ide-temp/notes/*.txt`에 저장됩니다.
 - workspace를 다시 열면 열려 있던 note tab과 Notes 패널 상태가 복원됩니다.
 
@@ -212,6 +213,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 
 - Calculator 패널은 workspace 안에서 빠르게 계산할 수 있는 간단한 계산기입니다.
 - 사칙연산, 괄호, `%` 연산을 지원합니다.
+- 숫자열과 넘버패드, `Enter`/`NumpadEnter`, `Backspace`, `Delete` 입력을 지원합니다.
 - 계산 history는 workspace snapshot에 저장됩니다.
 - Calculator에 포커스가 있을 때 `Ctrl` + `+`, `Ctrl` + `-`는 계산기 글자 크기를 조절합니다.
 
@@ -495,6 +497,7 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 - Each workspace can have multiple note tabs, and note text autosaves while you type.
 - Pin keeps the Notes panel above other IDE widgets.
 - Each note tab can use its own Default, Sticky, Mint, Rose, or Paper theme.
+- Theme colors are previewed on each note tab, while the selected theme only applies below the tab bar.
 - Notes are stored as `.vibe-ide-temp/notes/*.txt` inside the current workspace.
 - Reopening a workspace restores open note tabs and the Notes panel state.
 
@@ -502,6 +505,7 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 
 - The Calculator panel is a small in-workspace calculator for quick arithmetic.
 - It supports basic arithmetic, parentheses, and `%`.
+- It accepts the number row, numpad keys, `Enter`/`NumpadEnter`, `Backspace`, and `Delete`.
 - Calculation history is stored with the workspace snapshot.
 - When Calculator is focused, `Ctrl` + `+` and `Ctrl` + `-` resize calculator text.
 
