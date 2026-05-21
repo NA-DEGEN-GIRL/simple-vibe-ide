@@ -4824,14 +4824,20 @@ function renderEditor() {
         row.append(key, input, reveal);
         form.append(row);
       } else {
-        const raw = document.createElement('textarea');
+        const raw = document.createElement('div');
         raw.className = 'secure-raw-line';
-        raw.value = line.original;
-        raw.rows = 1;
+        raw.textContent = line.original || ' ';
+        raw.contentEditable = 'true';
         raw.spellcheck = false;
         raw.addEventListener('input', () => {
-          line.original = raw.value;
+          line.original = raw.textContent ?? '';
           markDirty();
+        });
+        raw.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            raw.blur();
+          }
         });
         form.append(raw);
       }

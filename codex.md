@@ -16,6 +16,15 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Secure editor plain comment lines
+
+#### Changed
+
+- Secure env editor raw/comment lines now render like plain text lines instead
+  of boxed textareas.
+- Raw/comment lines remain directly editable in place.
+
+
 ### 2026-05-22 - Workspace terminals, settings, and editor polish
 
 #### Added
