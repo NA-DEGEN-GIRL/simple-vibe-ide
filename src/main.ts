@@ -26,6 +26,8 @@ interface TerminalPane {
   element: HTMLElement;
   host: HTMLElement;
   outputBuffer: string;
+  cwdOutputBuffer: string;
+  inputBuffer: string;
   seenPorts: Set<number>;
   fitFrame?: number;
   lastRows?: number;
@@ -105,7 +107,7 @@ interface FontChoice {
   stack: string;
 }
 
-type EditorThemeId = 'simple-dark' | 'deep-contrast' | 'soft-slate' | 'warm-terminal';
+type EditorThemeId = 'simple-dark' | 'deep-contrast' | 'soft-slate' | 'warm-terminal' | 'solarized-dark';
 
 interface EditorThemeChoice {
   id: EditorThemeId;
@@ -146,6 +148,10 @@ interface TextFileCacheEntry {
 interface EditorTabState {
   id: string;
   file: OpenFileState | null;
+  pendingPath?: string;
+  pendingRawMode?: boolean;
+  pendingProfileId?: string;
+  loading?: boolean;
 }
 
 interface ImageTabState {
@@ -227,6 +233,7 @@ interface WorkspaceSnapshot {
   editorTabs: EditorTabSnapshot[];
   activeEditorTabId: string;
   editorOpenInNewTab: boolean;
+  editorWordWrap: boolean;
   imageTabs: ImageTabSnapshot[];
   activeImageTabId: string;
   imageOpenInNewTab: boolean;
@@ -256,6 +263,16 @@ interface WorkspaceStore {
   version: 1;
   activeId: string;
   workspaces: WorkspaceSnapshot[];
+}
+
+interface WorkspaceRuntimeCache {
+  editorTabs: EditorTabState[];
+  activeEditorTabId: string;
+  browserTabs: BrowserTab[];
+  activeBrowserTabId: string;
+  previewUrl: string;
+  previewProxies: PortForwardResult[];
+  browserConsoleLogs: BrowserConsoleLog[];
 }
 
 interface EditorRuntime {
@@ -380,11 +397,13 @@ const NOTE_THEMES: Array<{ id: NoteThemeId; label: string }> = [
 const PANEL_SNAP_DISTANCE = 14;
 const WIDGET_KEYBOARD_SCALE = 1.1;
 const TERMINAL_PORT_SCAN_LIMIT = 4000;
+const TERMINAL_CWD_SCAN_LIMIT = 6000;
 const EXPLORER_TYPEAHEAD_TIMEOUT_MS = 900;
 const EXPLORER_WATCH_LOCAL_MS = 2500;
 const EXPLORER_WATCH_WSL_MS = 3500;
 const EXPLORER_WATCH_SSH_MS = 7000;
 const EXPLORER_WATCH_MAX_DIRS = 12;
+const EXPLORER_DIRECTORY_CACHE_LIMIT = 48;
 const NOTES_AUTOSAVE_DELAY_MS = 1800;
 const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
@@ -426,114 +445,182 @@ const MONO_FONT_CHOICES: FontChoice[] = [
 const EDITOR_THEME_CHOICES: EditorThemeChoice[] = [
   {
     id: 'simple-dark',
-    label: 'Simple Dark',
+    label: 'VS Code Dark',
     vars: {
-      '--cm-bg': '#0a0f18',
-      '--cm-text': '#dfe8f4',
-      '--cm-gutter-bg': '#0b1019',
-      '--cm-gutter-text': '#7c8da3',
-      '--cm-border': '#1d2635',
-      '--cm-active-line': 'rgba(77, 141, 255, 0.16)',
-      '--cm-active-gutter-bg': '#1b2d4a',
-      '--cm-active-gutter-text': '#f8fbff',
-      '--cm-caret': '#f8fbff',
-      '--cm-selection': 'rgba(91, 149, 255, 0.36)',
-      '--cm-focus': 'rgba(77, 141, 255, 0.34)',
-      '--cm-comment': '#8fa0b5',
-      '--cm-keyword': '#8ab4ff',
-      '--cm-string': '#9fe6a0',
-      '--cm-number': '#ffd37a',
-      '--cm-variable': '#dfe8f4',
-      '--cm-definition': '#91c9ff',
-      '--cm-type': '#c9a7ff',
-      '--cm-property': '#8bd3ff',
-      '--cm-operator': '#f2a7d8',
-      '--cm-punctuation': '#aebbd0',
-      '--cm-invalid': '#ff8a8a'
+      '--cm-bg': '#1e1e1e',
+      '--cm-text': '#d4d4d4',
+      '--cm-gutter-bg': '#181818',
+      '--cm-gutter-text': '#858585',
+      '--cm-border': '#30363d',
+      '--cm-active-line': 'rgba(45, 95, 145, 0.32)',
+      '--cm-active-gutter-bg': '#263850',
+      '--cm-active-gutter-text': '#ffffff',
+      '--cm-caret': '#f8f8f0',
+      '--cm-selection': 'rgba(38, 79, 120, 0.72)',
+      '--cm-focus': 'rgba(0, 122, 204, 0.48)',
+      '--cm-comment': '#6a9955',
+      '--cm-keyword': '#569cd6',
+      '--cm-string': '#ce9178',
+      '--cm-number': '#b5cea8',
+      '--cm-variable': '#9cdcfe',
+      '--cm-definition': '#dcdcaa',
+      '--cm-type': '#4ec9b0',
+      '--cm-property': '#9cdcfe',
+      '--cm-operator': '#d4d4d4',
+      '--cm-punctuation': '#808080',
+      '--cm-constant': '#4fc1ff',
+      '--cm-regexp': '#d16969',
+      '--cm-escape': '#d7ba7d',
+      '--cm-meta': '#c586c0',
+      '--cm-heading': '#4ec9b0',
+      '--cm-link': '#3794ff',
+      '--cm-inserted': '#b5cea8',
+      '--cm-deleted': '#f48771',
+      '--cm-invalid': '#f48771'
     }
   },
   {
     id: 'deep-contrast',
-    label: 'Deep Contrast',
+    label: 'Tokyo Night',
     vars: {
-      '--cm-bg': '#05080d',
-      '--cm-text': '#f0f6ff',
-      '--cm-gutter-bg': '#080d14',
-      '--cm-gutter-text': '#92a6c0',
-      '--cm-border': '#2b3a52',
-      '--cm-active-line': 'rgba(102, 180, 255, 0.2)',
-      '--cm-active-gutter-bg': '#203858',
-      '--cm-active-gutter-text': '#ffffff',
-      '--cm-caret': '#ffffff',
-      '--cm-selection': 'rgba(126, 194, 255, 0.42)',
-      '--cm-focus': 'rgba(126, 194, 255, 0.46)',
-      '--cm-comment': '#a8b7ca',
-      '--cm-keyword': '#9bc8ff',
-      '--cm-string': '#b5f0a5',
-      '--cm-number': '#ffe08a',
-      '--cm-variable': '#f0f6ff',
-      '--cm-definition': '#9ee8ff',
-      '--cm-type': '#d9b7ff',
-      '--cm-property': '#9edcff',
-      '--cm-operator': '#ffaddf',
-      '--cm-punctuation': '#d2dbea',
-      '--cm-invalid': '#ff9a9a'
+      '--cm-bg': '#1a1b26',
+      '--cm-text': '#c0caf5',
+      '--cm-gutter-bg': '#16161e',
+      '--cm-gutter-text': '#565f89',
+      '--cm-border': '#2f3549',
+      '--cm-active-line': 'rgba(41, 46, 66, 0.88)',
+      '--cm-active-gutter-bg': '#24283b',
+      '--cm-active-gutter-text': '#c0caf5',
+      '--cm-caret': '#c0caf5',
+      '--cm-selection': 'rgba(55, 63, 90, 0.85)',
+      '--cm-focus': 'rgba(122, 162, 247, 0.42)',
+      '--cm-comment': '#565f89',
+      '--cm-keyword': '#bb9af7',
+      '--cm-string': '#9ece6a',
+      '--cm-number': '#ff9e64',
+      '--cm-variable': '#c0caf5',
+      '--cm-definition': '#7aa2f7',
+      '--cm-type': '#2ac3de',
+      '--cm-property': '#73daca',
+      '--cm-operator': '#89ddff',
+      '--cm-punctuation': '#a9b1d6',
+      '--cm-constant': '#ff9e64',
+      '--cm-regexp': '#b4f9f8',
+      '--cm-escape': '#e0af68',
+      '--cm-meta': '#f7768e',
+      '--cm-heading': '#7dcfff',
+      '--cm-link': '#7aa2f7',
+      '--cm-inserted': '#9ece6a',
+      '--cm-deleted': '#f7768e',
+      '--cm-invalid': '#ff757f'
     }
   },
   {
     id: 'soft-slate',
-    label: 'Soft Slate',
+    label: 'GitHub Dark',
     vars: {
-      '--cm-bg': '#111820',
-      '--cm-text': '#d8e2ed',
-      '--cm-gutter-bg': '#0e151d',
-      '--cm-gutter-text': '#8192a6',
-      '--cm-border': '#243142',
-      '--cm-active-line': 'rgba(125, 161, 205, 0.16)',
-      '--cm-active-gutter-bg': '#223149',
-      '--cm-active-gutter-text': '#edf5ff',
-      '--cm-caret': '#e7f0ff',
-      '--cm-selection': 'rgba(132, 173, 220, 0.36)',
-      '--cm-focus': 'rgba(132, 173, 220, 0.34)',
-      '--cm-comment': '#98a7b8',
-      '--cm-keyword': '#9bbcff',
-      '--cm-string': '#a5d6a7',
-      '--cm-number': '#e6c986',
-      '--cm-variable': '#d8e2ed',
-      '--cm-definition': '#91d0e8',
-      '--cm-type': '#c5ace8',
-      '--cm-property': '#8fc8e8',
-      '--cm-operator': '#e7a5c7',
-      '--cm-punctuation': '#b6c2cf',
-      '--cm-invalid': '#ef8f8f'
+      '--cm-bg': '#0d1117',
+      '--cm-text': '#c9d1d9',
+      '--cm-gutter-bg': '#0b1016',
+      '--cm-gutter-text': '#6e7681',
+      '--cm-border': '#30363d',
+      '--cm-active-line': 'rgba(56, 139, 253, 0.12)',
+      '--cm-active-gutter-bg': '#161b22',
+      '--cm-active-gutter-text': '#f0f6fc',
+      '--cm-caret': '#f0f6fc',
+      '--cm-selection': 'rgba(56, 139, 253, 0.36)',
+      '--cm-focus': 'rgba(56, 139, 253, 0.38)',
+      '--cm-comment': '#8b949e',
+      '--cm-keyword': '#ff7b72',
+      '--cm-string': '#a5d6ff',
+      '--cm-number': '#79c0ff',
+      '--cm-variable': '#c9d1d9',
+      '--cm-definition': '#d2a8ff',
+      '--cm-type': '#ffa657',
+      '--cm-property': '#7ee787',
+      '--cm-operator': '#ff7b72',
+      '--cm-punctuation': '#8b949e',
+      '--cm-constant': '#79c0ff',
+      '--cm-regexp': '#a5d6ff',
+      '--cm-escape': '#ffa657',
+      '--cm-meta': '#d2a8ff',
+      '--cm-heading': '#7ee787',
+      '--cm-link': '#58a6ff',
+      '--cm-inserted': '#7ee787',
+      '--cm-deleted': '#ff7b72',
+      '--cm-invalid': '#ffa198'
     }
   },
   {
     id: 'warm-terminal',
-    label: 'Warm Terminal',
+    label: 'Monokai',
     vars: {
-      '--cm-bg': '#12100c',
-      '--cm-text': '#eee4d1',
-      '--cm-gutter-bg': '#0e0c09',
-      '--cm-gutter-text': '#a0927d',
-      '--cm-border': '#30281d',
-      '--cm-active-line': 'rgba(255, 190, 104, 0.14)',
-      '--cm-active-gutter-bg': '#332716',
-      '--cm-active-gutter-text': '#fff3d8',
-      '--cm-caret': '#fff2cc',
-      '--cm-selection': 'rgba(255, 190, 104, 0.34)',
-      '--cm-focus': 'rgba(255, 190, 104, 0.34)',
-      '--cm-comment': '#a99b86',
-      '--cm-keyword': '#ffbd7a',
-      '--cm-string': '#b8e38f',
-      '--cm-number': '#ffd37a',
-      '--cm-variable': '#eee4d1',
-      '--cm-definition': '#8fd8d2',
-      '--cm-type': '#d8b7ff',
-      '--cm-property': '#a7d7ff',
-      '--cm-operator': '#ffb1c8',
-      '--cm-punctuation': '#d5c8b5',
-      '--cm-invalid': '#ff8f8f'
+      '--cm-bg': '#272822',
+      '--cm-text': '#f8f8f2',
+      '--cm-gutter-bg': '#20211c',
+      '--cm-gutter-text': '#75715e',
+      '--cm-border': '#3e3d32',
+      '--cm-active-line': 'rgba(73, 72, 62, 0.86)',
+      '--cm-active-gutter-bg': '#3e3d32',
+      '--cm-active-gutter-text': '#f8f8f2',
+      '--cm-caret': '#f8f8f0',
+      '--cm-selection': 'rgba(73, 72, 62, 0.95)',
+      '--cm-focus': 'rgba(166, 226, 46, 0.34)',
+      '--cm-comment': '#75715e',
+      '--cm-keyword': '#f92672',
+      '--cm-string': '#e6db74',
+      '--cm-number': '#ae81ff',
+      '--cm-variable': '#f8f8f2',
+      '--cm-definition': '#a6e22e',
+      '--cm-type': '#66d9ef',
+      '--cm-property': '#a6e22e',
+      '--cm-operator': '#f92672',
+      '--cm-punctuation': '#f8f8f2',
+      '--cm-constant': '#ae81ff',
+      '--cm-regexp': '#fd971f',
+      '--cm-escape': '#fd971f',
+      '--cm-meta': '#66d9ef',
+      '--cm-heading': '#a6e22e',
+      '--cm-link': '#66d9ef',
+      '--cm-inserted': '#a6e22e',
+      '--cm-deleted': '#f92672',
+      '--cm-invalid': '#f92672'
+    }
+  },
+  {
+    id: 'solarized-dark',
+    label: 'Solarized Dark',
+    vars: {
+      '--cm-bg': '#002b36',
+      '--cm-text': '#839496',
+      '--cm-gutter-bg': '#00212b',
+      '--cm-gutter-text': '#586e75',
+      '--cm-border': '#073642',
+      '--cm-active-line': 'rgba(7, 54, 66, 0.92)',
+      '--cm-active-gutter-bg': '#073642',
+      '--cm-active-gutter-text': '#93a1a1',
+      '--cm-caret': '#93a1a1',
+      '--cm-selection': 'rgba(7, 54, 66, 0.96)',
+      '--cm-focus': 'rgba(38, 139, 210, 0.38)',
+      '--cm-comment': '#586e75',
+      '--cm-keyword': '#859900',
+      '--cm-string': '#2aa198',
+      '--cm-number': '#d33682',
+      '--cm-variable': '#93a1a1',
+      '--cm-definition': '#268bd2',
+      '--cm-type': '#b58900',
+      '--cm-property': '#cb4b16',
+      '--cm-operator': '#6c71c4',
+      '--cm-punctuation': '#657b83',
+      '--cm-constant': '#d33682',
+      '--cm-regexp': '#2aa198',
+      '--cm-escape': '#cb4b16',
+      '--cm-meta': '#6c71c4',
+      '--cm-heading': '#b58900',
+      '--cm-link': '#268bd2',
+      '--cm-inserted': '#859900',
+      '--cm-deleted': '#dc322f',
+      '--cm-invalid': '#dc322f'
     }
   }
 ];
@@ -570,6 +657,7 @@ const state = {
   editorTabs: [] as EditorTabState[],
   activeEditorTabId: '',
   editorOpenInNewTab: false,
+  editorWordWrap: false,
   terminalWidgets: [] as TerminalWidget[],
   terminals: [] as TerminalPane[],
   activePaneId: '',
@@ -626,9 +714,12 @@ const autoForwardingPorts = new Set<string>();
 const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
+const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
+const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
 const noteSaveTimers = new Map<string, number>();
 let explorerWatchTimer = 0;
 let explorerWatchInFlight = false;
+let terminalCwdSaveTimer = 0;
 let marketTickerSocket: WebSocket | null = null;
 let marketTickerReconnectTimer = 0;
 let marketTickerFallbackTimer = 0;
@@ -733,6 +824,7 @@ app.innerHTML = `
           <span id="editor-label">Editor</span>
           <span class="spacer"></span>
           <label class="tab-option" title="Open unknown files in a new editor tab"><input id="editor-open-new-tab" type="checkbox" /> New tab</label>
+          <label class="tab-option" title="Toggle editor word wrap"><input id="editor-word-wrap" type="checkbox" /> Wrap</label>
           <button id="editor-new-tab" class="panel-mode" title="New editor tab">+</button>
           <button id="toggle-raw" class="hidden">Raw</button>
           <button id="save-file" disabled>Save</button>
@@ -900,6 +992,7 @@ const el = {
   editorTabs: document.querySelector<HTMLDivElement>('#editor-tabs')!,
   editorNewTab: document.querySelector<HTMLButtonElement>('#editor-new-tab')!,
   editorOpenNewTab: document.querySelector<HTMLInputElement>('#editor-open-new-tab')!,
+  editorWordWrap: document.querySelector<HTMLInputElement>('#editor-word-wrap')!,
   editorLabel: document.querySelector<HTMLSpanElement>('#editor-label')!,
   editorBody: document.querySelector<HTMLDivElement>('#editor-body')!,
   saveFile: document.querySelector<HTMLButtonElement>('#save-file')!,
@@ -985,6 +1078,7 @@ async function init() {
     const pane = state.terminals.find((item) => item.backendId === event.payload.id);
     if (!pane) return;
     pane.term.write(event.payload.data);
+    trackTerminalCwdFromOutput(pane, event.payload.data);
     void scanTerminalOutputForPorts(pane, event.payload.data);
   });
   await listen<TerminalExitEvent>('terminal-exit', (event) => {
@@ -1489,12 +1583,20 @@ function renderWorkspaceTabs() {
           <rect x="3.5" y="7" width="9" height="7" rx="1.5"></rect>
         </svg>
       </button>
+      <button class="workspace-tab-copy" title="Copy workspace" aria-label="Copy workspace">copy</button>
       <button class="workspace-tab-close" title="Close workspace" aria-label="Close workspace">x</button>
     `;
+    tab.querySelectorAll<HTMLButtonElement>('button').forEach((button) => {
+      button.draggable = false;
+    });
     tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!.addEventListener('click', () => void activateWorkspaceTab(workspace.id));
     tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!.addEventListener('click', (event) => {
       event.stopPropagation();
       void toggleWorkspaceCaptureProtection(workspace.id);
+    });
+    tab.querySelector<HTMLButtonElement>('.workspace-tab-copy')!.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void copyWorkspaceTab(workspace.id);
     });
     tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -1513,28 +1615,48 @@ function renderWorkspaceTabs() {
     tab.addEventListener('dragover', (event) => {
       if (draggedWorkspaceId && draggedWorkspaceId !== workspace.id) {
         event.preventDefault();
-        tab.classList.add('drop-before');
+        const position = workspaceDropPosition(event, tab);
+        tab.classList.toggle('drop-before', position === 'before');
+        tab.classList.toggle('drop-after', position === 'after');
       }
     });
-    tab.addEventListener('dragleave', () => tab.classList.remove('drop-before'));
+    tab.addEventListener('dragleave', () => clearWorkspaceDropMarkers());
     tab.addEventListener('drop', (event) => {
       event.preventDefault();
-      tab.classList.remove('drop-before');
-      reorderWorkspaceTab(draggedWorkspaceId || event.dataTransfer?.getData('text/plain') || '', workspace.id);
+      const position = workspaceDropPosition(event, tab);
+      clearWorkspaceDropMarkers();
+      reorderWorkspaceTab(draggedWorkspaceId || event.dataTransfer?.getData('text/plain') || '', workspace.id, position);
     });
     fragment.append(tab);
   }
   el.workspaceTabs.append(fragment);
 }
 
-function reorderWorkspaceTab(sourceId: string, targetId: string) {
+function workspaceDropPosition(event: DragEvent, tab: HTMLElement): 'before' | 'after' {
+  const rect = tab.getBoundingClientRect();
+  return event.clientX < rect.left + rect.width / 2 ? 'before' : 'after';
+}
+
+function clearWorkspaceDropMarkers() {
+  el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab').forEach((tab) => {
+    tab.classList.remove('drop-before', 'drop-after');
+  });
+}
+
+function reorderWorkspaceTab(sourceId: string, targetId: string, position: 'before' | 'after' = 'before') {
   if (!sourceId || !targetId || sourceId === targetId) return;
   const sourceIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === sourceId);
-  const targetIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === targetId);
-  if (sourceIndex < 0 || targetIndex < 0) return;
+  if (sourceIndex < 0) return;
   const [item] = state.workspaceSnapshots.splice(sourceIndex, 1);
-  state.workspaceSnapshots.splice(targetIndex, 0, item);
+  const targetIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === targetId);
+  if (targetIndex < 0) {
+    state.workspaceSnapshots.push(item);
+  } else {
+    const insertIndex = position === 'after' ? targetIndex + 1 : targetIndex;
+    state.workspaceSnapshots.splice(insertIndex, 0, item);
+  }
   persistWorkspaceStore();
+  renderWorkspaceTabs();
 }
 
 async function toggleWorkspaceCaptureProtection(id: string) {
@@ -1598,18 +1720,72 @@ function delay(ms: number) {
 async function createBlankWorkspaceTab() {
   await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceRuntimeCache();
+  const previousId = state.activeWorkspaceId;
   const id = crypto.randomUUID();
-  state.activeWorkspaceId = id;
+  const insertIndex = previousId
+    ? state.workspaceSnapshots.findIndex((workspace) => workspace.id === previousId) + 1
+    : state.workspaceSnapshots.length;
   state.workspaceCaptureProtected = false;
-  state.workspaceSnapshots.unshift(blankWorkspaceSnapshot(id));
+  state.workspaceSnapshots.splice(clamp(insertIndex, 0, state.workspaceSnapshots.length), 0, blankWorkspaceSnapshot(id));
+  state.activeWorkspaceId = id;
   await closeWorkspace();
   persistWorkspaceStore();
   setStatus('New empty workspace');
 }
 
+async function copyWorkspaceTab(id: string) {
+  await saveAllDirtyNotes();
+  if (id === state.activeWorkspaceId) {
+    saveActiveWorkspaceSnapshot();
+    saveActiveWorkspaceRuntimeCache();
+  }
+  const sourceIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === id);
+  if (sourceIndex < 0) return;
+  const clone = cloneWorkspaceSnapshotForCopy(state.workspaceSnapshots[sourceIndex]);
+  state.workspaceSnapshots.splice(sourceIndex + 1, 0, clone);
+  state.activeWorkspaceId = clone.id;
+  persistWorkspaceStore();
+  if (!clone.profileId) {
+    await closeWorkspace();
+    state.workspaceCaptureProtected = Boolean(clone.captureProtected);
+    await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+    renderWorkspaceTabs();
+  } else {
+    await restoreWorkspaceSnapshot(clone);
+  }
+  setStatus(`Workspace copied: ${clone.label}`);
+}
+
+function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnapshot {
+  return {
+    ...source,
+    id: crypto.randomUUID(),
+    label: `${source.label} copy`,
+    updatedAt: new Date().toISOString(),
+    panels: cloneJson(source.panels),
+    terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
+    terminals: source.terminals.map((terminal) => ({ ...terminal, rect: terminal.rect ? { ...terminal.rect } : undefined })),
+    editorTabs: source.editorTabs.map((tab) => ({ ...tab })),
+    imageTabs: source.imageTabs.map((tab) => ({
+      ...tab,
+      history: tab.history.map((item) => ({ ...item }))
+    })),
+    noteTabs: source.noteTabs.map((tab) => ({ ...tab })),
+    browserTabs: source.browserTabs.map((tab) => ({ ...tab })),
+    calculatorHistory: source.calculatorHistory?.map((item) => ({ ...item })) ?? []
+  };
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 async function closeWorkspaceTab(id: string) {
   const wasActive = state.activeWorkspaceId === id;
+  if (wasActive) saveActiveWorkspaceRuntimeCache();
   await closeTerminalsForWorkspace(id);
+  removeWorkspaceRuntimeCache(id);
   state.workspaceSnapshots = state.workspaceSnapshots.filter((workspace) => workspace.id !== id);
   if (wasActive) {
     const next = state.workspaceSnapshots[0];
@@ -1636,6 +1812,7 @@ async function activateWorkspaceTab(id: string) {
   if (id === state.activeWorkspaceId && state.workspaceOpen) return;
   await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceRuntimeCache();
   const snapshot = state.workspaceSnapshots.find((workspace) => workspace.id === id);
   if (!snapshot) return;
   state.activeWorkspaceId = id;
@@ -1668,6 +1845,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     editorTabs: [],
     activeEditorTabId: '',
     editorOpenInNewTab: false,
+    editorWordWrap: false,
     imageTabs: [],
     activeImageTabId: '',
     imageOpenInNewTab: false,
@@ -1714,6 +1892,17 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
   const profile = state.activeProfile!;
   const workspaceTerminals = activeWorkspaceTerminalPanes();
   const activeTerminalIndex = Math.max(0, workspaceTerminals.findIndex((pane) => pane.paneId === state.activePaneId));
+  const editorTabs = state.editorTabs
+    .map((tab) => {
+      const path = tab.file?.path ?? tab.pendingPath;
+      if (!path) return null;
+      return {
+        id: tab.id,
+        path,
+        rawMode: tab.file?.rawMode ?? Boolean(tab.pendingRawMode)
+      };
+    })
+    .filter((tab): tab is EditorTabSnapshot => Boolean(tab));
   return {
     id,
     label: workspaceLabel(profile, state.workspaceRoot || state.currentDir || profile.root),
@@ -1734,11 +1923,10 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
       rect: elementLayoutRatio(pane.element)
     })),
     activeTerminalIndex,
-    editorTabs: state.editorTabs
-      .filter((tab) => tab.file)
-      .map((tab) => ({ id: tab.id, path: tab.file!.path, rawMode: tab.file!.rawMode })),
+    editorTabs,
     activeEditorTabId: state.activeEditorTabId,
     editorOpenInNewTab: state.editorOpenInNewTab,
+    editorWordWrap: state.editorWordWrap,
     imageTabs: state.imageTabs
       .filter((tab) => tab.dataUrl || tab.sourcePath)
       .map((tab) => ({
@@ -1795,6 +1983,59 @@ function activeWorkspaceSnapshot() {
   return state.workspaceSnapshots.find((workspace) => workspace.id === state.activeWorkspaceId);
 }
 
+function saveActiveWorkspaceRuntimeCache() {
+  if (!state.activeWorkspaceId || !state.workspaceOpen) return;
+  syncActiveEditorTabFromView();
+  workspaceRuntimeCache.set(state.activeWorkspaceId, {
+    editorTabs: cloneEditorTabs(state.editorTabs),
+    activeEditorTabId: state.activeEditorTabId,
+    browserTabs: state.browserTabs.map((tab) => ({ ...tab })),
+    activeBrowserTabId: state.activeBrowserTabId,
+    previewUrl: state.previewUrl,
+    previewProxies: state.previewProxies.map((proxy) => ({ ...proxy })),
+    browserConsoleLogs: state.browserConsoleLogs.slice(-200).map((log) => ({ ...log }))
+  });
+  hideBrowserFramesForWorkspace(state.activeWorkspaceId);
+}
+
+function restoreWorkspaceRuntimeCache(workspaceId: string) {
+  return workspaceRuntimeCache.get(workspaceId) ?? null;
+}
+
+function removeWorkspaceRuntimeCache(workspaceId: string) {
+  const cached = workspaceRuntimeCache.get(workspaceId);
+  if (cached) {
+    for (const proxy of cached.previewProxies) {
+      void api.stopPortForward(proxy.id).catch(() => undefined);
+    }
+  }
+  workspaceRuntimeCache.delete(workspaceId);
+  clearBrowserFrames(workspaceId);
+}
+
+function cloneEditorTabs(tabs: EditorTabState[]) {
+  return tabs.map((tab) => ({
+    id: tab.id,
+    file: tab.file ? cloneOpenFile(tab.file) : null,
+    pendingPath: tab.pendingPath,
+    pendingRawMode: tab.pendingRawMode,
+    pendingProfileId: tab.pendingProfileId,
+    loading: false
+  }));
+}
+
+function cloneOpenFile(file: OpenFileState): OpenFileState {
+  return {
+    path: file.path,
+    content: file.content,
+    draftContent: file.draftContent,
+    masked: file.masked,
+    rawMode: file.rawMode,
+    lines: file.lines.map((line) => ({ ...line })),
+    dirty: file.dirty
+  };
+}
+
 async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
   const profile = state.profiles.find((item) => item.id === snapshot.profileId) ?? null;
   if (!profile) {
@@ -1814,6 +2055,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.explorerOpenMode = snapshot.explorerOpenMode ?? 'single';
     state.showFileSizes = snapshot.showFileSizes ?? true;
     state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
+    state.editorWordWrap = Boolean(snapshot.editorWordWrap);
     state.imageOpenInNewTab = Boolean(snapshot.imageOpenInNewTab);
     state.notePinned = Boolean(snapshot.notePinned);
     noteOpacity = clamp(snapshot.noteOpacity || 100, 45, 100);
@@ -1836,21 +2078,30 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     el.rootInput.value = state.workspaceRoot;
     el.rootInput.placeholder = profile.kind === 'ssh' ? 'remote working directory' : 'working directory';
     el.editorOpenNewTab.checked = state.editorOpenInNewTab;
+    el.editorWordWrap.checked = state.editorWordWrap;
     el.imageOpenNewTab.checked = state.imageOpenInNewTab;
     updateExplorerOpenMode();
     updateExplorerFileSizeMode();
     await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
 
-    await openWorkspace(state.currentDir);
     setWorkspaceOpen(true, { preserveVisibility: true });
     restorePanelSnapshots(snapshot.panels);
+    renderCalculator();
+    refreshTitle();
+
+    const hasLiveTerminals = state.terminals.some((pane) => pane.workspaceId === snapshot.id);
+    if (hasLiveTerminals) {
+      await restoreWorkspaceTerminals(snapshot, profile);
+      await nextAnimationFrame();
+    }
+
+    await openWorkspace(state.currentDir);
     await restoreEditorTabs(snapshot);
     restoreImageTabs(snapshot);
     await restoreNoteTabs(snapshot);
     restoreBrowserState(snapshot);
-    renderCalculator();
 
-    await restoreWorkspaceTerminals(snapshot, profile);
+    if (!hasLiveTerminals) await restoreWorkspaceTerminals(snapshot, profile);
     refreshTitle();
     setStatus(`Workspace loaded: ${snapshot.label}`);
   } finally {
@@ -1910,24 +2161,26 @@ async function restoreWorkspaceTerminals(snapshot: WorkspaceSnapshot, profile: C
 }
 
 async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
-  state.editorTabs = [];
-  for (const tab of snapshot.editorTabs ?? []) {
-    const editorTab = createEditorTab(null, false, tab.id);
-    try {
-      const content = await api.readTextFile(snapshot.profileId, tab.path);
-      const masked = shouldMaskFile(tab.path);
-      editorTab.file = {
-        path: tab.path,
-        content,
-        masked,
-        rawMode: tab.rawMode,
-        lines: masked ? parseSecretLines(content) : [],
-        dirty: false
-      };
-    } catch {
-      editorTab.file = null;
-    }
+  const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
+  if (runtime?.editorTabs.length) {
+    state.editorTabs = cloneEditorTabs(runtime.editorTabs);
+    state.activeEditorTabId = state.editorTabs.some((tab) => tab.id === runtime.activeEditorTabId)
+      ? runtime.activeEditorTabId
+      : state.editorTabs[0].id;
+    state.openFile = activeEditorTab().file;
+    renderEditorTabs();
+    renderEditor();
+    return;
   }
+
+  state.editorTabs = (snapshot.editorTabs ?? []).map((tab) => ({
+    id: tab.id || crypto.randomUUID(),
+    file: null,
+    pendingPath: tab.path,
+    pendingRawMode: tab.rawMode,
+    pendingProfileId: snapshot.profileId,
+    loading: false
+  }));
   if (!state.editorTabs.length) createEditorTab(null, false);
   state.activeEditorTabId = state.editorTabs.some((tab) => tab.id === snapshot.activeEditorTabId)
     ? snapshot.activeEditorTabId
@@ -1935,6 +2188,63 @@ async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
   state.openFile = activeEditorTab().file;
   renderEditorTabs();
   renderEditor();
+  void hydrateVisibleEditorTab();
+  window.setTimeout(() => hydrateInactiveEditorTabs(), 80);
+}
+
+async function hydrateVisibleEditorTab() {
+  const tab = activeEditorTab();
+  await hydrateEditorTab(tab, true);
+}
+
+function hydrateInactiveEditorTabs() {
+  for (const tab of state.editorTabs) {
+    if (tab.id !== state.activeEditorTabId) void hydrateEditorTab(tab, false);
+  }
+}
+
+async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
+  if (!tab.pendingPath || !tab.pendingProfileId || tab.loading) return;
+  const workspaceId = state.activeWorkspaceId;
+  const path = tab.pendingPath;
+  const rawMode = Boolean(tab.pendingRawMode);
+  const profileId = tab.pendingProfileId;
+  tab.loading = true;
+  renderEditorTabs();
+  try {
+    const content = await readTextFileCached(profileId, path);
+    if (state.activeWorkspaceId !== workspaceId) return;
+    const liveTab = state.editorTabs.find((item) => item.id === tab.id);
+    if (!liveTab || liveTab.pendingPath !== path) return;
+    const masked = shouldMaskFile(path);
+    liveTab.file = {
+      path,
+      content,
+      masked,
+      rawMode,
+      lines: masked ? parseSecretLines(content) : [],
+      dirty: false
+    };
+    liveTab.pendingPath = undefined;
+    liveTab.pendingRawMode = undefined;
+    liveTab.pendingProfileId = undefined;
+    liveTab.loading = false;
+    if (renderWhenDone && state.activeEditorTabId === liveTab.id) {
+      state.openFile = liveTab.file;
+      renderEditor();
+    } else {
+      renderEditorTabs();
+    }
+    saveActiveWorkspaceSnapshot();
+  } catch {
+    if (state.activeWorkspaceId !== workspaceId) return;
+    const liveTab = state.editorTabs.find((item) => item.id === tab.id);
+    if (liveTab) {
+      liveTab.loading = false;
+      if (renderWhenDone && state.activeEditorTabId === liveTab.id) renderEditor();
+      else renderEditorTabs();
+    }
+  }
 }
 
 function restoreImageTabs(snapshot: WorkspaceSnapshot) {
@@ -1957,26 +2267,26 @@ function restoreImageTabs(snapshot: WorkspaceSnapshot) {
 }
 
 async function restoreNoteTabs(snapshot: WorkspaceSnapshot) {
-  state.noteTabs = [];
-  for (const tab of snapshot.noteTabs ?? []) {
-    if (!tab.path) continue;
-    let content = '';
-    try {
-      content = await api.readTextFile(snapshot.profileId, tab.path);
-    } catch {
-      content = '';
-    }
-    state.noteTabs.push({
-      id: tab.id || crypto.randomUUID(),
-      path: tab.path,
-      title: tab.title || noteTitleFromPath(tab.path),
-      theme: normalizeNoteTheme(tab.theme),
-      content,
-      dirty: false,
-      saving: false,
-      lastSavedAt: Date.now()
-    });
-  }
+  state.noteTabs = await Promise.all((snapshot.noteTabs ?? [])
+    .filter((tab) => Boolean(tab.path))
+    .map(async (tab) => {
+      let content = '';
+      try {
+        content = await api.readTextFile(snapshot.profileId, tab.path);
+      } catch {
+        content = '';
+      }
+      return {
+        id: tab.id || crypto.randomUUID(),
+        path: tab.path,
+        title: tab.title || noteTitleFromPath(tab.path),
+        theme: normalizeNoteTheme(tab.theme),
+        content,
+        dirty: false,
+        saving: false,
+        lastSavedAt: Date.now()
+      };
+    }));
   state.activeNoteTabId = state.noteTabs.some((tab) => tab.id === snapshot.activeNoteTabId)
     ? snapshot.activeNoteTabId
     : state.noteTabs[0]?.id ?? '';
@@ -2508,23 +2818,33 @@ function formatCalculatorResult(value: number) {
 }
 
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
-  state.browserTabs = Array.isArray(snapshot.browserTabs)
-    ? snapshot.browserTabs
+  const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
+  state.browserTabs = runtime?.browserTabs.length
+    ? runtime.browserTabs.map((tab) => ({ ...tab }))
+    : Array.isArray(snapshot.browserTabs)
+      ? snapshot.browserTabs
       .filter((tab) => tab && typeof tab.url === 'string')
       .map((tab) => ({ id: tab.id || makeBrowserTabId(), url: tab.url, label: tab.label || browserTabLabel(tab.url) }))
-    : [];
-  state.activeBrowserTabId = '';
+      : [];
+  state.previewProxies = runtime ? runtime.previewProxies.map((proxy) => ({ ...proxy })) : [];
+  state.browserConsoleLogs = runtime ? runtime.browserConsoleLogs.map((log) => ({ ...log })) : state.browserConsoleLogs;
+  state.activeBrowserTabId = runtime?.activeBrowserTabId ?? '';
+  state.previewUrl = runtime?.previewUrl ?? '';
   state.browserDeviceId = snapshot.browserDeviceId || DEFAULT_BROWSER_DEVICE_ID;
   state.browserOrientation = snapshot.browserOrientation || 'portrait';
   setBrowserConsolePosition(snapshot.browserConsolePosition || 'bottom');
   setBrowserConsoleVisible(Boolean(snapshot.browserConsoleVisible));
-  renderBrowserTabs();
-  if (state.browserTabs.length) {
-    const active = state.browserTabs.find((tab) => tab.id === snapshot.activeBrowserTabId) ?? state.browserTabs[0];
-    activateBrowserTab(active.id);
-  }
   if (state.browserDeviceId === 'desktop') setBrowserMode('desktop');
   else if (state.browserDeviceId) setBrowserDevice(state.browserDeviceId);
+  if (state.browserTabs.length) {
+    const active = state.browserTabs.find((tab) => tab.id === (runtime?.activeBrowserTabId || snapshot.activeBrowserTabId)) ?? state.browserTabs[0];
+    state.activeBrowserTabId = active.id;
+    state.previewUrl = active.url;
+    el.previewUrl.value = active.url;
+    if (!getPanel('browser').classList.contains('hidden')) activateBrowserTab(active.id);
+  }
+  renderBrowserTabs();
+  renderBrowserConsole();
 }
 
 function workspaceLabel(profile: ConnectionProfile, root: string) {
@@ -2591,6 +2911,11 @@ function bindEvents() {
   });
   el.editorOpenNewTab.addEventListener('change', () => {
     state.editorOpenInNewTab = el.editorOpenNewTab.checked;
+    saveActiveWorkspaceSnapshot();
+  });
+  el.editorWordWrap.addEventListener('change', () => {
+    state.editorWordWrap = el.editorWordWrap.checked;
+    renderEditor();
     saveActiveWorkspaceSnapshot();
   });
   el.notesNewTab.addEventListener('click', () => {
@@ -3263,6 +3588,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       void refreshExplorerTree({ silent: true });
       scheduleExplorerWatch();
     }
+    if (id === 'browser') ensureActiveBrowserFrame();
     codeView?.requestMeasure();
   } else if (keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
     setKeyboardResizeTarget({ kind: 'ide' });
@@ -3636,11 +3962,20 @@ async function switchWorkspace(path: string) {
   el.rootInput.value = path;
   if (!state.activeWorkspaceId) state.activeWorkspaceId = crypto.randomUUID();
   await closeTerminalsForWorkspace(state.activeWorkspaceId);
+  discardWorkspacePreviewRuntime(state.activeWorkspaceId);
   clearWorkspacePanels();
   await openWorkspace(path);
   setWorkspaceOpen(true);
   await createTerminal(null, 'shell');
   saveActiveWorkspaceSnapshot();
+}
+
+function discardWorkspacePreviewRuntime(workspaceId: string) {
+  for (const proxy of state.previewProxies) {
+    void api.stopPortForward(proxy.id).catch(() => undefined);
+  }
+  state.previewProxies = [];
+  removeWorkspaceRuntimeCache(workspaceId);
 }
 
 async function closeWorkspace(options: { killTerminals?: boolean } = {}) {
@@ -3750,9 +4085,6 @@ function clearWorkspacePanels() {
   state.calculatorResult = '';
   state.calculatorHistory = [];
   renderCalculator();
-  for (const proxy of state.previewProxies) {
-    void api.stopPortForward(proxy.id).catch(() => undefined);
-  }
   state.previewProxies = [];
   state.previewUrl = '';
   state.forwards = [];
@@ -3761,7 +4093,7 @@ function clearWorkspacePanels() {
   state.activeBrowserTabId = '';
   state.browserConsoleLogs = [];
   el.previewUrl.value = '';
-  clearBrowserFrames();
+  hideAllBrowserFrames();
   el.browserShell.classList.remove('has-preview');
   renderEditorTabs();
   renderImageTabs();
@@ -3801,21 +4133,65 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
   renderShellTabs();
 }
 
+function explorerDirectoryCacheKey(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  return `${workspaceId || 'workspace'}\0${profileId}\0${path}`;
+}
+
+function cloneExplorerEntries(entries: FileEntry[]) {
+  return entries.map((entry) => ({ ...entry }));
+}
+
+function cachedExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  const cached = explorerDirectoryCache.get(key);
+  if (!cached) return null;
+  explorerDirectoryCache.delete(key);
+  explorerDirectoryCache.set(key, cached);
+  return cloneExplorerEntries(cached.entries);
+}
+
+function cacheExplorerDirectory(profileId: string, path: string, entries: FileEntry[], workspaceId = state.activeWorkspaceId) {
+  const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  explorerDirectoryCache.delete(key);
+  explorerDirectoryCache.set(key, { entries: cloneExplorerEntries(entries), cachedAt: Date.now() });
+  while (explorerDirectoryCache.size > EXPLORER_DIRECTORY_CACHE_LIMIT) {
+    const oldest = explorerDirectoryCache.keys().next().value;
+    if (!oldest) break;
+    explorerDirectoryCache.delete(oldest);
+  }
+}
+
+function applyLoadedDirectory(path: string, entries: FileEntry[]) {
+  state.entries = cloneExplorerEntries(entries);
+  state.currentDir = path;
+  state.explorerExpanded = new Set([path]);
+  state.explorerChildren = new Map();
+  state.explorerLoading = new Set();
+  state.explorerSignatures = new Map([[path, explorerDirectorySignature(state.entries)]]);
+  state.explorerSelectedPath = '';
+  state.explorerTypeahead = '';
+  state.explorerTypeaheadAt = 0;
+  renderExplorer();
+  refreshTitle();
+}
+
 async function loadDirectory(path: string) {
   if (!state.activeProfile) return;
-  setStatus(`Loading ${path}...`);
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  const cached = cachedExplorerDirectory(profileId, path, workspaceId);
+  if (cached) {
+    applyLoadedDirectory(path, cached);
+    setStatus(`Refreshing ${path}...`);
+    saveActiveWorkspaceSnapshot();
+  } else {
+    setStatus(`Loading ${path}...`);
+  }
   try {
-    state.entries = await api.listDirectory(state.activeProfile.id, path);
-    state.currentDir = path;
-    state.explorerExpanded = new Set([path]);
-    state.explorerChildren = new Map();
-    state.explorerLoading = new Set();
-    state.explorerSignatures = new Map([[path, explorerDirectorySignature(state.entries)]]);
-    state.explorerSelectedPath = '';
-    state.explorerTypeahead = '';
-    state.explorerTypeaheadAt = 0;
-    renderExplorer();
-    refreshTitle();
+    const entries = await api.listDirectory(profileId, path);
+    cacheExplorerDirectory(profileId, path, entries, workspaceId);
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    applyLoadedDirectory(path, entries);
     setStatus('Directory loaded');
     saveActiveWorkspaceSnapshot();
   } catch (error) {
@@ -4410,6 +4786,7 @@ async function pollExplorerDirectories() {
     for (const path of explorerWatchPaths()) {
       try {
         const entries = await api.listDirectory(state.activeProfile.id, path);
+        cacheExplorerDirectory(state.activeProfile.id, path, entries);
         const signature = explorerDirectorySignature(entries);
         const previous = state.explorerSignatures.get(path);
         if (previous !== signature) {
@@ -4693,6 +5070,7 @@ function activateEditorTab(id: string) {
   state.openFile = tab.file;
   renderEditorTabs();
   renderEditor();
+  void hydrateVisibleEditorTab();
   saveActiveWorkspaceSnapshot();
 }
 
@@ -4715,11 +5093,12 @@ function closeEditorTab(id: string) {
 function renderEditorTabs() {
   el.editorTabs.innerHTML = '';
   el.editorOpenNewTab.checked = state.editorOpenInNewTab;
+  el.editorWordWrap.checked = state.editorWordWrap;
   const fragment = document.createDocumentFragment();
   for (const tab of state.editorTabs) {
     const item = document.createElement('div');
     item.className = `widget-tab${tab.id === state.activeEditorTabId ? ' active' : ''}`;
-    item.title = tab.file?.path ?? 'Empty editor';
+    item.title = tab.file?.path ?? tab.pendingPath ?? 'Empty editor';
     item.innerHTML = `<button class="widget-tab-label">${escapeHtml(editorTabLabel(tab))}</button><button class="widget-tab-close" title="Close editor tab" aria-label="Close editor tab">x</button>`;
     item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => activateEditorTab(tab.id));
     item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
@@ -4732,9 +5111,11 @@ function renderEditorTabs() {
 }
 
 function editorTabLabel(tab: EditorTabState) {
-  if (!tab.file) return 'Empty';
-  const name = tab.file.path.split(/[\\/]/).filter(Boolean).pop() ?? tab.file.path;
-  return `${name}${tab.file.dirty ? ' *' : ''}`;
+  const path = tab.file?.path ?? tab.pendingPath;
+  if (!path) return 'Empty';
+  const name = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  const suffix = tab.file?.dirty ? ' *' : tab.loading ? ' ...' : '';
+  return `${name}${suffix}`;
 }
 
 function syncActiveEditorTabFromView() {
@@ -4995,7 +5376,8 @@ function renderEditor() {
   const renderToken = ++editorRenderToken;
   codeView?.destroy();
   codeView = null;
-  state.openFile = activeEditorTab().file;
+  const activeTab = activeEditorTab();
+  state.openFile = activeTab.file;
   const file = state.openFile;
   el.editorBody.innerHTML = '';
   el.editorBody.classList.remove('empty');
@@ -5003,8 +5385,8 @@ function renderEditor() {
   el.saveFile.disabled = !file;
 
   if (!file) {
-    el.editorLabel.textContent = 'Editor';
-    el.editorBody.textContent = 'Open a file from Explorer.';
+    el.editorLabel.textContent = activeTab.pendingPath ?? 'Editor';
+    el.editorBody.textContent = activeTab.pendingPath ? 'Opening file...' : 'Open a file from Explorer.';
     el.editorBody.classList.add('empty');
     renderEditorTabs();
     return;
@@ -5203,6 +5585,7 @@ function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
     runtime.lineNumbers(),
     runtime.highlightActiveLine(),
     runtime.highlightSelectionMatches(),
+    ...(state.editorWordWrap ? [runtime.EditorView.lineWrapping] : []),
     editorCodeMirrorTheme(runtime),
     runtime.syntaxHighlighting(editorHighlightStyle(runtime)),
     runtime.history(),
@@ -5268,17 +5651,30 @@ function editorCodeMirrorTheme(runtime: EditorRuntime): Extension {
 function editorHighlightStyle(runtime: EditorRuntime) {
   const tags = runtime.tags;
   return runtime.HighlightStyle.define([
-    { tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment], color: 'var(--cm-comment)' },
-    { tag: [tags.keyword, tags.atom, tags.bool, tags.null, tags.controlKeyword, tags.definitionKeyword, tags.moduleKeyword], color: 'var(--cm-keyword)' },
+    { tag: [tags.comment, tags.lineComment, tags.blockComment], color: 'var(--cm-comment)', fontStyle: 'italic' },
+    { tag: tags.docComment, color: 'var(--cm-comment)', fontStyle: 'italic' },
+    { tag: [tags.keyword, tags.controlKeyword, tags.definitionKeyword, tags.moduleKeyword, tags.modifier, tags.self], color: 'var(--cm-keyword)' },
+    { tag: [tags.atom, tags.bool, tags.null, tags.unit, tags.constant(tags.variableName), tags.constant(tags.name)], color: 'var(--cm-constant)' },
     { tag: [tags.string, tags.docString, tags.character, tags.attributeValue], color: 'var(--cm-string)' },
+    { tag: [tags.regexp, tags.special(tags.string)], color: 'var(--cm-regexp)' },
+    { tag: [tags.escape, tags.color, tags.url], color: 'var(--cm-escape)' },
     { tag: [tags.number, tags.integer, tags.float], color: 'var(--cm-number)' },
     { tag: [tags.variableName, tags.name, tags.labelName], color: 'var(--cm-variable)' },
-    { tag: [tags.definition(tags.variableName), tags.function(tags.variableName), tags.className], color: 'var(--cm-definition)' },
+    { tag: [tags.definition(tags.variableName), tags.function(tags.variableName), tags.function(tags.propertyName)], color: 'var(--cm-definition)' },
+    { tag: [tags.className, tags.definition(tags.typeName), tags.definition(tags.className)], color: 'var(--cm-type)' },
     { tag: [tags.typeName, tags.namespace, tags.macroName], color: 'var(--cm-type)' },
     { tag: [tags.propertyName, tags.attributeName, tags.tagName], color: 'var(--cm-property)' },
-    { tag: [tags.operator, tags.operatorKeyword, tags.arithmeticOperator, tags.logicOperator, tags.compareOperator, tags.definitionOperator], color: 'var(--cm-operator)' },
-    { tag: [tags.punctuation, tags.separator, tags.bracket], color: 'var(--cm-punctuation)' },
-    { tag: tags.invalid, color: 'var(--cm-invalid)' }
+    { tag: [tags.operator, tags.operatorKeyword, tags.arithmeticOperator, tags.logicOperator, tags.compareOperator, tags.definitionOperator, tags.derefOperator, tags.typeOperator], color: 'var(--cm-operator)' },
+    { tag: [tags.meta, tags.documentMeta, tags.annotation, tags.processingInstruction], color: 'var(--cm-meta)' },
+    { tag: [tags.heading, tags.heading1, tags.heading2, tags.heading3, tags.heading4, tags.heading5, tags.heading6], color: 'var(--cm-heading)', fontWeight: '700' },
+    { tag: tags.link, color: 'var(--cm-link)', textDecoration: 'underline' },
+    { tag: tags.monospace, color: 'var(--cm-string)' },
+    { tag: tags.strong, fontWeight: '700' },
+    { tag: tags.emphasis, fontStyle: 'italic' },
+    { tag: tags.inserted, color: 'var(--cm-inserted)' },
+    { tag: tags.deleted, color: 'var(--cm-deleted)' },
+    { tag: [tags.punctuation, tags.separator, tags.bracket, tags.angleBracket, tags.squareBracket, tags.paren, tags.brace], color: 'var(--cm-punctuation)' },
+    { tag: tags.invalid, color: 'var(--cm-invalid)', textDecoration: 'underline wavy var(--cm-invalid)' }
   ], { themeType: 'dark' });
 }
 
@@ -5561,6 +5957,8 @@ async function createTerminalTab(
     element: widget.element,
     host,
     outputBuffer: '',
+    cwdOutputBuffer: '',
+    inputBuffer: '',
     seenPorts: new Set(),
     lastRows: term.rows,
     lastCols: term.cols
@@ -5578,6 +5976,7 @@ async function createTerminalTab(
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
+    trackTerminalCwdFromInput(pane, data);
     if (pane.backendId) void api.writeTerminal(pane.backendId, data);
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
@@ -6253,6 +6652,184 @@ async function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
   }
 }
 
+function trackTerminalCwdFromOutput(pane: TerminalPane, data: string) {
+  const oscCwd = extractOsc7Cwd(data);
+  if (oscCwd) updateTerminalCwd(pane, oscCwd);
+
+  const clean = stripAnsi(data).replace(/\r/g, '\n');
+  pane.cwdOutputBuffer = trimTerminalCwdBuffer(`${pane.cwdOutputBuffer}${clean}`);
+  const promptCwd = extractPromptCwd(pane.cwdOutputBuffer, pane);
+  if (promptCwd) updateTerminalCwd(pane, promptCwd);
+}
+
+function trackTerminalCwdFromInput(pane: TerminalPane, data: string) {
+  if (pane.command) return;
+  for (const char of data) {
+    if (char === '\r' || char === '\n') {
+      updateTerminalCwdFromCommand(pane, pane.inputBuffer);
+      pane.inputBuffer = '';
+    } else if (char === '\u007f' || char === '\b') {
+      pane.inputBuffer = pane.inputBuffer.slice(0, -1);
+    } else if (char >= ' ' && char !== '\x7f') {
+      pane.inputBuffer = `${pane.inputBuffer}${char}`.slice(-1000);
+    }
+  }
+}
+
+function updateTerminalCwdFromCommand(pane: TerminalPane, command: string) {
+  const target = parseCdTarget(command);
+  if (target === null) return;
+  const next = resolveTerminalCdTarget(pane, target);
+  if (next) updateTerminalCwd(pane, next);
+}
+
+function parseCdTarget(command: string) {
+  const cleaned = command
+    .replace(/\x1b\[[0-9;]*[A-Za-z~]/g, '')
+    .trim();
+  const match = cleaned.match(/^(?:builtin\s+)?(?:cd|chdir|pushd)(?:\s+(.+?))?\s*(?:&&|;|$)/);
+  if (!match) return null;
+  const raw = (match[1] ?? '').trim();
+  if (!raw) return '~';
+  if (raw === '-') return null;
+  return unquoteShellToken(raw);
+}
+
+function unquoteShellToken(value: string) {
+  const token = value.trim().match(/^("(?:\\.|[^"])*"|'[^']*'|[^\s;&|]+)/)?.[1] ?? '';
+  if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+    return token.slice(1, -1);
+  }
+  return token.replace(/\\ /g, ' ');
+}
+
+function resolveTerminalCdTarget(pane: TerminalPane, target: string) {
+  const profile = state.profiles.find((item) => item.id === pane.profileId) ?? state.activeProfile;
+  if (isWindowsPath(pane.cwd) || profile?.kind === 'windows') {
+    return normalizeWindowsTerminalPath(resolveWindowsCdTarget(pane.cwd, target, profile?.root));
+  }
+  return normalizePosixTerminalPath(resolvePosixCdTarget(pane.cwd, target, profile?.root));
+}
+
+function resolvePosixCdTarget(cwd: string, target: string, root = '~') {
+  if (!target || target === '~') return expandTildeTerminalPath(root || '~', cwd);
+  if (target.startsWith('~/') || target === '~') return expandTildeTerminalPath(target, cwd);
+  if (target.startsWith('/')) return target;
+  const base = cwd || root || '~';
+  if (base.endsWith('/')) return `${base}${target}`;
+  return `${base}/${target}`;
+}
+
+function resolveWindowsCdTarget(cwd: string, target: string, root = '') {
+  if (!target || target === '~') return root || cwd;
+  if (/^[A-Za-z]:[\\/]/.test(target) || target.startsWith('\\\\')) return target;
+  const base = cwd || root || '';
+  return `${base.replace(/[\\/]+$/, '')}\\${target}`;
+}
+
+function extractOsc7Cwd(data: string) {
+  let found = '';
+  const pattern = /\x1b]7;file:\/\/[^\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  for (const match of data.matchAll(pattern)) {
+    found = decodeTerminalPath(match[1]);
+  }
+  return found;
+}
+
+function extractPromptCwd(buffer: string, pane: TerminalPane) {
+  const lines = buffer.split('\n').slice(-40);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trimEnd();
+    const powershell = line.match(/(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*)>\s*$/);
+    if (powershell) return normalizeWindowsTerminalPath(powershell[1]);
+
+    const bash = line.match(/(?:^|\s)[^@\s:]+@[^:\s]+:([^#$\r\n]+)[#$]\s*$/);
+    if (bash) return normalizePosixTerminalPath(expandTildeTerminalPath(bash[1].trim(), pane.cwd));
+  }
+  return '';
+}
+
+function expandTildeTerminalPath(path: string, currentCwd: string) {
+  if (!path.startsWith('~')) return path;
+  const tail = path === '~' ? '' : path.slice(2);
+  const candidates = [currentCwd, state.workspaceRoot, state.currentDir, state.activeProfile?.root ?? '']
+    .filter((value) => value.startsWith('/'));
+  if (!tail) {
+    const current = candidates[0];
+    const home = current?.match(/^(\/home\/[^/]+|\/Users\/[^/]+)/)?.[1];
+    return home || path;
+  }
+  const first = tail.split('/')[0];
+  for (const candidate of candidates) {
+    const marker = `/${first}`;
+    const index = candidate.indexOf(marker);
+    if (index > 0) return `${candidate.slice(0, index)}/${tail}`;
+  }
+  return path;
+}
+
+function updateTerminalCwd(pane: TerminalPane, cwd: string) {
+  const normalized = isWindowsPath(cwd) ? normalizeWindowsTerminalPath(cwd) : normalizePosixTerminalPath(cwd);
+  if (normalized.startsWith('~')) return;
+  if (!normalized || normalized === pane.cwd) return;
+  pane.cwd = normalized;
+  const widget = terminalWidgetForPane(pane);
+  if (widget) updateTerminalWidgetTitle(widget);
+  scheduleTerminalCwdSnapshotSave();
+}
+
+function normalizePosixTerminalPath(path: string) {
+  const absoluteLike = path.startsWith('/') || path.startsWith('~');
+  const parts: string[] = [];
+  for (const part of path.replace(/\\/g, '/').split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  if (path.startsWith('~/')) return `~/${parts.slice(1).join('/')}`;
+  if (path === '~') return '~';
+  return absoluteLike ? `/${parts.join('/')}` : parts.join('/');
+}
+
+function normalizeWindowsTerminalPath(path: string) {
+  const normalized = path.replace(/\//g, '\\');
+  const prefix = normalized.match(/^[A-Za-z]:/)?.[0] ?? '';
+  const parts: string[] = [];
+  for (const part of normalized.replace(/^[A-Za-z]:\\?/, '').split('\\')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return prefix ? `${prefix}\\${parts.join('\\')}` : parts.join('\\');
+}
+
+function isWindowsPath(path: string) {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\');
+}
+
+function decodeTerminalPath(path: string) {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+}
+
+function trimTerminalCwdBuffer(value: string) {
+  return value.length > TERMINAL_CWD_SCAN_LIMIT
+    ? value.slice(value.length - TERMINAL_CWD_SCAN_LIMIT)
+    : value;
+}
+
+function scheduleTerminalCwdSnapshotSave() {
+  if (restoringWorkspace || !state.workspaceOpen) return;
+  if (terminalCwdSaveTimer) window.clearTimeout(terminalCwdSaveTimer);
+  terminalCwdSaveTimer = window.setTimeout(() => {
+    terminalCwdSaveTimer = 0;
+    saveActiveWorkspaceSnapshot();
+  }, 900);
+}
+
 async function openPort(port: number, source: 'manual' | 'auto') {
   if (!state.activeProfile || !isPreviewPort(port)) return;
   const profile = state.activeProfile;
@@ -6361,12 +6938,14 @@ function loadPreview(url: string) {
   openBrowserTab(url);
 }
 
-function previewFrames() {
-  return Array.from(el.browserShell.querySelectorAll<HTMLIFrameElement>('iframe.preview-frame'));
+function previewFrames(workspaceId?: string) {
+  const frames = Array.from(el.browserShell.querySelectorAll<HTMLIFrameElement>('iframe.preview-frame'));
+  if (!workspaceId) return frames;
+  return frames.filter((frame) => frame.dataset.browserWorkspaceId === workspaceId);
 }
 
-function browserFrameForTab(id: string) {
-  return previewFrames().find((frame) => frame.dataset.browserTabId === id) ?? null;
+function browserFrameForTab(id: string, workspaceId = state.activeWorkspaceId) {
+  return previewFrames(workspaceId).find((frame) => frame.dataset.browserTabId === id) ?? null;
 }
 
 function activeBrowserFrame() {
@@ -6374,12 +6953,16 @@ function activeBrowserFrame() {
 }
 
 function ensureBrowserFrame(tab: BrowserTab) {
+  const workspaceId = state.activeWorkspaceId || 'workspace';
   let frame = browserFrameForTab(tab.id);
   if (frame) return frame;
 
-  frame = el.previewFrame.dataset.browserTabId ? document.createElement('iframe') : el.previewFrame;
+  frame = el.previewFrame.dataset.browserTabId || el.previewFrame.dataset.browserWorkspaceId
+    ? document.createElement('iframe')
+    : el.previewFrame;
   frame.classList.add('preview-frame', 'hidden');
   frame.dataset.browserTabId = tab.id;
+  frame.dataset.browserWorkspaceId = workspaceId;
   frame.title = tab.label;
   bindBrowserFrameEvents(frame);
   if (!frame.parentElement) el.browserShell.append(frame);
@@ -6422,6 +7005,7 @@ function removeBrowserFrame(id: string) {
   if (frame === el.previewFrame) {
     frame.removeAttribute('src');
     delete frame.dataset.browserTabId;
+    delete frame.dataset.browserWorkspaceId;
     delete frame.dataset.loadedUrl;
     frame.classList.add('hidden');
     frame.classList.remove('active');
@@ -6430,17 +7014,32 @@ function removeBrowserFrame(id: string) {
   frame.remove();
 }
 
-function clearBrowserFrames() {
-  for (const frame of previewFrames()) {
+function clearBrowserFrames(workspaceId = state.activeWorkspaceId) {
+  for (const frame of previewFrames(workspaceId)) {
     if (frame === el.previewFrame) {
       frame.removeAttribute('src');
       delete frame.dataset.browserTabId;
+      delete frame.dataset.browserWorkspaceId;
       delete frame.dataset.loadedUrl;
       frame.classList.add('hidden');
       frame.classList.remove('active');
     } else {
       frame.remove();
     }
+  }
+}
+
+function hideBrowserFramesForWorkspace(workspaceId: string) {
+  for (const frame of previewFrames(workspaceId)) {
+    frame.classList.add('hidden');
+    frame.classList.remove('active');
+  }
+}
+
+function hideAllBrowserFrames() {
+  for (const frame of previewFrames()) {
+    frame.classList.add('hidden');
+    frame.classList.remove('active');
   }
 }
 
@@ -6485,6 +7084,12 @@ function normalizedLocalPreviewOrigin(url: URL) {
     ? '127.0.0.1'
     : url.hostname;
   return `http://${host}:${url.port}`;
+}
+
+function ensureActiveBrowserFrame() {
+  if (getPanel('browser').classList.contains('hidden')) return;
+  const active = state.browserTabs.find((tab) => tab.id === state.activeBrowserTabId) ?? state.browserTabs[0];
+  if (active) activateBrowserTab(active.id);
 }
 
 function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = url) {

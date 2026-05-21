@@ -25,6 +25,18 @@ kept with the repository.
   corner, while keeping the existing snap behavior.
 - Browser tabs now keep their own iframe alive while switching tabs, preventing
   tab clicks from reloading the preview page.
+- Terminal panes track their last detected working directory, so workspace
+  snapshots and new shell tabs can resume from the folder where the shell was
+  actually used.
+- Workspace switching now restores live shell widgets before heavier panels,
+  reuses the last Explorer directory listing immediately, and reads restored
+  editor/notes tabs in parallel for a snappier tab switch.
+- Editor/browser workspace switching now keeps runtime state in memory: editor
+  tabs can be reused without rereading, inactive editor tabs hydrate in the
+  background, and browser iframes/proxies are hidden per workspace instead of
+  being torn down on every tab switch.
+- Bash terminals now report their real working directory through a lightweight
+  OSC7 prompt hook, reducing reliance on prompt parsing or guessed `cd` input.
 
 #### Changed
 
@@ -38,6 +50,16 @@ kept with the repository.
 - Local preview URLs now open through a lightweight loopback preview proxy that
   strips iframe-blocking headers, so paths such as `/test.html` and `/admin`
   can render inside the IDE even when they work in Chrome but reject iframes.
+- The local preview proxy injects a small console bridge for HTML pages and
+  tunnels WebSocket upgrade requests, allowing IDE Console to show page
+  `console.*`, runtime errors, promise rejections, and WebSocket failures.
+- IDE editor themes now use distinct syntax palettes, including keyword,
+  string, type, property, function, regex, metadata, markdown heading/link, and
+  diff token colors rather than mostly changing editor background colors.
+- Editor panels now expose a per-workspace word-wrap toggle.
+- Workspace tabs can be duplicated, new empty workspaces open immediately to
+  the right of the active tab, and drag reorder updates the tab order
+  immediately with before/after drop markers.
 
 
 ### 2026-05-22 - Secure editor plain comment lines

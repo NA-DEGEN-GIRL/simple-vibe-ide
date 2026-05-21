@@ -1440,20 +1440,19 @@ fn terminal_command(
                 .distro
                 .clone()
                 .unwrap_or_else(|| "Ubuntu".to_string());
-            let mut args = vec!["-d".to_string(), distro];
-            if !cwd.is_empty() {
-                args.push("--cd".to_string());
-                args.push(cwd.to_string());
-            }
-            args.push("--".to_string());
+            let mut args = vec!["-d".to_string(), distro, "--".to_string()];
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
                 args.extend([
                     "bash".to_string(),
                     "-lic".to_string(),
-                    keepalive_bash_script(None, &command),
+                    bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command)),
                 ]);
             } else {
-                args.extend(["bash".to_string(), "-li".to_string()]);
+                args.extend([
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    bash_bootstrap_script(Some(cwd), Some(&profile.root), None),
+                ]);
             }
             ("wsl.exe".to_string(), args)
         }
@@ -1465,12 +1464,10 @@ fn terminal_command(
             let remote_command = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
                 format!(
                     "bash -lic {}",
-                    shell_quote(&keepalive_bash_script(Some(cwd), &command))
+                    shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command)))
                 )
-            } else if !cwd.is_empty() && cwd != "~" {
-                format!("cd {} && exec bash -li", shell_quote(cwd))
             } else {
-                "exec bash -li".to_string()
+                format!("bash -lc {}", shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None)))
             };
             (
                 "ssh.exe".to_string(),
@@ -1499,21 +1496,44 @@ fn terminal_command(
     }
 }
 
-fn keepalive_bash_script(cwd: Option<&str>, command: &str) -> String {
+fn bash_bootstrap_script(cwd: Option<&str>, fallback_cwd: Option<&str>, command: Option<&str>) -> String {
     let mut script = String::new();
-    if let Some(cwd) = cwd.filter(|value| !value.is_empty() && *value != "~") {
-        script.push_str(&format!(
-            "cd {} || {{ printf '\\n[simple-vibe-ide] failed to enter workspace\\n'; exec bash -li; }}\n",
-            shell_quote(cwd)
-        ));
-    }
-    script.push_str(command);
-    script.push_str(
+    script.push_str(&format!(
+        "__svide_start_cwd={}\n\
+__svide_fallback_cwd={}\n\
+case \"$__svide_start_cwd\" in \"~/\"*) __svide_start_cwd=\"$HOME/${{__svide_start_cwd#~/}}\" ;; esac\n\
+case \"$__svide_fallback_cwd\" in \"~/\"*) __svide_fallback_cwd=\"$HOME/${{__svide_fallback_cwd#~/}}\" ;; esac\n\
+if [ -n \"$__svide_start_cwd\" ] && [ \"$__svide_start_cwd\" != \"~\" ]; then\n\
+  cd \"$__svide_start_cwd\" || {{\n\
+    printf '\\n[simple-vibe-ide] saved folder is unavailable; falling back\\n'\n\
+    if [ -n \"$__svide_fallback_cwd\" ] && [ \"$__svide_fallback_cwd\" != \"~\" ] && [ \"$__svide_fallback_cwd\" != \"$__svide_start_cwd\" ]; then\n\
+      cd \"$__svide_fallback_cwd\" 2>/dev/null || cd ~ 2>/dev/null || true\n\
+    else\n\
+      cd ~ 2>/dev/null || true\n\
+    fi\n\
+  }}\n\
+fi\n",
+        shell_quote(cwd.unwrap_or("")),
+        shell_quote(fallback_cwd.unwrap_or(""))
+    ));
+    if let Some(command) = command {
+        script.push_str(command);
+        script.push_str(
         "\n_status=$?\n\
 if [ $_status -ne 0 ]; then\n\
   printf '\\n[simple-vibe-ide] command exited with status %s\\n' \"$_status\"\n\
-fi\n\
-exec bash -li",
+fi\n",
+        );
+    }
+    script.push_str(
+        "exec bash --rcfile <(cat <<'__SVIDE_RC__'\n\
+[ -f ~/.bashrc ] && . ~/.bashrc\n\
+__simple_vibe_ide_prompt_command() { local __sv_status=$?; printf '\\033]7;file://simple-vibe-ide%s\\033\\\\' \"$PWD\"; return $__sv_status; }\n\
+case \";${PROMPT_COMMAND:-};\" in *__simple_vibe_ide_prompt_command*) ;; *) PROMPT_COMMAND=\"__simple_vibe_ide_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}\" ;; esac\n\
+export PROMPT_COMMAND\n\
+__simple_vibe_ide_prompt_command\n\
+__SVIDE_RC__\n\
+) -i",
     );
     script
 }
@@ -2455,6 +2475,15 @@ fn proxy_http_preview(
     let (request_headers, request_body) = request.split_at(header_end + 4);
     let request_text = String::from_utf8_lossy(request_headers);
     let content_length = http_content_length(&request_text).unwrap_or(0);
+    if is_websocket_upgrade(&request_text) {
+        return proxy_websocket_upgrade(
+            incoming,
+            target_host,
+            target_port,
+            &request_text,
+            request_body,
+        );
+    }
     let rewritten_request = rewrite_preview_request_headers(&request_text, &target_host, target_port);
 
     let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
@@ -2473,12 +2502,44 @@ fn proxy_http_preview(
     };
     let (response_headers, response_body) = response.split_at(response_header_end + 4);
     let response_text = String::from_utf8_lossy(response_headers);
-    let rewritten_response = strip_preview_blocking_headers(&response_text);
-    incoming.write_all(rewritten_response.as_bytes())?;
-    if !response_body.is_empty() {
-        incoming.write_all(response_body)?;
+    if should_inject_preview_console_bridge(&response_text) {
+        let body = read_http_response_body(&mut remote, response_body, &response_text)?;
+        let injected = inject_preview_console_bridge(&body);
+        let rewritten_response =
+            rewrite_preview_response_headers(&response_text, Some(injected.len()));
+        incoming.write_all(rewritten_response.as_bytes())?;
+        incoming.write_all(&injected)?;
+    } else {
+        let rewritten_response = rewrite_preview_response_headers(&response_text, None);
+        incoming.write_all(rewritten_response.as_bytes())?;
+        if !response_body.is_empty() {
+            incoming.write_all(response_body)?;
+        }
+        std::io::copy(&mut remote, &mut incoming)?;
     }
-    std::io::copy(&mut remote, &mut incoming)?;
+    Ok(())
+}
+
+fn proxy_websocket_upgrade(
+    mut incoming: TcpStream,
+    target_host: String,
+    target_port: u16,
+    request_headers: &str,
+    request_body: &[u8],
+) -> std::io::Result<()> {
+    let rewritten_request = rewrite_preview_upgrade_headers(request_headers, &target_host, target_port);
+    let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
+    remote.write_all(rewritten_request.as_bytes())?;
+    if !request_body.is_empty() {
+        remote.write_all(request_body)?;
+    }
+    let mut incoming_to_remote = incoming.try_clone()?;
+    let mut remote_from_incoming = remote.try_clone()?;
+    let writer = thread::spawn(move || {
+        let _ = std::io::copy(&mut incoming_to_remote, &mut remote_from_incoming);
+    });
+    let _ = std::io::copy(&mut remote, &mut incoming);
+    let _ = writer.join();
     Ok(())
 }
 
@@ -2551,6 +2612,29 @@ fn http_content_length(headers: &str) -> Option<usize> {
     })
 }
 
+fn is_websocket_upgrade(headers: &str) -> bool {
+    let mut has_upgrade = false;
+    let mut has_connection_upgrade = false;
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("upgrade")
+            && value.trim().eq_ignore_ascii_case("websocket")
+        {
+            has_upgrade = true;
+        }
+        if name.trim().eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|item| item.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            has_connection_upgrade = true;
+        }
+    }
+    has_upgrade && has_connection_upgrade
+}
+
 fn rewrite_preview_request_headers(headers: &str, target_host: &str, target_port: u16) -> String {
     let mut lines = headers.lines();
     let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
@@ -2569,7 +2653,10 @@ fn rewrite_preview_request_headers(headers: &str, target_host: &str, target_port
         if lower == "host" {
             saw_host = true;
             rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
-        } else if lower == "connection" || lower == "proxy-connection" {
+        } else if lower == "connection"
+            || lower == "proxy-connection"
+            || lower == "accept-encoding"
+        {
             continue;
         } else {
             rewritten.push_str(line.trim_end());
@@ -2579,11 +2666,44 @@ fn rewrite_preview_request_headers(headers: &str, target_host: &str, target_port
     if !saw_host {
         rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
     }
+    rewritten.push_str("Accept-Encoding: identity\r\n");
     rewritten.push_str("Connection: close\r\n\r\n");
     rewritten
 }
 
-fn strip_preview_blocking_headers(headers: &str) -> String {
+fn rewrite_preview_upgrade_headers(headers: &str, target_host: &str, target_port: u16) -> String {
+    let mut lines = headers.lines();
+    let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
+    let mut rewritten = String::new();
+    rewritten.push_str(request_line);
+    rewritten.push_str("\r\n");
+    let mut saw_host = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lower = line
+            .split_once(':')
+            .map(|(name, _)| name.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if lower == "host" {
+            saw_host = true;
+            rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+        } else if lower == "proxy-connection" {
+            continue;
+        } else {
+            rewritten.push_str(line.trim_end());
+            rewritten.push_str("\r\n");
+        }
+    }
+    if !saw_host {
+        rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+    }
+    rewritten.push_str("\r\n");
+    rewritten
+}
+
+fn rewrite_preview_response_headers(headers: &str, content_length: Option<usize>) -> String {
     let mut lines = headers.lines();
     let status_line = lines.next().unwrap_or("HTTP/1.1 502 Bad Gateway").trim_end();
     let mut rewritten = String::new();
@@ -2599,15 +2719,189 @@ fn strip_preview_blocking_headers(headers: &str) -> String {
             .unwrap_or_default();
         if matches!(
             lower.as_str(),
-            "x-frame-options" | "content-security-policy" | "content-security-policy-report-only"
+            "x-frame-options"
+                | "content-security-policy"
+                | "content-security-policy-report-only"
         ) {
+            continue;
+        }
+        if content_length.is_some() && matches!(lower.as_str(), "content-length" | "transfer-encoding")
+        {
             continue;
         }
         rewritten.push_str(line.trim_end());
         rewritten.push_str("\r\n");
     }
+    if let Some(length) = content_length {
+        rewritten.push_str(&format!("Content-Length: {length}\r\n"));
+    }
     rewritten.push_str("\r\n");
     rewritten
+}
+
+fn should_inject_preview_console_bridge(headers: &str) -> bool {
+    let mut html = false;
+    let mut encoded = false;
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-type")
+            && value.to_ascii_lowercase().contains("text/html")
+        {
+            html = true;
+        }
+        if name.trim().eq_ignore_ascii_case("content-encoding")
+            && !value.trim().eq_ignore_ascii_case("identity")
+        {
+            encoded = true;
+        }
+    }
+    html && !encoded
+}
+
+fn read_http_response_body(
+    remote: &mut TcpStream,
+    first_body: &[u8],
+    headers: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut body = first_body.to_vec();
+    if is_chunked_response(headers) {
+        remote.read_to_end(&mut body)?;
+        return decode_chunked_body(&body);
+    }
+    if let Some(length) = http_content_length(headers) {
+        if body.len() < length {
+            let mut rest = vec![0_u8; length - body.len()];
+            remote.read_exact(&mut rest)?;
+            body.extend(rest);
+        }
+        body.truncate(length);
+        return Ok(body);
+    }
+    remote.read_to_end(&mut body)?;
+    Ok(body)
+}
+
+fn is_chunked_response(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+fn decode_chunked_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut index = 0;
+    let mut decoded = Vec::new();
+    while index < body.len() {
+        let Some(line_end) = find_crlf(&body[index..]) else {
+            break;
+        };
+        let size_line = String::from_utf8_lossy(&body[index..index + line_end]);
+        let size_text = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size")
+        })?;
+        index += line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if index + size > body.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated chunked response",
+            ));
+        }
+        decoded.extend_from_slice(&body[index..index + size]);
+        index += size + 2;
+    }
+    Ok(decoded)
+}
+
+fn find_crlf(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|window| window == b"\r\n")
+}
+
+fn inject_preview_console_bridge(body: &[u8]) -> Vec<u8> {
+    let mut html = String::from_utf8_lossy(body).to_string();
+    let script = preview_console_bridge_script();
+    let lower = html.to_ascii_lowercase();
+    if let Some(index) = lower.find("<head") {
+        if let Some(close) = lower[index..].find('>') {
+            html.insert_str(index + close + 1, script);
+            return html.into_bytes();
+        }
+    }
+    if let Some(index) = lower.find("<body") {
+        if let Some(close) = lower[index..].find('>') {
+            html.insert_str(index + close + 1, script);
+            return html.into_bytes();
+        }
+    }
+    html.insert_str(0, script);
+    html.into_bytes()
+}
+
+fn preview_console_bridge_script() -> &'static str {
+    r#"<script>
+(function () {
+  if (window.__simpleVibeConsoleBridge) return;
+  window.__simpleVibeConsoleBridge = true;
+  function format(value) {
+    try {
+      if (typeof value === 'string') return value;
+      if (value instanceof Error) return value.stack || value.message || String(value);
+      return JSON.stringify(value);
+    } catch (_) {
+      return String(value);
+    }
+  }
+  function send(level, args) {
+    try {
+      window.parent.postMessage({ __simpleVibeConsole: { level: level, args: Array.prototype.slice.call(args).map(format) } }, '*');
+    } catch (_) {}
+  }
+  ['log', 'info', 'warn', 'error'].forEach(function (level) {
+    var original = console[level];
+    console[level] = function () {
+      send(level === 'log' ? 'info' : level, arguments);
+      return original && original.apply(console, arguments);
+    };
+  });
+  window.addEventListener('error', function (event) {
+    send('error', [event.message || 'Script error']);
+  });
+  window.addEventListener('unhandledrejection', function (event) {
+    send('error', ['Unhandled promise rejection', event.reason]);
+  });
+  if (window.WebSocket) {
+    var NativeWebSocket = window.WebSocket;
+    window.WebSocket = function (url, protocols) {
+      var socket = protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+      var target = String(url);
+      socket.addEventListener('error', function () {
+        send('error', ["WebSocket connection to '" + target + "' failed."]);
+      });
+      socket.addEventListener('close', function (event) {
+        if (!event.wasClean && event.code !== 1000) {
+          send('warn', ["WebSocket connection to '" + target + "' closed (" + event.code + ")."]);
+        }
+      });
+      return socket;
+    };
+    window.WebSocket.prototype = NativeWebSocket.prototype;
+    Object.setPrototypeOf(window.WebSocket, NativeWebSocket);
+    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (key) {
+      window.WebSocket[key] = NativeWebSocket[key];
+    });
+  }
+})();
+</script>"#
 }
 
 fn copy_exact_bytes(
