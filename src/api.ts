@@ -25,6 +25,8 @@ export const api = {
     invoke<void>('rename_path', { profileId, oldPath, newPath }),
   openPath: (profileId: string, path: string) =>
     invoke<void>('open_path', { profileId, path }),
+  copyDroppedFiles: (profileId: string, targetDir: string, sourcePaths: string[]) =>
+    invoke<number>('copy_dropped_files', { profileId, targetDir, sourcePaths }),
   saveAttachment: (
     profileId: string,
     currentDir: string,

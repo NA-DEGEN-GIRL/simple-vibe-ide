@@ -15,6 +15,24 @@ kept with the repository.
 
 ## Patch Notes
 
+
+### 2026-05-21 - Drag-and-drop import
+
+#### Added
+
+- Explorer accepts files or folders dragged in from Windows and copies them into
+  the current Explorer folder or the hovered folder row.
+- Dropped items never overwrite existing files; duplicate names are copied with a
+  numbered suffix.
+- WSL targets use the Windows-accessible WSL filesystem when available, while SSH
+  targets copy files through the configured SSH profile.
+
+#### Known Limits
+
+- Dragging files out from the IDE into Windows Explorer is not implemented yet;
+  WebView/Tauri can receive OS file drops cleanly, but initiating native Windows
+  file drags from web content needs a separate native drag-out path.
+
 ### 2026-05-21 - Frameless window chrome
 
 #### Changed

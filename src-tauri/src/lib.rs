@@ -22,8 +22,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowDisplayAffinity, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    SetWindowDisplayAffinity, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE,
 };
 
 #[cfg(windows)]
@@ -56,14 +56,17 @@ fn default_windows_root() -> String {
 }
 
 fn default_wsl_root(distro: &str) -> String {
-    detect_wsl_home(distro)
-        .unwrap_or_else(|| "/home".to_string())
+    detect_wsl_home(distro).unwrap_or_else(|| "/home".to_string())
 }
 
 fn windows_spawn_cwd() -> PathBuf {
     let drive = std::env::var("SystemDrive")
         .ok()
-        .map(|value| value.trim_end_matches(|c| c == '\\' || c == '/').to_string())
+        .map(|value| {
+            value
+                .trim_end_matches(|c| c == '\\' || c == '/')
+                .to_string()
+        })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "C:".to_string());
     let root = PathBuf::from(format!("{drive}\\"));
@@ -84,7 +87,11 @@ fn windows_shell_cwd() -> PathBuf {
 
     let drive = std::env::var("SystemDrive")
         .ok()
-        .map(|value| value.trim_end_matches(|c| c == '\\' || c == '/').to_string())
+        .map(|value| {
+            value
+                .trim_end_matches(|c| c == '\\' || c == '/')
+                .to_string()
+        })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "C:".to_string());
     candidates.push(PathBuf::from(format!("{drive}\\Temp")).join(app_dir));
@@ -120,10 +127,7 @@ fn wsl_windows_path_to_posix(path: &str, distro: &str) -> Option<String> {
 }
 
 fn windows_tail_to_posix(tail: &str) -> String {
-    let parts: Vec<&str> = tail
-        .split('\\')
-        .filter(|part| !part.is_empty())
-        .collect();
+    let parts: Vec<&str> = tail.split('\\').filter(|part| !part.is_empty()).collect();
     if parts.is_empty() {
         "/".to_string()
     } else {
@@ -166,7 +170,9 @@ fn wsl_posix_path_to_windows_path(profile: &ConnectionProfile, path: &str) -> Op
     }
     let distro = profile.distro.as_deref()?;
     let tail = normalized.trim_start_matches('/').replace('/', "\\");
-    Some(PathBuf::from(format!("\\\\wsl.localhost\\{distro}\\{tail}")))
+    Some(PathBuf::from(format!(
+        "\\\\wsl.localhost\\{distro}\\{tail}"
+    )))
 }
 
 fn hide_command_window(command: &mut Command) -> &mut Command {
@@ -689,6 +695,32 @@ fn open_path(profile_id: String, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn copy_dropped_files(
+    profile_id: String,
+    target_dir: String,
+    source_paths: Vec<String>,
+) -> Result<usize, String> {
+    if source_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let profile = profile_from_id(&profile_id);
+    let target_dir = normalize_profile_path(&profile, &target_dir);
+    match profile.kind.as_str() {
+        "windows" => copy_dropped_files_to_local(Path::new(&target_dir), &source_paths),
+        "wsl" => {
+            if let Some(windows_dir) = wsl_posix_path_to_windows_path(&profile, &target_dir) {
+                copy_dropped_files_to_local(&windows_dir, &source_paths)
+            } else {
+                copy_dropped_files_to_remote(&profile, &target_dir, &source_paths)
+            }
+        }
+        "ssh" => copy_dropped_files_to_remote(&profile, &target_dir, &source_paths),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+#[tauri::command]
 fn save_attachment(
     profile_id: String,
     current_dir: String,
@@ -747,7 +779,10 @@ fn save_attachment(
     }
 
     let tag = format!("@{relative}");
-    Ok(AttachmentResult { path: relative, tag })
+    Ok(AttachmentResult {
+        path: relative,
+        tag,
+    })
 }
 
 #[tauri::command]
@@ -783,8 +818,14 @@ fn spawn_terminal(
         cmd.cwd(windows_spawn_cwd());
     }
 
-    let child = pair.slave.spawn_command(cmd).map_err(|err| err.to_string())?;
-    let mut reader = pair.master.try_clone_reader().map_err(|err| err.to_string())?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|err| err.to_string())?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|err| err.to_string())?;
     let writer = pair.master.take_writer().map_err(|err| err.to_string())?;
     let terminal_id = Uuid::new_v4().to_string();
 
@@ -797,18 +838,24 @@ fn spawn_terminal(
                 Ok(0) => break,
                 Ok(n) => {
                     let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = read_app.emit("terminal-data", TerminalDataEvent {
-                        id: read_id.clone(),
-                        data,
-                    });
+                    let _ = read_app.emit(
+                        "terminal-data",
+                        TerminalDataEvent {
+                            id: read_id.clone(),
+                            data,
+                        },
+                    );
                 }
                 Err(_) => break,
             }
         }
-        let _ = read_app.emit("terminal-exit", TerminalExitEvent {
-            id: read_id,
-            code: None,
-        });
+        let _ = read_app.emit(
+            "terminal-exit",
+            TerminalExitEvent {
+                id: read_id,
+                code: None,
+            },
+        );
     });
 
     state
@@ -888,14 +935,18 @@ fn start_port_forward(
 
     if profile.kind == "ssh" {
         if requested_local == 0 {
-            return Err("automatic local port allocation is not supported for SSH forwards yet".to_string());
+            return Err(
+                "automatic local port allocation is not supported for SSH forwards yet".to_string(),
+            );
         }
         let alias = profile.ssh_alias.unwrap_or_else(|| "default".to_string());
         let mut command = Command::new("ssh.exe");
         command
             .arg("-N")
             .arg("-L")
-            .arg(format!("127.0.0.1:{requested_local}:127.0.0.1:{remote_port}"))
+            .arg(format!(
+                "127.0.0.1:{requested_local}:127.0.0.1:{remote_port}"
+            ))
             .arg(alias)
             .current_dir(windows_spawn_cwd())
             .stdin(Stdio::null())
@@ -952,10 +1003,7 @@ fn start_port_forward(
 
     let listener = TcpListener::bind(("127.0.0.1", requested_local))
         .map_err(|err| format!("failed to bind local port {requested_local}: {err}"))?;
-    let actual_local = listener
-        .local_addr()
-        .map_err(|err| err.to_string())?
-        .port();
+    let actual_local = listener.local_addr().map_err(|err| err.to_string())?.port();
     listener
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
@@ -1022,7 +1070,9 @@ fn detect_wsl_distros() -> Vec<String> {
     let mut command = Command::new("wsl.exe");
     command.current_dir(windows_spawn_cwd()).arg("-l").arg("-q");
     let output = hide_command_window(&mut command).output();
-    let Ok(output) = output else { return Vec::new(); };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     if !output.status.success() {
         return Vec::new();
     }
@@ -1149,7 +1199,10 @@ fn terminal_command(
 ) -> (String, Vec<String>) {
     match profile.kind.as_str() {
         "wsl" => {
-            let distro = profile.distro.clone().unwrap_or_else(|| "Ubuntu".to_string());
+            let distro = profile
+                .distro
+                .clone()
+                .unwrap_or_else(|| "Ubuntu".to_string());
             let mut args = vec!["-d".to_string(), distro];
             if !cwd.is_empty() {
                 args.push("--cd".to_string());
@@ -1157,22 +1210,35 @@ fn terminal_command(
             }
             args.push("--".to_string());
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
-                args.extend(["bash".to_string(), "-lic".to_string(), keepalive_bash_script(None, &command)]);
+                args.extend([
+                    "bash".to_string(),
+                    "-lic".to_string(),
+                    keepalive_bash_script(None, &command),
+                ]);
             } else {
                 args.extend(["bash".to_string(), "-li".to_string()]);
             }
             ("wsl.exe".to_string(), args)
         }
         "ssh" => {
-            let alias = profile.ssh_alias.clone().unwrap_or_else(|| "default".to_string());
+            let alias = profile
+                .ssh_alias
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
             let remote_command = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
-                format!("bash -lic {}", shell_quote(&keepalive_bash_script(Some(cwd), &command)))
+                format!(
+                    "bash -lic {}",
+                    shell_quote(&keepalive_bash_script(Some(cwd), &command))
+                )
             } else if !cwd.is_empty() && cwd != "~" {
                 format!("cd {} && exec bash -li", shell_quote(cwd))
             } else {
                 "exec bash -li".to_string()
             };
-            ("ssh.exe".to_string(), vec!["-tt".to_string(), alias, remote_command])
+            (
+                "ssh.exe".to_string(),
+                vec!["-tt".to_string(), alias, remote_command],
+            )
         }
         _ => {
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
@@ -1263,7 +1329,10 @@ fn list_wsl_directory(windows_path: &Path, posix_path: &str) -> Result<Vec<FileE
     sort_entries(entries)
 }
 
-fn list_remote_directory(profile: &ConnectionProfile, path: &str) -> Result<Vec<FileEntry>, String> {
+fn list_remote_directory(
+    profile: &ConnectionProfile,
+    path: &str,
+) -> Result<Vec<FileEntry>, String> {
     let quoted_path = shell_quote(path);
     let script = format!(
         r#"if [ ! -d {quoted_path} ]; then echo "not a directory" >&2; exit 2; fi
@@ -1327,6 +1396,192 @@ fn rename_local_path(old_path: &Path, new_path: &Path) -> Result<(), String> {
     fs::rename(old_path, new_path).map_err(|err| err.to_string())
 }
 
+fn copy_dropped_files_to_local(
+    target_dir: &Path,
+    source_paths: &[String],
+) -> Result<usize, String> {
+    if !target_dir.is_dir() {
+        return Err("drop target is not a directory".to_string());
+    }
+
+    let mut copied = 0;
+    for source in source_paths {
+        copy_local_source_to_local(Path::new(source), target_dir)?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+fn copy_local_source_to_local(source: &Path, target_dir: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Err("dropped source does not exist".to_string());
+    }
+    let name = local_file_name(source)?;
+    let target = unique_local_child_path(target_dir, &name);
+    copy_local_path_recursive(source, &target)
+}
+
+fn copy_local_path_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(source).map_err(|err| err.to_string())?;
+    if metadata.is_dir() {
+        reject_copy_directory_into_itself(source, target)?;
+        fs::create_dir(target).map_err(|err| err.to_string())?;
+        for child in fs::read_dir(source).map_err(|err| err.to_string())? {
+            let child = child.map_err(|err| err.to_string())?;
+            let child_name = local_file_name(&child.path())?;
+            copy_local_path_recursive(&child.path(), &target.join(child_name))?;
+        }
+    } else if metadata.is_file() {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        fs::copy(source, target).map_err(|err| err.to_string())?;
+    } else {
+        return Err("unsupported dropped item type".to_string());
+    }
+    Ok(())
+}
+
+fn copy_dropped_files_to_remote(
+    profile: &ConnectionProfile,
+    target_dir: &str,
+    source_paths: &[String],
+) -> Result<usize, String> {
+    create_remote_directory(profile, target_dir)?;
+    let mut copied = 0;
+    for source in source_paths {
+        copy_local_source_to_remote(profile, Path::new(source), target_dir)?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+fn copy_local_source_to_remote(
+    profile: &ConnectionProfile,
+    source: &Path,
+    target_dir: &str,
+) -> Result<(), String> {
+    if !source.exists() {
+        return Err("dropped source does not exist".to_string());
+    }
+    let name = local_file_name(source)?;
+    let target = unique_remote_child_path(profile, target_dir, &name)?;
+    copy_local_path_to_remote(profile, source, &target)
+}
+
+fn copy_local_path_to_remote(
+    profile: &ConnectionProfile,
+    source: &Path,
+    remote_target: &str,
+) -> Result<(), String> {
+    let metadata = fs::metadata(source).map_err(|err| err.to_string())?;
+    if metadata.is_dir() {
+        create_remote_directory(profile, remote_target)?;
+        for child in fs::read_dir(source).map_err(|err| err.to_string())? {
+            let child = child.map_err(|err| err.to_string())?;
+            let child_name = local_file_name(&child.path())?;
+            let child_target = join_posix(remote_target, &child_name);
+            copy_local_path_to_remote(profile, &child.path(), &child_target)?;
+        }
+    } else if metadata.is_file() {
+        let bytes = fs::read(source).map_err(|err| err.to_string())?;
+        write_remote_file(profile, remote_target, bytes)?;
+    } else {
+        return Err("unsupported dropped item type".to_string());
+    }
+    Ok(())
+}
+
+fn write_remote_file(
+    profile: &ConnectionProfile,
+    target: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let dir = parent_posix(target);
+    let script = format!(
+        "mkdir -p -- {} && cat > {}",
+        shell_quote(&dir),
+        shell_quote(target)
+    );
+    run_profile_shell(profile, &script, Some(bytes))?;
+    Ok(())
+}
+
+fn create_remote_directory(profile: &ConnectionProfile, path: &str) -> Result<(), String> {
+    let script = format!("mkdir -p -- {}", shell_quote(path));
+    run_profile_shell(profile, &script, None)?;
+    Ok(())
+}
+
+fn remote_path_exists(profile: &ConnectionProfile, path: &str) -> Result<bool, String> {
+    let script = format!("if [ -e {} ]; then printf y; fi", shell_quote(path));
+    let output = run_profile_shell(profile, &script, None)?;
+    Ok(output == b"y")
+}
+
+fn unique_local_child_path(parent: &Path, name: &str) -> PathBuf {
+    let mut candidate = parent.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let (stem, extension) = split_name_extension(name);
+    for index in 2..10000 {
+        candidate = parent.join(format!("{stem} {index}{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{stem} copy{extension}"))
+}
+
+fn unique_remote_child_path(
+    profile: &ConnectionProfile,
+    parent: &str,
+    name: &str,
+) -> Result<String, String> {
+    let candidate = join_posix(parent, name);
+    if !remote_path_exists(profile, &candidate)? {
+        return Ok(candidate);
+    }
+
+    let (stem, extension) = split_name_extension(name);
+    for index in 2..10000 {
+        let candidate = join_posix(parent, &format!("{stem} {index}{extension}"));
+        if !remote_path_exists(profile, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Ok(join_posix(parent, &format!("{stem} copy{extension}")))
+}
+
+fn split_name_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    }
+}
+
+fn local_file_name(path: &Path) -> Result<String, String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "dropped source has no file name".to_string())
+}
+
+fn reject_copy_directory_into_itself(source: &Path, target: &Path) -> Result<(), String> {
+    let source = source.canonicalize().map_err(|err| err.to_string())?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| "drop target has no parent directory".to_string())?
+        .canonicalize()
+        .map_err(|err| err.to_string())?;
+    if target_parent.starts_with(&source) {
+        return Err("cannot copy a folder into itself".to_string());
+    }
+    Ok(())
+}
+
 fn run_profile_shell(
     profile: &ConnectionProfile,
     script: &str,
@@ -1380,7 +1635,11 @@ fn run_profile_shell(
     Ok(output.stdout)
 }
 
-fn proxy_stream(mut incoming: TcpStream, target_host: String, target_port: u16) -> std::io::Result<()> {
+fn proxy_stream(
+    mut incoming: TcpStream,
+    target_host: String,
+    target_port: u16,
+) -> std::io::Result<()> {
     let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
     let mut incoming_to_remote = incoming.try_clone()?;
     let mut remote_from_incoming = remote.try_clone()?;
@@ -1421,7 +1680,13 @@ fn parent_posix(path: &str) -> String {
 fn sanitize_segment(value: &str) -> String {
     let cleaned: String = value
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "default".to_string()
@@ -1505,6 +1770,7 @@ pub fn run() {
             create_file,
             rename_path,
             open_path,
+            copy_dropped_files,
             save_attachment,
             spawn_terminal,
             write_terminal,
@@ -1521,7 +1787,9 @@ pub fn run() {
             let app_for_events = app_handle.clone();
             let main_for_events = window.clone();
             window.on_window_event(move |event| match event {
-                WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                WindowEvent::Moved(_)
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. } => {
                     if let Some(cover) = app_for_events.get_webview_window("capture-cover") {
                         if cover.is_visible().unwrap_or(false) {
                             let _ = sync_capture_cover(&main_for_events, &cover);

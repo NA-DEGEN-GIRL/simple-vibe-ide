@@ -80,6 +80,14 @@ interface BrowserConsoleLog {
   message: string;
 }
 
+interface TauriDragDropPayload {
+  paths?: string[];
+  position?: {
+    x: number;
+    y: number;
+  };
+}
+
 interface TextFileCacheEntry {
   content: string;
   cachedAt: number;
@@ -256,6 +264,7 @@ const state = {
   explorerExpanded: new Set<string>(),
   explorerChildren: new Map<string, FileEntry[]>(),
   explorerLoading: new Set<string>(),
+  explorerDropTargetDir: '',
   workspaceSnapshots: [] as WorkspaceSnapshot[],
   activeWorkspaceId: '',
   workspaceCaptureProtected: false,
@@ -563,6 +572,19 @@ async function init() {
       const widget = terminalWidgetForPane(pane);
       if (widget) renderTerminalWidgetTabs(widget);
     }
+  });
+
+  await listen<TauriDragDropPayload>('tauri://drag-enter', (event) => {
+    updateExplorerDropTarget(event.payload.position);
+  });
+  await listen<TauriDragDropPayload>('tauri://drag-over', (event) => {
+    updateExplorerDropTarget(event.payload.position);
+  });
+  await listen<TauriDragDropPayload>('tauri://drag-drop', (event) => {
+    void handleExplorerFileDrop(event.payload);
+  });
+  await listen('tauri://drag-leave', () => {
+    clearExplorerDropTarget();
   });
 
   state.profiles = await api.listProfiles();
@@ -1998,6 +2020,7 @@ function clearWorkspacePanels() {
   state.explorerSelectedPath = '';
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
+  state.explorerDropTargetDir = '';
   state.openFile = null;
   state.editorTabs = [];
   state.activeEditorTabId = '';
@@ -2121,6 +2144,7 @@ function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], de
     const row = document.createElement('div');
     row.className = `file-row ${entry.kind}`;
     row.dataset.path = entry.path;
+    if (sameExplorerPath(entry.path, state.explorerDropTargetDir)) row.classList.add('drop-target');
     row.tabIndex = 0;
     row.style.setProperty('--depth', String(depth));
     row.setAttribute('role', 'option');
@@ -2164,6 +2188,68 @@ function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], de
       renderExplorerRows(fragment, state.explorerChildren.get(entry.path) ?? [], depth + 1);
     }
   }
+}
+
+async function handleExplorerFileDrop(payload: TauriDragDropPayload) {
+  const targetDir = explorerDropTargetDirectory(payload.position);
+  const sourcePaths = (payload.paths ?? []).filter(Boolean);
+  clearExplorerDropTarget();
+
+  if (!targetDir || !sourcePaths.length || !state.activeProfile || !state.workspaceOpen) return;
+
+  try {
+    setStatus(`Copying ${sourcePaths.length} dropped item${sourcePaths.length === 1 ? '' : 's'}...`);
+    const copied = await api.copyDroppedFiles(state.activeProfile.id, targetDir, sourcePaths);
+    await reloadExplorerDirectory(targetDir);
+    selectExplorerEntry(targetDir, false);
+    setStatus(`Copied ${copied} dropped item${copied === 1 ? '' : 's'}`);
+  } catch (error) {
+    setStatus(`Drop copy failed: ${String(error)}`, true);
+  }
+}
+
+function updateExplorerDropTarget(position?: { x: number; y: number }) {
+  const targetDir = explorerDropTargetDirectory(position);
+  const explorer = getPanel('explorer');
+  explorer.classList.toggle('drop-active', Boolean(targetDir));
+  state.explorerDropTargetDir = targetDir ?? '';
+  el.fileList.querySelectorAll<HTMLElement>('.file-row.drop-target')
+    .forEach((row) => row.classList.remove('drop-target'));
+  if (targetDir) explorerRowForPath(targetDir)?.classList.add('drop-target');
+}
+
+function clearExplorerDropTarget() {
+  state.explorerDropTargetDir = '';
+  getPanel('explorer').classList.remove('drop-active');
+  el.fileList.querySelectorAll<HTMLElement>('.file-row.drop-target')
+    .forEach((row) => row.classList.remove('drop-target'));
+}
+
+function explorerDropTargetDirectory(position?: { x: number; y: number }) {
+  if (!state.workspaceOpen || !state.currentDir) return '';
+  const explorer = getPanel('explorer');
+  if (explorer.classList.contains('hidden')) return '';
+  const target = elementFromDragPosition(position);
+  if (!target || !explorer.contains(target)) return '';
+
+  const row = target.closest<HTMLElement>('.file-row');
+  if (row?.dataset.path) {
+    const entry = findExplorerEntry(row.dataset.path);
+    if (entry?.kind === 'dir') return entry.path;
+    if (entry) return parentPath(entry.path);
+  }
+  return state.currentDir;
+}
+
+function elementFromDragPosition(position?: { x: number; y: number }) {
+  if (!position) return null;
+  const explorer = getPanel('explorer');
+  const ratio = window.devicePixelRatio || 1;
+  const direct = document.elementFromPoint(position.x, position.y);
+  const scaled = ratio === 1 ? null : document.elementFromPoint(position.x / ratio, position.y / ratio);
+  if (direct && explorer.contains(direct)) return direct;
+  if (scaled && explorer.contains(scaled)) return scaled;
+  return direct ?? scaled;
 }
 
 async function toggleExplorerDirectory(entry: FileEntry) {
