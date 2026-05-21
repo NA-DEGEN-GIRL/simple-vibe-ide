@@ -501,6 +501,7 @@ app.innerHTML = `
         <span id="title-context" class="muted">starting...</span>
       </div>
       <div id="status" class="status" data-window-drag-region>Ready</div>
+      <div id="app-clock" class="app-clock" data-window-drag-region></div>
     </header>
     <section class="workspace-tabs-bar">
       <div id="workspace-tabs" class="workspace-tabs" aria-label="Workspaces"></div>
@@ -670,6 +671,7 @@ const el = {
   windowResizeZones: Array.from(document.querySelectorAll<HTMLElement>('[data-window-resize-direction]')),
   titleContext: document.querySelector<HTMLSpanElement>('#title-context')!,
   status: document.querySelector<HTMLDivElement>('#status')!,
+  appClock: document.querySelector<HTMLDivElement>('#app-clock')!,
   captureFreezeFrame: document.querySelector<HTMLDivElement>('#capture-freeze-frame')!,
   workspaceTabs: document.querySelector<HTMLDivElement>('#workspace-tabs')!,
   newWorkspaceTab: document.querySelector<HTMLButtonElement>('#new-workspace-tab')!,
@@ -752,6 +754,18 @@ function setStatus(message: string, danger = false) {
   el.status.classList.toggle('danger', danger);
 }
 
+function startAppClock() {
+  renderAppClock();
+  window.setInterval(renderAppClock, 1000);
+}
+
+function renderAppClock() {
+  const now = new Date();
+  const days = ['일', '월', '화', '수', '목', '금', '토'];
+  const pad = (value: number) => String(value).padStart(2, '0');
+  el.appClock.textContent = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(now.getDate())} ${days[now.getDay()]} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+}
+
 function refreshTitle() {
   const profile = state.activeProfile;
   const location = profile ? `${profile.label} ${state.currentDir || state.workspaceRoot}` : 'no profile';
@@ -818,6 +832,7 @@ async function init() {
   applyBrowserZoom();
   scheduleEditorRuntimeWarmup();
   bindEvents();
+  startAppClock();
   selectProfile('');
   setWorkspaceOpen(false);
   setStatus('Ready');

@@ -16,6 +16,15 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Toolbar clock and ticker colors
+
+#### Changed
+
+- Market ticker label, price, and percent text now follow the up/down color
+  direction together.
+- Added a lightweight local date/time clock near the titlebar status area.
+
+
 ### 2026-05-22 - Market ticker
 
 #### Added
