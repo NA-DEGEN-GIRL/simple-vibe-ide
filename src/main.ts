@@ -9,7 +9,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { ConnectionProfile, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { ConnectionProfile, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
 import { parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 interface TerminalPane {
@@ -86,6 +86,10 @@ interface TauriDragDropPayload {
     x: number;
     y: number;
   };
+}
+
+interface ExportJobState extends ExportProgressEvent {
+  createdAt: number;
 }
 
 interface TextFileCacheEntry {
@@ -265,6 +269,7 @@ const state = {
   explorerChildren: new Map<string, FileEntry[]>(),
   explorerLoading: new Set<string>(),
   explorerDropTargetDir: '',
+  exportJobs: [] as ExportJobState[],
   workspaceSnapshots: [] as WorkspaceSnapshot[],
   activeWorkspaceId: '',
   workspaceCaptureProtected: false,
@@ -382,11 +387,13 @@ app.innerHTML = `
           <span class="spacer"></span>
           <button id="new-file" class="panel-mode" title="New file">File</button>
           <button id="new-folder" class="panel-mode" title="New folder">Folder</button>
+          <button id="export-selected" class="panel-mode" title="Export selected item for Windows drag-out">Export</button>
           <button id="toggle-explorer-open-mode" class="panel-mode" title="Toggle single/double click open">Open: 1x</button>
           <button id="toggle-file-sizes" class="panel-mode active" title="Toggle file sizes" aria-pressed="true">Size</button>
           <button class="panel-close" data-close-panel="explorer" title="Close Explorer" aria-label="Close Explorer">x</button>
         </div>
         <div id="path-row" class="path-row"></div>
+        <div id="export-list" class="export-list hidden" aria-live="polite"></div>
         <div id="file-list" class="file-list" tabindex="0" role="listbox" aria-label="Explorer files"></div>
       </aside>
       <div id="shell-tabs" class="shell-tabs hidden" aria-label="Shell tabs">
@@ -498,6 +505,8 @@ const el = {
   mainGrid: document.querySelector<HTMLElement>('.main-grid')!,
   newFile: document.querySelector<HTMLButtonElement>('#new-file')!,
   newFolder: document.querySelector<HTMLButtonElement>('#new-folder')!,
+  exportSelected: document.querySelector<HTMLButtonElement>('#export-selected')!,
+  exportList: document.querySelector<HTMLDivElement>('#export-list')!,
   explorerOpenModeToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-open-mode')!,
   fileSizeToggle: document.querySelector<HTMLButtonElement>('#toggle-file-sizes')!,
   fileList: document.querySelector<HTMLDivElement>('#file-list')!,
@@ -585,6 +594,10 @@ async function init() {
   });
   await listen('tauri://drag-leave', () => {
     clearExplorerDropTarget();
+  });
+
+  await listen<ExportProgressEvent>('export-progress', (event) => {
+    handleExportProgress(event.payload);
   });
 
   state.profiles = await api.listProfiles();
@@ -1153,6 +1166,7 @@ function bindEvents() {
   el.hardRefreshPreview.addEventListener('click', () => refreshPreview(true));
   el.newFile.addEventListener('click', () => void createExplorerItem('file'));
   el.newFolder.addEventListener('click', () => void createExplorerItem('dir'));
+  el.exportSelected.addEventListener('click', () => void startExportSelectedExplorerEntry());
   el.explorerOpenModeToggle.addEventListener('click', () => {
     state.explorerOpenMode = state.explorerOpenMode === 'single' ? 'double' : 'single';
     updateExplorerOpenMode();
@@ -2021,6 +2035,8 @@ function clearWorkspacePanels() {
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   state.explorerDropTargetDir = '';
+  state.exportJobs = [];
+  renderExportJobs();
   state.openFile = null;
   state.editorTabs = [];
   state.activeEditorTabId = '';
@@ -2066,6 +2082,7 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
   });
   el.newFile.disabled = !open;
   el.newFolder.disabled = !open;
+  el.exportSelected.disabled = !open;
 
   if (!options.preserveVisibility) {
     for (const id of FLOATING_PANELS) {
@@ -2119,6 +2136,7 @@ function renderExplorer() {
   renderExplorerRows(fragment, state.entries, 0);
   el.fileList.append(fragment);
   updateExplorerSelection(false);
+  renderExportJobs();
 }
 
 function openExplorerEntry(entry: FileEntry) {
@@ -2188,6 +2206,152 @@ function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], de
       renderExplorerRows(fragment, state.explorerChildren.get(entry.path) ?? [], depth + 1);
     }
   }
+}
+
+async function startExportSelectedExplorerEntry() {
+  if (!state.activeProfile || !state.workspaceOpen) return;
+  const entry = findExplorerEntry(state.explorerSelectedPath);
+  if (!entry) {
+    setStatus('Select an item to export', true);
+    return;
+  }
+
+  try {
+    const result = await api.startExportPath(state.activeProfile.id, entry.path);
+    upsertExportJob({
+      id: result.id,
+      name: result.name,
+      status: 'running',
+      progress: 0,
+      outputPath: null,
+      message: 'Export queued',
+      directory: entry.kind === 'dir',
+      createdAt: Date.now()
+    });
+    setStatus(`Exporting ${entry.name} in background`);
+  } catch (error) {
+    setStatus(`Export failed to start: ${String(error)}`, true);
+  }
+}
+
+function handleExportProgress(payload: ExportProgressEvent) {
+  upsertExportJob({
+    id: payload.id,
+    name: payload.name,
+    status: payload.status,
+    progress: payload.progress ?? null,
+    outputPath: payload.outputPath ?? null,
+    message: payload.message ?? null,
+    directory: payload.directory,
+    createdAt: state.exportJobs.find((job) => job.id === payload.id)?.createdAt ?? Date.now()
+  });
+  if (payload.status === 'completed') setStatus(`${payload.name} ready to drag out`);
+  else if (payload.status === 'failed') setStatus(`Export failed: ${payload.message ?? payload.name}`, true);
+  else if (payload.status === 'cancelled') setStatus(`Export cancelled: ${payload.name}`);
+}
+
+function upsertExportJob(job: ExportJobState) {
+  const existing = state.exportJobs.findIndex((item) => item.id === job.id);
+  if (existing >= 0) state.exportJobs[existing] = { ...state.exportJobs[existing], ...job };
+  else state.exportJobs.unshift(job);
+  state.exportJobs = state.exportJobs.slice(0, 8);
+  renderExportJobs();
+}
+
+function renderExportJobs() {
+  el.exportList.classList.toggle('hidden', state.exportJobs.length === 0);
+  el.exportList.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (const job of state.exportJobs) {
+    const row = document.createElement('div');
+    row.className = `export-job ${job.status}`;
+
+    const meta = document.createElement('div');
+    meta.className = 'export-meta';
+    const title = document.createElement('strong');
+    title.textContent = job.name;
+    const detail = document.createElement('span');
+    detail.textContent = exportJobDetail(job);
+    meta.append(title, detail);
+
+    const progress = document.createElement('div');
+    progress.className = 'export-progress';
+    const bar = document.createElement('div');
+    bar.style.width = `${Math.round((job.progress ?? 0) * 100)}%`;
+    progress.classList.toggle('indeterminate', job.status === 'running' && job.progress == null);
+    progress.append(bar);
+
+    const actions = document.createElement('div');
+    actions.className = 'export-actions';
+    if (job.status === 'running') {
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Cancel';
+      cancel.addEventListener('click', () => void cancelExportJob(job.id));
+      actions.append(cancel);
+    } else if (job.status === 'completed' && job.outputPath) {
+      const drag = document.createElement('button');
+      drag.textContent = 'Drag out';
+      drag.className = 'export-drag';
+      drag.draggable = true;
+      drag.title = 'Drag this to Windows Explorer';
+      drag.addEventListener('dragstart', (event) => prepareExportDrag(event, job));
+      const open = document.createElement('button');
+      open.textContent = 'Open';
+      open.addEventListener('click', () => void api.openExportPath(job.outputPath!));
+      actions.append(drag, open);
+    }
+
+    row.append(meta, progress, actions);
+    fragment.append(row);
+  }
+  el.exportList.append(fragment);
+}
+
+function exportJobDetail(job: ExportJobState) {
+  if (job.status === 'running') return job.message ?? 'Running in background';
+  if (job.status === 'completed') return job.directory ? 'Ready in export folder' : 'Ready to drag out';
+  if (job.status === 'cancelled') return 'Cancelled';
+  return job.message ?? 'Failed';
+}
+
+async function cancelExportJob(id: string) {
+  await api.cancelExportPath(id).catch((error) => setStatus(String(error), true));
+}
+
+function prepareExportDrag(event: DragEvent, job: ExportJobState) {
+  if (!event.dataTransfer || !job.outputPath) return;
+  const url = windowsPathToFileUrl(job.outputPath);
+  const mime = job.directory ? 'application/x-directory' : mimeTypeForExportName(job.name);
+  event.dataTransfer.effectAllowed = 'copy';
+  event.dataTransfer.setData('DownloadURL', `${mime}:${job.name}:${url}`);
+  event.dataTransfer.setData('text/uri-list', url);
+  event.dataTransfer.setData('text/plain', job.name);
+  setStatus(`Drag ${job.name} to Windows Explorer`);
+}
+
+function windowsPathToFileUrl(path: string) {
+  const normalized = path.replace(/\\/g, '/');
+  const encoded = normalized.split('/').map((part, index) => {
+    if (index === 0 && /^[A-Za-z]:$/.test(part)) return part;
+    return encodeURIComponent(part);
+  }).join('/');
+  if (/^[A-Za-z]:\//.test(normalized)) return `file:///${encoded}`;
+  if (normalized.startsWith('//')) return `file:${encoded}`;
+  return `file://${encoded.startsWith('/') ? '' : '/'}${encoded}`;
+}
+
+function mimeTypeForExportName(name: string) {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.svg')) return 'image/svg+xml';
+  if (lower.endsWith('.txt') || lower.endsWith('.md') || lower.endsWith('.log')) return 'text/plain';
+  if (lower.endsWith('.json')) return 'application/json';
+  if (lower.endsWith('.tar')) return 'application/x-tar';
+  if (lower.endsWith('.zip')) return 'application/zip';
+  return 'application/octet-stream';
 }
 
 async function handleExplorerFileDrop(payload: TauriDragDropPayload) {

@@ -40,3 +40,20 @@ export interface TerminalExitEvent {
   id: string;
   code?: number | null;
 }
+
+export type ExportJobStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface ExportStartResult {
+  id: string;
+  name: string;
+}
+
+export interface ExportProgressEvent {
+  id: string;
+  name: string;
+  status: ExportJobStatus;
+  progress?: number | null;
+  outputPath?: string | null;
+  message?: string | null;
+  directory: boolean;
+}

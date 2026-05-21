@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AttachmentResult, ConnectionProfile, FileEntry, PortForwardResult } from './types';
+import type { AttachmentResult, ConnectionProfile, ExportStartResult, FileEntry, PortForwardResult } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -27,6 +27,10 @@ export const api = {
     invoke<void>('open_path', { profileId, path }),
   copyDroppedFiles: (profileId: string, targetDir: string, sourcePaths: string[]) =>
     invoke<number>('copy_dropped_files', { profileId, targetDir, sourcePaths }),
+  startExportPath: (profileId: string, path: string) =>
+    invoke<ExportStartResult>('start_export_path', { profileId, path }),
+  cancelExportPath: (id: string) => invoke<void>('cancel_export_path', { id }),
+  openExportPath: (path: string) => invoke<void>('open_export_path', { path }),
   saveAttachment: (
     profileId: string,
     currentDir: string,

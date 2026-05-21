@@ -16,6 +16,26 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-21 - Async export and drag-out
+
+#### Added
+
+- Explorer can export the selected item into a Windows temp export folder without
+  blocking the UI, editor, terminal, or browser.
+- Export jobs show progress, support cancellation, and expose completed items with
+  Open and Drag out actions.
+- Drag out uses a completed Windows-side export path so files can be dragged to
+  Windows Explorer using DownloadURL/file URI data.
+- SSH exports run in a separate backend task. SSH folders are streamed as tar
+  archives so long transfers do not require loading the whole folder into memory.
+
+#### Known Limits
+
+- Native Shell drag-out support depends on WebView2 accepting DownloadURL/file URI
+  drag data. Open remains available as a reliable fallback.
+- SSH folder export requires tar on the remote host.
+
+
 ### 2026-05-21 - Drag-and-drop import
 
 #### Added

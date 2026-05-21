@@ -33,6 +33,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
     forwards: Mutex<HashMap<String, ForwardSession>>,
+    exports: Mutex<HashMap<String, ExportSession>>,
 }
 
 struct TerminalSession {
@@ -44,6 +45,10 @@ struct TerminalSession {
 struct ForwardSession {
     stop: Option<Arc<AtomicBool>>,
     child: Option<ProcessChild>,
+}
+
+struct ExportSession {
+    cancel: Arc<AtomicBool>,
 }
 
 fn default_windows_root() -> String {
@@ -234,6 +239,25 @@ struct PortForwardResult {
     target_host: String,
     remote_port: u16,
     url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportStartResult {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportProgressEvent {
+    id: String,
+    name: String,
+    status: String,
+    progress: Option<f64>,
+    output_path: Option<String>,
+    message: Option<String>,
+    directory: bool,
 }
 
 #[tauri::command]
@@ -718,6 +742,110 @@ fn copy_dropped_files(
         "ssh" => copy_dropped_files_to_remote(&profile, &target_dir, &source_paths),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
+}
+
+#[tauri::command]
+fn start_export_path(
+    app: tauri::AppHandle,
+    state: State<IdeState>,
+    profile_id: String,
+    path: String,
+) -> Result<ExportStartResult, String> {
+    let profile = profile_from_id(&profile_id);
+    let source_path = normalize_profile_path(&profile, &path);
+    let display_name = export_display_name(&profile, &source_path);
+    let id = Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .exports
+        .lock()
+        .map_err(|_| "export lock poisoned".to_string())?
+        .insert(
+            id.clone(),
+            ExportSession {
+                cancel: cancel.clone(),
+            },
+        );
+
+    let app_handle = app.clone();
+    let id_for_thread = id.clone();
+    let name_for_thread = display_name.clone();
+    let name_for_result = display_name.clone();
+    thread::spawn(move || {
+        let result = export_source_info(&profile, &source_path).and_then(|info| {
+            run_export_job(
+                &app_handle,
+                &id_for_thread,
+                &profile,
+                &source_path,
+                info,
+                cancel.clone(),
+            )
+        });
+        if let Err(error) = result {
+            emit_export_event(
+                &app_handle,
+                ExportProgressEvent {
+                    id: id_for_thread.clone(),
+                    name: name_for_thread.clone(),
+                    status: if cancel.load(Ordering::Relaxed) {
+                        "cancelled".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    progress: None,
+                    output_path: None,
+                    message: Some(error),
+                    directory: false,
+                },
+            );
+        }
+        if let Ok(mut exports) = app_handle.state::<IdeState>().exports.lock() {
+            exports.remove(&id_for_thread);
+        }
+    });
+
+    Ok(ExportStartResult {
+        id,
+        name: name_for_result,
+    })
+}
+
+#[tauri::command]
+fn cancel_export_path(state: State<IdeState>, id: String) -> Result<(), String> {
+    if let Some(session) = state
+        .exports
+        .lock()
+        .map_err(|_| "export lock poisoned".to_string())?
+        .get(&id)
+    {
+        session.cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_export_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if !target.exists() {
+        return Err("export path does not exist".to_string());
+    }
+
+    let mut command = Command::new("explorer.exe");
+    if target.is_dir() {
+        command.arg(target.to_string_lossy().to_string());
+    } else {
+        command.arg(format!("/select,{}", target.to_string_lossy()));
+    }
+    command
+        .current_dir(windows_spawn_cwd())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command)
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1396,6 +1524,492 @@ fn rename_local_path(old_path: &Path, new_path: &Path) -> Result<(), String> {
     fs::rename(old_path, new_path).map_err(|err| err.to_string())
 }
 
+#[derive(Clone)]
+struct ExportSourceInfo {
+    name: String,
+    kind: String,
+    size: Option<u64>,
+    direct_windows_path: Option<PathBuf>,
+}
+
+fn export_display_name(profile: &ConnectionProfile, path: &str) -> String {
+    match profile.kind.as_str() {
+        "windows" => local_file_name(Path::new(path)).unwrap_or_else(|_| "export".to_string()),
+        "wsl" => wsl_posix_path_to_windows_path(profile, path)
+            .and_then(|windows_path| local_file_name(&windows_path).ok())
+            .unwrap_or_else(|| remote_file_name(path)),
+        "ssh" => remote_file_name(path),
+        _ => "export".to_string(),
+    }
+}
+
+fn export_source_info(profile: &ConnectionProfile, path: &str) -> Result<ExportSourceInfo, String> {
+    match profile.kind.as_str() {
+        "windows" => export_local_source_info(Path::new(path)),
+        "wsl" => {
+            if let Some(windows_path) = wsl_posix_path_to_windows_path(profile, path) {
+                let mut info = export_local_source_info(&windows_path)?;
+                info.direct_windows_path = Some(windows_path);
+                Ok(info)
+            } else {
+                export_remote_source_info(profile, path)
+            }
+        }
+        "ssh" => export_remote_source_info(profile, path),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+fn export_local_source_info(path: &Path) -> Result<ExportSourceInfo, String> {
+    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+    let kind = if metadata.is_dir() {
+        "dir"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    if kind == "other" {
+        return Err("unsupported export item type".to_string());
+    }
+    Ok(ExportSourceInfo {
+        name: local_file_name(path)?,
+        kind: kind.to_string(),
+        size: if metadata.is_file() {
+            Some(metadata.len())
+        } else {
+            None
+        },
+        direct_windows_path: Some(path.to_path_buf()),
+    })
+}
+
+fn export_remote_source_info(
+    profile: &ConnectionProfile,
+    path: &str,
+) -> Result<ExportSourceInfo, String> {
+    let script = format!(
+        "if [ -d {0} ]; then printf 'dir\\t0'; elif [ -f {0} ]; then printf 'file\\t'; wc -c < {0}; else printf 'other\\t0'; fi",
+        shell_quote(path)
+    );
+    let output = run_profile_shell(profile, &script, None)?;
+    let text = String::from_utf8_lossy(&output);
+    let mut parts = text.trim().splitn(2, '\t');
+    let kind = parts.next().unwrap_or("other").to_string();
+    let size = parts
+        .next()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if kind == "other" {
+        return Err("unsupported export item type".to_string());
+    }
+    Ok(ExportSourceInfo {
+        name: remote_file_name(path),
+        kind,
+        size,
+        direct_windows_path: None,
+    })
+}
+
+fn run_export_job(
+    app: &tauri::AppHandle,
+    id: &str,
+    profile: &ConnectionProfile,
+    source_path: &str,
+    info: ExportSourceInfo,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let root = export_root()?;
+    let job_dir = root.join(sanitize_segment(id));
+    fs::create_dir_all(&job_dir).map_err(|err| err.to_string())?;
+    let output_name = if info.kind == "dir" && info.direct_windows_path.is_none() {
+        format!("{}.tar", info.name)
+    } else {
+        info.name.clone()
+    };
+    let output_path = unique_local_child_path(&job_dir, &output_name);
+    let directory = info.kind == "dir" && info.direct_windows_path.is_some();
+
+    emit_export_event(
+        app,
+        ExportProgressEvent {
+            id: id.to_string(),
+            name: output_name.clone(),
+            status: "running".to_string(),
+            progress: Some(0.0),
+            output_path: None,
+            message: Some("Preparing export".to_string()),
+            directory,
+        },
+    );
+
+    if let Some(source) = info.direct_windows_path.as_deref() {
+        if info.kind == "dir" {
+            let total = directory_total_size(source, &cancel)?;
+            copy_local_path_recursive_with_progress(
+                source,
+                &output_path,
+                &cancel,
+                total,
+                &mut |done, total| {
+                    emit_export_progress(app, id, &output_name, done, total, directory);
+                },
+            )?;
+        } else {
+            copy_file_streaming(
+                source,
+                &output_path,
+                &cancel,
+                info.size.unwrap_or(0),
+                &mut |done, total| {
+                    emit_export_progress(app, id, &output_name, done, total, false);
+                },
+            )?;
+        }
+    } else if info.kind == "dir" {
+        stream_remote_directory_tar(
+            profile,
+            source_path,
+            &output_path,
+            &cancel,
+            app,
+            id,
+            &output_name,
+        )?;
+    } else {
+        stream_remote_file(
+            profile,
+            source_path,
+            &output_path,
+            &cancel,
+            info.size.unwrap_or(0),
+            app,
+            id,
+            &output_name,
+        )?;
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        let _ = remove_export_output(&output_path);
+        emit_export_event(
+            app,
+            ExportProgressEvent {
+                id: id.to_string(),
+                name: output_name,
+                status: "cancelled".to_string(),
+                progress: None,
+                output_path: None,
+                message: Some("Export cancelled".to_string()),
+                directory,
+            },
+        );
+        return Ok(());
+    }
+
+    emit_export_event(
+        app,
+        ExportProgressEvent {
+            id: id.to_string(),
+            name: output_name,
+            status: "completed".to_string(),
+            progress: Some(1.0),
+            output_path: Some(output_path.to_string_lossy().to_string()),
+            message: Some("Ready to drag out".to_string()),
+            directory,
+        },
+    );
+    Ok(())
+}
+
+fn export_root() -> Result<PathBuf, String> {
+    let root = std::env::temp_dir().join("simple-vibe-ide-exports");
+    fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+    Ok(root)
+}
+
+fn emit_export_progress(
+    app: &tauri::AppHandle,
+    id: &str,
+    name: &str,
+    done: u64,
+    total: u64,
+    directory: bool,
+) {
+    let progress = if total > 0 {
+        Some((done as f64 / total as f64).clamp(0.0, 0.995))
+    } else {
+        None
+    };
+    emit_export_event(
+        app,
+        ExportProgressEvent {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: "running".to_string(),
+            progress,
+            output_path: None,
+            message: Some(format!("{} / {}", format_bytes(done), format_bytes(total))),
+            directory,
+        },
+    );
+}
+
+fn emit_export_event(app: &tauri::AppHandle, event: ExportProgressEvent) {
+    let _ = app.emit("export-progress", event);
+}
+
+fn directory_total_size(path: &Path, cancel: &Arc<AtomicBool>) -> Result<u64, String> {
+    check_export_cancelled(cancel)?;
+    let mut total = 0;
+    for child in fs::read_dir(path).map_err(|err| err.to_string())? {
+        check_export_cancelled(cancel)?;
+        let child = child.map_err(|err| err.to_string())?;
+        let metadata = child.metadata().map_err(|err| err.to_string())?;
+        if metadata.is_dir() {
+            total += directory_total_size(&child.path(), cancel)?;
+        } else if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
+fn copy_local_path_recursive_with_progress<F>(
+    source: &Path,
+    target: &Path,
+    cancel: &Arc<AtomicBool>,
+    total: u64,
+    progress: &mut F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64, u64),
+{
+    check_export_cancelled(cancel)?;
+    let metadata = fs::metadata(source).map_err(|err| err.to_string())?;
+    if metadata.is_dir() {
+        reject_copy_directory_into_itself(source, target)?;
+        fs::create_dir(target).map_err(|err| err.to_string())?;
+        let mut done = 0;
+        for child in fs::read_dir(source).map_err(|err| err.to_string())? {
+            check_export_cancelled(cancel)?;
+            let child = child.map_err(|err| err.to_string())?;
+            let child_name = local_file_name(&child.path())?;
+            done += copy_local_path_recursive_with_progress(
+                &child.path(),
+                &target.join(child_name),
+                cancel,
+                total,
+                progress,
+            )?;
+            progress(done.min(total), total);
+        }
+        Ok(done)
+    } else if metadata.is_file() {
+        copy_file_streaming(source, target, cancel, total, progress)
+    } else {
+        Err("unsupported export item type".to_string())
+    }
+}
+
+fn copy_file_streaming<F>(
+    source: &Path,
+    target: &Path,
+    cancel: &Arc<AtomicBool>,
+    total: u64,
+    progress: &mut F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64, u64),
+{
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut input = fs::File::open(source).map_err(|err| err.to_string())?;
+    let mut output = fs::File::create(target).map_err(|err| err.to_string())?;
+    copy_reader_to_writer(&mut input, &mut output, cancel, total, progress)
+}
+
+fn copy_reader_to_writer<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: &Arc<AtomicBool>,
+    total: u64,
+    progress: &mut F,
+) -> Result<u64, String>
+where
+    R: Read,
+    W: Write,
+    F: FnMut(u64, u64),
+{
+    let mut buffer = vec![0_u8; 1024 * 256];
+    let mut done = 0;
+    loop {
+        check_export_cancelled(cancel)?;
+        let read = reader.read(&mut buffer).map_err(|err| err.to_string())?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|err| err.to_string())?;
+        done += read as u64;
+        progress(done, total);
+    }
+    Ok(done)
+}
+
+fn stream_remote_file(
+    profile: &ConnectionProfile,
+    source_path: &str,
+    output_path: &Path,
+    cancel: &Arc<AtomicBool>,
+    total: u64,
+    app: &tauri::AppHandle,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let script = format!("cat -- {}", shell_quote(source_path));
+    stream_profile_shell_to_file(profile, &script, output_path, cancel, total, app, id, name)
+}
+
+fn stream_remote_directory_tar(
+    profile: &ConnectionProfile,
+    source_path: &str,
+    output_path: &Path,
+    cancel: &Arc<AtomicBool>,
+    app: &tauri::AppHandle,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let parent = parent_posix(source_path);
+    let name_in_parent = remote_path_basename(source_path);
+    let script = format!(
+        "tar -C {} -cf - -- {}",
+        shell_quote(&parent),
+        shell_quote(&name_in_parent)
+    );
+    stream_profile_shell_to_file(profile, &script, output_path, cancel, 0, app, id, name)
+}
+
+fn stream_profile_shell_to_file(
+    profile: &ConnectionProfile,
+    script: &str,
+    output_path: &Path,
+    cancel: &Arc<AtomicBool>,
+    total: u64,
+    app: &tauri::AppHandle,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut command = profile_shell_command(profile, script)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = hide_command_window(&mut command)
+        .spawn()
+        .map_err(|err| format!("failed to start export: {err}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture export stream".to_string())?;
+    let mut output = fs::File::create(output_path).map_err(|err| err.to_string())?;
+    let copy_result = copy_reader_to_writer(
+        &mut stdout,
+        &mut output,
+        cancel,
+        total,
+        &mut |done, total| {
+            emit_export_progress(app, id, name, done, total, false);
+        },
+    );
+    if copy_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return copy_result.map(|_| ());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait for export: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+fn profile_shell_command(profile: &ConnectionProfile, script: &str) -> Result<Command, String> {
+    match profile.kind.as_str() {
+        "wsl" => {
+            let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
+            let mut command = Command::new("wsl.exe");
+            command
+                .current_dir(windows_spawn_cwd())
+                .arg("-d")
+                .arg(distro)
+                .arg("--")
+                .arg("bash")
+                .arg("-lc")
+                .arg(script);
+            Ok(command)
+        }
+        "ssh" => {
+            let alias = profile.ssh_alias.as_deref().unwrap_or("default");
+            let remote = format!("sh -lc {}", shell_quote(script));
+            let mut command = Command::new("ssh.exe");
+            command
+                .current_dir(windows_spawn_cwd())
+                .arg("-T")
+                .arg(alias)
+                .arg(remote);
+            Ok(command)
+        }
+        _ => Err(format!("profile is not remote: {}", profile.kind)),
+    }
+}
+
+fn check_export_cancelled(cancel: &Arc<AtomicBool>) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err("Export cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_export_output(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|err| err.to_string())
+    } else if path.exists() {
+        fs::remove_file(path).map_err(|err| err.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn remote_path_basename(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    trimmed
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .filter(|part| !part.is_empty())
+        .unwrap_or("export")
+        .to_string()
+}
+
+fn remote_file_name(path: &str) -> String {
+    sanitize_file_name(&remote_path_basename(path))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else {
+        format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
 fn copy_dropped_files_to_local(
     target_dir: &Path,
     source_paths: &[String],
@@ -1771,6 +2385,9 @@ pub fn run() {
             rename_path,
             open_path,
             copy_dropped_files,
+            start_export_path,
+            cancel_export_path,
+            open_export_path,
             save_attachment,
             spawn_terminal,
             write_terminal,
