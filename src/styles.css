@@ -554,8 +554,9 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
   0% { transform: translateX(-120%); }
   100% { transform: translateX(240%); }
 }
-.file-list { overflow: auto; padding: 6px; }
-.file-row { width: 100%; display: grid; grid-template-columns: 22px minmax(0, 1fr) max-content; gap: 6px; align-items: center; text-align: left; border: 0; background: transparent; padding: 6px 7px 6px calc(7px + var(--depth, 0) * 14px); cursor: default; border-radius: 5px; }
+.file-list { --explorer-row-height: 32px; overflow: auto; padding: 6px; contain: layout paint style; }
+.explorer-spacer { width: 100%; pointer-events: none; }
+.file-row { width: 100%; height: var(--explorer-row-height); box-sizing: border-box; display: grid; grid-template-columns: 22px minmax(0, 1fr) max-content; gap: 6px; align-items: center; text-align: left; border: 0; background: transparent; padding: 6px 7px 6px calc(7px + var(--depth, 0) * 14px); cursor: default; border-radius: 5px; }
 .file-row:hover { background: #172033; }
 .file-row.selected { background: #16243a; box-shadow: inset 2px 0 0 #4d8dff; }
 .file-row.loading { color: #7f8da3; font-style: italic; pointer-events: none; }

@@ -328,6 +328,13 @@ interface ExplorerRuntimeCache {
   selectedPath: string;
 }
 
+interface ExplorerVisibleRow {
+  entry: FileEntry | null;
+  path: string;
+  depth: number;
+  loading: boolean;
+}
+
 interface EditorRuntime {
   EditorState: typeof import('@codemirror/state').EditorState;
   EditorView: typeof import('@codemirror/view').EditorView;
@@ -478,6 +485,10 @@ const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const SECRET_PARSE_CACHE_LIMIT = 32;
 const EDITOR_LOADING_DELAY_MS = 180;
+const EXPLORER_ROW_HEIGHT = 32;
+const EXPLORER_VIRTUAL_OVERSCAN = 12;
+const EXPLORER_SCROLL_IDLE_MS = 180;
+const EXPLORER_HOVER_PREFETCH_DELAY_MS = 180;
 const EXPLORER_DIRECTORY_PREFETCH_DELAY_MS = 120;
 const EXPLORER_DIRECTORY_PREFETCH_LIMIT = 6;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
@@ -955,6 +966,16 @@ const explorerDirectoryPrefetchTimers = new Map<string, number>();
 const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
 const edgeDevtoolsSessions = new Map<string, EdgeDevtoolsSession>();
 const noteSaveTimers = new Map<string, number>();
+const explorerVisibleEntryByPath = new Map<string, FileEntry>();
+let explorerVisibleRows: ExplorerVisibleRow[] = [];
+let explorerRenderedStart = 0;
+let explorerRenderedEnd = 0;
+let explorerRenderFrame = 0;
+let explorerScrollIdleTimer = 0;
+let explorerScrollingUntil = 0;
+let explorerHoverPrefetchTimer = 0;
+let explorerHoverPrefetchPath = '';
+let explorerResizeObserver: ResizeObserver | null = null;
 let explorerWatchTimer = 0;
 let explorerWatchInFlight = false;
 let terminalCwdSaveTimer = 0;
@@ -3395,6 +3416,7 @@ function bindEvents() {
     state.showFileSizes = !state.showFileSizes;
     updateExplorerFileSizeMode();
   });
+  bindExplorerListEvents();
   el.autoPasteImageTag.addEventListener('change', () => {
     state.autoPasteImageTagToShell = el.autoPasteImageTag.checked;
   });
@@ -3455,6 +3477,7 @@ function bindEvents() {
       applyStoredLayoutRatio(widget.element);
       scheduleFitTerminalWidget(widget);
     });
+    scheduleExplorerVirtualRender();
     codeView?.requestMeasure();
     scheduleConfigureEdgeViewport();
   });
@@ -4974,6 +4997,7 @@ async function loadDirectory(path: string) {
 }
 
 function renderExplorer() {
+  const scrollTop = el.fileList.scrollTop;
   el.pathRow.innerHTML = '';
   updateExplorerFileSizeMode();
   updateExplorerOpenMode();
@@ -4990,10 +5014,8 @@ function renderExplorer() {
   });
   el.pathRow.append(up, pathBadge(state.currentDir), useFolder);
 
-  el.fileList.innerHTML = '';
-  const fragment = document.createDocumentFragment();
-  renderExplorerRows(fragment, state.entries, 0);
-  el.fileList.append(fragment);
+  rebuildExplorerVisibleRows();
+  renderVirtualExplorerRows(scrollTop);
   updateExplorerSelection(false);
   renderExportJobs();
   scheduleVisibleExplorerDirectoryPrefetch();
@@ -5017,71 +5039,210 @@ function openSelectedExplorerEntry() {
   return true;
 }
 
-function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], depth: number) {
+function rebuildExplorerVisibleRows() {
+  explorerVisibleRows = [];
+  explorerVisibleEntryByPath.clear();
+  appendExplorerVisibleRows(state.entries, 0);
+}
+
+function appendExplorerVisibleRows(entries: FileEntry[], depth: number) {
   for (const entry of entries) {
-    const row = document.createElement('div');
-    row.className = `file-row ${entry.kind}`;
-    row.dataset.path = entry.path;
-    if (sameExplorerPath(entry.path, state.explorerDropTargetDir)) row.classList.add('drop-target');
-    row.tabIndex = 0;
-    row.style.setProperty('--depth', String(depth));
-    row.setAttribute('role', 'option');
-    row.setAttribute('aria-selected', String(sameExplorerPath(entry.path, state.explorerSelectedPath)));
-
-    const disclosure = document.createElement('span');
-    disclosure.className = 'file-disclosure';
-    disclosure.textContent = entry.kind === 'dir'
-      ? state.explorerExpanded.has(entry.path) ? 'v' : '>'
-      : '';
-
-    const name = document.createElement('span');
-    name.className = 'file-name';
-    if (activeExplorerRename && sameExplorerPath(activeExplorerRename.path, entry.path)) {
-      attachExplorerRenameInput(name, entry);
-    } else {
-      name.textContent = entry.name;
-    }
-
-    const size = document.createElement('small');
-    size.textContent = entry.kind === 'file' ? formatBytes(entry.size) : '';
-
-    row.append(disclosure, name, size);
-    row.addEventListener('pointerenter', () => {
-      scheduleTextFilePrefetch(entry);
-      scheduleExplorerDirectoryPrefetch(entry);
-    });
-    row.addEventListener('pointerdown', () => {
-      selectExplorerEntry(entry.path, false);
-      scheduleTextFilePrefetch(entry, 0);
-      scheduleExplorerDirectoryPrefetch(entry, 0);
-    });
-    row.addEventListener('focus', () => {
-      selectExplorerEntry(entry.path, false);
-      scheduleTextFilePrefetch(entry, 0);
-      scheduleExplorerDirectoryPrefetch(entry, 0);
-    });
-    row.addEventListener('click', () => {
-      if (state.explorerOpenMode === 'single') openExplorerEntry(entry);
-      else selectExplorerEntry(entry.path, false);
-    });
-    row.addEventListener('dblclick', () => openExplorerEntry(entry));
-    fragment.append(row);
+    explorerVisibleRows.push({ entry, path: entry.path, depth, loading: false });
+    explorerVisibleEntryByPath.set(explorerPathKey(entry.path), entry);
 
     if (entry.kind === 'dir' && state.explorerExpanded.has(entry.path)) {
       const children = state.explorerChildren.get(entry.path);
-      if (children) renderExplorerRows(fragment, children, depth + 1);
-      else if (state.explorerLoading.has(entry.path)) appendExplorerLoadingRow(fragment, depth + 1);
+      if (children) appendExplorerVisibleRows(children, depth + 1);
+      else if (state.explorerLoading.has(entry.path)) {
+        explorerVisibleRows.push({
+          entry: null,
+          path: `${entry.path}::loading`,
+          depth: depth + 1,
+          loading: true
+        });
+      }
     }
   }
 }
 
-function appendExplorerLoadingRow(fragment: DocumentFragment, depth: number) {
+function renderVirtualExplorerRows(scrollTop = el.fileList.scrollTop) {
+  const total = explorerVisibleRows.length;
+  const viewportHeight = Math.max(el.fileList.clientHeight, EXPLORER_ROW_HEIGHT * 8);
+  const maxScrollTop = Math.max(0, total * EXPLORER_ROW_HEIGHT - viewportHeight);
+  const nextScrollTop = clamp(scrollTop, 0, maxScrollTop);
+  const visibleCount = Math.ceil(viewportHeight / EXPLORER_ROW_HEIGHT) + EXPLORER_VIRTUAL_OVERSCAN * 2;
+  explorerRenderedStart = clamp(Math.floor(nextScrollTop / EXPLORER_ROW_HEIGHT) - EXPLORER_VIRTUAL_OVERSCAN, 0, total);
+  explorerRenderedEnd = clamp(explorerRenderedStart + visibleCount, explorerRenderedStart, total);
+
+  const fragment = document.createDocumentFragment();
+  appendExplorerSpacer(fragment, explorerRenderedStart * EXPLORER_ROW_HEIGHT);
+  for (let index = explorerRenderedStart; index < explorerRenderedEnd; index += 1) {
+    const item = explorerVisibleRows[index];
+    fragment.append(item.loading ? createExplorerLoadingRow(item.depth) : createExplorerRow(item.entry!, item.depth));
+  }
+  appendExplorerSpacer(fragment, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT);
+  el.fileList.replaceChildren(fragment);
+  el.fileList.scrollTop = nextScrollTop;
+}
+
+function appendExplorerSpacer(fragment: DocumentFragment, height: number) {
+  if (height <= 0) return;
+  const spacer = document.createElement('div');
+  spacer.className = 'explorer-spacer';
+  spacer.style.height = `${height}px`;
+  fragment.append(spacer);
+}
+
+function createExplorerRow(entry: FileEntry, depth: number) {
+  const row = document.createElement('div');
+  row.className = `file-row ${entry.kind}`;
+  row.dataset.path = entry.path;
+  if (sameExplorerPath(entry.path, state.explorerDropTargetDir)) row.classList.add('drop-target');
+  row.tabIndex = 0;
+  row.style.setProperty('--depth', String(depth));
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', String(sameExplorerPath(entry.path, state.explorerSelectedPath)));
+
+  const disclosure = document.createElement('span');
+  disclosure.className = 'file-disclosure';
+  disclosure.textContent = entry.kind === 'dir'
+    ? state.explorerExpanded.has(entry.path) ? 'v' : '>'
+    : '';
+
+  const name = document.createElement('span');
+  name.className = 'file-name';
+  if (activeExplorerRename && sameExplorerPath(activeExplorerRename.path, entry.path)) {
+    attachExplorerRenameInput(name, entry);
+  } else {
+    name.textContent = entry.name;
+  }
+
+  const size = document.createElement('small');
+  size.textContent = entry.kind === 'file' ? formatBytes(entry.size) : '';
+
+  row.append(disclosure, name, size);
+  return row;
+}
+
+function createExplorerLoadingRow(depth: number) {
   const row = document.createElement('div');
   row.className = 'file-row loading';
   row.style.setProperty('--depth', String(depth));
   row.setAttribute('role', 'option');
   row.innerHTML = '<span class="file-disclosure"></span><span class="file-name">Loading...</span><small></small>';
-  fragment.append(row);
+  return row;
+}
+
+function bindExplorerListEvents() {
+  el.fileList.addEventListener('scroll', handleExplorerScroll, { passive: true });
+  el.fileList.addEventListener('wheel', markExplorerScrolling, { passive: true });
+  el.fileList.addEventListener('pointerover', handleExplorerPointerOver);
+  el.fileList.addEventListener('pointerdown', handleExplorerPointerDown);
+  el.fileList.addEventListener('focusin', handleExplorerFocusIn);
+  el.fileList.addEventListener('click', handleExplorerClick);
+  el.fileList.addEventListener('dblclick', handleExplorerDoubleClick);
+  explorerResizeObserver = new ResizeObserver(scheduleExplorerVirtualRender);
+  explorerResizeObserver.observe(el.fileList);
+}
+
+function handleExplorerScroll() {
+  markExplorerScrolling();
+  scheduleExplorerVirtualRender();
+}
+
+function scheduleExplorerVirtualRender() {
+  if (explorerRenderFrame) return;
+  explorerRenderFrame = window.requestAnimationFrame(() => {
+    explorerRenderFrame = 0;
+    renderVirtualExplorerRows();
+    updateExplorerSelection(false);
+  });
+}
+
+function markExplorerScrolling() {
+  explorerScrollingUntil = Date.now() + EXPLORER_SCROLL_IDLE_MS;
+  cancelExplorerHoverPrefetch();
+  if (explorerScrollIdleTimer) window.clearTimeout(explorerScrollIdleTimer);
+  explorerScrollIdleTimer = window.setTimeout(() => {
+    explorerScrollIdleTimer = 0;
+    scheduleVisibleExplorerDirectoryPrefetch();
+  }, EXPLORER_SCROLL_IDLE_MS);
+}
+
+function handleExplorerPointerOver(event: PointerEvent) {
+  const row = explorerRowFromEvent(event);
+  if (!row || row.contains(event.relatedTarget as Node | null)) return;
+  const entry = explorerEntryForRow(row);
+  if (!entry) return;
+  scheduleExplorerHoverPrefetch(entry);
+}
+
+function handleExplorerPointerDown(event: PointerEvent) {
+  if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
+  const entry = explorerEntryFromEvent(event);
+  if (!entry) return;
+  selectExplorerEntry(entry.path, false);
+  scheduleTextFilePrefetch(entry, 0);
+  scheduleExplorerDirectoryPrefetch(entry, 0);
+}
+
+function handleExplorerFocusIn(event: FocusEvent) {
+  if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
+  const entry = explorerEntryFromEvent(event);
+  if (!entry) return;
+  selectExplorerEntry(entry.path, false);
+  scheduleTextFilePrefetch(entry, 0);
+  scheduleExplorerDirectoryPrefetch(entry, 0);
+}
+
+function handleExplorerClick(event: MouseEvent) {
+  if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
+  const entry = explorerEntryFromEvent(event);
+  if (!entry) return;
+  if (state.explorerOpenMode === 'single') openExplorerEntry(entry);
+  else selectExplorerEntry(entry.path, false);
+}
+
+function handleExplorerDoubleClick(event: MouseEvent) {
+  if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
+  const entry = explorerEntryFromEvent(event);
+  if (entry) openExplorerEntry(entry);
+}
+
+function explorerEntryFromEvent(event: Event) {
+  const row = explorerRowFromEvent(event);
+  return row ? explorerEntryForRow(row) : null;
+}
+
+function explorerRowFromEvent(event: Event) {
+  if (!(event.target instanceof Element)) return null;
+  const row = event.target.closest<HTMLElement>('.file-row[data-path]');
+  return row && el.fileList.contains(row) ? row : null;
+}
+
+function explorerEntryForRow(row: HTMLElement) {
+  const path = row.dataset.path ?? '';
+  return explorerVisibleEntryByPath.get(explorerPathKey(path)) ?? findExplorerEntry(path);
+}
+
+function scheduleExplorerHoverPrefetch(entry: FileEntry) {
+  if (Date.now() < explorerScrollingUntil) return;
+  if (explorerHoverPrefetchTimer) window.clearTimeout(explorerHoverPrefetchTimer);
+  explorerHoverPrefetchPath = entry.path;
+  explorerHoverPrefetchTimer = window.setTimeout(() => {
+    explorerHoverPrefetchTimer = 0;
+    if (Date.now() < explorerScrollingUntil || explorerHoverPrefetchPath !== entry.path) return;
+    scheduleTextFilePrefetch(entry);
+    scheduleExplorerDirectoryPrefetch(entry, EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + 120);
+  }, EXPLORER_HOVER_PREFETCH_DELAY_MS);
+}
+
+function cancelExplorerHoverPrefetch() {
+  explorerHoverPrefetchPath = '';
+  if (explorerHoverPrefetchTimer) {
+    window.clearTimeout(explorerHoverPrefetchTimer);
+    explorerHoverPrefetchTimer = 0;
+  }
 }
 
 async function startExportSelectedExplorerEntry() {
@@ -5727,15 +5888,27 @@ function selectExplorerEntry(path: string, scrollIntoView = true) {
 }
 
 function updateExplorerSelection(scrollIntoView = true) {
-  let selectedRow: HTMLElement | null = null;
+  if (scrollIntoView) scrollExplorerPathIntoView(state.explorerSelectedPath);
   el.fileList.querySelectorAll<HTMLElement>('.file-row').forEach((row) => {
     const selected = sameExplorerPath(row.dataset.path ?? '', state.explorerSelectedPath);
     row.classList.toggle('selected', selected);
     row.setAttribute('aria-selected', String(selected));
-    if (selected) selectedRow = row;
   });
-  const rowToReveal = selectedRow as HTMLElement | null;
-  if (scrollIntoView && rowToReveal) rowToReveal.scrollIntoView({ block: 'nearest' });
+}
+
+function scrollExplorerPathIntoView(path: string) {
+  if (!path) return;
+  const index = explorerVisibleRows.findIndex((row) => !row.loading && sameExplorerPath(row.path, path));
+  if (index < 0) return;
+  const top = index * EXPLORER_ROW_HEIGHT;
+  const bottom = top + EXPLORER_ROW_HEIGHT;
+  const currentTop = el.fileList.scrollTop;
+  const currentBottom = currentTop + el.fileList.clientHeight;
+  let nextTop = currentTop;
+  if (top < currentTop) nextTop = top;
+  else if (bottom > currentBottom) nextTop = bottom - el.fileList.clientHeight;
+  if (nextTop === currentTop) return;
+  renderVirtualExplorerRows(nextTop);
 }
 
 function scheduleTextFilePrefetch(entry: FileEntry, delay = 80) {
@@ -5783,14 +5956,22 @@ function scheduleExplorerDirectoryPrefetch(entry: FileEntry, delay = EXPLORER_DI
 
 function scheduleVisibleExplorerDirectoryPrefetch() {
   if (!state.activeProfile || !state.workspaceOpen || getPanel('explorer').classList.contains('hidden')) return;
+  if (Date.now() < explorerScrollingUntil) return;
   const limit = explorerDirectoryPrefetchLimit();
   let count = 0;
-  for (const entry of visibleExplorerEntries()) {
+  for (const entry of visibleExplorerViewportEntries()) {
     if (count >= limit) break;
     if (entry.kind !== 'dir' || state.explorerExpanded.has(entry.path)) continue;
     scheduleExplorerDirectoryPrefetch(entry, EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + count * 90);
     count += 1;
   }
+}
+
+function visibleExplorerViewportEntries() {
+  return explorerVisibleRows
+    .slice(explorerRenderedStart, explorerRenderedEnd)
+    .map((row) => row.entry)
+    .filter((entry): entry is FileEntry => Boolean(entry));
 }
 
 function explorerDirectoryPrefetchLimit() {

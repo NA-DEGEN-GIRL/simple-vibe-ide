@@ -16,6 +16,27 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Explorer scroll performance
+
+#### Changed
+
+- Explorer now virtualizes visible rows, keeping only the viewport and a small
+  overscan window in the DOM while large folders or expanded trees scroll.
+- Explorer row events are delegated from the list instead of attaching multiple
+  listeners to every file row.
+- Hover prefetch is paused while the Explorer is scrolling, so WSL/SSH directory
+  and text prefetch work does not compete with scroll frames.
+- Explorer viewport prefetch now focuses on rows near the current viewport
+  instead of the beginning of the full visible tree.
+
+#### Verified
+
+- `npm run check` passed.
+- `npm run build` passed.
+- `npm run tauri -- build --no-bundle` passed and rebuilt the Windows release
+  exe.
+
+
 ### 2026-05-22 - Terminal cwd persistence fix
 
 #### Fixed
