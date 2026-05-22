@@ -466,6 +466,9 @@ const EXPLORER_DIRECTORY_CACHE_LIMIT = 48;
 const NOTES_AUTOSAVE_DELAY_MS = 1800;
 const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
+const EDITOR_LOADING_DELAY_MS = 180;
+const EXPLORER_DIRECTORY_PREFETCH_DELAY_MS = 120;
+const EXPLORER_DIRECTORY_PREFETCH_LIMIT = 6;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const USE_EDGE_CDP_BROWSER = true;
 const EDGE_SCREENCAST_QUALITY = 66;
@@ -934,6 +937,8 @@ const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
 const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
+const explorerDirectoryReads = new Map<string, Promise<FileEntry[]>>();
+const explorerDirectoryPrefetchTimers = new Map<string, number>();
 const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
 const edgeDevtoolsSessions = new Map<string, EdgeDevtoolsSession>();
 const noteSaveTimers = new Map<string, number>();
@@ -948,6 +953,8 @@ let marketTickerReconnectAttempt = 0;
 let workspaceDragState: WorkspaceDragState | null = null;
 let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
+let editorLoadingTimer = 0;
+let editorLoadingRequest = 0;
 let activeEdgeCdp: EdgeCdpState | null = null;
 let edgePreviewResizeObserver: ResizeObserver | null = null;
 let edgeViewportFrame = 0;
@@ -4804,6 +4811,10 @@ function explorerDirectoryCacheKey(profileId: string, path: string, workspaceId 
   return `${workspaceId || 'workspace'}\0${profileId}\0${path}`;
 }
 
+function hasCachedExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  return explorerDirectoryCache.has(explorerDirectoryCacheKey(profileId, path, workspaceId));
+}
+
 function cloneExplorerEntries(entries: FileEntry[]) {
   return entries.map((entry) => ({ ...entry }));
 }
@@ -4828,6 +4839,30 @@ function cacheExplorerDirectory(profileId: string, path: string, entries: FileEn
   }
 }
 
+async function readExplorerDirectoryCached(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  const cached = cachedExplorerDirectory(profileId, path, workspaceId);
+  if (cached) return cached;
+  return fetchExplorerDirectory(profileId, path, workspaceId);
+}
+
+async function fetchExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId, force = false) {
+  const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  const pending = explorerDirectoryReads.get(key);
+  if (pending && !force) return cloneExplorerEntries(await pending);
+
+  let read: Promise<FileEntry[]>;
+  read = api.listDirectory(profileId, path)
+    .then((entries) => {
+      cacheExplorerDirectory(profileId, path, entries, workspaceId);
+      return cloneExplorerEntries(entries);
+    })
+    .finally(() => {
+      if (explorerDirectoryReads.get(key) === read) explorerDirectoryReads.delete(key);
+    });
+  explorerDirectoryReads.set(key, read);
+  return cloneExplorerEntries(await read);
+}
+
 function applyLoadedDirectory(path: string, entries: FileEntry[]) {
   state.entries = cloneExplorerEntries(entries);
   state.currentDir = path;
@@ -4839,6 +4874,7 @@ function applyLoadedDirectory(path: string, entries: FileEntry[]) {
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   renderExplorer();
+  scheduleVisibleExplorerDirectoryPrefetch();
   refreshTitle();
 }
 
@@ -4855,7 +4891,7 @@ async function loadDirectory(path: string) {
     setStatus(`Loading ${path}...`);
   }
   try {
-    const entries = await api.listDirectory(profileId, path);
+    const entries = await fetchExplorerDirectory(profileId, path, workspaceId);
     cacheExplorerDirectory(profileId, path, entries, workspaceId);
     if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
     applyLoadedDirectory(path, entries);
@@ -4889,6 +4925,7 @@ function renderExplorer() {
   el.fileList.append(fragment);
   updateExplorerSelection(false);
   renderExportJobs();
+  scheduleVisibleExplorerDirectoryPrefetch();
 }
 
 function openExplorerEntry(entry: FileEntry) {
@@ -4938,14 +4975,19 @@ function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], de
     size.textContent = entry.kind === 'file' ? formatBytes(entry.size) : '';
 
     row.append(disclosure, name, size);
-    row.addEventListener('pointerenter', () => scheduleTextFilePrefetch(entry));
+    row.addEventListener('pointerenter', () => {
+      scheduleTextFilePrefetch(entry);
+      scheduleExplorerDirectoryPrefetch(entry);
+    });
     row.addEventListener('pointerdown', () => {
       selectExplorerEntry(entry.path, false);
       scheduleTextFilePrefetch(entry, 0);
+      scheduleExplorerDirectoryPrefetch(entry, 0);
     });
     row.addEventListener('focus', () => {
       selectExplorerEntry(entry.path, false);
       scheduleTextFilePrefetch(entry, 0);
+      scheduleExplorerDirectoryPrefetch(entry, 0);
     });
     row.addEventListener('click', () => {
       if (state.explorerOpenMode === 'single') openExplorerEntry(entry);
@@ -4955,9 +4997,20 @@ function renderExplorerRows(fragment: DocumentFragment, entries: FileEntry[], de
     fragment.append(row);
 
     if (entry.kind === 'dir' && state.explorerExpanded.has(entry.path)) {
-      renderExplorerRows(fragment, state.explorerChildren.get(entry.path) ?? [], depth + 1);
+      const children = state.explorerChildren.get(entry.path);
+      if (children) renderExplorerRows(fragment, children, depth + 1);
+      else if (state.explorerLoading.has(entry.path)) appendExplorerLoadingRow(fragment, depth + 1);
     }
   }
+}
+
+function appendExplorerLoadingRow(fragment: DocumentFragment, depth: number) {
+  const row = document.createElement('div');
+  row.className = 'file-row loading';
+  row.style.setProperty('--depth', String(depth));
+  row.setAttribute('role', 'option');
+  row.innerHTML = '<span class="file-disclosure"></span><span class="file-name">Loading...</span><small></small>';
+  fragment.append(row);
 }
 
 async function startExportSelectedExplorerEntry() {
@@ -5177,14 +5230,34 @@ async function toggleExplorerDirectory(entry: FileEntry) {
     return;
   }
 
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  const cached = state.explorerChildren.get(entry.path) ?? cachedExplorerDirectory(profileId, entry.path, workspaceId);
+  if (cached) {
+    state.explorerChildren.set(entry.path, cached);
+    state.explorerSignatures.set(entry.path, explorerDirectorySignature(cached));
+    state.explorerExpanded.add(entry.path);
+    state.explorerLoading.delete(entry.path);
+    renderExplorer();
+    saveActiveWorkspaceSnapshot();
+    void refreshExplorerDirectory(entry.path, profileId, workspaceId).catch(() => undefined);
+    return;
+  }
+
+  state.explorerExpanded.add(entry.path);
+  state.explorerLoading.add(entry.path);
+  renderExplorer();
+
   try {
-    state.explorerLoading.add(entry.path);
-    const children = await api.listDirectory(state.activeProfile.id, entry.path);
+    const children = await fetchExplorerDirectory(profileId, entry.path, workspaceId);
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
     state.explorerChildren.set(entry.path, children);
     state.explorerSignatures.set(entry.path, explorerDirectorySignature(children));
     state.explorerExpanded.add(entry.path);
+    scheduleVisibleExplorerDirectoryPrefetch();
     setStatus(`Expanded ${entry.name}`);
   } catch (error) {
+    state.explorerExpanded.delete(entry.path);
     setStatus(String(error), true);
   } finally {
     state.explorerLoading.delete(entry.path);
@@ -5217,7 +5290,7 @@ async function createExplorerItem(kind: 'file' | 'dir') {
   try {
     if (kind === 'file') await api.createFile(state.activeProfile.id, path);
     else await api.createDirectory(state.activeProfile.id, path);
-    if (kind === 'file' && !shouldMaskFile(path)) cacheTextFile(state.activeProfile.id, path, '');
+    if (kind === 'file') cacheTextFile(state.activeProfile.id, path, '');
     await reloadExplorerDirectory(targetDir);
     selectExplorerEntry(path);
     startInlineExplorerRename(path, { created: true });
@@ -5366,7 +5439,7 @@ async function ensureExplorerDirectoryChildren(path: string) {
   if (path === state.currentDir) return state.entries;
   const cached = state.explorerChildren.get(path);
   if (cached) return cached;
-  const children = await api.listDirectory(state.activeProfile.id, path);
+  const children = await readExplorerDirectoryCached(state.activeProfile.id, path);
   state.explorerChildren.set(path, children);
   state.explorerExpanded.add(path);
   return children;
@@ -5374,19 +5447,36 @@ async function ensureExplorerDirectoryChildren(path: string) {
 
 async function reloadExplorerDirectory(path: string) {
   if (!state.activeProfile) return;
+  await refreshExplorerDirectory(path, state.activeProfile.id, state.activeWorkspaceId, false, true);
+}
+
+async function refreshExplorerDirectory(
+  path: string,
+  profileId = state.activeProfile?.id ?? '',
+  workspaceId = state.activeWorkspaceId,
+  renderOnlyIfChanged = true,
+  force = false
+) {
+  if (!profileId) return;
+  const selected = state.explorerSelectedPath;
+  const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force);
+  if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+  const signature = explorerDirectorySignature(entries);
+  const previous = state.explorerSignatures.get(path);
+  if (renderOnlyIfChanged && previous === signature) return;
+
   if (path === state.currentDir) {
-    const selected = state.explorerSelectedPath;
-    state.entries = await api.listDirectory(state.activeProfile.id, path);
-    state.explorerSignatures.set(path, explorerDirectorySignature(state.entries));
+    state.entries = entries;
+    state.explorerSignatures.set(path, signature);
     state.explorerSelectedPath = selected;
     renderExplorer();
     return;
   }
 
-  const children = await api.listDirectory(state.activeProfile.id, path);
-  state.explorerChildren.set(path, children);
-  state.explorerSignatures.set(path, explorerDirectorySignature(children));
+  state.explorerChildren.set(path, entries);
+  state.explorerSignatures.set(path, signature);
   state.explorerExpanded.add(path);
+  state.explorerSelectedPath = selected;
   renderExplorer();
 }
 
@@ -5452,8 +5542,7 @@ async function pollExplorerDirectories() {
   try {
     for (const path of explorerWatchPaths()) {
       try {
-        const entries = await api.listDirectory(state.activeProfile.id, path);
-        cacheExplorerDirectory(state.activeProfile.id, path, entries);
+        const entries = await fetchExplorerDirectory(state.activeProfile.id, path);
         const signature = explorerDirectorySignature(entries);
         const previous = state.explorerSignatures.get(path);
         if (previous !== signature) {
@@ -5601,6 +5690,42 @@ function shouldPrefetchTextFile(entry: FileEntry) {
   if (isImagePath(entry.path)) return false;
   if (shouldMaskFile(entry.path)) return false;
   return isLikelyTextPath(entry.path);
+}
+
+function scheduleExplorerDirectoryPrefetch(entry: FileEntry, delay = EXPLORER_DIRECTORY_PREFETCH_DELAY_MS) {
+  if (!state.activeProfile || entry.kind !== 'dir') return;
+  if (state.explorerChildren.has(entry.path) || state.explorerLoading.has(entry.path)) return;
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  const key = explorerDirectoryCacheKey(profileId, entry.path, workspaceId);
+  if (hasCachedExplorerDirectory(profileId, entry.path, workspaceId) || explorerDirectoryReads.has(key)) return;
+  const existing = explorerDirectoryPrefetchTimers.get(key);
+  if (existing) window.clearTimeout(existing);
+
+  const timer = window.setTimeout(() => {
+    explorerDirectoryPrefetchTimers.delete(key);
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    void fetchExplorerDirectory(profileId, entry.path, workspaceId).catch(() => undefined);
+  }, delay);
+  explorerDirectoryPrefetchTimers.set(key, timer);
+}
+
+function scheduleVisibleExplorerDirectoryPrefetch() {
+  if (!state.activeProfile || !state.workspaceOpen || getPanel('explorer').classList.contains('hidden')) return;
+  const limit = explorerDirectoryPrefetchLimit();
+  let count = 0;
+  for (const entry of visibleExplorerEntries()) {
+    if (count >= limit) break;
+    if (entry.kind !== 'dir' || state.explorerExpanded.has(entry.path)) continue;
+    scheduleExplorerDirectoryPrefetch(entry, EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + count * 90);
+    count += 1;
+  }
+}
+
+function explorerDirectoryPrefetchLimit() {
+  if (state.activeProfile?.kind === 'ssh') return 2;
+  if (state.activeProfile?.kind === 'wsl') return Math.min(4, EXPLORER_DIRECTORY_PREFETCH_LIMIT);
+  return EXPLORER_DIRECTORY_PREFETCH_LIMIT;
 }
 
 function isLikelyTextPath(path: string) {
@@ -5803,7 +5928,6 @@ async function openFile(path: string) {
     return;
   }
 
-  setStatus(`Opening ${path}...`);
   try {
     syncActiveEditorTabFromView();
     const existing = state.editorTabs.find((tab) => tab.file?.path === path);
@@ -5813,9 +5937,10 @@ async function openFile(path: string) {
       return;
     }
 
-    showEditorLoading(path);
+    const cancelLoading = scheduleEditorLoading(path);
     warmEditorForPath(path);
     const content = await readTextFileCached(profile.id, path);
+    cancelLoading();
     if (openToken !== fileOpenToken || state.activeProfile?.id !== profile.id) return;
     const masked = shouldMaskFile(path);
     const file = {
@@ -5839,12 +5964,33 @@ async function openFile(path: string) {
     saveActiveWorkspaceSnapshot();
   } catch (error) {
     if (openToken !== fileOpenToken) return;
+    cancelPendingEditorLoading();
     setStatus(String(error), true);
   }
 }
 
-function showEditorLoading(path: string) {
+function scheduleEditorLoading(path: string) {
   setPanelVisible('editor', true, { skipSave: true });
+  if (editorLoadingTimer) window.clearTimeout(editorLoadingTimer);
+  const request = ++editorLoadingRequest;
+  editorLoadingTimer = window.setTimeout(() => {
+    editorLoadingTimer = 0;
+    if (request === editorLoadingRequest) showEditorLoading(path);
+  }, EDITOR_LOADING_DELAY_MS);
+  return () => {
+    if (request !== editorLoadingRequest) return;
+    cancelPendingEditorLoading();
+  };
+}
+
+function cancelPendingEditorLoading() {
+  editorLoadingRequest += 1;
+  if (editorLoadingTimer) window.clearTimeout(editorLoadingTimer);
+  editorLoadingTimer = 0;
+}
+
+function showEditorLoading(path: string) {
+  setStatus(`Opening ${path}...`);
   el.editorLabel.textContent = path;
   el.toggleRaw.classList.add('hidden');
   el.saveFile.disabled = true;
@@ -5858,7 +6004,6 @@ function textFileCacheKey(profileId: string, path: string) {
 }
 
 async function readTextFileCached(profileId: string, path: string) {
-  if (shouldMaskFile(path)) return api.readTextFile(profileId, path);
   const key = textFileCacheKey(profileId, path);
   const cached = textFileCache.get(key);
   if (cached) {
@@ -5883,7 +6028,6 @@ async function readTextFileCached(profileId: string, path: string) {
 }
 
 function cacheTextFile(profileId: string, path: string, content: string) {
-  if (shouldMaskFile(path)) return;
   if (content.length > TEXT_FILE_PREFETCH_MAX_BYTES) return;
   const key = textFileCacheKey(profileId, path);
   textFileCache.delete(key);
@@ -6484,8 +6628,7 @@ async function saveOpenFile() {
     : codeView?.state.doc.toString() ?? file.draftContent ?? file.content;
   try {
     await api.writeTextFile(profile.id, file.path, content);
-    if (shouldMaskFile(file.path)) invalidateTextFileCache(profile.id, file.path);
-    else cacheTextFile(profile.id, file.path, content);
+    cacheTextFile(profile.id, file.path, content);
     file.content = content;
     file.draftContent = undefined;
     file.lines = file.masked ? parseSecretLines(content, file.path) : [];
