@@ -311,11 +311,21 @@ interface WorkspaceStore {
 interface WorkspaceRuntimeCache {
   editorTabs: EditorTabState[];
   activeEditorTabId: string;
+  explorer?: ExplorerRuntimeCache;
   browserTabs: BrowserTab[];
   activeBrowserTabId: string;
   previewUrl: string;
   previewProxies: PortForwardResult[];
   browserConsoleLogs: BrowserConsoleLog[];
+}
+
+interface ExplorerRuntimeCache {
+  currentDir: string;
+  entries: FileEntry[];
+  expanded: string[];
+  children: Array<[string, FileEntry[]]>;
+  signatures: Array<[string, string]>;
+  selectedPath: string;
 }
 
 interface EditorRuntime {
@@ -466,6 +476,7 @@ const EXPLORER_DIRECTORY_CACHE_LIMIT = 48;
 const NOTES_AUTOSAVE_DELAY_MS = 1800;
 const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
+const SECRET_PARSE_CACHE_LIMIT = 32;
 const EDITOR_LOADING_DELAY_MS = 180;
 const EXPLORER_DIRECTORY_PREFETCH_DELAY_MS = 120;
 const EXPLORER_DIRECTORY_PREFETCH_LIMIT = 6;
@@ -936,6 +947,7 @@ const autoForwardingPorts = new Set<string>();
 const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
+const secretParseCache = new Map<string, SecretLine[]>();
 const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
 const explorerDirectoryReads = new Map<string, Promise<FileEntry[]>>();
 const explorerDirectoryPrefetchTimers = new Map<string, number>();
@@ -2309,6 +2321,7 @@ function saveActiveWorkspaceRuntimeCache() {
   workspaceRuntimeCache.set(state.activeWorkspaceId, {
     editorTabs: cloneEditorTabs(state.editorTabs),
     activeEditorTabId: state.activeEditorTabId,
+    explorer: cloneExplorerRuntimeCache(),
     browserTabs: state.browserTabs.map((tab) => ({ ...tab })),
     activeBrowserTabId: state.activeBrowserTabId,
     previewUrl: state.previewUrl,
@@ -2359,6 +2372,37 @@ function cloneOpenFile(file: OpenFileState): OpenFileState {
     lines: file.lines.map((line) => ({ ...line })),
     dirty: file.dirty
   };
+}
+
+function cloneExplorerRuntimeCache(): ExplorerRuntimeCache {
+  return {
+    currentDir: state.currentDir,
+    entries: cloneExplorerEntries(state.entries),
+    expanded: Array.from(state.explorerExpanded),
+    children: Array.from(state.explorerChildren.entries())
+      .map(([path, entries]) => [path, cloneExplorerEntries(entries)]),
+    signatures: Array.from(state.explorerSignatures.entries()),
+    selectedPath: state.explorerSelectedPath
+  };
+}
+
+function restoreExplorerRuntimeCache(workspaceId: string, currentDir: string) {
+  const cached = restoreWorkspaceRuntimeCache(workspaceId)?.explorer;
+  if (!cached || !sameExplorerPath(cached.currentDir, currentDir)) return false;
+  state.entries = cloneExplorerEntries(cached.entries);
+  state.currentDir = cached.currentDir;
+  state.explorerExpanded = new Set(cached.expanded);
+  state.explorerChildren = new Map(cached.children.map(([path, entries]) => [path, cloneExplorerEntries(entries)]));
+  state.explorerLoading = new Set();
+  state.explorerSignatures = new Map(cached.signatures);
+  state.explorerSelectedPath = cached.selectedPath;
+  state.explorerTypeahead = '';
+  state.explorerTypeaheadAt = 0;
+  renderExplorer();
+  refreshTitle();
+  void refreshExplorerDirectory(currentDir, state.activeProfile?.id ?? '', state.activeWorkspaceId, true, true)
+    .catch(() => undefined);
+  return true;
 }
 
 async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
@@ -2422,7 +2466,9 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
       await nextAnimationFrame();
     }
 
-    await openWorkspace(state.currentDir);
+    if (!restoreExplorerRuntimeCache(snapshot.id, state.currentDir)) {
+      await openWorkspace(state.currentDir);
+    }
     await restoreEditorTabs(snapshot);
     restoreImageTabs(snapshot);
     await restoreNoteTabs(snapshot);
@@ -2549,7 +2595,7 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
       content,
       masked,
       rawMode,
-      lines: masked ? parseSecretLines(content, path) : [],
+      lines: masked ? parseSecretLinesCached(content, path) : [],
       dirty: false
     };
     liveTab.pendingPath = undefined;
@@ -4885,11 +4931,14 @@ async function loadDirectory(path: string) {
   const cached = cachedExplorerDirectory(profileId, path, workspaceId);
   if (cached) {
     applyLoadedDirectory(path, cached);
-    setStatus(`Refreshing ${path}...`);
+    setStatus('Directory loaded from cache');
     saveActiveWorkspaceSnapshot();
-  } else {
-    setStatus(`Loading ${path}...`);
+    void refreshExplorerDirectory(path, profileId, workspaceId, true, true)
+      .then(() => saveActiveWorkspaceSnapshot())
+      .catch(() => undefined);
+    return;
   }
+  setStatus(`Loading ${path}...`);
   try {
     const entries = await fetchExplorerDirectory(profileId, path, workspaceId);
     cacheExplorerDirectory(profileId, path, entries, workspaceId);
@@ -5948,7 +5997,7 @@ async function openFile(path: string) {
       content,
       masked,
       rawMode: false,
-      lines: masked ? parseSecretLines(content, path) : [],
+      lines: masked ? parseSecretLinesCached(content, path) : [],
       dirty: false
     };
     const tab = state.editorOpenInNewTab && activeEditorTab().file
@@ -6046,6 +6095,38 @@ function invalidateTextFileCache(profileId: string, path: string) {
   const timer = textFilePrefetchTimers.get(key);
   if (timer) window.clearTimeout(timer);
   textFilePrefetchTimers.delete(key);
+}
+
+function parseSecretLinesCached(content: string, path: string) {
+  const key = `${path}\0${content.length}\0${hashText(content)}`;
+  const cached = secretParseCache.get(key);
+  if (cached) {
+    secretParseCache.delete(key);
+    secretParseCache.set(key, cached);
+    return cloneSecretLines(cached);
+  }
+
+  const lines = parseSecretLines(content, path);
+  secretParseCache.set(key, cloneSecretLines(lines));
+  while (secretParseCache.size > SECRET_PARSE_CACHE_LIMIT) {
+    const oldest = secretParseCache.keys().next().value;
+    if (!oldest) break;
+    secretParseCache.delete(oldest);
+  }
+  return lines;
+}
+
+function cloneSecretLines(lines: SecretLine[]) {
+  return lines.map((line) => ({ ...line }));
+}
+
+function hashText(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
 }
 
 function ensureImageTab() {
@@ -6631,7 +6712,7 @@ async function saveOpenFile() {
     cacheTextFile(profile.id, file.path, content);
     file.content = content;
     file.draftContent = undefined;
-    file.lines = file.masked ? parseSecretLines(content, file.path) : [];
+    file.lines = file.masked ? parseSecretLinesCached(content, file.path) : [];
     file.dirty = false;
     setStatus('Saved');
     renderEditor();
@@ -6647,7 +6728,7 @@ function toggleRawMode() {
     state.openFile.draftContent = serializeSecretLines(state.openFile.lines);
   } else if (codeView) {
     state.openFile.draftContent = codeView.state.doc.toString();
-    state.openFile.lines = parseSecretLines(state.openFile.draftContent, state.openFile.path);
+    state.openFile.lines = parseSecretLinesCached(state.openFile.draftContent, state.openFile.path);
     state.openFile.dirty = !sameEditorContent(state.openFile.draftContent, state.openFile.content);
   }
   state.openFile.rawMode = !state.openFile.rawMode;
