@@ -6641,7 +6641,6 @@ async function createTerminalTab(
     if (spawnCwd !== pane.cwd) {
       pane.cwd = spawnCwd;
       updateTerminalWidgetTitle(widget);
-      term.write('\r\n[simple-vibe-ide] saved folder is unavailable; using an available workspace folder\r\n');
     }
     pane.backendId = await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols);
     if (options.focus !== false) {

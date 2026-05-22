@@ -1854,8 +1854,7 @@ __svide_fallback_cwd={}\n\
 case \"$__svide_start_cwd\" in \"~/\"*) __svide_start_cwd=\"$HOME/${{__svide_start_cwd#~/}}\" ;; esac\n\
 case \"$__svide_fallback_cwd\" in \"~/\"*) __svide_fallback_cwd=\"$HOME/${{__svide_fallback_cwd#~/}}\" ;; esac\n\
 if [ -n \"$__svide_start_cwd\" ] && [ \"$__svide_start_cwd\" != \"~\" ]; then\n\
-  cd \"$__svide_start_cwd\" || {{\n\
-    printf '\\n[simple-vibe-ide] saved folder is unavailable; falling back\\n'\n\
+  cd \"$__svide_start_cwd\" 2>/dev/null || {{\n\
     if [ -n \"$__svide_fallback_cwd\" ] && [ \"$__svide_fallback_cwd\" != \"~\" ] && [ \"$__svide_fallback_cwd\" != \"$__svide_start_cwd\" ]; then\n\
       cd \"$__svide_fallback_cwd\" 2>/dev/null || cd ~ 2>/dev/null || true\n\
     else\n\
