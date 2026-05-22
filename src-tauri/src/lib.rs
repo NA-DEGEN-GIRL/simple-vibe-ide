@@ -3238,12 +3238,21 @@ fn rewrite_preview_response_headers(
             .unwrap_or_default();
         if matches!(
             lower.as_str(),
-            "x-frame-options" | "content-security-policy" | "content-security-policy-report-only"
+            "x-frame-options"
+                | "content-security-policy"
+                | "content-security-policy-report-only"
+                | "cross-origin-embedder-policy"
+                | "cross-origin-opener-policy"
+                | "cross-origin-resource-policy"
+                | "permissions-policy"
         ) {
             continue;
         }
         if content_length.is_some()
-            && matches!(lower.as_str(), "content-length" | "transfer-encoding")
+            && matches!(
+                lower.as_str(),
+                "content-length" | "transfer-encoding" | "cache-control" | "etag"
+            )
         {
             continue;
         }
@@ -3275,6 +3284,7 @@ fn rewrite_preview_response_headers(
         rewritten.push_str("\r\n");
     }
     if let Some(length) = content_length {
+        rewritten.push_str("Cache-Control: no-store\r\n");
         rewritten.push_str(&format!("Content-Length: {length}\r\n"));
     }
     rewritten.push_str("\r\n");
@@ -3285,11 +3295,20 @@ fn strip_preview_cookie_domain(value: &str, target_host: &str) -> String {
     let target_domain = format!("domain={}", target_host.to_ascii_lowercase());
     value
         .split(';')
-        .filter(|part| {
-            let normalized = part.trim().to_ascii_lowercase();
-            normalized != target_domain && normalized != "domain=localhost"
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            let normalized = trimmed.to_ascii_lowercase();
+            if normalized == target_domain
+                || normalized == "domain=localhost"
+                || normalized == "secure"
+            {
+                return None;
+            }
+            if normalized == "samesite=none" {
+                return Some("SameSite=Lax");
+            }
+            Some(trimmed)
         })
-        .map(str::trim)
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -3349,11 +3368,37 @@ Connection: close\r\n\r\n"
         )));
         assert!(!received.contains(&format!("Origin: http://127.0.0.1:{proxy_port}")));
     }
+
+    #[test]
+    fn preview_cookie_rewrite_keeps_loopback_auth_cookies_usable() {
+        let rewritten = strip_preview_cookie_domain(
+            "sid=abc; Domain=127.0.0.1; Path=/; SameSite=None; Secure; HttpOnly",
+            "127.0.0.1",
+        );
+
+        assert_eq!(rewritten, "sid=abc; Path=/; SameSite=Lax; HttpOnly");
+    }
+
+    #[test]
+    fn preview_html_injection_skips_partial_content() {
+        assert!(!should_inject_preview_console_bridge(
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: text/html\r\nContent-Range: bytes 0-9/100\r\n\r\n"
+        ));
+        assert!(should_inject_preview_console_bridge(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        ));
+    }
 }
 
 fn should_inject_preview_console_bridge(headers: &str) -> bool {
     let mut html = false;
     let mut encoded = false;
+    let mut cacheable_success = false;
+    let mut partial = false;
+    if let Some(status) = headers.lines().next() {
+        let code = status.split_whitespace().nth(1).unwrap_or_default();
+        cacheable_success = code.starts_with('2') && code != "206";
+    }
     for line in headers.lines() {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -3368,8 +3413,11 @@ fn should_inject_preview_console_bridge(headers: &str) -> bool {
         {
             encoded = true;
         }
+        if name.trim().eq_ignore_ascii_case("content-range") {
+            partial = true;
+        }
     }
-    html && !encoded
+    cacheable_success && html && !encoded && !partial
 }
 
 fn read_http_response_body(
@@ -3527,6 +3575,67 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
   window.addEventListener('unhandledrejection', function (event) {
     send('error', ['Unhandled promise rejection', event.reason]);
   });
+  function installRuntimeDiagnostics() {
+    if (window.fetch && !window.fetch.__simpleVibePreviewPatched) {
+      var nativeFetch = window.fetch;
+      window.fetch = function () {
+        var args = arguments;
+        return nativeFetch.apply(this, args).catch(function (error) {
+          send('error', ['Fetch failed', args[0], error]);
+          throw error;
+        });
+      };
+      window.fetch.__simpleVibePreviewPatched = true;
+    }
+    if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && !window.XMLHttpRequest.prototype.__simpleVibePreviewPatched) {
+      var nativeXhrOpen = window.XMLHttpRequest.prototype.open;
+      window.XMLHttpRequest.prototype.open = function (method, url) {
+        this.__simpleVibePreviewUrl = url;
+        if (!this.__simpleVibePreviewBound) {
+          this.__simpleVibePreviewBound = true;
+          this.addEventListener('error', function () { send('error', ['XHR failed', this.__simpleVibePreviewUrl]); });
+          this.addEventListener('timeout', function () { send('error', ['XHR timed out', this.__simpleVibePreviewUrl]); });
+          this.addEventListener('abort', function () { send('warn', ['XHR aborted', this.__simpleVibePreviewUrl]); });
+        }
+        return nativeXhrOpen.apply(this, arguments);
+      };
+      window.XMLHttpRequest.prototype.__simpleVibePreviewPatched = true;
+    }
+    if (window.EventSource && !window.EventSource.__simpleVibePreviewPatched) {
+      var NativeEventSource = window.EventSource;
+      window.EventSource = function (url, config) {
+        var source = config === undefined ? new NativeEventSource(url) : new NativeEventSource(url, config);
+        source.addEventListener('error', function () {
+          send('warn', ['EventSource connection issue', url]);
+        });
+        return source;
+      };
+      window.EventSource.prototype = NativeEventSource.prototype;
+      Object.setPrototypeOf(window.EventSource, NativeEventSource);
+      ['CONNECTING', 'OPEN', 'CLOSED'].forEach(function (key) { window.EventSource[key] = NativeEventSource[key]; });
+      window.EventSource.__simpleVibePreviewPatched = true;
+    }
+    if (window.WebSocket && !window.WebSocket.__simpleVibePreviewPatched) {
+      var NativeWebSocket = window.WebSocket;
+      window.WebSocket = function (url, protocols) {
+        var socket = protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+        socket.addEventListener('error', function () {
+          send('error', ["WebSocket connection to '" + String(url) + "' failed."]);
+        });
+        socket.addEventListener('close', function (event) {
+          if (!event.wasClean && event.code !== 1000) {
+            send('warn', ["WebSocket connection to '" + String(url) + "' closed (" + event.code + ")."]);
+          }
+        });
+        return socket;
+      };
+      window.WebSocket.prototype = NativeWebSocket.prototype;
+      Object.setPrototypeOf(window.WebSocket, NativeWebSocket);
+      ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (key) { window.WebSocket[key] = NativeWebSocket[key]; });
+      window.WebSocket.__simpleVibePreviewPatched = true;
+    }
+  }
+  installRuntimeDiagnostics();
   var previewTargetOrigin = window.__simpleVibePreviewTargetOrigin || '';
   function simpleVibeSocketIoUrl(url) {
     try {

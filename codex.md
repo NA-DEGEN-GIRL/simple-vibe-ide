@@ -16,6 +16,29 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Browser preview common dev-server safeguards
+
+#### Added
+
+- Preview iframes now allow common local-dev capabilities such as clipboard,
+  fullscreen, camera, microphone, and display capture.
+- Injected preview diagnostics now report failed `fetch`, `XMLHttpRequest`,
+  `EventSource`, and `WebSocket` connections to the IDE Browser console.
+- Preview proxy tests now cover cookie rewriting and partial-content HTML
+  injection skips.
+
+#### Changed
+
+- Preview proxy strips additional iframe/cross-origin policy headers that often
+  make pages work in Chrome but fail inside a preview iframe.
+- Injected HTML previews are sent with `Cache-Control: no-store` to avoid stale
+  dev-server pages during quick reloads.
+- Loopback auth cookies are normalized for preview mode by dropping `Domain` and
+  `Secure`, and converting `SameSite=None` to `SameSite=Lax`.
+- HTML console/script injection now skips `206 Partial Content` responses so
+  range-based media/PDF requests stay byte-for-byte compatible.
+
+
 ### 2026-05-22 - Browser proxy socket.io origin handling
 
 #### Fixed

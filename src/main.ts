@@ -7932,6 +7932,15 @@ function ensureBrowserFrame(tab: BrowserTab) {
   frame.dataset.browserWorkspaceId = workspaceId;
   frame.dataset.displayUrl = tab.url;
   frame.title = tab.label;
+  frame.referrerPolicy = 'no-referrer-when-downgrade';
+  frame.allow = [
+    'clipboard-read',
+    'clipboard-write',
+    'fullscreen',
+    'microphone',
+    'camera',
+    'display-capture'
+  ].join('; ');
   bindBrowserFrameEvents(frame);
   if (!frame.parentElement) el.browserShell.append(frame);
   applyBrowserFrameSizing(frame);
