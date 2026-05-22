@@ -1018,7 +1018,7 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .browser-workspace.console-visible.console-top { grid-template-areas: "console" "preview"; grid-template-rows: minmax(110px, var(--browser-console-size)) minmax(0, 1fr); }
 .browser-workspace.console-visible.console-right { grid-template-areas: "preview console"; grid-template-columns: minmax(0, 1fr) minmax(220px, var(--browser-console-size)); }
 .browser-workspace.console-visible.console-left { grid-template-areas: "console preview"; grid-template-columns: minmax(220px, var(--browser-console-size)) minmax(0, 1fr); }
-.browser-shell { min-height: 0; overflow: auto; display: grid; align-items: start; justify-items: center; background: #070a0f; padding: 8px; }
+.browser-shell { min-height: 0; overflow: auto; display: grid; align-items: start; justify-items: center; background: #070a0f; padding: 8px; position: relative; }
 .browser-shell { grid-area: preview; }
 .browser-shell:not(.has-preview) { min-height: 160px; }
 .browser-shell iframe {
@@ -1031,6 +1031,36 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 }
 .browser-shell.desktop iframe { width: 100%; height: 100%; }
 .browser-shell.device iframe { max-width: none; min-height: 0; box-shadow: 0 0 0 1px #111827, 0 12px 24px rgba(0, 0, 0, 0.24); }
+.edge-preview-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid #273449;
+  background: #05070b;
+  outline: none;
+}
+.edge-preview-canvas.hidden { display: none; }
+.edge-preview-canvas:focus { border-color: #4d8dff; box-shadow: 0 0 0 1px rgba(77, 141, 255, 0.45); }
+.browser-shell.device .edge-preview-canvas { max-width: none; box-shadow: 0 0 0 1px #111827, 0 12px 24px rgba(0, 0, 0, 0.24); }
+.edge-preview-status {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  max-width: calc(100% - 28px);
+  border: 1px solid #223047;
+  border-radius: 6px;
+  background: rgba(7, 10, 15, 0.86);
+  color: #c7d4e5;
+  font-size: 12px;
+  padding: 6px 8px;
+  pointer-events: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.edge-preview-status.hidden { display: none; }
 .browser-console { grid-area: console; min-width: 0; min-height: 0; display: grid; grid-template-rows: 30px minmax(0, 1fr); border: 1px solid #223047; background: #080c12; overflow: hidden; }
 .browser-console-resizer { display: none; position: absolute; z-index: 5; background: transparent; }
 .browser-workspace.console-visible .browser-console-resizer { display: block; }

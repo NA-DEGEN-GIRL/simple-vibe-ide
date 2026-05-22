@@ -33,6 +33,19 @@ export interface PortForwardResult {
 
 export type PreviewProxyResult = PortForwardResult;
 
+export interface EdgeDevtoolsSession {
+  id: string;
+  port: number;
+  browserUrl: string;
+}
+
+export interface EdgeDevtoolsPage {
+  id: string;
+  url: string;
+  title: string;
+  webSocketDebuggerUrl: string;
+}
+
 export interface TerminalDataEvent {
   id: string;
   data: string;

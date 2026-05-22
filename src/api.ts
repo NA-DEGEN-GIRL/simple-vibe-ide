@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AttachmentResult, ConnectionProfile, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
+import type { AttachmentResult, ConnectionProfile, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -70,5 +70,15 @@ export const api = {
     invoke<PortForwardResult>('start_port_forward', { profileId, remotePort, localPort }),
   startPreviewProxy: (targetUrl: string) =>
     invoke<PreviewProxyResult>('start_preview_proxy', { targetUrl }),
+  startEdgeDevtoolsSession: (workspaceId: string) =>
+    invoke<EdgeDevtoolsSession>('start_edge_devtools_session', { workspaceId }),
+  edgeDevtoolsNewPage: (sessionId: string, url: string) =>
+    invoke<EdgeDevtoolsPage>('edge_devtools_new_page', { sessionId, url }),
+  edgeDevtoolsActivatePage: (sessionId: string, targetId: string) =>
+    invoke<void>('edge_devtools_activate_page', { sessionId, targetId }),
+  edgeDevtoolsClosePage: (sessionId: string, targetId: string) =>
+    invoke<void>('edge_devtools_close_page', { sessionId, targetId }),
+  stopEdgeDevtoolsSession: (sessionId: string) =>
+    invoke<void>('stop_edge_devtools_session', { sessionId }),
   stopPortForward: (id: string) => invoke<void>('stop_port_forward', { id })
 };

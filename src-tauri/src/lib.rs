@@ -45,6 +45,7 @@ struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
     forwards: Mutex<HashMap<String, ForwardSession>>,
     exports: Mutex<HashMap<String, ExportSession>>,
+    edge_sessions: Mutex<HashMap<String, EdgeDevtoolsSessionState>>,
 }
 
 struct TerminalSession {
@@ -60,6 +61,11 @@ struct ForwardSession {
 
 struct ExportSession {
     cancel: Arc<AtomicBool>,
+}
+
+struct EdgeDevtoolsSessionState {
+    child: Option<ProcessChild>,
+    port: u16,
 }
 
 fn default_windows_root() -> String {
@@ -250,6 +256,25 @@ struct PortForwardResult {
     target_host: String,
     remote_port: u16,
     url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EdgeDevtoolsSession {
+    id: String,
+    port: u16,
+    browser_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EdgeDevtoolsPage {
+    id: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    title: String,
+    web_socket_debugger_url: String,
 }
 
 struct HttpTarget {
@@ -1305,6 +1330,317 @@ fn stop_port_forward(state: State<IdeState>, id: String) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn start_edge_devtools_session(
+    state: State<IdeState>,
+    workspace_id: String,
+) -> Result<EdgeDevtoolsSession, String> {
+    let id = normalized_edge_session_id(&workspace_id);
+    {
+        let mut sessions = state
+            .edge_sessions
+            .lock()
+            .map_err(|_| "edge session state poisoned".to_string())?;
+        if let Some(session) = sessions.get_mut(&id) {
+            let alive = match session.child.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => true,
+            };
+            if alive {
+                return Ok(edge_session_result(&id, session.port));
+            }
+            sessions.remove(&id);
+        }
+    }
+
+    let port = allocate_local_port()?;
+    let user_data_dir = std::env::temp_dir()
+        .join("simple-vibe-ide-edge")
+        .join(safe_edge_session_path(&id));
+    fs::create_dir_all(&user_data_dir)
+        .map_err(|err| format!("failed to prepare Edge profile: {err}"))?;
+
+    let mut command = Command::new(resolve_edge_executable());
+    command
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg("--remote-allow-origins=*")
+        .arg(format!(
+            "--user-data-dir={}",
+            user_data_dir.to_string_lossy()
+        ))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-background-networking")
+        .arg("--headless=new")
+        .arg("--window-size=1280,900")
+        .arg("about:blank")
+        .current_dir(windows_spawn_cwd())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = hide_command_window(&mut command)
+        .spawn()
+        .map_err(|err| format!("failed to start Edge: {err}"))?;
+
+    if let Err(err) = wait_for_edge_devtools(port) {
+        let _ = child.kill();
+        return Err(err);
+    }
+
+    state
+        .edge_sessions
+        .lock()
+        .map_err(|_| "edge session state poisoned".to_string())?
+        .insert(
+            id.clone(),
+            EdgeDevtoolsSessionState {
+                child: Some(child),
+                port,
+            },
+        );
+
+    Ok(edge_session_result(&id, port))
+}
+
+#[tauri::command]
+fn edge_devtools_new_page(
+    state: State<IdeState>,
+    session_id: String,
+    url: String,
+) -> Result<EdgeDevtoolsPage, String> {
+    let port = edge_session_port(&state, &session_id)?;
+    let path = format!("/json/new?{}", percent_encode_component(&url));
+    let body = devtools_http_request(port, "PUT", &path)
+        .or_else(|_| devtools_http_request(port, "GET", &path))?;
+    let page: EdgeDevtoolsPage = serde_json::from_str(&body)
+        .map_err(|err| format!("failed to parse Edge target: {err}"))?;
+    if page.web_socket_debugger_url.trim().is_empty() {
+        return Err("Edge target did not expose a debugger websocket".to_string());
+    }
+    Ok(page)
+}
+
+#[tauri::command]
+fn edge_devtools_activate_page(
+    state: State<IdeState>,
+    session_id: String,
+    target_id: String,
+) -> Result<(), String> {
+    let port = edge_session_port(&state, &session_id)?;
+    let path = format!("/json/activate/{}", percent_encode_component(&target_id));
+    devtools_http_request(port, "GET", &path).map(|_| ())
+}
+
+#[tauri::command]
+fn edge_devtools_close_page(
+    state: State<IdeState>,
+    session_id: String,
+    target_id: String,
+) -> Result<(), String> {
+    let port = edge_session_port(&state, &session_id)?;
+    let path = format!("/json/close/{}", percent_encode_component(&target_id));
+    devtools_http_request(port, "GET", &path).map(|_| ())
+}
+
+#[tauri::command]
+fn stop_edge_devtools_session(state: State<IdeState>, session_id: String) -> Result<(), String> {
+    let id = normalized_edge_session_id(&session_id);
+    let mut sessions = state
+        .edge_sessions
+        .lock()
+        .map_err(|_| "edge session state poisoned".to_string())?;
+    if let Some(mut session) = sessions.remove(&id) {
+        if let Some(mut child) = session.child.take() {
+            let _ = child.kill();
+        }
+    }
+    Ok(())
+}
+
+fn normalized_edge_session_id(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "workspace".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn edge_session_result(id: &str, port: u16) -> EdgeDevtoolsSession {
+    EdgeDevtoolsSession {
+        id: id.to_string(),
+        port,
+        browser_url: format!("http://127.0.0.1:{port}"),
+    }
+}
+
+fn edge_session_port(state: &State<IdeState>, session_id: &str) -> Result<u16, String> {
+    let id = normalized_edge_session_id(session_id);
+    state
+        .edge_sessions
+        .lock()
+        .map_err(|_| "edge session state poisoned".to_string())?
+        .get(&id)
+        .map(|session| session.port)
+        .ok_or_else(|| format!("Edge session not found: {id}"))
+}
+
+fn allocate_local_port() -> Result<u16, String> {
+    TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|err| format!("failed to allocate local port: {err}"))?
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|err| err.to_string())
+}
+
+fn wait_for_edge_devtools(port: u16) -> Result<(), String> {
+    for _ in 0..50 {
+        if devtools_http_request(port, "GET", "/json/version").is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    Err("Edge DevTools endpoint did not become ready".to_string())
+}
+
+fn resolve_edge_executable() -> PathBuf {
+    let mut candidates = Vec::new();
+    push_env_candidate(
+        &mut candidates,
+        "ProgramFiles",
+        r"Microsoft\Edge\Application\msedge.exe",
+    );
+    push_env_candidate(
+        &mut candidates,
+        "ProgramFiles(x86)",
+        r"Microsoft\Edge\Application\msedge.exe",
+    );
+    push_env_candidate(
+        &mut candidates,
+        "LOCALAPPDATA",
+        r"Microsoft\Edge\Application\msedge.exe",
+    );
+    push_env_candidate(
+        &mut candidates,
+        "ProgramFiles",
+        r"Google\Chrome\Application\chrome.exe",
+    );
+    push_env_candidate(
+        &mut candidates,
+        "LOCALAPPDATA",
+        r"Google\Chrome\Application\chrome.exe",
+    );
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| PathBuf::from("msedge.exe"))
+}
+
+fn push_env_candidate(candidates: &mut Vec<PathBuf>, env_key: &str, tail: &str) {
+    if let Ok(root) = std::env::var(env_key) {
+        candidates.push(PathBuf::from(root).join(tail));
+    }
+}
+
+fn safe_edge_session_path(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "workspace".to_string()
+    } else {
+        output
+    }
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            output.push(byte as char);
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
+}
+
+fn devtools_http_request(port: u16, method: &str, path: &str) -> Result<String, String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|err| format!("failed to connect to Edge DevTools: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(4)))
+        .map_err(|err| err.to_string())?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| err.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|err| err.to_string())?;
+    let status_end = response
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or_else(|| "invalid DevTools HTTP response".to_string())?;
+    let status_line = String::from_utf8_lossy(&response[..status_end]);
+    if !status_line.contains(" 200 ") && !status_line.contains(" 201 ") {
+        return Err(format!("DevTools request failed: {status_line}"));
+    }
+    http_response_body(response)
+}
+
+fn http_response_body(response: Vec<u8>) -> Result<String, String> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "invalid DevTools HTTP response body".to_string())?;
+    let headers = String::from_utf8_lossy(&response[..header_end]).to_ascii_lowercase();
+    let body = &response[header_end + 4..];
+    let bytes = if headers.contains("transfer-encoding: chunked") {
+        decode_devtools_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+    String::from_utf8(bytes).map_err(|err| err.to_string())
+}
+
+fn decode_devtools_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| "invalid chunked DevTools response".to_string())?;
+        let size_line = String::from_utf8_lossy(&body[..line_end]);
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|err| format!("invalid chunk size: {err}"))?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        if body.len() < size + 2 {
+            return Err("truncated chunked DevTools response".to_string());
+        }
+        output.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+    Ok(output)
 }
 
 fn detect_wsl_distros() -> Vec<String> {
@@ -3091,6 +3427,11 @@ pub fn run() {
             kill_terminal,
             start_port_forward,
             start_preview_proxy,
+            start_edge_devtools_session,
+            edge_devtools_new_page,
+            edge_devtools_activate_page,
+            edge_devtools_close_page,
+            stop_edge_devtools_session,
             stop_port_forward
         ])
         .setup(|app| {

@@ -9,7 +9,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { ConnectionProfile, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { ConnectionProfile, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 interface TerminalPane {
@@ -76,6 +76,30 @@ interface BrowserTab {
   url: string;
   label: string;
   frameUrl?: string;
+  edge?: EdgeBrowserTarget;
+}
+
+interface EdgeBrowserTarget {
+  sessionId: string;
+  targetId: string;
+  webSocketDebuggerUrl: string;
+}
+
+interface EdgeCdpPending {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+}
+
+interface EdgeCdpState {
+  tabId: string;
+  sessionId: string;
+  socket: WebSocket;
+  seq: number;
+  pending: Map<number, EdgeCdpPending>;
+  viewportWidth: number;
+  viewportHeight: number;
+  frameWidth: number;
+  frameHeight: number;
 }
 
 interface BrowserConsoleLog {
@@ -434,6 +458,8 @@ const NOTES_AUTOSAVE_DELAY_MS = 1800;
 const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
+const USE_EDGE_CDP_BROWSER = true;
+const EDGE_SCREENCAST_QUALITY = 74;
 const BROWSER_DEVICE_PRESETS: BrowserDevicePreset[] = [
   { id: 'iphone-se', label: 'iPhone SE', width: 375, height: 667, kind: 'phone' },
   { id: 'iphone-15', label: 'iPhone 15', width: 393, height: 852, kind: 'phone' },
@@ -894,6 +920,7 @@ const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
 const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
 const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
+const edgeDevtoolsSessions = new Map<string, EdgeDevtoolsSession>();
 const noteSaveTimers = new Map<string, number>();
 let explorerWatchTimer = 0;
 let explorerWatchInFlight = false;
@@ -906,6 +933,9 @@ let marketTickerReconnectAttempt = 0;
 let workspaceDragState: WorkspaceDragState | null = null;
 let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
+let activeEdgeCdp: EdgeCdpState | null = null;
+let edgePreviewResizeObserver: ResizeObserver | null = null;
+let edgeViewportFrame = 0;
 let activeExplorerRename: {
   path: string;
   originalName: string;
@@ -1086,7 +1116,11 @@ app.innerHTML = `
         </div>
         <div id="forward-list" class="forward-list"></div>
         <div id="browser-workspace" class="browser-workspace console-bottom">
-          <div id="browser-shell" class="browser-shell desktop"><iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe></div>
+          <div id="browser-shell" class="browser-shell desktop">
+            <iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe>
+            <canvas id="edge-preview-canvas" class="edge-preview-canvas hidden" tabindex="0" aria-label="Edge browser preview"></canvas>
+            <div id="edge-preview-status" class="edge-preview-status hidden">Edge preview idle</div>
+          </div>
           <div id="browser-console-resizer" class="browser-console-resizer" aria-hidden="true"></div>
           <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
             <div class="browser-console-toolbar">
@@ -1223,6 +1257,8 @@ const el = {
   browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
   browserConsoleLog: document.querySelector<HTMLDivElement>('#browser-console-log')!,
   previewFrame: document.querySelector<HTMLIFrameElement>('#preview-frame')!,
+  edgePreviewCanvas: document.querySelector<HTMLCanvasElement>('#edge-preview-canvas')!,
+  edgePreviewStatus: document.querySelector<HTMLDivElement>('#edge-preview-status')!,
   calculatorExpression: document.querySelector<HTMLInputElement>('#calculator-expression')!,
   calculatorResult: document.querySelector<HTMLDivElement>('#calculator-result')!,
   calculatorKeys: document.querySelector<HTMLDivElement>('#calculator-keys')!,
@@ -2258,6 +2294,10 @@ function saveActiveWorkspaceRuntimeCache() {
     browserConsoleLogs: state.browserConsoleLogs.slice(-200).map((log) => ({ ...log }))
   });
   hideBrowserFramesForWorkspace(state.activeWorkspaceId);
+  if (activeEdgeCdp && state.browserTabs.some((tab) => tab.id === activeEdgeCdp?.tabId)) {
+    disconnectActiveEdgeCdp();
+    setEdgePreviewVisible(false);
+  }
 }
 
 function restoreWorkspaceRuntimeCache(workspaceId: string) {
@@ -2271,6 +2311,7 @@ function removeWorkspaceRuntimeCache(workspaceId: string) {
       void api.stopPortForward(proxy.id).catch(() => undefined);
     }
   }
+  stopEdgeDevtoolsForWorkspace(workspaceId);
   workspaceRuntimeCache.delete(workspaceId);
   clearBrowserFrames(workspaceId);
 }
@@ -3269,6 +3310,7 @@ function bindEvents() {
   });
   el.browserShell.addEventListener('pointerdown', activateBrowserPanel);
   bindBrowserFrameEvents(el.previewFrame);
+  bindEdgePreviewInput();
   el.calculatorExpression.addEventListener('input', () => {
     state.calculatorExpression = el.calculatorExpression.value;
     updateCalculatorPreview();
@@ -3298,10 +3340,12 @@ function bindEvents() {
       scheduleFitTerminalWidget(widget);
     });
     codeView?.requestMeasure();
+    scheduleConfigureEdgeViewport();
   });
   window.addEventListener('blur', hideContextMenu);
   window.addEventListener('beforeunload', () => {
     if (marketTickerSocket) marketTickerSocket.close();
+    stopAllEdgeDevtoolsSessions();
     hideCaptureFreezeFrame();
     if (state.captureProtectionApplied) void api.setCaptureProtection(false);
   });
@@ -4548,6 +4592,7 @@ function discardWorkspacePreviewRuntime(workspaceId: string) {
     void api.stopPortForward(proxy.id).catch(() => undefined);
   }
   state.previewProxies = [];
+  stopEdgeDevtoolsForWorkspace(workspaceId);
   removeWorkspaceRuntimeCache(workspaceId);
 }
 
@@ -4667,6 +4712,8 @@ function clearWorkspacePanels() {
   state.browserConsoleLogs = [];
   el.previewUrl.value = '';
   hideAllBrowserFrames();
+  disconnectActiveEdgeCdp();
+  setEdgePreviewVisible(false);
   el.browserShell.classList.remove('has-preview');
   renderEditorTabs();
   renderImageTabs();
@@ -7649,7 +7696,527 @@ function hideAllBrowserFrames() {
   }
 }
 
+function loadBrowserTabFallback(tab: BrowserTab) {
+  disconnectActiveEdgeCdp();
+  setEdgePreviewVisible(false);
+  if (!tab.frameUrl && localHttpPreviewUrl(tab.url)) {
+    showBrowserFrame(tab);
+    void previewFrameUrl(tab.url).then((frameUrl) => {
+      tab.frameUrl = frameUrl;
+      if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab);
+    }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+  } else {
+    loadBrowserFrame(tab);
+  }
+}
+
+async function loadEdgeBrowserTab(tab: BrowserTab) {
+  setEdgePreviewVisible(true);
+  showEdgePreviewStatus('Starting Edge browser...');
+  const session = await ensureEdgeDevtoolsSession();
+  if (tab.edge && tab.edge.sessionId === session.id) {
+    try {
+      await api.edgeDevtoolsActivatePage(tab.edge.sessionId, tab.edge.targetId);
+    } catch {
+      tab.edge = undefined;
+    }
+  } else if (tab.edge) {
+    closeEdgeBrowserTab(tab);
+  }
+
+  if (!tab.edge) {
+    const page = await api.edgeDevtoolsNewPage(session.id, tab.url);
+    tab.edge = {
+      sessionId: session.id,
+      targetId: page.id,
+      webSocketDebuggerUrl: page.webSocketDebuggerUrl
+    };
+    logBrowserConsole('info', `Edge opened ${tab.url}`);
+  }
+
+  if (state.activeBrowserTabId !== tab.id) return;
+  await connectEdgeCdp(tab);
+  await api.edgeDevtoolsActivatePage(tab.edge.sessionId, tab.edge.targetId).catch(() => undefined);
+  saveActiveWorkspaceSnapshot();
+}
+
+async function ensureEdgeDevtoolsSession() {
+  const workspaceId = state.activeWorkspaceId || 'workspace';
+  const existing = edgeDevtoolsSessions.get(workspaceId);
+  if (existing) return existing;
+  const session = await api.startEdgeDevtoolsSession(workspaceId);
+  edgeDevtoolsSessions.set(workspaceId, session);
+  return session;
+}
+
+function closeEdgeBrowserTab(tab: BrowserTab) {
+  if (!tab.edge) return;
+  const { sessionId, targetId } = tab.edge;
+  if (activeEdgeCdp?.tabId === tab.id) disconnectActiveEdgeCdp();
+  void api.edgeDevtoolsClosePage(sessionId, targetId).catch(() => undefined);
+  tab.edge = undefined;
+}
+
+function stopEdgeDevtoolsForWorkspace(workspaceId: string) {
+  const session = edgeDevtoolsSessions.get(workspaceId);
+  if (!session) return;
+  if (activeEdgeCdp?.sessionId === session.id) disconnectActiveEdgeCdp();
+  edgeDevtoolsSessions.delete(workspaceId);
+  void api.stopEdgeDevtoolsSession(session.id).catch(() => undefined);
+}
+
+function stopAllEdgeDevtoolsSessions() {
+  disconnectActiveEdgeCdp();
+  for (const session of edgeDevtoolsSessions.values()) {
+    void api.stopEdgeDevtoolsSession(session.id).catch(() => undefined);
+  }
+  edgeDevtoolsSessions.clear();
+}
+
+function setEdgePreviewVisible(visible: boolean) {
+  el.edgePreviewCanvas.classList.toggle('hidden', !visible);
+  el.browserShell.classList.toggle('edge-preview-active', visible);
+  if (visible) {
+    hideAllBrowserFrames();
+    el.browserShell.classList.add('has-preview');
+    applyEdgePreviewSizing();
+    return;
+  }
+  el.edgePreviewStatus.classList.add('hidden');
+  el.browserShell.classList.remove('edge-preview-active');
+}
+
+function showEdgePreviewStatus(message: string) {
+  el.edgePreviewStatus.textContent = message;
+  el.edgePreviewStatus.classList.remove('hidden');
+}
+
+function connectEdgeCdp(tab: BrowserTab) {
+  const target = tab.edge;
+  if (!target) return Promise.reject(new Error('Edge target is not ready'));
+  if (
+    activeEdgeCdp?.tabId === tab.id
+    && activeEdgeCdp.socket.readyState === WebSocket.OPEN
+  ) {
+    return configureEdgeViewport(activeEdgeCdp);
+  }
+
+  disconnectActiveEdgeCdp();
+  showEdgePreviewStatus('Connecting to Edge DevTools...');
+
+  return new Promise<void>((resolve, reject) => {
+    const socket = new WebSocket(target.webSocketDebuggerUrl);
+    const cdp: EdgeCdpState = {
+      tabId: tab.id,
+      sessionId: target.sessionId,
+      socket,
+      seq: 0,
+      pending: new Map(),
+      viewportWidth: 0,
+      viewportHeight: 0,
+      frameWidth: 0,
+      frameHeight: 0
+    };
+    let opened = false;
+    activeEdgeCdp = cdp;
+
+    socket.addEventListener('open', async () => {
+      opened = true;
+      try {
+        await edgeCdpSend('Page.enable', {}, cdp);
+        await Promise.all([
+          edgeCdpSend('Runtime.enable', {}, cdp),
+          edgeCdpSend('Log.enable', {}, cdp),
+          edgeCdpSend('Network.enable', {}, cdp)
+        ]);
+        await edgeCdpSend('Page.bringToFront', {}, cdp).catch(() => undefined);
+        await configureEdgeViewport(cdp);
+        showEdgePreviewStatus('Edge preview connected');
+        resolve();
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+
+    socket.addEventListener('message', (event) => handleEdgeCdpMessage(cdp, event.data));
+    socket.addEventListener('error', () => {
+      const error = new Error('Edge DevTools websocket error');
+      if (!opened) reject(error);
+      logBrowserConsole('error', error.message);
+    });
+    socket.addEventListener('close', () => {
+      rejectEdgePending(cdp, new Error('Edge DevTools websocket closed'));
+      if (activeEdgeCdp === cdp) {
+        activeEdgeCdp = null;
+        showEdgePreviewStatus('Edge preview disconnected');
+      }
+    });
+  });
+}
+
+function disconnectActiveEdgeCdp() {
+  const cdp = activeEdgeCdp;
+  if (!cdp) return;
+  activeEdgeCdp = null;
+  rejectEdgePending(cdp, new Error('Edge DevTools disconnected'));
+  try {
+    cdp.socket.close();
+  } catch {
+    // Best-effort cleanup only.
+  }
+}
+
+function rejectEdgePending(cdp: EdgeCdpState, error: Error) {
+  for (const pending of cdp.pending.values()) pending.reject(error);
+  cdp.pending.clear();
+}
+
+function edgeCdpSend(method: string, params: Record<string, unknown> = {}, cdp = activeEdgeCdp): Promise<unknown> {
+  if (!cdp || cdp.socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error('Edge DevTools is not connected'));
+  }
+  const id = ++cdp.seq;
+  const payload = { id, method, params };
+  return new Promise((resolve, reject) => {
+    cdp.pending.set(id, { resolve, reject });
+    try {
+      cdp.socket.send(JSON.stringify(payload));
+    } catch (error) {
+      cdp.pending.delete(id);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+function handleEdgeCdpMessage(cdp: EdgeCdpState, data: unknown) {
+  const raw = typeof data === 'string' ? data : '';
+  if (!raw) return;
+  let message: { id?: number; method?: string; params?: unknown; result?: unknown; error?: { message?: string } };
+  try {
+    message = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  if (typeof message.id === 'number') {
+    const pending = cdp.pending.get(message.id);
+    if (!pending) return;
+    cdp.pending.delete(message.id);
+    if (message.error) pending.reject(new Error(message.error.message || 'DevTools command failed'));
+    else pending.resolve(message.result);
+    return;
+  }
+
+  const params = asRecord(message.params);
+  if (!message.method || !params) return;
+  if (message.method === 'Page.screencastFrame') {
+    const sessionId = params.sessionId;
+    if (typeof sessionId === 'number') {
+      void edgeCdpSend('Page.screencastFrameAck', { sessionId }, cdp).catch(() => undefined);
+    }
+    if (typeof params.data === 'string') drawEdgeScreencastFrame(cdp, params.data, asRecord(params.metadata));
+    return;
+  }
+  if (message.method === 'Runtime.consoleAPICalled') {
+    const level = edgeConsoleLevel(String(params.type || 'log'));
+    const args = Array.isArray(params.args) ? params.args : [];
+    const text = args.map(formatEdgeRemoteObject).join(' ').trim();
+    if (text) logBrowserConsole(level, text);
+    return;
+  }
+  if (message.method === 'Runtime.exceptionThrown') {
+    const details = asRecord(params.exceptionDetails);
+    const text = typeof details?.text === 'string' ? details.text : 'JavaScript exception';
+    logBrowserConsole('error', text);
+    return;
+  }
+  if (message.method === 'Log.entryAdded') {
+    const entry = asRecord(params.entry);
+    const text = typeof entry?.text === 'string' ? entry.text : '';
+    if (text) logBrowserConsole(edgeConsoleLevel(String(entry?.level || 'info')), text);
+    return;
+  }
+  if (message.method === 'Network.loadingFailed') {
+    const errorText = typeof params.errorText === 'string' ? params.errorText : '';
+    const blockedReason = typeof params.blockedReason === 'string' ? ` (${params.blockedReason})` : '';
+    if (errorText) logBrowserConsole('warn', `Network request failed: ${errorText}${blockedReason}`);
+    return;
+  }
+  if (message.method === 'Page.frameNavigated') {
+    updateEdgeTabUrl(cdp.tabId, params);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function edgeConsoleLevel(level: string): BrowserConsoleLog['level'] {
+  if (level === 'error' || level === 'severe') return 'error';
+  if (level === 'warning' || level === 'warn') return 'warn';
+  return 'info';
+}
+
+function formatEdgeRemoteObject(value: unknown) {
+  const record = asRecord(value);
+  if (!record) return formatConsoleValue(value);
+  if ('value' in record) return formatConsoleValue(record.value);
+  if (typeof record.description === 'string') return record.description;
+  if (typeof record.unserializableValue === 'string') return record.unserializableValue;
+  return formatConsoleValue(value);
+}
+
+function updateEdgeTabUrl(tabId: string, params: Record<string, unknown>) {
+  const frame = asRecord(params.frame);
+  const url = typeof frame?.url === 'string' ? frame.url : '';
+  if (!url || url === 'about:blank' || typeof frame?.parentId === 'string') return;
+  const tab = state.browserTabs.find((item) => item.id === tabId);
+  if (!tab || tab.url === url) return;
+  tab.url = url;
+  tab.label = browserTabLabel(url);
+  if (state.activeBrowserTabId === tabId) {
+    state.previewUrl = url;
+    el.previewUrl.value = url;
+  }
+  renderBrowserTabs();
+  saveActiveWorkspaceSnapshot();
+}
+
+function drawEdgeScreencastFrame(cdp: EdgeCdpState, base64Data: string, metadata: Record<string, unknown> | null) {
+  const image = new Image();
+  image.onload = () => {
+    if (activeEdgeCdp !== cdp) return;
+    const width = Math.max(1, Math.round(Number(metadata?.deviceWidth) || cdp.viewportWidth || image.width));
+    const height = Math.max(1, Math.round(Number(metadata?.deviceHeight) || cdp.viewportHeight || image.height));
+    if (el.edgePreviewCanvas.width !== width || el.edgePreviewCanvas.height !== height) {
+      el.edgePreviewCanvas.width = width;
+      el.edgePreviewCanvas.height = height;
+    }
+    cdp.frameWidth = width;
+    cdp.frameHeight = height;
+    const context = el.edgePreviewCanvas.getContext('2d');
+    if (!context) return;
+    context.drawImage(image, 0, 0, width, height);
+    el.edgePreviewStatus.classList.add('hidden');
+  };
+  image.src = `data:image/jpeg;base64,${base64Data}`;
+}
+
+function scheduleConfigureEdgeViewport() {
+  if (!activeEdgeCdp) return;
+  if (edgeViewportFrame) cancelAnimationFrame(edgeViewportFrame);
+  edgeViewportFrame = requestAnimationFrame(() => {
+    edgeViewportFrame = 0;
+    void configureEdgeViewport().catch((error) => logBrowserConsole('warn', `Edge viewport update failed: ${String(error)}`));
+  });
+}
+
+async function configureEdgeViewport(cdp = activeEdgeCdp) {
+  if (!cdp || cdp.socket.readyState !== WebSocket.OPEN) return;
+  const size = edgePreviewViewportSize();
+  cdp.viewportWidth = size.width;
+  cdp.viewportHeight = size.height;
+  applyEdgePreviewSizing();
+  if (el.edgePreviewCanvas.width !== size.width) el.edgePreviewCanvas.width = size.width;
+  if (el.edgePreviewCanvas.height !== size.height) el.edgePreviewCanvas.height = size.height;
+
+  if (el.browserShell.classList.contains('device')) {
+    const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+    await edgeCdpSend('Emulation.setDeviceMetricsOverride', {
+      width: size.width,
+      height: size.height,
+      deviceScaleFactor: preset.kind === 'phone' ? 2 : 1.5,
+      mobile: preset.kind === 'phone',
+      screenWidth: size.width,
+      screenHeight: size.height
+    }, cdp);
+  } else {
+    await edgeCdpSend('Emulation.clearDeviceMetricsOverride', {}, cdp).catch(() => undefined);
+  }
+
+  await edgeCdpSend('Page.stopScreencast', {}, cdp).catch(() => undefined);
+  await edgeCdpSend('Page.startScreencast', {
+    format: 'jpeg',
+    quality: EDGE_SCREENCAST_QUALITY,
+    maxWidth: size.width,
+    maxHeight: size.height
+  }, cdp);
+}
+
+function edgePreviewViewportSize() {
+  if (el.browserShell.classList.contains('device')) {
+    const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+    const portrait = state.browserOrientation === 'portrait';
+    return {
+      width: portrait ? preset.width : preset.height,
+      height: portrait ? preset.height : preset.width
+    };
+  }
+  return {
+    width: Math.max(320, Math.floor(el.browserShell.clientWidth - 16) || 960),
+    height: Math.max(240, Math.floor(el.browserShell.clientHeight - 16) || 640)
+  };
+}
+
+function applyEdgePreviewSizing() {
+  if (el.browserShell.classList.contains('desktop')) {
+    el.edgePreviewCanvas.style.width = '';
+    el.edgePreviewCanvas.style.height = '';
+    return;
+  }
+  const { width, height } = edgePreviewViewportSize();
+  el.edgePreviewCanvas.style.width = `${width}px`;
+  el.edgePreviewCanvas.style.height = `${height}px`;
+}
+
+function bindEdgePreviewInput() {
+  el.edgePreviewCanvas.addEventListener('pointerdown', (event) => {
+    if (!activeEdgeCdp) return;
+    event.preventDefault();
+    event.stopPropagation();
+    activateBrowserPanel();
+    el.edgePreviewCanvas.focus();
+    el.edgePreviewCanvas.setPointerCapture(event.pointerId);
+    dispatchEdgeMouseEvent(event, 'mousePressed');
+  });
+  el.edgePreviewCanvas.addEventListener('pointermove', (event) => {
+    if (!activeEdgeCdp) return;
+    dispatchEdgeMouseEvent(event, 'mouseMoved');
+  });
+  el.edgePreviewCanvas.addEventListener('pointerup', (event) => {
+    if (!activeEdgeCdp) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dispatchEdgeMouseEvent(event, 'mouseReleased');
+    if (el.edgePreviewCanvas.hasPointerCapture(event.pointerId)) {
+      el.edgePreviewCanvas.releasePointerCapture(event.pointerId);
+    }
+  });
+  el.edgePreviewCanvas.addEventListener('wheel', (event) => {
+    if (!activeEdgeCdp) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = edgeCanvasPoint(event);
+    void edgeCdpSend('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: point.x,
+      y: point.y,
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      modifiers: edgeInputModifiers(event)
+    }).catch(() => undefined);
+  }, { passive: false });
+  el.edgePreviewCanvas.addEventListener('keydown', (event) => dispatchEdgeKeyEvent(event, 'keyDown'));
+  el.edgePreviewCanvas.addEventListener('keyup', (event) => dispatchEdgeKeyEvent(event, 'keyUp'));
+  el.edgePreviewCanvas.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    showContextMenu(event.clientX, event.clientY, browserContextMenuItems());
+  });
+  edgePreviewResizeObserver = new ResizeObserver(scheduleConfigureEdgeViewport);
+  edgePreviewResizeObserver.observe(el.browserShell);
+}
+
+function dispatchEdgeMouseEvent(event: PointerEvent, type: 'mousePressed' | 'mouseReleased' | 'mouseMoved') {
+  const point = edgeCanvasPoint(event);
+  const params: Record<string, unknown> = {
+    type,
+    x: point.x,
+    y: point.y,
+    modifiers: edgeInputModifiers(event)
+  };
+  if (type !== 'mouseMoved') {
+    params.button = edgeMouseButton(event.button);
+    params.clickCount = 1;
+  } else {
+    params.button = event.buttons ? edgeMouseButton(event.button) : 'none';
+  }
+  void edgeCdpSend('Input.dispatchMouseEvent', params).catch(() => undefined);
+}
+
+function edgeCanvasPoint(event: MouseEvent) {
+  const cdp = activeEdgeCdp;
+  const rect = el.edgePreviewCanvas.getBoundingClientRect();
+  const width = cdp?.frameWidth || cdp?.viewportWidth || el.edgePreviewCanvas.width || 1;
+  const height = cdp?.frameHeight || cdp?.viewportHeight || el.edgePreviewCanvas.height || 1;
+  return {
+    x: clamp(((event.clientX - rect.left) / Math.max(1, rect.width)) * width, 0, width),
+    y: clamp(((event.clientY - rect.top) / Math.max(1, rect.height)) * height, 0, height)
+  };
+}
+
+function edgeMouseButton(button: number) {
+  if (button === 1) return 'middle';
+  if (button === 2) return 'right';
+  if (button === 0) return 'left';
+  return 'none';
+}
+
+function dispatchEdgeKeyEvent(event: KeyboardEvent, type: 'keyDown' | 'keyUp') {
+  if (!activeEdgeCdp) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const printable = type === 'keyDown'
+    && event.key.length === 1
+    && !event.ctrlKey
+    && !event.metaKey
+    && !event.altKey;
+  const params: Record<string, unknown> = {
+    type: type === 'keyUp' ? 'keyUp' : printable ? 'keyDown' : 'rawKeyDown',
+    key: event.key,
+    code: event.code,
+    windowsVirtualKeyCode: edgeVirtualKey(event),
+    nativeVirtualKeyCode: edgeVirtualKey(event),
+    modifiers: edgeInputModifiers(event),
+    isKeypad: event.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD
+  };
+  if (printable) {
+    params.text = event.key;
+    params.unmodifiedText = event.key;
+  }
+  void edgeCdpSend('Input.dispatchKeyEvent', params).catch(() => undefined);
+}
+
+function edgeInputModifiers(event: MouseEvent | KeyboardEvent) {
+  return (event.altKey ? 1 : 0)
+    | (event.ctrlKey ? 2 : 0)
+    | (event.metaKey ? 4 : 0)
+    | (event.shiftKey ? 8 : 0);
+}
+
+function edgeVirtualKey(event: KeyboardEvent) {
+  if (event.key.length === 1) return event.key.toUpperCase().charCodeAt(0);
+  if (/^F\d{1,2}$/.test(event.key)) return 111 + Number(event.key.slice(1));
+  const map: Record<string, number> = {
+    Backspace: 8,
+    Tab: 9,
+    Enter: 13,
+    Shift: 16,
+    Control: 17,
+    Alt: 18,
+    Pause: 19,
+    CapsLock: 20,
+    Escape: 27,
+    ' ': 32,
+    PageUp: 33,
+    PageDown: 34,
+    End: 35,
+    Home: 36,
+    ArrowLeft: 37,
+    ArrowUp: 38,
+    ArrowRight: 39,
+    ArrowDown: 40,
+    Insert: 45,
+    Delete: 46
+  };
+  return map[event.key] ?? 0;
+}
+
 async function openLocalBrowserTab(url: string, label = browserTabLabel(url)) {
+  if (USE_EDGE_CDP_BROWSER) {
+    openBrowserTab(url, label, url);
+    return;
+  }
   try {
     openBrowserTab(url, label, await previewFrameUrl(url));
   } catch (error) {
@@ -7708,7 +8275,7 @@ function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = ur
     return;
   }
 
-  const tab = { id: makeBrowserTabId(), url, label, frameUrl };
+  const tab: BrowserTab = { id: makeBrowserTabId(), url, label, frameUrl };
   state.browserTabs.push(tab);
   logBrowserConsole('info', `Opened preview tab ${url}`);
   activateBrowserTab(tab.id);
@@ -7722,6 +8289,18 @@ function activateBrowserTab(id: string) {
   state.activeBrowserTabId = tab.id;
   state.previewUrl = tab.url;
   el.previewUrl.value = tab.url;
+  if (USE_EDGE_CDP_BROWSER) {
+    renderBrowserTabs();
+    setEdgePreviewVisible(true);
+    void loadEdgeBrowserTab(tab).catch((error) => {
+      logBrowserConsole('error', `Edge preview failed: ${String(error)}`);
+      setStatus(`Edge preview failed: ${String(error)}`, true);
+      loadBrowserTabFallback(tab);
+    });
+    if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
+    saveActiveWorkspaceSnapshot();
+    return;
+  }
   if (!tab.frameUrl && localHttpPreviewUrl(tab.url)) {
     showBrowserFrame(tab);
     void previewFrameUrl(tab.url).then((frameUrl) => {
@@ -7740,7 +8319,9 @@ function closeBrowserTab(id: string) {
   const index = state.browserTabs.findIndex((tab) => tab.id === id);
   if (index < 0) return;
   const wasActive = state.activeBrowserTabId === id;
-  const closedUrl = state.browserTabs[index].url;
+  const closedTab = state.browserTabs[index];
+  const closedUrl = closedTab.url;
+  closeEdgeBrowserTab(closedTab);
   state.browserTabs.splice(index, 1);
   removeBrowserFrame(id);
   logBrowserConsole('info', `Closed tab ${closedUrl}`);
@@ -7754,6 +8335,8 @@ function closeBrowserTab(id: string) {
       el.previewUrl.value = '';
       clearBrowserFrames();
       el.browserShell.classList.remove('has-preview');
+      disconnectActiveEdgeCdp();
+      setEdgePreviewVisible(false);
       renderBrowserTabs();
     }
   } else {
@@ -7924,6 +8507,10 @@ function maybeAutoForwardBrowserLocalUrl(message: string) {
 }
 
 function showBrowserContextMenuFromFrame(x: number, y: number) {
+  if (activeEdgeCdp) {
+    showContextMenu(Number.isFinite(x) ? x : 16, Number.isFinite(y) ? y : 16, browserContextMenuItems());
+    return;
+  }
   const frame = activeBrowserFrame();
   if (!frame) return;
   const rect = frame.getBoundingClientRect();
@@ -7947,6 +8534,16 @@ function currentBrowserTab() {
 }
 
 function navigateBrowserHistory(delta: -1 | 1) {
+  if (activeEdgeCdp) {
+    void edgeCdpSend('Runtime.evaluate', {
+      expression: delta < 0 ? 'history.back()' : 'history.forward()',
+      userGesture: true
+    }).then(() => {
+      activateBrowserPanel();
+      logBrowserConsole('info', delta < 0 ? 'Browser back' : 'Browser forward');
+    }).catch((error) => setStatus(`Browser history navigation failed: ${String(error)}`, true));
+    return;
+  }
   const frame = activeBrowserFrame();
   if (!frame?.contentWindow) {
     setStatus('No active browser tab', true);
@@ -7963,17 +8560,28 @@ function navigateBrowserHistory(delta: -1 | 1) {
 
 function handleBrowserRefreshShortcut(event: KeyboardEvent) {
   if (event.key !== 'F5') return;
-  event.preventDefault();
-  event.stopPropagation();
   const target = event.target instanceof Element ? event.target : null;
   const browserFocused = keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'browser';
-  if (target?.closest('.browser-panel') || browserFocused) refreshPreview(event.ctrlKey || event.shiftKey);
+  if (!target?.closest('.browser-panel') && !browserFocused) return;
+  event.preventDefault();
+  event.stopPropagation();
+  refreshPreview(event.ctrlKey || event.shiftKey);
 }
 
 function refreshPreview(hard: boolean) {
   const tab = currentBrowserTab();
   if (!tab) {
     setStatus('No preview URL to refresh', true);
+    return;
+  }
+
+  if (activeEdgeCdp && tab.edge && activeEdgeCdp.tabId === tab.id) {
+    void edgeCdpSend('Page.reload', { ignoreCache: hard }).then(() => {
+      state.previewUrl = tab.url;
+      el.previewUrl.value = tab.url;
+      logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
+      setStatus(hard ? `Hard refreshed ${tab.url}` : `Reloaded ${tab.url}`);
+    }).catch((error) => setStatus(`Browser reload failed: ${String(error)}`, true));
     return;
   }
 
@@ -8119,6 +8727,8 @@ function setBrowserMode(mode: 'desktop' | 'device') {
     });
     el.browserShell.dataset.device = 'Desktop';
     el.rotateDevice.textContent = 'Rotate';
+    applyEdgePreviewSizing();
+    scheduleConfigureEdgeViewport();
     saveActiveWorkspaceSnapshot();
     return;
   }
@@ -8151,6 +8761,8 @@ function applyBrowserDevice() {
   });
   el.browserShell.dataset.device = `${preset.label} ${width} x ${height}`;
   el.rotateDevice.textContent = portrait ? 'Rotate' : 'Portrait';
+  applyEdgePreviewSizing();
+  scheduleConfigureEdgeViewport();
 }
 
 function applyBrowserFrameSizing(frame: HTMLIFrameElement) {

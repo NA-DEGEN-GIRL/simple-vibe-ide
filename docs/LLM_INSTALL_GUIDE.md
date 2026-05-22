@@ -43,6 +43,7 @@ Optional runtime tools:
 
 - WSL distro for WSL workspaces
 - Windows OpenSSH client for SSH workspaces
+- Microsoft Edge or Chrome for the Browser widget's hidden DevTools/CDP preview
 - LLM CLIs if the launcher buttons should work: `codex`, `claude`, `grok`,
   `antigravity`
 
@@ -145,7 +146,10 @@ Smoke test in the app:
 - Image files open in Image Preview, not as UTF-8 text.
 - Clipboard image paste saves an attachment and optionally pastes an `@...` tag
   into the active shell.
-- Browser tabs can open a local port or full URL.
+- Browser tabs can open a local port or full URL through the hidden Edge
+  DevTools/CDP canvas preview, with the iframe preview proxy left as fallback.
+- Browser console shows page console/log/network failure events where CDP
+  exposes them.
 - Notes, Calculator, and Browser keyboard zoom controls affect the focused
   widget content, not the whole widget frame.
 

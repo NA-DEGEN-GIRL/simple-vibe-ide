@@ -42,7 +42,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - Explorer clipboard paste: Windows Explorer에서 `Ctrl+C`한 파일/폴더를 IDE Explorer에서 `Ctrl+V`로 붙여넣기
 - Explorer export/drag-out: 선택한 항목을 백그라운드 export한 뒤 Windows Explorer로 끌어내기
 - 자동 local/WSL development server 감지와 browser preview tab
-- browser desktop/phone/tablet viewport preset, hard refresh, lightweight console pane
+- Edge DevTools/CDP 기반 browser preview tab, desktop/phone/tablet viewport preset, hard refresh, lightweight console pane
 - workspace별 capture protection toggle
 
 ## 설치 요구사항
@@ -58,6 +58,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 
 - WSL distro
 - Windows OpenSSH client
+- Microsoft Edge 또는 Chrome: Browser 위젯의 hidden DevTools/CDP preview에 사용
 - 실행하려는 LLM CLI: `codex`, `claude`, `grok`, `antigravity`
 
 ## 빠른 시작
@@ -248,11 +249,12 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - 감지된 server는 Browser tab으로 열 수 있고, WSL profile은 가능한 경우 local forwarding/proxy를 자동 설정합니다.
 - Browser URL box에는 full URL 또는 `3000` 같은 port 번호만 입력할 수 있습니다.
 - full local URL은 path/query/hash를 유지하므로 `/test.html`, `/admin` 같은 route도 forwarded preview에서 그대로 열립니다.
+- Browser tab은 기본적으로 hidden Edge DevTools/CDP session을 열고 canvas screencast로 표시합니다. 그래서 iframe embedding 제한이나 WebSocket console 누락이 적습니다.
 - desktop, phone, tablet viewport preset이 device menu에 포함되어 있습니다.
 - stale local preview를 위한 hard refresh가 있습니다.
 - manual remote/local forwarding은 fallback으로 남아 있습니다.
 - WSL/local forwarding은 in-app TCP proxy를 사용하고, SSH forwarding은 `ssh.exe -N -L`을 사용합니다.
-- Browser preview는 lightweight preview입니다. full devtools, extension, 복잡한 cross-origin debugging이 필요하면 일반 브라우저를 사용하세요.
+- iframe preview proxy는 Edge CDP가 실패할 때의 fallback으로 남아 있습니다. extension이나 완전한 DevTools UI가 필요하면 일반 브라우저를 사용하세요.
 
 ### Capture protection
 
@@ -295,7 +297,7 @@ Windows OpenSSH config의 literal `Host` alias만 자동 import됩니다. wildca
 
 ### local server를 껐는데 Browser preview에 화면이 남아 있음
 
-정적 페이지나 iframe cache 때문에 남아 보일 수 있습니다. hard refresh를 누르거나 해당 port를 새 tab으로 다시 열어보세요.
+정적 페이지, 브라우저 cache, 또는 기존 preview session 때문에 남아 보일 수 있습니다. hard refresh를 누르거나 해당 port를 새 tab으로 다시 열어보세요.
 
 ## 현재 제한사항
 
@@ -360,7 +362,7 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Explorer clipboard paste from Windows Explorer into the active workspace
 - Explorer async export and drag-out to Windows Explorer
 - Automatic local/WSL development server detection and browser preview tabs
-- Browser desktop/phone/tablet viewport presets, hard refresh, and lightweight console pane
+- Edge DevTools/CDP browser preview tabs, desktop/phone/tablet viewport presets, hard refresh, and lightweight console pane
 - Workspace-level capture protection toggle
 
 ## Requirements
@@ -376,6 +378,7 @@ Optional depending on your workflow:
 
 - One or more WSL distros
 - Windows OpenSSH client
+- Microsoft Edge or Chrome for the Browser widget's hidden DevTools/CDP preview
 - LLM CLIs you want to launch: `codex`, `claude`, `grok`, or `antigravity`
 
 ## Quick Start
@@ -567,11 +570,12 @@ Before launching, the app checks aliases, functions, and wrapper scripts, then s
 - Detected servers can be opened in Browser tabs, and WSL profiles get automatic local forwarding where possible.
 - The Browser URL box accepts a full URL or just a port number like `3000`.
 - Full local URLs keep their path/query/hash, so forwarded previews such as `/test.html` and `/admin` open at the intended route.
+- Browser tabs now default to a hidden Edge DevTools/CDP session rendered through a canvas screencast, which avoids most iframe embedding limits and captures more browser console events.
 - Desktop, phone, and tablet viewport presets are included in the device menu.
 - Hard refresh is available for stale local previews.
 - Manual remote/local forwarding remains available as a fallback.
 - WSL/local forwarding uses an in-app TCP proxy. SSH forwarding uses `ssh.exe -N -L`.
-- Browser Preview is intentionally lightweight. Use a full browser when you need full devtools, extensions, or complex cross-origin debugging.
+- The iframe preview proxy remains as a fallback when Edge CDP cannot start. Use a full browser when you need extensions or the complete DevTools UI.
 
 ### Capture Protection
 
@@ -614,7 +618,7 @@ Only literal `Host` aliases from your Windows OpenSSH config are auto-imported. 
 
 ### Browser preview still shows a stopped local server
 
-Static pages and iframe cache can remain visible. Use hard refresh or open the port in a new browser tab.
+Static pages, browser cache, or an existing preview session can remain visible. Use hard refresh or open the port in a new browser tab.
 
 ## Current Limitations
 
