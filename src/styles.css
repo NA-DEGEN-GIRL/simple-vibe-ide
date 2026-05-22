@@ -991,13 +991,13 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 #image-preview.visible { display: block; }
 .hint, .console-note { color: #7f91a8; font-size: 12px; line-height: 1.35; padding: 8px 10px; margin: 0; border-top: 1px solid #182132; }
 
-.browser-panel { min-height: 0; display: grid; grid-template-rows: 34px auto auto auto auto auto minmax(0, 1fr) auto; }
-.manual-forward { border-bottom: 1px solid #182132; }
-.manual-forward summary { cursor: pointer; color: #9fb0c3; font-size: 12px; padding: 7px 9px; user-select: none; }
-.manual-forward[open] summary { color: #d6e2f0; }
+.browser-panel { min-height: 0; display: grid; grid-template-rows: 34px auto auto auto minmax(0, 1fr) auto auto; }
+.browser-advanced { border-top: 1px solid #182132; }
+.browser-advanced summary { cursor: pointer; color: #9fb0c3; font-size: 12px; padding: 7px 9px; user-select: none; }
+.browser-advanced[open] summary { color: #d6e2f0; }
 .port-form, .browser-form, .device-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; padding: 8px; border-bottom: 1px solid #182132; }
-.manual-forward .port-form { border-bottom: 0; padding-top: 0; }
-.browser-form { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+.browser-advanced .port-form { grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto auto; padding-top: 0; }
+.browser-form { grid-template-columns: auto auto minmax(0, 1fr) auto auto; align-items: center; }
 .browser-tabs { display: flex; gap: 2px; overflow-x: auto; padding: 5px 8px 0; border-bottom: 1px solid #182132; align-items: flex-end; }
 .browser-tab { flex: 0 1 180px; min-width: 86px; min-height: 28px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px; border: 1px solid #263244; border-bottom-color: #1d2635; border-radius: 7px 7px 0 0; background: #0c121d; }
 .browser-tab.active { border-color: #4d8dff; border-bottom-color: #16243a; background: #16243a; box-shadow: inset 0 2px 0 #7fb0ff; }
@@ -1012,6 +1012,7 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .forward-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 6px; align-items: center; font-size: 12px; }
 .forward-row.pending { grid-template-columns: auto minmax(0, 1fr) auto; }
 .forward-row span { color: #9fb0c3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.forward-row.empty { grid-template-columns: minmax(0, 1fr); color: #7f91a8; padding: 3px 0; }
 .browser-workspace {
   min-height: 0;
   position: relative;
@@ -1116,7 +1117,8 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
   .terminal-card { min-width: 260px; min-height: 240px; }
   .port-form { grid-template-columns: 1fr 1fr; }
   .port-form button { grid-column: 1 / -1; }
-  .browser-form { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+  .browser-form { grid-template-columns: auto auto minmax(0, 1fr) auto; }
+  .browser-form #reload-preview { grid-column: 1 / -1; }
   .device-form { grid-template-columns: 1fr 1fr; }
   .device-form button, .device-form select { width: 100%; }
 }
@@ -1137,6 +1139,6 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
   .terminal-card { min-width: 220px; min-height: 220px; }
   .panel-title { padding-inline: 7px; font-size: 12px; }
   .path-row, .file-list, .export-list, .port-form, .browser-form, .device-form { padding: 5px; }
-  .manual-forward summary { padding: 5px 7px; }
+  .browser-advanced summary { padding: 5px 7px; }
   .hint, .console-note, .image-label { padding: 6px 7px; }
 }

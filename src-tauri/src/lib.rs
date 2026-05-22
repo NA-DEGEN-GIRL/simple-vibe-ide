@@ -2904,6 +2904,10 @@ fn proxy_websocket_upgrade(
 ) -> std::io::Result<()> {
     let rewritten_request = rewrite_preview_upgrade_headers(request_headers, &target_host, target_port);
     let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
+    incoming.set_read_timeout(None)?;
+    incoming.set_write_timeout(None)?;
+    remote.set_read_timeout(None)?;
+    remote.set_write_timeout(None)?;
     remote.write_all(rewritten_request.as_bytes())?;
     if !request_body.is_empty() {
         remote.write_all(request_body)?;

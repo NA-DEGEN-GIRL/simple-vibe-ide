@@ -482,6 +482,7 @@ const EXPLORER_DIRECTORY_PREFETCH_DELAY_MS = 120;
 const EXPLORER_DIRECTORY_PREFETCH_LIMIT = 6;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const USE_EDGE_CDP_BROWSER = false;
+const USE_PREVIEW_PROXY_BROWSER = false;
 const EDGE_SCREENCAST_QUALITY = 66;
 const EDGE_SCREENCAST_EVERY_NTH_FRAME = 2;
 const EDGE_SCREENCAST_MIN_DRAW_INTERVAL_MS = 58;
@@ -1116,25 +1117,16 @@ app.innerHTML = `
       </section>
       <section class="panel browser-panel floating-panel hidden" data-panel="browser">
         <div class="panel-title panel-drag-handle">
-          <span>Browser / Ports</span>
+          <span>Browser</span>
           <span class="spacer"></span>
           <button class="panel-close" data-close-panel="browser" title="Close Browser" aria-label="Close Browser">x</button>
         </div>
-        <details class="manual-forward">
-          <summary>Manual forward</summary>
-          <div class="port-form">
-            <input id="remote-port" type="number" min="1" max="65535" placeholder="remote port" />
-            <input id="local-port" type="number" min="0" max="65535" placeholder="local=remote" />
-            <button id="start-forward">Forward</button>
-          </div>
-        </details>
         <div class="browser-form">
-          <input id="preview-url" placeholder="3000 or http://127.0.0.1:3000" />
-          <button id="load-preview">Load</button>
           <button id="browser-back" title="Back">Back</button>
           <button id="browser-forward" title="Forward">Forward</button>
+          <input id="preview-url" placeholder="3000 or http://127.0.0.1:3000" />
+          <button id="load-preview">Go</button>
           <button id="reload-preview" title="Reload preview">Reload</button>
-          <button id="hard-refresh-preview" title="Reload with a cache-busting local URL">Hard</button>
         </div>
         <div id="browser-tabs" class="browser-tabs"></div>
         <div class="device-form">
@@ -1148,7 +1140,6 @@ app.innerHTML = `
             <option value="left">Left</option>
           </select>
         </div>
-        <div id="forward-list" class="forward-list"></div>
         <div id="browser-workspace" class="browser-workspace console-bottom">
           <div id="browser-shell" class="browser-shell desktop">
             <iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe>
@@ -1164,6 +1155,16 @@ app.innerHTML = `
             <div id="browser-console-log" class="browser-console-log"></div>
           </section>
         </div>
+        <details class="browser-advanced">
+          <summary>Advanced ports</summary>
+          <div class="port-form">
+            <input id="remote-port" type="number" min="1" max="65535" placeholder="remote port" />
+            <input id="local-port" type="number" min="0" max="65535" placeholder="local=remote" />
+            <button id="start-forward">Forward</button>
+            <button id="hard-refresh-preview" title="Reload with a cache-busting local URL">Hard reload</button>
+          </div>
+          <div id="forward-list" class="forward-list"></div>
+        </details>
         <div class="console-note">Local and live URLs can open here. Some public sites block iframe embedding; open those in a full browser when their own policy rejects preview.</div>
       </section>
       <section class="panel calculator-panel floating-panel hidden" data-panel="calculator">
@@ -3246,9 +3247,14 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
 
 function showRestoredBrowserIdle(tab: BrowserTab) {
   disconnectActiveEdgeCdp();
+  if (!USE_EDGE_CDP_BROWSER) {
+    setEdgePreviewVisible(false);
+    loadBrowserTabFallback(tab);
+    return;
+  }
   hideAllBrowserFrames();
   setEdgePreviewVisible(true);
-  showEdgePreviewStatus(`Browser paused for fast workspace switch. Click "${tab.label}" or Reload to reconnect.`);
+  showEdgePreviewStatus(`Browser paused. Click "${tab.label}" or Reload to reconnect.`);
 }
 
 function workspaceLabel(profile: ConnectionProfile, root: string) {
@@ -7800,6 +7806,7 @@ async function openPort(port: number, source: 'manual' | 'auto') {
 
 function queueDetectedPort(port: number) {
   if (!state.activeProfile || !isPreviewPort(port)) return;
+  if (isPreviewProxyLocalPort(port)) return;
   const profile = state.activeProfile;
   const id = detectedPortId(profile.id, port);
   const url = `http://127.0.0.1:${port}`;
@@ -7810,7 +7817,7 @@ function queueDetectedPort(port: number) {
   renderForwards();
   setPanelVisible('browser', true);
   logBrowserConsole('info', `Detected local server on ${url}`);
-  setStatus(`Detected port ${port}; open it from Browser / Ports`);
+  setStatus(`Detected local server on :${port}`);
 }
 
 function detectedPortId(profileId: string, port: number) {
@@ -7831,28 +7838,38 @@ function renderForwards() {
   el.forwardList.innerHTML = '';
   const fragment = document.createDocumentFragment();
   const activeProfileId = state.activeProfile?.id;
+  let rows = 0;
   for (const item of state.detectedPorts.filter((port) => port.profileId === activeProfileId)) {
     const row = document.createElement('div');
     row.className = 'forward-row pending';
-    row.innerHTML = `<button class="load">Open</button><span>Detected ${item.port} (${escapeHtml(item.url)})</span><button class="stop">Dismiss</button>`;
+    row.innerHTML = `<button class="load">Open</button><span>Detected :${item.port}</span><button class="stop">Ignore</button>`;
     row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => void openPort(item.port, 'manual'));
     row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', () => {
       state.detectedPorts = state.detectedPorts.filter((port) => port.id !== item.id);
       renderForwards();
     });
     fragment.append(row);
+    rows += 1;
   }
 
   for (const forward of state.forwards) {
+    if (isPreviewProxyLocalPort(forward.localPort)) continue;
     const row = document.createElement('div');
     row.className = 'forward-row';
-    row.innerHTML = `<button class="load">${escapeHtml(forward.url)}</button><span>-> ${escapeHtml(forward.targetHost)}:${forward.remotePort}</span><button class="stop">Stop</button>`;
+    row.innerHTML = `<button class="load">:${forward.localPort}</button><span>Forwarded to ${escapeHtml(forward.targetHost)}:${forward.remotePort}</span><button class="stop">Stop</button>`;
     row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => void openLocalBrowserTab(forward.url, portTabLabel(forward.localPort)));
     row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', async () => {
       await api.stopPortForward(forward.id).catch((error) => setStatus(String(error), true));
       state.forwards = state.forwards.filter((item) => item.id !== forward.id);
       renderForwards();
     });
+    fragment.append(row);
+    rows += 1;
+  }
+  if (!rows) {
+    const row = document.createElement('div');
+    row.className = 'forward-row empty';
+    row.textContent = 'No active manual forwards.';
     fragment.append(row);
   }
   el.forwardList.append(fragment);
@@ -7970,7 +7987,7 @@ function hideAllBrowserFrames() {
 function loadBrowserTabFallback(tab: BrowserTab) {
   disconnectActiveEdgeCdp();
   setEdgePreviewVisible(false);
-  if (!tab.frameUrl && localHttpPreviewUrl(tab.url)) {
+  if (USE_PREVIEW_PROXY_BROWSER && !tab.frameUrl && localHttpPreviewUrl(tab.url)) {
     showBrowserFrame(tab);
     void previewFrameUrl(tab.url).then((frameUrl) => {
       tab.frameUrl = frameUrl;
@@ -8573,6 +8590,10 @@ async function openLocalBrowserTab(url: string, label = browserTabLabel(url)) {
     openBrowserTab(url, label, url);
     return;
   }
+  if (!USE_PREVIEW_PROXY_BROWSER) {
+    openBrowserTab(url, label, url);
+    return;
+  }
   try {
     openBrowserTab(url, label, await previewFrameUrl(url));
   } catch (error) {
@@ -8613,6 +8634,10 @@ function normalizedLocalPreviewOrigin(url: URL) {
     ? '127.0.0.1'
     : url.hostname;
   return `http://${host}:${url.port}`;
+}
+
+function isPreviewProxyLocalPort(port: number) {
+  return state.previewProxies.some((proxy) => proxy.localPort === port);
 }
 
 function ensureActiveBrowserFrame() {
@@ -8657,7 +8682,7 @@ function activateBrowserTab(id: string) {
     saveActiveWorkspaceSnapshot();
     return;
   }
-  if (!tab.frameUrl && localHttpPreviewUrl(tab.url)) {
+  if (USE_PREVIEW_PROXY_BROWSER && !tab.frameUrl && localHttpPreviewUrl(tab.url)) {
     showBrowserFrame(tab);
     void previewFrameUrl(tab.url).then((frameUrl) => {
       tab.frameUrl = frameUrl;
@@ -8847,6 +8872,7 @@ function maybeAutoForwardBrowserLocalUrl(message: string) {
   for (const match of matches) {
     const port = Number(match[1]);
     if (!isPreviewPort(port)) continue;
+    if (isPreviewProxyLocalPort(port)) continue;
     if (state.forwards.some((forward) => forward.remotePort === port)) continue;
     const key = `browser-dep:${state.activeProfile.id}:${port}`;
     if (autoForwardingPorts.has(key)) continue;
