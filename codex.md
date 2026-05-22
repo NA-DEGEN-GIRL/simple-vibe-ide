@@ -16,6 +16,24 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Browser proxy socket.io origin handling
+
+#### Fixed
+
+- Browser preview proxy now rewrites `Host`, `Origin`, and `Referer` from the
+  preview proxy origin back to the real loopback target origin for normal HTTP
+  requests and WebSocket upgrades.
+- Socket.IO polling and upgrade traffic can stay on the proxy origin, making
+  the proxy behave more like a transparent reverse proxy for local dev servers.
+- Removed the injected WebSocket URL rewrite shim because it could bypass the
+  proxy and leave the browser-sent `Origin` on the preview proxy port.
+
+#### Verified
+
+- Added a Rust unit test for the proxy path used by Socket.IO polling requests.
+- Rebuilt the Windows release exe with the updated proxy code.
+
+
 ### 2026-05-22 - Editor theme and widget resize polish
 
 #### Added

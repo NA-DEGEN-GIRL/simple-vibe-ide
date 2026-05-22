@@ -2849,6 +2849,7 @@ fn proxy_http_preview(
     target_host: String,
     target_port: u16,
 ) -> std::io::Result<()> {
+    incoming.set_nodelay(true)?;
     incoming.set_read_timeout(Some(Duration::from_secs(15)))?;
     let request = read_http_headers(&mut incoming, 128 * 1024)?;
     let Some(header_end) = find_http_header_end(&request) else {
@@ -2857,6 +2858,9 @@ fn proxy_http_preview(
     let (request_headers, request_body) = request.split_at(header_end + 4);
     let request_text = String::from_utf8_lossy(request_headers);
     let content_length = http_content_length(&request_text).unwrap_or(0);
+    let proxy_host =
+        http_header_value(&request_text, "host").unwrap_or_else(|| "127.0.0.1".to_string());
+    let proxy_origin = format!("http://{}", proxy_host.trim());
     if is_websocket_upgrade(&request_text) {
         return proxy_websocket_upgrade(
             incoming,
@@ -2864,18 +2868,25 @@ fn proxy_http_preview(
             target_port,
             &request_text,
             request_body,
+            &proxy_origin,
         );
     }
-    let rewritten_request = rewrite_preview_request_headers(&request_text, &target_host, target_port);
+    let rewritten_request =
+        rewrite_preview_request_headers(&request_text, &target_host, target_port, &proxy_origin);
 
     let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
-    remote.set_read_timeout(Some(Duration::from_secs(20)))?;
+    remote.set_nodelay(true)?;
+    remote.set_read_timeout(Some(Duration::from_secs(75)))?;
     remote.write_all(rewritten_request.as_bytes())?;
     if !request_body.is_empty() {
         remote.write_all(request_body)?;
     }
     if content_length > request_body.len() {
-        copy_exact_bytes(&mut incoming, &mut remote, content_length - request_body.len())?;
+        copy_exact_bytes(
+            &mut incoming,
+            &mut remote,
+            content_length - request_body.len(),
+        )?;
     }
 
     let response = read_http_headers(&mut remote, 256 * 1024)?;
@@ -2884,15 +2895,28 @@ fn proxy_http_preview(
     };
     let (response_headers, response_body) = response.split_at(response_header_end + 4);
     let response_text = String::from_utf8_lossy(response_headers);
+    let target_origin = format!("http://{target_host}:{target_port}");
     if should_inject_preview_console_bridge(&response_text) {
         let body = read_http_response_body(&mut remote, response_body, &response_text)?;
         let injected = inject_preview_console_bridge(&body, &target_host, target_port);
-        let rewritten_response =
-            rewrite_preview_response_headers(&response_text, Some(injected.len()));
+        let rewritten_response = rewrite_preview_response_headers(
+            &response_text,
+            Some(injected.len()),
+            &target_origin,
+            &proxy_origin,
+            &target_host,
+        );
         incoming.write_all(rewritten_response.as_bytes())?;
         incoming.write_all(&injected)?;
     } else {
-        let rewritten_response = rewrite_preview_response_headers(&response_text, None);
+        let rewritten_response = rewrite_preview_response_headers(
+            &response_text,
+            None,
+            &target_origin,
+            &proxy_origin,
+            &target_host,
+        );
+        remote.set_read_timeout(None)?;
         incoming.write_all(rewritten_response.as_bytes())?;
         if !response_body.is_empty() {
             incoming.write_all(response_body)?;
@@ -2908,9 +2932,13 @@ fn proxy_websocket_upgrade(
     target_port: u16,
     request_headers: &str,
     request_body: &[u8],
+    proxy_origin: &str,
 ) -> std::io::Result<()> {
-    let rewritten_request = rewrite_preview_upgrade_headers(request_headers, &target_host, target_port);
+    let rewritten_request =
+        rewrite_preview_upgrade_headers(request_headers, &target_host, target_port, proxy_origin);
     let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
+    remote.set_nodelay(true)?;
+    incoming.set_nodelay(true)?;
     incoming.set_read_timeout(None)?;
     incoming.set_write_timeout(None)?;
     remote.set_read_timeout(None)?;
@@ -2998,6 +3026,17 @@ fn http_content_length(headers: &str) -> Option<usize> {
     })
 }
 
+fn http_header_value(headers: &str, header_name: &str) -> Option<String> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case(header_name) {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn is_websocket_upgrade(headers: &str) -> bool {
     let mut has_upgrade = false;
     let mut has_connection_upgrade = false;
@@ -3021,27 +3060,51 @@ fn is_websocket_upgrade(headers: &str) -> bool {
     has_upgrade && has_connection_upgrade
 }
 
-fn rewrite_preview_request_headers(headers: &str, target_host: &str, target_port: u16) -> String {
+fn rewrite_preview_request_headers(
+    headers: &str,
+    target_host: &str,
+    target_port: u16,
+    proxy_origin: &str,
+) -> String {
     let mut lines = headers.lines();
     let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
+    let target_origin = format!("http://{target_host}:{target_port}");
     let mut rewritten = String::new();
-    rewritten.push_str(request_line);
+    rewritten.push_str(&rewrite_preview_request_line(
+        request_line,
+        &target_origin,
+        proxy_origin,
+    ));
     rewritten.push_str("\r\n");
     let mut saw_host = false;
+    let mut saw_forwarded_host = false;
+    let proxy_host = proxy_origin.trim_start_matches("http://");
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let lower = line
-            .split_once(':')
-            .map(|(name, _)| name.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let lower = name.trim().to_ascii_lowercase();
         if lower == "host" {
             saw_host = true;
             rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
-        } else if lower == "connection"
-            || lower == "proxy-connection"
-            || lower == "accept-encoding"
+        } else if lower == "origin" {
+            rewritten.push_str(&format!("Origin: {target_origin}\r\n"));
+        } else if lower == "referer" {
+            rewritten.push_str("Referer: ");
+            rewritten.push_str(&rewrite_preview_header_url(
+                value.trim(),
+                &target_origin,
+                proxy_origin,
+            ));
+            rewritten.push_str("\r\n");
+        } else if lower == "x-forwarded-host" {
+            saw_forwarded_host = true;
+            rewritten.push_str(line.trim_end());
+            rewritten.push_str("\r\n");
+        } else if lower == "connection" || lower == "proxy-connection" || lower == "accept-encoding"
         {
             continue;
         } else {
@@ -3052,29 +3115,53 @@ fn rewrite_preview_request_headers(headers: &str, target_host: &str, target_port
     if !saw_host {
         rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
     }
+    if !saw_forwarded_host && !proxy_host.is_empty() {
+        rewritten.push_str(&format!("X-Forwarded-Host: {proxy_host}\r\n"));
+        rewritten.push_str("X-Forwarded-Proto: http\r\n");
+    }
     rewritten.push_str("Accept-Encoding: identity\r\n");
     rewritten.push_str("Connection: close\r\n\r\n");
     rewritten
 }
 
-fn rewrite_preview_upgrade_headers(headers: &str, target_host: &str, target_port: u16) -> String {
+fn rewrite_preview_upgrade_headers(
+    headers: &str,
+    target_host: &str,
+    target_port: u16,
+    proxy_origin: &str,
+) -> String {
     let mut lines = headers.lines();
     let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
+    let target_origin = format!("http://{target_host}:{target_port}");
     let mut rewritten = String::new();
-    rewritten.push_str(request_line);
+    rewritten.push_str(&rewrite_preview_request_line(
+        request_line,
+        &target_origin,
+        proxy_origin,
+    ));
     rewritten.push_str("\r\n");
     let mut saw_host = false;
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let lower = line
-            .split_once(':')
-            .map(|(name, _)| name.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let lower = name.trim().to_ascii_lowercase();
         if lower == "host" {
             saw_host = true;
             rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+        } else if lower == "origin" {
+            rewritten.push_str(&format!("Origin: {target_origin}\r\n"));
+        } else if lower == "referer" {
+            rewritten.push_str("Referer: ");
+            rewritten.push_str(&rewrite_preview_header_url(
+                value.trim(),
+                &target_origin,
+                proxy_origin,
+            ));
+            rewritten.push_str("\r\n");
         } else if lower == "proxy-connection" {
             continue;
         } else {
@@ -3089,9 +3176,55 @@ fn rewrite_preview_upgrade_headers(headers: &str, target_host: &str, target_port
     rewritten
 }
 
-fn rewrite_preview_response_headers(headers: &str, content_length: Option<usize>) -> String {
+fn rewrite_preview_request_line(
+    request_line: &str,
+    target_origin: &str,
+    proxy_origin: &str,
+) -> String {
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() != 3 {
+        return request_line.to_string();
+    }
+    let uri = if parts[1].starts_with(proxy_origin) {
+        let path = parts[1].trim_start_matches(proxy_origin);
+        if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        }
+    } else if parts[1].starts_with(target_origin) {
+        let path = parts[1].trim_start_matches(target_origin);
+        if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        }
+    } else {
+        parts[1].to_string()
+    };
+    format!("{} {} {}", parts[0], uri, parts[2])
+}
+
+fn rewrite_preview_header_url(value: &str, target_origin: &str, proxy_origin: &str) -> String {
+    if value.starts_with(proxy_origin) {
+        value.replacen(proxy_origin, target_origin, 1)
+    } else {
+        value.to_string()
+    }
+}
+
+fn rewrite_preview_response_headers(
+    headers: &str,
+    content_length: Option<usize>,
+    target_origin: &str,
+    proxy_origin: &str,
+    target_host: &str,
+) -> String {
     let mut lines = headers.lines();
-    let status_line = lines.next().unwrap_or("HTTP/1.1 502 Bad Gateway").trim_end();
+    let status_line = lines
+        .next()
+        .unwrap_or("HTTP/1.1 502 Bad Gateway")
+        .trim_end();
     let mut rewritten = String::new();
     rewritten.push_str(status_line);
     rewritten.push_str("\r\n");
@@ -3105,15 +3238,38 @@ fn rewrite_preview_response_headers(headers: &str, content_length: Option<usize>
             .unwrap_or_default();
         if matches!(
             lower.as_str(),
-            "x-frame-options"
-                | "content-security-policy"
-                | "content-security-policy-report-only"
+            "x-frame-options" | "content-security-policy" | "content-security-policy-report-only"
         ) {
             continue;
         }
-        if content_length.is_some() && matches!(lower.as_str(), "content-length" | "transfer-encoding")
+        if content_length.is_some()
+            && matches!(lower.as_str(), "content-length" | "transfer-encoding")
         {
             continue;
+        }
+        if lower == "location" {
+            if let Some((name, value)) = line.split_once(':') {
+                rewritten.push_str(name.trim_end());
+                rewritten.push_str(": ");
+                rewritten.push_str(&value.trim().replacen(target_origin, proxy_origin, 1));
+                rewritten.push_str("\r\n");
+                continue;
+            }
+        }
+        if lower == "access-control-allow-origin" {
+            rewritten.push_str("Access-Control-Allow-Origin: ");
+            rewritten.push_str(proxy_origin);
+            rewritten.push_str("\r\n");
+            continue;
+        }
+        if lower == "set-cookie" {
+            if let Some((name, value)) = line.split_once(':') {
+                rewritten.push_str(name.trim_end());
+                rewritten.push_str(": ");
+                rewritten.push_str(&strip_preview_cookie_domain(value.trim(), target_host));
+                rewritten.push_str("\r\n");
+                continue;
+            }
         }
         rewritten.push_str(line.trim_end());
         rewritten.push_str("\r\n");
@@ -3123,6 +3279,76 @@ fn rewrite_preview_response_headers(headers: &str, content_length: Option<usize>
     }
     rewritten.push_str("\r\n");
     rewritten
+}
+
+fn strip_preview_cookie_domain(value: &str, target_host: &str) -> String {
+    let target_domain = format!("domain={}", target_host.to_ascii_lowercase());
+    value
+        .split(';')
+        .filter(|part| {
+            let normalized = part.trim().to_ascii_lowercase();
+            normalized != target_domain && normalized != "domain=localhost"
+        })
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod preview_proxy_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn spawn_one_request_target() -> (u16, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("target listener");
+        let port = listener.local_addr().expect("target addr").port();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("target accept");
+            let request = read_http_headers(&mut stream, 64 * 1024).expect("target read");
+            let text = String::from_utf8_lossy(&request).to_string();
+            sender.send(text).expect("target send");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("target write");
+        });
+        (port, receiver)
+    }
+
+    fn spawn_one_request_proxy(target_port: u16) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("proxy listener");
+        let port = listener.local_addr().expect("proxy addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("proxy accept");
+            proxy_http_preview(stream, "127.0.0.1".to_string(), target_port).expect("proxy");
+        });
+        port
+    }
+
+    #[test]
+    fn preview_proxy_rewrites_socket_io_polling_origin_to_target() {
+        let (target_port, target_request) = spawn_one_request_target();
+        let proxy_port = spawn_one_request_proxy(target_port);
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).expect("client connect");
+        let request = format!(
+            "GET /socket.io/?EIO=4&transport=polling HTTP/1.1\r\n\
+Host: 127.0.0.1:{proxy_port}\r\n\
+Origin: http://127.0.0.1:{proxy_port}\r\n\
+Referer: http://127.0.0.1:{proxy_port}/test.html\r\n\
+Connection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).expect("client write");
+        let received = target_request
+            .recv_timeout(Duration::from_secs(3))
+            .expect("target received request");
+
+        assert!(received.contains(&format!("Host: 127.0.0.1:{target_port}")));
+        assert!(received.contains(&format!("Origin: http://127.0.0.1:{target_port}")));
+        assert!(received.contains(&format!(
+            "Referer: http://127.0.0.1:{target_port}/test.html"
+        )));
+        assert!(!received.contains(&format!("Origin: http://127.0.0.1:{proxy_port}")));
+    }
 }
 
 fn should_inject_preview_console_bridge(headers: &str) -> bool {
@@ -3235,9 +3461,8 @@ fn inject_preview_console_bridge(body: &[u8], target_host: &str, target_port: u1
 
 fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String {
     let target_origin = format!("http://{target_host}:{target_port}");
-    let mut script = format!(
-        "<script>\nwindow.__simpleVibePreviewTargetOrigin = {target_origin:?};\n"
-    );
+    let mut script =
+        format!("<script>\nwindow.__simpleVibePreviewTargetOrigin = {target_origin:?};\n");
     script.push_str(r#"
 (function () {
   if (window.__simpleVibeConsoleBridge) return;
@@ -3302,42 +3527,6 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
   window.addEventListener('unhandledrejection', function (event) {
     send('error', ['Unhandled promise rejection', event.reason]);
   });
-  if (window.WebSocket) {
-    var NativeWebSocket = window.WebSocket;
-    var previewTargetOrigin = window.__simpleVibePreviewTargetOrigin || '';
-    function rewritePreviewSocketUrl(url) {
-      try {
-        if (!previewTargetOrigin) return url;
-        var parsed = new URL(String(url), window.location.href);
-        if (parsed.origin !== window.location.origin) return url;
-        var target = new URL(previewTargetOrigin);
-        parsed.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
-        parsed.host = target.host;
-        return parsed.href;
-      } catch (_) {
-        return url;
-      }
-    }
-    window.WebSocket = function (url, protocols) {
-      var socketUrl = rewritePreviewSocketUrl(url);
-      var socket = protocols === undefined ? new NativeWebSocket(socketUrl) : new NativeWebSocket(socketUrl, protocols);
-      var target = String(socketUrl);
-      socket.addEventListener('error', function () {
-        send('error', ["WebSocket connection to '" + target + "' failed."]);
-      });
-      socket.addEventListener('close', function (event) {
-        if (!event.wasClean && event.code !== 1000) {
-          send('warn', ["WebSocket connection to '" + target + "' closed (" + event.code + ")."]);
-        }
-      });
-      return socket;
-    };
-    window.WebSocket.prototype = NativeWebSocket.prototype;
-    Object.setPrototypeOf(window.WebSocket, NativeWebSocket);
-    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (key) {
-      window.WebSocket[key] = NativeWebSocket[key];
-    });
-  }
 })();
 </script>"#);
     script
