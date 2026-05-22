@@ -3169,10 +3169,17 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
     state.activeBrowserTabId = active.id;
     state.previewUrl = active.url;
     el.previewUrl.value = active.url;
-    if (!getPanel('browser').classList.contains('hidden')) activateBrowserTab(active.id);
+    if (!getPanel('browser').classList.contains('hidden')) showRestoredBrowserIdle(active);
   }
   renderBrowserTabs();
   renderBrowserConsole();
+}
+
+function showRestoredBrowserIdle(tab: BrowserTab) {
+  disconnectActiveEdgeCdp();
+  hideAllBrowserFrames();
+  setEdgePreviewVisible(true);
+  showEdgePreviewStatus(`Browser paused for fast workspace switch. Click "${tab.label}" or Reload to reconnect.`);
 }
 
 function workspaceLabel(profile: ConnectionProfile, root: string) {
@@ -4228,7 +4235,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       void refreshExplorerTree({ silent: true });
       scheduleExplorerWatch();
     }
-    if (id === 'browser') ensureActiveBrowserFrame();
+    if (id === 'browser' && !restoringWorkspace) ensureActiveBrowserFrame();
     codeView?.requestMeasure();
   } else if (keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
     setKeyboardResizeTarget({ kind: 'ide' });
@@ -8639,6 +8646,11 @@ function refreshPreview(hard: boolean) {
       logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
       setStatus(hard ? `Hard refreshed ${tab.url}` : `Reloaded ${tab.url}`);
     }).catch((error) => setStatus(`Browser reload failed: ${String(error)}`, true));
+    return;
+  }
+
+  if (USE_EDGE_CDP_BROWSER) {
+    activateBrowserTab(tab.id);
     return;
   }
 
