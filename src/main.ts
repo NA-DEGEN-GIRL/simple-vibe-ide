@@ -2542,7 +2542,7 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
       content,
       masked,
       rawMode,
-      lines: masked ? parseSecretLines(content) : [],
+      lines: masked ? parseSecretLines(content, path) : [],
       dirty: false
     };
     liveTab.pendingPath = undefined;
@@ -5823,7 +5823,7 @@ async function openFile(path: string) {
       content,
       masked,
       rawMode: false,
-      lines: masked ? parseSecretLines(content) : [],
+      lines: masked ? parseSecretLines(content, path) : [],
       dirty: false
     };
     const tab = state.editorOpenInNewTab && activeEditorTab().file
@@ -6109,7 +6109,9 @@ function appendSecureKeyRow(form: HTMLElement, line: SecretLine) {
   reveal.title = line.reveal ? 'Hide value' : 'Reveal value';
   reveal.addEventListener('click', () => {
     line.reveal = !line.reveal;
-    renderEditor();
+    input.type = line.reveal ? 'text' : 'password';
+    reveal.textContent = line.reveal ? 'Hide' : 'Show';
+    reveal.title = line.reveal ? 'Hide value' : 'Reveal value';
   });
   row.append(key, input, reveal);
   form.append(row);
@@ -6486,7 +6488,7 @@ async function saveOpenFile() {
     else cacheTextFile(profile.id, file.path, content);
     file.content = content;
     file.draftContent = undefined;
-    file.lines = file.masked ? parseSecretLines(content) : [];
+    file.lines = file.masked ? parseSecretLines(content, file.path) : [];
     file.dirty = false;
     setStatus('Saved');
     renderEditor();
@@ -6502,7 +6504,7 @@ function toggleRawMode() {
     state.openFile.draftContent = serializeSecretLines(state.openFile.lines);
   } else if (codeView) {
     state.openFile.draftContent = codeView.state.doc.toString();
-    state.openFile.lines = parseSecretLines(state.openFile.draftContent);
+    state.openFile.lines = parseSecretLines(state.openFile.draftContent, state.openFile.path);
     state.openFile.dirty = !sameEditorContent(state.openFile.draftContent, state.openFile.content);
   }
   state.openFile.rawMode = !state.openFile.rawMode;

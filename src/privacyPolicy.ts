@@ -13,6 +13,9 @@ const PRIVATE_TERMS = [
 ].join('|');
 const ENV_FILE = '(^|[/\\\\])[^/\\\\]*\\.' + 'env' + '(?:\\.[^/\\\\]+)?$';
 const PRIVATE_PATH = new RegExp(ENV_FILE + '|(^|[/\\\\])\\.' + 'env' + '($|\\.)|' + PRIVATE_TERMS, 'i');
+const ENV_LINE = /^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(.*)$/;
+const JSON_LINE = /^(\s*"((?:\\.|[^"\\])+)?"\s*:\s*)(.*?)(\s*,?\s*)$/;
+const JSON_SCALAR = /^(?:"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)$/;
 let extraMaskPatterns: RegExp[] = [];
 export interface SecretLine {
   id: string;
@@ -47,9 +50,11 @@ function globToRegExp(pattern: string) {
   return new RegExp(escaped, 'i');
 }
 
-export function parseSecretLines(content: string): SecretLine[] {
-  return content.split(/\n/).map((line, index) => {
-    const envMatch = line.match(/^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(.*)$/);
+export function parseSecretLines(content: string, path = ''): SecretLine[] {
+  const lines = content.split(/\n/);
+  if (isJsonPath(path)) return parseJsonSecretLines(lines);
+  return lines.map((line, index) => {
+    const envMatch = line.match(ENV_LINE);
     if (envMatch) {
       const [, indent, key, sep, value] = envMatch;
       return {
@@ -63,7 +68,7 @@ export function parseSecretLines(content: string): SecretLine[] {
       };
     }
 
-    const jsonMatch = line.match(/^(\s*"((?:\\.|[^"\\])+)?"\s*:\s*)(.*?)(\s*,?\s*)$/);
+    const jsonMatch = line.match(JSON_LINE);
     if (!jsonMatch) {
       return { id: String(index), kind: 'raw', original: line };
     }
@@ -79,6 +84,36 @@ export function parseSecretLines(content: string): SecretLine[] {
       reveal: false
     };
   });
+}
+
+function parseJsonSecretLines(lines: string[]): SecretLine[] {
+  return lines.map((line, index) => {
+    const jsonMatch = line.match(JSON_LINE);
+    if (!jsonMatch) return { id: String(index), kind: 'raw', original: line };
+
+    const [, prefix, key, value, suffix] = jsonMatch;
+    if (!isJsonScalar(value)) return { id: String(index), kind: 'raw', original: line };
+    return {
+      id: String(index),
+      kind: 'kv',
+      original: line,
+      prefix,
+      key,
+      value,
+      suffix,
+      reveal: false
+    };
+  });
+}
+
+function isJsonPath(path: string) {
+  return path.toLocaleLowerCase().replace(/\\/g, '/').endsWith('.json');
+}
+
+function isJsonScalar(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '[' || trimmed === '{') return false;
+  return JSON_SCALAR.test(trimmed);
 }
 
 export function serializeSecretLines(lines: SecretLine[]): string {
