@@ -2323,10 +2323,10 @@ function saveActiveWorkspaceRuntimeCache() {
     editorTabs: cloneEditorTabs(state.editorTabs),
     activeEditorTabId: state.activeEditorTabId,
     explorer: cloneExplorerRuntimeCache(),
-    browserTabs: state.browserTabs.map((tab) => ({ ...tab })),
+    browserTabs: state.browserTabs.map((tab) => normalizeBrowserTabForCurrentMode(tab)),
     activeBrowserTabId: state.activeBrowserTabId,
     previewUrl: state.previewUrl,
-    previewProxies: state.previewProxies.map((proxy) => ({ ...proxy })),
+    previewProxies: USE_PREVIEW_PROXY_BROWSER ? state.previewProxies.map((proxy) => ({ ...proxy })) : [],
     browserConsoleLogs: state.browserConsoleLogs.slice(-200).map((log) => ({ ...log }))
   });
   hideBrowserFramesForWorkspace(state.activeWorkspaceId);
@@ -3218,13 +3218,13 @@ function yieldToUi() {
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
   state.browserTabs = runtime?.browserTabs.length
-    ? runtime.browserTabs.map((tab) => ({ ...tab }))
+    ? runtime.browserTabs.map((tab) => normalizeBrowserTabForCurrentMode(tab))
     : Array.isArray(snapshot.browserTabs)
       ? snapshot.browserTabs
       .filter((tab) => tab && typeof tab.url === 'string')
-      .map((tab) => ({ id: tab.id || makeBrowserTabId(), url: tab.url, label: tab.label || browserTabLabel(tab.url) }))
+      .map((tab) => normalizeBrowserTabForCurrentMode({ id: tab.id || makeBrowserTabId(), url: tab.url, label: tab.label || browserTabLabel(tab.url) }))
       : [];
-  state.previewProxies = runtime ? runtime.previewProxies.map((proxy) => ({ ...proxy })) : [];
+  state.previewProxies = USE_PREVIEW_PROXY_BROWSER && runtime ? runtime.previewProxies.map((proxy) => ({ ...proxy })) : [];
   state.browserConsoleLogs = runtime ? runtime.browserConsoleLogs.map((log) => ({ ...log })) : state.browserConsoleLogs;
   state.activeBrowserTabId = runtime?.activeBrowserTabId ?? '';
   state.previewUrl = runtime?.previewUrl ?? '';
@@ -3243,6 +3243,13 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   }
   renderBrowserTabs();
   renderBrowserConsole();
+}
+
+function normalizeBrowserTabForCurrentMode(tab: BrowserTab): BrowserTab {
+  const normalized = { ...tab };
+  if (!USE_EDGE_CDP_BROWSER) normalized.edge = undefined;
+  if (!USE_PREVIEW_PROXY_BROWSER) normalized.frameUrl = normalized.url;
+  return normalized;
 }
 
 function showRestoredBrowserIdle(tab: BrowserTab) {
@@ -7552,8 +7559,15 @@ async function openLocalPreviewUrl(url: URL) {
   const port = Number(url.port);
   if (!isPreviewPort(port)) return;
   const suffix = `${url.pathname}${url.search}${url.hash}`;
+  const directUrl = `http://127.0.0.1:${port}${suffix}`;
   if (!state.activeProfile || state.activeProfile.kind === 'windows') {
-    await openLocalBrowserTab(`http://127.0.0.1:${port}${suffix}`, browserTabLabel(url.toString()));
+    await openLocalBrowserTab(directUrl, browserTabLabel(url.toString()));
+    return;
+  }
+
+  if (await canUseDirectLocalPreview(directUrl)) {
+    await openLocalBrowserTab(directUrl, browserTabLabel(url.toString()));
+    setStatus(`Previewing local :${port}`);
     return;
   }
 
@@ -7569,6 +7583,14 @@ async function openLocalPreviewUrl(url: URL) {
   renderForwards();
   await openLocalBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
   setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
+}
+
+async function canUseDirectLocalPreview(url: string) {
+  try {
+    return await api.probeLocalHttpUrl(url);
+  } catch {
+    return false;
+  }
 }
 
 async function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
@@ -7829,7 +7851,7 @@ async function startForwardForPort(port: number, source: 'manual' | 'auto') {
   try {
     return await api.startPortForward(state.activeProfile.id, port, port);
   } catch (error) {
-    if (source !== 'auto' || state.activeProfile.kind === 'ssh') throw error;
+    if (state.activeProfile.kind === 'windows') throw error;
     return api.startPortForward(state.activeProfile.id, port, 0);
   }
 }
@@ -7932,6 +7954,9 @@ function showBrowserFrame(tab: BrowserTab) {
 }
 
 function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean } = {}) {
+  if (!USE_PREVIEW_PROXY_BROWSER && !USE_EDGE_CDP_BROWSER) {
+    tab.frameUrl = tab.url;
+  }
   const frame = showBrowserFrame(tab);
   const frameUrl = tab.frameUrl ?? tab.url;
   if (!options.hard && frame.dataset.loadedUrl === frameUrl) return frame;

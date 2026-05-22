@@ -68,6 +68,8 @@ export const api = {
   killTerminal: (id: string) => invoke<void>('kill_terminal', { id }),
   startPortForward: (profileId: string, remotePort: number, localPort: number) =>
     invoke<PortForwardResult>('start_port_forward', { profileId, remotePort, localPort }),
+  probeLocalHttpUrl: (targetUrl: string) =>
+    invoke<boolean>('probe_local_http_url', { targetUrl }),
   startPreviewProxy: (targetUrl: string) =>
     invoke<PreviewProxyResult>('start_preview_proxy', { targetUrl }),
   startEdgeDevtoolsSession: (workspaceId: string) =>

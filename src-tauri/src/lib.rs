@@ -1318,6 +1318,13 @@ fn start_preview_proxy(
 }
 
 #[tauri::command]
+fn probe_local_http_url(target_url: String) -> Result<bool, String> {
+    let target = parse_http_preview_target(&target_url)?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], target.port));
+    Ok(TcpStream::connect_timeout(&addr, Duration::from_millis(450)).is_ok())
+}
+
+#[tauri::command]
 fn stop_port_forward(state: State<IdeState>, id: String) -> Result<(), String> {
     let mut forwards = state
         .forwards
@@ -3465,6 +3472,7 @@ pub fn run() {
             resize_terminal,
             kill_terminal,
             start_port_forward,
+            probe_local_http_url,
             start_preview_proxy,
             start_edge_devtools_session,
             edge_devtools_new_page,
