@@ -88,6 +88,7 @@ interface EdgeBrowserTarget {
 interface EdgeCdpPending {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  timer: number;
 }
 
 interface EdgeCdpState {
@@ -460,6 +461,10 @@ const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const USE_EDGE_CDP_BROWSER = true;
 const EDGE_SCREENCAST_QUALITY = 74;
+const EDGE_START_TIMEOUT_MS = 6500;
+const EDGE_PAGE_TIMEOUT_MS = 6500;
+const EDGE_CDP_CONNECT_TIMEOUT_MS = 6500;
+const EDGE_CDP_COMMAND_TIMEOUT_MS = 5000;
 const BROWSER_DEVICE_PRESETS: BrowserDevicePreset[] = [
   { id: 'iphone-se', label: 'iPhone SE', width: 375, height: 667, kind: 'phone' },
   { id: 'iphone-15', label: 'iPhone 15', width: 393, height: 852, kind: 'phone' },
@@ -3120,6 +3125,24 @@ function tokenizeExpression(expression: string) {
 function formatCalculatorResult(value: number) {
   if (Number.isInteger(value)) return String(value);
   return Number(value.toPrecision(12)).toString();
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${(timeoutMs / 1000).toFixed(1)}s`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
@@ -7713,10 +7736,10 @@ function loadBrowserTabFallback(tab: BrowserTab) {
 async function loadEdgeBrowserTab(tab: BrowserTab) {
   setEdgePreviewVisible(true);
   showEdgePreviewStatus('Starting Edge browser...');
-  const session = await ensureEdgeDevtoolsSession();
+  const session = await withTimeout(ensureEdgeDevtoolsSession(), EDGE_START_TIMEOUT_MS, 'Starting Edge browser');
   if (tab.edge && tab.edge.sessionId === session.id) {
     try {
-      await api.edgeDevtoolsActivatePage(tab.edge.sessionId, tab.edge.targetId);
+      await withTimeout(api.edgeDevtoolsActivatePage(tab.edge.sessionId, tab.edge.targetId), EDGE_PAGE_TIMEOUT_MS, 'Activating Edge tab');
     } catch {
       tab.edge = undefined;
     }
@@ -7725,7 +7748,8 @@ async function loadEdgeBrowserTab(tab: BrowserTab) {
   }
 
   if (!tab.edge) {
-    const page = await api.edgeDevtoolsNewPage(session.id, tab.url);
+    showEdgePreviewStatus('Opening Edge tab...');
+    const page = await withTimeout(api.edgeDevtoolsNewPage(session.id, tab.url), EDGE_PAGE_TIMEOUT_MS, 'Opening Edge tab');
     tab.edge = {
       sessionId: session.id,
       targetId: page.id,
@@ -7735,8 +7759,8 @@ async function loadEdgeBrowserTab(tab: BrowserTab) {
   }
 
   if (state.activeBrowserTabId !== tab.id) return;
-  await connectEdgeCdp(tab);
-  await api.edgeDevtoolsActivatePage(tab.edge.sessionId, tab.edge.targetId).catch(() => undefined);
+  await withTimeout(connectEdgeCdp(tab), EDGE_CDP_CONNECT_TIMEOUT_MS, 'Connecting Edge DevTools');
+  await withTimeout(api.edgeDevtoolsActivatePage(tab.edge.sessionId, tab.edge.targetId), EDGE_PAGE_TIMEOUT_MS, 'Activating Edge tab').catch(() => undefined);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -7818,7 +7842,30 @@ function connectEdgeCdp(tab: BrowserTab) {
       frameHeight: 0
     };
     let opened = false;
+    let settled = false;
     activeEdgeCdp = cdp;
+    const settleResolve = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(connectTimer);
+      resolve();
+    };
+    const settleReject = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(connectTimer);
+      reject(error);
+    };
+    const connectTimer = window.setTimeout(() => {
+      if (activeEdgeCdp === cdp) activeEdgeCdp = null;
+      rejectEdgePending(cdp, new Error('Edge DevTools connection timed out'));
+      try {
+        socket.close();
+      } catch {
+        // Best-effort cleanup only.
+      }
+      settleReject(new Error('Edge DevTools connection timed out'));
+    }, EDGE_CDP_CONNECT_TIMEOUT_MS);
 
     socket.addEventListener('open', async () => {
       opened = true;
@@ -7832,20 +7879,21 @@ function connectEdgeCdp(tab: BrowserTab) {
         await edgeCdpSend('Page.bringToFront', {}, cdp).catch(() => undefined);
         await configureEdgeViewport(cdp);
         showEdgePreviewStatus('Edge preview connected');
-        resolve();
+        settleResolve();
       } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
+        settleReject(error instanceof Error ? error : new Error(String(error)));
       }
     });
 
     socket.addEventListener('message', (event) => handleEdgeCdpMessage(cdp, event.data));
     socket.addEventListener('error', () => {
       const error = new Error('Edge DevTools websocket error');
-      if (!opened) reject(error);
+      if (!opened) settleReject(error);
       logBrowserConsole('error', error.message);
     });
     socket.addEventListener('close', () => {
       rejectEdgePending(cdp, new Error('Edge DevTools websocket closed'));
+      if (!settled && !opened) settleReject(new Error('Edge DevTools websocket closed'));
       if (activeEdgeCdp === cdp) {
         activeEdgeCdp = null;
         showEdgePreviewStatus('Edge preview disconnected');
@@ -7867,7 +7915,10 @@ function disconnectActiveEdgeCdp() {
 }
 
 function rejectEdgePending(cdp: EdgeCdpState, error: Error) {
-  for (const pending of cdp.pending.values()) pending.reject(error);
+  for (const pending of cdp.pending.values()) {
+    window.clearTimeout(pending.timer);
+    pending.reject(error);
+  }
   cdp.pending.clear();
 }
 
@@ -7878,10 +7929,15 @@ function edgeCdpSend(method: string, params: Record<string, unknown> = {}, cdp =
   const id = ++cdp.seq;
   const payload = { id, method, params };
   return new Promise((resolve, reject) => {
-    cdp.pending.set(id, { resolve, reject });
+    const timer = window.setTimeout(() => {
+      cdp.pending.delete(id);
+      reject(new Error(`${method} timed out`));
+    }, EDGE_CDP_COMMAND_TIMEOUT_MS);
+    cdp.pending.set(id, { resolve, reject, timer });
     try {
       cdp.socket.send(JSON.stringify(payload));
     } catch (error) {
+      window.clearTimeout(timer);
       cdp.pending.delete(id);
       reject(error instanceof Error ? error : new Error(String(error)));
     }
@@ -7902,6 +7958,7 @@ function handleEdgeCdpMessage(cdp: EdgeCdpState, data: unknown) {
     const pending = cdp.pending.get(message.id);
     if (!pending) return;
     cdp.pending.delete(message.id);
+    window.clearTimeout(pending.timer);
     if (message.error) pending.reject(new Error(message.error.message || 'DevTools command failed'));
     else pending.resolve(message.result);
     return;

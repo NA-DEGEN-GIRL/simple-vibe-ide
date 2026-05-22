@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1497,8 +1497,8 @@ fn allocate_local_port() -> Result<u16, String> {
 }
 
 fn wait_for_edge_devtools(port: u16) -> Result<(), String> {
-    for _ in 0..50 {
-        if devtools_http_request(port, "GET", "/json/version").is_ok() {
+    for _ in 0..14 {
+        if devtools_http_request_with_timeout(port, "GET", "/json/version", Duration::from_millis(250)).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(80));
@@ -1575,13 +1575,23 @@ fn percent_encode_component(value: &str) -> String {
 }
 
 fn devtools_http_request(port: u16, method: &str, path: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
+    devtools_http_request_with_timeout(port, method, path, Duration::from_secs(4))
+}
+
+fn devtools_http_request_with_timeout(
+    port: u16,
+    method: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
         .map_err(|err| format!("failed to connect to Edge DevTools: {err}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
+        .set_read_timeout(Some(timeout))
         .map_err(|err| err.to_string())?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(4)))
+        .set_write_timeout(Some(timeout))
         .map_err(|err| err.to_string())?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
