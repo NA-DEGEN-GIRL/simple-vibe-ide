@@ -2886,7 +2886,7 @@ fn proxy_http_preview(
     let response_text = String::from_utf8_lossy(response_headers);
     if should_inject_preview_console_bridge(&response_text) {
         let body = read_http_response_body(&mut remote, response_body, &response_text)?;
-        let injected = inject_preview_console_bridge(&body);
+        let injected = inject_preview_console_bridge(&body, &target_host, target_port);
         let rewritten_response =
             rewrite_preview_response_headers(&response_text, Some(injected.len()));
         incoming.write_all(rewritten_response.as_bytes())?;
@@ -3213,28 +3213,32 @@ fn find_crlf(buffer: &[u8]) -> Option<usize> {
     buffer.windows(2).position(|window| window == b"\r\n")
 }
 
-fn inject_preview_console_bridge(body: &[u8]) -> Vec<u8> {
+fn inject_preview_console_bridge(body: &[u8], target_host: &str, target_port: u16) -> Vec<u8> {
     let mut html = String::from_utf8_lossy(body).to_string();
-    let script = preview_console_bridge_script();
+    let script = preview_console_bridge_script(target_host, target_port);
     let lower = html.to_ascii_lowercase();
     if let Some(index) = lower.find("<head") {
         if let Some(close) = lower[index..].find('>') {
-            html.insert_str(index + close + 1, script);
+            html.insert_str(index + close + 1, &script);
             return html.into_bytes();
         }
     }
     if let Some(index) = lower.find("<body") {
         if let Some(close) = lower[index..].find('>') {
-            html.insert_str(index + close + 1, script);
+            html.insert_str(index + close + 1, &script);
             return html.into_bytes();
         }
     }
-    html.insert_str(0, script);
+    html.insert_str(0, &script);
     html.into_bytes()
 }
 
-fn preview_console_bridge_script() -> &'static str {
-    r#"<script>
+fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String {
+    let target_origin = format!("http://{target_host}:{target_port}");
+    let mut script = format!(
+        "<script>\nwindow.__simpleVibePreviewTargetOrigin = {target_origin:?};\n"
+    );
+    script.push_str(r#"
 (function () {
   if (window.__simpleVibeConsoleBridge) return;
   window.__simpleVibeConsoleBridge = true;
@@ -3300,9 +3304,24 @@ fn preview_console_bridge_script() -> &'static str {
   });
   if (window.WebSocket) {
     var NativeWebSocket = window.WebSocket;
+    var previewTargetOrigin = window.__simpleVibePreviewTargetOrigin || '';
+    function rewritePreviewSocketUrl(url) {
+      try {
+        if (!previewTargetOrigin) return url;
+        var parsed = new URL(String(url), window.location.href);
+        if (parsed.origin !== window.location.origin) return url;
+        var target = new URL(previewTargetOrigin);
+        parsed.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
+        parsed.host = target.host;
+        return parsed.href;
+      } catch (_) {
+        return url;
+      }
+    }
     window.WebSocket = function (url, protocols) {
-      var socket = protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
-      var target = String(url);
+      var socketUrl = rewritePreviewSocketUrl(url);
+      var socket = protocols === undefined ? new NativeWebSocket(socketUrl) : new NativeWebSocket(socketUrl, protocols);
+      var target = String(socketUrl);
       socket.addEventListener('error', function () {
         send('error', ["WebSocket connection to '" + target + "' failed."]);
       });
@@ -3320,7 +3339,8 @@ fn preview_console_bridge_script() -> &'static str {
     });
   }
 })();
-</script>"#
+</script>"#);
+    script
 }
 
 fn copy_exact_bytes(
