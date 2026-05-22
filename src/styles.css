@@ -1004,11 +1004,20 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .forward-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 6px; align-items: center; font-size: 12px; }
 .forward-row.pending { grid-template-columns: auto minmax(0, 1fr) auto; }
 .forward-row span { color: #9fb0c3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.browser-workspace { min-height: 0; display: grid; grid-template-areas: "preview"; grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); background: #070a0f; }
-.browser-workspace.console-visible.console-bottom { grid-template-areas: "preview" "console"; grid-template-rows: minmax(0, 1fr) minmax(110px, 34%); }
-.browser-workspace.console-visible.console-top { grid-template-areas: "console" "preview"; grid-template-rows: minmax(110px, 34%) minmax(0, 1fr); }
-.browser-workspace.console-visible.console-right { grid-template-areas: "preview console"; grid-template-columns: minmax(0, 1fr) minmax(220px, 34%); }
-.browser-workspace.console-visible.console-left { grid-template-areas: "console preview"; grid-template-columns: minmax(220px, 34%) minmax(0, 1fr); }
+.browser-workspace {
+  min-height: 0;
+  position: relative;
+  display: grid;
+  grid-template-areas: "preview";
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  background: #070a0f;
+  --browser-console-size: 34%;
+}
+.browser-workspace.console-visible.console-bottom { grid-template-areas: "preview" "console"; grid-template-rows: minmax(0, 1fr) minmax(110px, var(--browser-console-size)); }
+.browser-workspace.console-visible.console-top { grid-template-areas: "console" "preview"; grid-template-rows: minmax(110px, var(--browser-console-size)) minmax(0, 1fr); }
+.browser-workspace.console-visible.console-right { grid-template-areas: "preview console"; grid-template-columns: minmax(0, 1fr) minmax(220px, var(--browser-console-size)); }
+.browser-workspace.console-visible.console-left { grid-template-areas: "console preview"; grid-template-columns: minmax(220px, var(--browser-console-size)) minmax(0, 1fr); }
 .browser-shell { min-height: 0; overflow: auto; display: grid; align-items: start; justify-items: center; background: #070a0f; padding: 8px; }
 .browser-shell { grid-area: preview; }
 .browser-shell:not(.has-preview) { min-height: 160px; }
@@ -1023,6 +1032,18 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .browser-shell.desktop iframe { width: 100%; height: 100%; }
 .browser-shell.device iframe { max-width: none; min-height: 0; box-shadow: 0 0 0 1px #111827, 0 12px 24px rgba(0, 0, 0, 0.24); }
 .browser-console { grid-area: console; min-width: 0; min-height: 0; display: grid; grid-template-rows: 30px minmax(0, 1fr); border: 1px solid #223047; background: #080c12; overflow: hidden; }
+.browser-console-resizer { display: none; position: absolute; z-index: 5; background: transparent; }
+.browser-workspace.console-visible .browser-console-resizer { display: block; }
+.browser-workspace.console-bottom .browser-console-resizer,
+.browser-workspace.console-top .browser-console-resizer { left: 0; right: 0; height: 8px; cursor: row-resize; }
+.browser-workspace.console-bottom .browser-console-resizer { bottom: calc(var(--browser-console-size) - 4px); }
+.browser-workspace.console-top .browser-console-resizer { top: calc(var(--browser-console-size) - 4px); }
+.browser-workspace.console-right .browser-console-resizer,
+.browser-workspace.console-left .browser-console-resizer { top: 0; bottom: 0; width: 8px; cursor: col-resize; }
+.browser-workspace.console-right .browser-console-resizer { right: calc(var(--browser-console-size) - 4px); }
+.browser-workspace.console-left .browser-console-resizer { left: calc(var(--browser-console-size) - 4px); }
+.browser-console-resizer:hover,
+.browser-console-resizer:active { background: rgba(77, 141, 255, 0.28); }
 .browser-console-toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-bottom: 1px solid #182132; color: #c7d4e5; font-size: 12px; }
 .browser-console-toolbar button { margin-left: auto; padding: 3px 7px; }
 .browser-console-log { min-height: 0; overflow: auto; padding: 5px 0; font-family: var(--mono-font); font-size: 12px; line-height: 1.35; }

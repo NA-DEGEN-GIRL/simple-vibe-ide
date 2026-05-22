@@ -107,7 +107,16 @@ interface FontChoice {
   stack: string;
 }
 
-type EditorThemeId = 'simple-dark' | 'deep-contrast' | 'soft-slate' | 'warm-terminal' | 'solarized-dark';
+type EditorThemeId =
+  | 'simple-dark'
+  | 'deep-contrast'
+  | 'soft-slate'
+  | 'warm-terminal'
+  | 'solarized-dark'
+  | 'dracula'
+  | 'nord'
+  | 'ayu-dark'
+  | 'one-dark';
 
 interface EditorThemeChoice {
   id: EditorThemeId;
@@ -247,6 +256,7 @@ interface WorkspaceSnapshot {
   browserOrientation: BrowserOrientation;
   browserConsoleVisible: boolean;
   browserConsolePosition: BrowserConsolePosition;
+  browserConsoleSize?: number;
   browserZoom?: number;
   calculatorExpression?: string;
   calculatorHistory?: CalculatorHistoryItem[];
@@ -448,14 +458,21 @@ const MARKET_TICKER_STALE_MS = 45000;
 const MARKET_TICKER_MAX_CUSTOM = 1;
 const UI_FONT_CHOICES: FontChoice[] = [
   { id: 'system', label: 'System KR/EN', stack: 'Inter, "Segoe UI", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif' },
+  { id: 'segoe', label: 'Segoe UI', stack: '"Segoe UI", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif' },
+  { id: 'noto-kr', label: 'Noto Sans KR', stack: '"Noto Sans KR", "Malgun Gothic", "Segoe UI", system-ui, sans-serif' },
   { id: 'malgun', label: 'Malgun Gothic', stack: '"Malgun Gothic", "Segoe UI", system-ui, sans-serif' },
   { id: 'pretendard', label: 'Pretendard', stack: 'Pretendard, "Noto Sans KR", "Segoe UI", system-ui, sans-serif' },
+  { id: 'inter', label: 'Inter', stack: 'Inter, "Noto Sans KR", "Segoe UI", system-ui, sans-serif' },
   { id: 'arial', label: 'Arial', stack: 'Arial, "Noto Sans KR", sans-serif' }
 ];
 const MONO_FONT_CHOICES: FontChoice[] = [
   { id: 'cascadia', label: 'Cascadia Mono (mono)', stack: '"Cascadia Mono", Consolas, "D2Coding", monospace' },
+  { id: 'cascadia-code', label: 'Cascadia Code (mono)', stack: '"Cascadia Code", "Cascadia Mono", Consolas, monospace' },
   { id: 'd2coding', label: 'D2Coding (mono)', stack: 'D2Coding, "Cascadia Mono", Consolas, monospace' },
   { id: 'jetbrains', label: 'JetBrains Mono (mono)', stack: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace' },
+  { id: 'fira', label: 'Fira Code (mono)', stack: '"Fira Code", "Cascadia Mono", Consolas, monospace' },
+  { id: 'source-code-pro', label: 'Source Code Pro (mono)', stack: '"Source Code Pro", "Cascadia Mono", Consolas, monospace' },
+  { id: 'noto-mono', label: 'Noto Sans Mono (mono)', stack: '"Noto Sans Mono", "D2Coding", "Cascadia Mono", monospace' },
   { id: 'consolas', label: 'Consolas (mono)', stack: 'Consolas, "Cascadia Mono", monospace' }
 ];
 const EDITOR_THEME_CHOICES: EditorThemeChoice[] = [
@@ -638,6 +655,150 @@ const EDITOR_THEME_CHOICES: EditorThemeChoice[] = [
       '--cm-deleted': '#dc322f',
       '--cm-invalid': '#dc322f'
     }
+  },
+  {
+    id: 'dracula',
+    label: 'Dracula',
+    vars: {
+      '--cm-bg': '#282a36',
+      '--cm-text': '#f8f8f2',
+      '--cm-gutter-bg': '#21222c',
+      '--cm-gutter-text': '#6272a4',
+      '--cm-border': '#44475a',
+      '--cm-active-line': 'rgba(68, 71, 90, 0.78)',
+      '--cm-active-gutter-bg': '#343746',
+      '--cm-active-gutter-text': '#f8f8f2',
+      '--cm-caret': '#f8f8f0',
+      '--cm-selection': 'rgba(68, 71, 90, 0.96)',
+      '--cm-focus': 'rgba(189, 147, 249, 0.42)',
+      '--cm-comment': '#6272a4',
+      '--cm-keyword': '#ff79c6',
+      '--cm-string': '#f1fa8c',
+      '--cm-number': '#bd93f9',
+      '--cm-variable': '#f8f8f2',
+      '--cm-definition': '#50fa7b',
+      '--cm-type': '#8be9fd',
+      '--cm-property': '#50fa7b',
+      '--cm-operator': '#ff79c6',
+      '--cm-punctuation': '#f8f8f2',
+      '--cm-constant': '#bd93f9',
+      '--cm-regexp': '#ffb86c',
+      '--cm-escape': '#ffb86c',
+      '--cm-meta': '#8be9fd',
+      '--cm-heading': '#50fa7b',
+      '--cm-link': '#8be9fd',
+      '--cm-inserted': '#50fa7b',
+      '--cm-deleted': '#ff5555',
+      '--cm-invalid': '#ff5555'
+    }
+  },
+  {
+    id: 'nord',
+    label: 'Nord',
+    vars: {
+      '--cm-bg': '#2e3440',
+      '--cm-text': '#d8dee9',
+      '--cm-gutter-bg': '#262c36',
+      '--cm-gutter-text': '#6b778d',
+      '--cm-border': '#3b4252',
+      '--cm-active-line': 'rgba(67, 76, 94, 0.68)',
+      '--cm-active-gutter-bg': '#3b4252',
+      '--cm-active-gutter-text': '#eceff4',
+      '--cm-caret': '#88c0d0',
+      '--cm-selection': 'rgba(76, 86, 106, 0.9)',
+      '--cm-focus': 'rgba(136, 192, 208, 0.38)',
+      '--cm-comment': '#6b778d',
+      '--cm-keyword': '#81a1c1',
+      '--cm-string': '#a3be8c',
+      '--cm-number': '#b48ead',
+      '--cm-variable': '#d8dee9',
+      '--cm-definition': '#88c0d0',
+      '--cm-type': '#8fbcbb',
+      '--cm-property': '#d8dee9',
+      '--cm-operator': '#81a1c1',
+      '--cm-punctuation': '#d8dee9',
+      '--cm-constant': '#b48ead',
+      '--cm-regexp': '#ebcb8b',
+      '--cm-escape': '#d08770',
+      '--cm-meta': '#5e81ac',
+      '--cm-heading': '#88c0d0',
+      '--cm-link': '#88c0d0',
+      '--cm-inserted': '#a3be8c',
+      '--cm-deleted': '#bf616a',
+      '--cm-invalid': '#bf616a'
+    }
+  },
+  {
+    id: 'ayu-dark',
+    label: 'Ayu Dark',
+    vars: {
+      '--cm-bg': '#0f1419',
+      '--cm-text': '#e6e1cf',
+      '--cm-gutter-bg': '#0b1015',
+      '--cm-gutter-text': '#5c6773',
+      '--cm-border': '#253340',
+      '--cm-active-line': 'rgba(37, 51, 64, 0.72)',
+      '--cm-active-gutter-bg': '#1b2733',
+      '--cm-active-gutter-text': '#e6e1cf',
+      '--cm-caret': '#f29718',
+      '--cm-selection': 'rgba(67, 78, 92, 0.86)',
+      '--cm-focus': 'rgba(255, 204, 102, 0.36)',
+      '--cm-comment': '#5c6773',
+      '--cm-keyword': '#ff7733',
+      '--cm-string': '#bae67e',
+      '--cm-number': '#ffcc66',
+      '--cm-variable': '#e6e1cf',
+      '--cm-definition': '#ffd580',
+      '--cm-type': '#5ccfe6',
+      '--cm-property': '#73d0ff',
+      '--cm-operator': '#f29e74',
+      '--cm-punctuation': '#95a3b3',
+      '--cm-constant': '#d2a6ff',
+      '--cm-regexp': '#95e6cb',
+      '--cm-escape': '#ffcc66',
+      '--cm-meta': '#f28779',
+      '--cm-heading': '#ffd580',
+      '--cm-link': '#73d0ff',
+      '--cm-inserted': '#bae67e',
+      '--cm-deleted': '#ff3333',
+      '--cm-invalid': '#ff3333'
+    }
+  },
+  {
+    id: 'one-dark',
+    label: 'One Dark',
+    vars: {
+      '--cm-bg': '#282c34',
+      '--cm-text': '#abb2bf',
+      '--cm-gutter-bg': '#21252b',
+      '--cm-gutter-text': '#5c6370',
+      '--cm-border': '#3e4451',
+      '--cm-active-line': 'rgba(44, 49, 60, 0.95)',
+      '--cm-active-gutter-bg': '#2c313c',
+      '--cm-active-gutter-text': '#abb2bf',
+      '--cm-caret': '#528bff',
+      '--cm-selection': 'rgba(62, 68, 81, 0.98)',
+      '--cm-focus': 'rgba(82, 139, 255, 0.34)',
+      '--cm-comment': '#5c6370',
+      '--cm-keyword': '#c678dd',
+      '--cm-string': '#98c379',
+      '--cm-number': '#d19a66',
+      '--cm-variable': '#abb2bf',
+      '--cm-definition': '#61afef',
+      '--cm-type': '#e5c07b',
+      '--cm-property': '#e06c75',
+      '--cm-operator': '#56b6c2',
+      '--cm-punctuation': '#abb2bf',
+      '--cm-constant': '#d19a66',
+      '--cm-regexp': '#98c379',
+      '--cm-escape': '#d19a66',
+      '--cm-meta': '#c678dd',
+      '--cm-heading': '#61afef',
+      '--cm-link': '#56b6c2',
+      '--cm-inserted': '#98c379',
+      '--cm-deleted': '#e06c75',
+      '--cm-invalid': '#e06c75'
+    }
   }
 ];
 const DEFAULT_IDE_SETTINGS: IdeSettings = {
@@ -701,6 +862,7 @@ const state = {
   browserOrientation: 'portrait' as BrowserOrientation,
   browserConsoleVisible: false,
   browserConsolePosition: 'bottom' as BrowserConsolePosition,
+  browserConsoleSize: 0.34,
   browserConsoleLogs: [] as BrowserConsoleLog[],
   browserZoom: 1,
   calculatorExpression: '',
@@ -794,6 +956,7 @@ app.innerHTML = `
       <label>Profile <select id="profile-select"></select></label>
       <label>Root <input id="root-input" spellcheck="false" placeholder="select a profile first" /></label>
       <button id="open-root">Open / Connect</button>
+      <button id="copy-current-cd" title="Copy a cd command for the current folder" disabled>Copy cd</button>
       <button id="new-shell" disabled>+ Shell</button>
       <button id="new-windows-shell" title="Open local Windows PowerShell at a non-user path">Win Shell</button>
       <button data-llm="codex">Codex</button>
@@ -904,6 +1067,8 @@ app.innerHTML = `
         <div class="browser-form">
           <input id="preview-url" placeholder="3000 or http://127.0.0.1:3000" />
           <button id="load-preview">Load</button>
+          <button id="browser-back" title="Back">Back</button>
+          <button id="browser-forward" title="Forward">Forward</button>
           <button id="reload-preview" title="Reload preview">Reload</button>
           <button id="hard-refresh-preview" title="Reload with a cache-busting local URL">Hard</button>
         </div>
@@ -922,6 +1087,7 @@ app.innerHTML = `
         <div id="forward-list" class="forward-list"></div>
         <div id="browser-workspace" class="browser-workspace console-bottom">
           <div id="browser-shell" class="browser-shell desktop"><iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe></div>
+          <div id="browser-console-resizer" class="browser-console-resizer" aria-hidden="true"></div>
           <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
             <div class="browser-console-toolbar">
               <span>Console</span>
@@ -987,6 +1153,7 @@ const el = {
   profileSelect: document.querySelector<HTMLSelectElement>('#profile-select')!,
   rootInput: document.querySelector<HTMLInputElement>('#root-input')!,
   openRoot: document.querySelector<HTMLButtonElement>('#open-root')!,
+  copyCurrentCd: document.querySelector<HTMLButtonElement>('#copy-current-cd')!,
   newShell: document.querySelector<HTMLButtonElement>('#new-shell')!,
   newWindowsShell: document.querySelector<HTMLButtonElement>('#new-windows-shell')!,
   resetLayout: document.querySelector<HTMLButtonElement>('#reset-layout')!,
@@ -1038,6 +1205,8 @@ const el = {
   startForward: document.querySelector<HTMLButtonElement>('#start-forward')!,
   previewUrl: document.querySelector<HTMLInputElement>('#preview-url')!,
   loadPreview: document.querySelector<HTMLButtonElement>('#load-preview')!,
+  browserBack: document.querySelector<HTMLButtonElement>('#browser-back')!,
+  browserForward: document.querySelector<HTMLButtonElement>('#browser-forward')!,
   reloadPreview: document.querySelector<HTMLButtonElement>('#reload-preview')!,
   hardRefreshPreview: document.querySelector<HTMLButtonElement>('#hard-refresh-preview')!,
   browserTabs: document.querySelector<HTMLDivElement>('#browser-tabs')!,
@@ -1049,6 +1218,7 @@ const el = {
   forwardList: document.querySelector<HTMLDivElement>('#forward-list')!,
   browserWorkspace: document.querySelector<HTMLDivElement>('#browser-workspace')!,
   browserShell: document.querySelector<HTMLDivElement>('#browser-shell')!,
+  browserConsoleResizer: document.querySelector<HTMLDivElement>('#browser-console-resizer')!,
   browserConsole: document.querySelector<HTMLElement>('#browser-console')!,
   browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
   browserConsoleLog: document.querySelector<HTMLDivElement>('#browser-console-log')!,
@@ -1148,6 +1318,7 @@ async function init() {
   renderMarketTicker();
   setBrowserMode('desktop');
   setBrowserConsolePosition(state.browserConsolePosition);
+  applyBrowserConsoleSize();
   setBrowserConsoleVisible(false);
   applyNoteFontSize();
   applyNoteOpacity();
@@ -1948,6 +2119,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     browserOrientation: 'portrait',
     browserConsoleVisible: false,
     browserConsolePosition: 'bottom',
+    browserConsoleSize: 0.34,
     browserZoom: 1,
     calculatorExpression: '',
     calculatorHistory: [],
@@ -2038,6 +2210,7 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
     browserOrientation: state.browserOrientation,
     browserConsoleVisible: state.browserConsoleVisible,
     browserConsolePosition: state.browserConsolePosition,
+    browserConsoleSize: state.browserConsoleSize,
     browserZoom: state.browserZoom,
     calculatorExpression: state.calculatorExpression,
     calculatorHistory: state.calculatorHistory.slice(0, 20),
@@ -2148,6 +2321,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.imageOpenInNewTab = Boolean(snapshot.imageOpenInNewTab);
     state.notePinned = Boolean(snapshot.notePinned);
     noteOpacity = clamp(snapshot.noteOpacity || 100, 45, 100);
+    state.browserConsoleSize = clamp(snapshot.browserConsoleSize || 0.34, 0.18, 0.72);
     state.browserZoom = clamp(snapshot.browserZoom || 1, 0.5, 2);
     state.calculatorExpression = snapshot.calculatorExpression || '';
     state.calculatorHistory = Array.isArray(snapshot.calculatorHistory) ? snapshot.calculatorHistory.slice(0, 20) : [];
@@ -2162,6 +2336,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     applyNoteFontSize();
     applyNoteOpacity();
     applyCalculatorFontSize();
+    applyBrowserConsoleSize();
     applyBrowserZoom();
     el.profileSelect.value = profile.id;
     el.rootInput.value = state.workspaceRoot;
@@ -2987,6 +3162,7 @@ function bindEvents() {
     else void createTerminal(null, 'shell');
   });
   el.newWindowsShell.addEventListener('click', () => void createWindowsShell());
+  el.copyCurrentCd.addEventListener('click', () => void copyCurrentFolderCdCommand());
   el.marketAddSymbol.addEventListener('click', addMarketTickerFromInput);
   el.marketSymbolInput.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter') return;
@@ -3046,6 +3222,8 @@ function bindEvents() {
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
   el.loadPreview.addEventListener('click', () => void openPreviewValue(el.previewUrl.value.trim()));
+  el.browserBack.addEventListener('click', () => navigateBrowserHistory(-1));
+  el.browserForward.addEventListener('click', () => navigateBrowserHistory(1));
   el.reloadPreview.addEventListener('click', () => refreshPreview(false));
   el.hardRefreshPreview.addEventListener('click', () => refreshPreview(true));
   el.newFile.addEventListener('click', () => void createExplorerItem('file'));
@@ -3084,11 +3262,12 @@ function bindEvents() {
   el.rotateDevice.addEventListener('click', rotateBrowserDevice);
   el.browserConsoleToggle.addEventListener('click', () => setBrowserConsoleVisible(!state.browserConsoleVisible));
   el.browserConsolePosition.addEventListener('change', () => setBrowserConsolePosition(el.browserConsolePosition.value as BrowserConsolePosition));
+  el.browserConsoleResizer.addEventListener('pointerdown', startBrowserConsoleResize);
   el.browserConsoleClear.addEventListener('click', () => {
     state.browserConsoleLogs = [];
     renderBrowserConsole();
   });
-  el.browserShell.addEventListener('pointerenter', activateBrowserPanel);
+  el.browserShell.addEventListener('pointerdown', activateBrowserPanel);
   bindBrowserFrameEvents(el.previewFrame);
   el.calculatorExpression.addEventListener('input', () => {
     state.calculatorExpression = el.calculatorExpression.value;
@@ -3106,6 +3285,7 @@ function bindEvents() {
   document.addEventListener('keydown', handleWidgetFocusShortcut, true);
   document.addEventListener('keydown', handleExplorerKeyboard, true);
   document.addEventListener('keydown', handleCalculatorGlobalKey, true);
+  document.addEventListener('keydown', handleBrowserRefreshShortcut, true);
   document.addEventListener('mousedown', handleExplorerMouseNavigation, true);
   document.addEventListener('contextmenu', handleContextMenu, true);
   document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
@@ -3232,6 +3412,7 @@ function explorerContextMenuItems(): ContextMenuItem[] {
     { separator: true },
     { label: 'New file', action: () => createExplorerItem('file') },
     { label: 'New folder', action: () => createExplorerItem('dir') },
+    { label: 'Copy current cd', action: copyCurrentFolderCdCommand },
     { label: 'Refresh', action: () => refreshExplorerTree({ manual: true }) }
   ];
 }
@@ -3271,6 +3452,8 @@ function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMe
 function browserContextMenuItems(): ContextMenuItem[] {
   const tab = currentBrowserTab();
   return [
+    { label: 'Back', action: () => navigateBrowserHistory(-1), disabled: !tab },
+    { label: 'Forward', action: () => navigateBrowserHistory(1), disabled: !tab },
     { label: 'Reload', action: () => refreshPreview(false), disabled: !tab },
     { label: 'Hard refresh', action: () => refreshPreview(true), disabled: !tab },
     { label: 'Copy URL', action: () => { if (tab) void copyTextToClipboard(tab.url, 'Copied browser URL'); }, disabled: !tab },
@@ -3395,6 +3578,30 @@ async function pasteIntoTerminal(pane: TerminalPane | null | undefined) {
 async function copyTextToClipboard(text: string, message: string) {
   await writeText(text);
   setStatus(message);
+}
+
+async function copyCurrentFolderCdCommand() {
+  const activeWidget = activeTerminalWidget();
+  const activePane = activeWidget ? activePaneForWidget(activeWidget) : null;
+  const dir = activePane?.cwd ?? state.currentDir ?? state.workspaceRoot;
+  if (!dir) {
+    setStatus('No current folder to copy', true);
+    return;
+  }
+  const profile = activePane
+    ? state.profiles.find((item) => item.id === activePane.profileId) ?? state.activeProfile
+    : state.activeProfile;
+  await writeText(cdCommandForPath(dir, profile?.kind ?? 'wsl'));
+  setStatus('Copied cd command for current folder');
+}
+
+function cdCommandForPath(path: string, profileKind: string) {
+  if (profileKind === 'windows' || isWindowsPath(path)) return `Set-Location -LiteralPath ${powershellQuote(path)}`;
+  return `cd ${posixShellQuote(path)}`;
+}
+
+function posixShellQuote(value: string) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function bindWindowChrome() {
@@ -4473,6 +4680,7 @@ function clearWorkspacePanels() {
 
 function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean } = {}) {
   state.workspaceOpen = open;
+  el.copyCurrentCd.disabled = !open;
   el.newShell.disabled = !open;
   el.shellNewTab.disabled = !open;
   el.shellTabs.classList.add('hidden');
@@ -6352,7 +6560,13 @@ async function createTerminalTab(
 
   try {
     await settleTerminalInitialFit(pane);
-    pane.backendId = await api.spawnTerminal(terminalProfile.id, terminalCwd, command, term.rows, term.cols);
+    const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd);
+    if (spawnCwd !== pane.cwd) {
+      pane.cwd = spawnCwd;
+      updateTerminalWidgetTitle(widget);
+      term.write('\r\n[simple-vibe-ide] saved folder is unavailable; using an available workspace folder\r\n');
+    }
+    pane.backendId = await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols);
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
       bringPanelToFront(widget.element);
@@ -6499,6 +6713,25 @@ function workspaceShellCwd() {
   return state.workspaceRoot || state.currentDir || state.activeProfile?.root || '.';
 }
 
+async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: string) {
+  const candidates = [
+    requestedCwd,
+    state.currentDir,
+    state.workspaceRoot,
+    profile.root,
+    profile.kind === 'windows' ? '' : '~'
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      await api.listDirectory(profile.id, candidate);
+      return candidate;
+    } catch {
+      // Try the next likely folder without surfacing private paths.
+    }
+  }
+  return profile.kind === 'windows' ? '' : '~';
+}
+
 function updateTerminalWidgetTitle(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   widget.activePaneId = pane?.paneId ?? '';
@@ -6520,7 +6753,14 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
   }
 
   if (event.type !== 'keydown' || !(event.ctrlKey || event.metaKey) || event.altKey) return true;
-  if (event.key.toLowerCase() !== 'c') return true;
+  const key = event.key.toLowerCase();
+  if (key === 'v' && !event.shiftKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    void pasteTerminalText(pane);
+    return false;
+  }
+  if (key !== 'c') return true;
   if (!pane.term.hasSelection()) return true;
 
   void copyTerminalSelection(pane);
@@ -7339,7 +7579,7 @@ function ensureBrowserFrame(tab: BrowserTab) {
 function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
   if (frame.dataset.browserFrameBound === 'true') return;
   frame.dataset.browserFrameBound = 'true';
-  frame.addEventListener('pointerenter', activateBrowserPanel);
+  frame.addEventListener('pointerdown', activateBrowserPanel);
   frame.addEventListener('focus', activateBrowserPanel);
   frame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${frame.src || state.previewUrl}`));
   frame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${frame.src || state.previewUrl}`));
@@ -7546,6 +7786,7 @@ function setBrowserConsoleVisible(visible: boolean) {
   el.browserConsole.classList.toggle('hidden', !visible);
   el.browserConsoleToggle.classList.toggle('active', visible);
   el.browserConsoleToggle.setAttribute('aria-pressed', String(visible));
+  applyBrowserConsoleSize();
   if (visible) renderBrowserConsole();
   saveActiveWorkspaceSnapshot();
 }
@@ -7556,8 +7797,49 @@ function setBrowserConsolePosition(position: BrowserConsolePosition) {
   el.browserConsolePosition.value = position;
   el.browserWorkspace.classList.remove('console-bottom', 'console-right', 'console-top', 'console-left');
   el.browserWorkspace.classList.add(`console-${position}`);
+  applyBrowserConsoleSize();
   if (state.browserConsoleVisible) logBrowserConsole('info', `Console moved to ${position}`);
   saveActiveWorkspaceSnapshot();
+}
+
+function applyBrowserConsoleSize() {
+  state.browserConsoleSize = clamp(state.browserConsoleSize || 0.34, 0.18, 0.72);
+  el.browserWorkspace.style.setProperty('--browser-console-size', `${(state.browserConsoleSize * 100).toFixed(2)}%`);
+}
+
+function startBrowserConsoleResize(event: PointerEvent) {
+  if (event.button !== 0 || !state.browserConsoleVisible) return;
+  event.preventDefault();
+  event.stopPropagation();
+  activateBrowserPanel();
+  el.browserConsoleResizer.setPointerCapture(event.pointerId);
+  const move = (moveEvent: PointerEvent) => {
+    if (moveEvent.pointerId !== event.pointerId) return;
+    const rect = el.browserWorkspace.getBoundingClientRect();
+    const position = state.browserConsolePosition;
+    const raw = position === 'bottom'
+      ? (rect.bottom - moveEvent.clientY) / rect.height
+      : position === 'top'
+        ? (moveEvent.clientY - rect.top) / rect.height
+        : position === 'right'
+          ? (rect.right - moveEvent.clientX) / rect.width
+          : (moveEvent.clientX - rect.left) / rect.width;
+    state.browserConsoleSize = clamp(raw, 0.18, 0.72);
+    applyBrowserConsoleSize();
+  };
+  const up = (upEvent: PointerEvent) => {
+    if (upEvent.pointerId !== event.pointerId) return;
+    if (el.browserConsoleResizer.hasPointerCapture(event.pointerId)) {
+      el.browserConsoleResizer.releasePointerCapture(event.pointerId);
+    }
+    el.browserConsoleResizer.removeEventListener('pointermove', move);
+    el.browserConsoleResizer.removeEventListener('pointerup', up);
+    el.browserConsoleResizer.removeEventListener('pointercancel', up);
+    saveActiveWorkspaceSnapshot();
+  };
+  el.browserConsoleResizer.addEventListener('pointermove', move);
+  el.browserConsoleResizer.addEventListener('pointerup', up);
+  el.browserConsoleResizer.addEventListener('pointercancel', up);
 }
 
 function logBrowserConsole(level: BrowserConsoleLog['level'], message: string) {
@@ -7570,6 +7852,7 @@ function logBrowserConsole(level: BrowserConsoleLog['level'], message: string) {
   state.browserConsoleLogs.push(entry);
   if (state.browserConsoleLogs.length > 250) state.browserConsoleLogs.shift();
   if (state.browserConsoleVisible) renderBrowserConsole();
+  maybeAutoForwardBrowserLocalUrl(message);
 }
 
 function renderBrowserConsole() {
@@ -7593,6 +7876,16 @@ function renderBrowserConsole() {
 function handleBrowserConsoleMessage(event: MessageEvent) {
   const data = event.data;
   if (!data || typeof data !== 'object') return;
+  const openUrl = (data as { __simpleVibeOpenUrl?: unknown }).__simpleVibeOpenUrl;
+  if (typeof openUrl === 'string' && openUrl.trim()) {
+    void openPreviewValue(openUrl.trim());
+    return;
+  }
+  const refresh = (data as { __simpleVibeRefresh?: unknown }).__simpleVibeRefresh;
+  if (refresh && typeof refresh === 'object') {
+    refreshPreview(Boolean((refresh as { hard?: unknown }).hard));
+    return;
+  }
   const contextMenu = (data as { __simpleVibeContextMenu?: unknown }).__simpleVibeContextMenu;
   if (contextMenu && typeof contextMenu === 'object') {
     const payload = contextMenu as { x?: unknown; y?: unknown };
@@ -7607,6 +7900,27 @@ function handleBrowserConsoleMessage(event: MessageEvent) {
   const level = record.level === 'warn' || record.level === 'error' ? record.level : 'info';
   const message = record.args?.map(formatConsoleValue).join(' ') ?? formatConsoleValue(record.message ?? '');
   if (message) logBrowserConsole(level, message);
+}
+
+function maybeAutoForwardBrowserLocalUrl(message: string) {
+  if (!state.activeProfile || state.activeProfile.kind === 'windows') return;
+  const matches = message.matchAll(/\b(?:https?|wss?):\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d{2,5})\b/gi);
+  for (const match of matches) {
+    const port = Number(match[1]);
+    if (!isPreviewPort(port)) continue;
+    if (state.forwards.some((forward) => forward.remotePort === port)) continue;
+    const key = `browser-dep:${state.activeProfile.id}:${port}`;
+    if (autoForwardingPorts.has(key)) continue;
+    autoForwardingPorts.add(key);
+    void startForwardForPort(port, 'auto')
+      .then((forward) => {
+        state.forwards.push(forward);
+        renderForwards();
+        logBrowserConsole('info', `Auto forwarded browser dependency port ${port}`);
+      })
+      .catch((error) => logBrowserConsole('warn', `Auto forward for browser dependency port ${port} failed: ${String(error)}`))
+      .finally(() => autoForwardingPorts.delete(key));
+  }
 }
 
 function showBrowserContextMenuFromFrame(x: number, y: number) {
@@ -7630,6 +7944,30 @@ function formatConsoleValue(value: unknown) {
 
 function currentBrowserTab() {
   return state.browserTabs.find((tab) => tab.id === state.activeBrowserTabId) ?? null;
+}
+
+function navigateBrowserHistory(delta: -1 | 1) {
+  const frame = activeBrowserFrame();
+  if (!frame?.contentWindow) {
+    setStatus('No active browser tab', true);
+    return;
+  }
+  try {
+    frame.contentWindow.history.go(delta);
+    activateBrowserPanel();
+    logBrowserConsole('info', delta < 0 ? 'Browser back' : 'Browser forward');
+  } catch (error) {
+    setStatus(`Browser history navigation failed: ${String(error)}`, true);
+  }
+}
+
+function handleBrowserRefreshShortcut(event: KeyboardEvent) {
+  if (event.key !== 'F5') return;
+  event.preventDefault();
+  event.stopPropagation();
+  const target = event.target instanceof Element ? event.target : null;
+  const browserFocused = keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'browser';
+  if (target?.closest('.browser-panel') || browserFocused) refreshPreview(event.ctrlKey || event.shiftKey);
 }
 
 function refreshPreview(hard: boolean) {

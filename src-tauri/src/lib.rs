@@ -2876,6 +2876,33 @@ fn preview_console_bridge_script() -> &'static str {
       window.parent.postMessage({ __simpleVibeContextMenu: { x: event.clientX, y: event.clientY } }, '*');
     } catch (_) {}
   });
+  window.addEventListener('keydown', function (event) {
+    if (event.key !== 'F5') return;
+    try {
+      event.preventDefault();
+      window.parent.postMessage({ __simpleVibeRefresh: { hard: !!(event.ctrlKey || event.shiftKey) } }, '*');
+    } catch (_) {}
+  }, true);
+  var nativeOpen = window.open;
+  function sendOpenUrl(url) {
+    try {
+      if (!url) return false;
+      window.parent.postMessage({ __simpleVibeOpenUrl: new URL(String(url), window.location.href).href }, '*');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  window.open = function (url, target, features) {
+    if (sendOpenUrl(url)) return null;
+    return nativeOpen && nativeOpen.call(window, url, target, features);
+  };
+  document.addEventListener('click', function (event) {
+    var anchor = event.target && event.target.closest ? event.target.closest('a[target="_blank"], a[rel~="external"]') : null;
+    if (anchor && sendOpenUrl(anchor.href)) {
+      event.preventDefault();
+    }
+  }, true);
   ['log', 'info', 'warn', 'error'].forEach(function (level) {
     var original = console[level];
     console[level] = function () {

@@ -21,6 +21,7 @@ export interface SecretLine {
   prefix?: string;
   key?: string;
   value?: string;
+  suffix?: string;
   reveal?: boolean;
 }
 
@@ -48,18 +49,33 @@ function globToRegExp(pattern: string) {
 
 export function parseSecretLines(content: string): SecretLine[] {
   return content.split(/\n/).map((line, index) => {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(.*)$/);
-    if (!match) {
+    const envMatch = line.match(/^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(.*)$/);
+    if (envMatch) {
+      const [, indent, key, sep, value] = envMatch;
+      return {
+        id: String(index),
+        kind: 'kv',
+        original: line,
+        prefix: `${indent}${key}${sep}`,
+        key,
+        value,
+        reveal: false
+      };
+    }
+
+    const jsonMatch = line.match(/^(\s*"((?:\\.|[^"\\])+)?"\s*:\s*)(.*?)(\s*,?\s*)$/);
+    if (!jsonMatch) {
       return { id: String(index), kind: 'raw', original: line };
     }
-    const [, key, sep, value] = match;
+    const [, prefix, key, value, suffix] = jsonMatch;
     return {
       id: String(index),
       kind: 'kv',
       original: line,
-      prefix: `${key}${sep}`,
+      prefix,
       key,
       value,
+      suffix,
       reveal: false
     };
   });
@@ -68,7 +84,7 @@ export function parseSecretLines(content: string): SecretLine[] {
 export function serializeSecretLines(lines: SecretLine[]): string {
   return lines
     .map((line) => {
-      if (line.kind === 'kv') return `${line.prefix ?? ''}${line.value ?? ''}`;
+      if (line.kind === 'kv') return `${line.prefix ?? ''}${line.value ?? ''}${line.suffix ?? ''}`;
       return line.original;
     })
     .join('\n');
