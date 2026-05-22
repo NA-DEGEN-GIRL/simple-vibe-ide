@@ -1371,7 +1371,7 @@ fn start_edge_devtools_session_blocking(
     let port = allocate_local_port()?;
     let user_data_dir = std::env::temp_dir()
         .join("simple-vibe-ide-edge")
-        .join(safe_edge_session_path(&id));
+        .join(format!("{}-{port}", safe_edge_session_path(&id)));
     fs::create_dir_all(&user_data_dir)
         .map_err(|err| format!("failed to prepare Edge profile: {err}"))?;
 
@@ -1523,11 +1523,11 @@ fn allocate_local_port() -> Result<u16, String> {
 }
 
 fn wait_for_edge_devtools(port: u16) -> Result<(), String> {
-    for _ in 0..14 {
-        if devtools_http_request_with_timeout(port, "GET", "/json/version", Duration::from_millis(250)).is_ok() {
+    for _ in 0..36 {
+        if devtools_http_request_with_timeout(port, "GET", "/json/version", Duration::from_millis(350)).is_ok() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(120));
     }
     Err("Edge DevTools endpoint did not become ready".to_string())
 }
