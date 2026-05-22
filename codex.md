@@ -16,6 +16,26 @@ kept with the repository.
 ## Patch Notes
 
 
+### 2026-05-22 - Terminal cwd persistence fix
+
+#### Fixed
+
+- Shell workspace restore now keeps the full bash working directory reported by
+  OSC7 instead of truncating it to the final path segment.
+- Terminal cwd snapshot saves flush when the app is hidden or closed, reducing
+  the chance that a just-changed shell directory is lost on restart.
+- `run-built.cmd` and `run-built.vbs` now prefer the freshly built release exe
+  in the repo before falling back to the cached `%TEMP%` copy.
+
+#### Verified
+
+- Confirmed the OSC7 parser keeps a full redacted-style nested POSIX path.
+- `npm run check` passed.
+- `npm run build` passed.
+- `npm run tauri -- build --no-bundle` passed and rebuilt the Windows release
+  exe.
+
+
 ### 2026-05-22 - Browser preview common dev-server safeguards
 
 #### Added

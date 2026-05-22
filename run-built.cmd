@@ -3,9 +3,9 @@ setlocal
 
 set "APP_DIR=%TEMP%\simple-vibe-ide-target\release"
 set "APP_EXE=%APP_DIR%\simple-vibe-ide.exe"
-set "SOURCE_EXE=%APP_EXE%"
+set "SOURCE_EXE=%~dp0src-tauri\target\release\simple-vibe-ide.exe"
 
-if not exist "%SOURCE_EXE%" set "SOURCE_EXE=%~dp0src-tauri\target\release\simple-vibe-ide.exe"
+if not exist "%SOURCE_EXE%" if exist "%APP_EXE%" set "SOURCE_EXE=%APP_EXE%"
 
 if not exist "%SOURCE_EXE%" (
   echo Built app not found:

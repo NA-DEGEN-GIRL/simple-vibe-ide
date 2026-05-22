@@ -19,10 +19,10 @@ tempDir = shell.ExpandEnvironmentStrings("%TEMP%")
 appRoot = fso.BuildPath(tempDir, "simple-vibe-ide-target")
 appDir = fso.BuildPath(appRoot, "release")
 appExe = fso.BuildPath(appDir, "simple-vibe-ide.exe")
-sourceExe = appExe
+sourceExe = fso.BuildPath(scriptDir, "src-tauri\target\release\simple-vibe-ide.exe")
 
 If Not fso.FileExists(sourceExe) Then
-  sourceExe = fso.BuildPath(scriptDir, "src-tauri\target\release\simple-vibe-ide.exe")
+  sourceExe = appExe
 End If
 
 If Not fso.FileExists(sourceExe) Then

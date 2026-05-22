@@ -3459,7 +3459,12 @@ function bindEvents() {
     scheduleConfigureEdgeViewport();
   });
   window.addEventListener('blur', hideContextMenu);
+  window.addEventListener('pagehide', flushTerminalCwdSnapshotSave);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushTerminalCwdSnapshotSave();
+  });
   window.addEventListener('beforeunload', () => {
+    flushTerminalCwdSnapshotSave();
     if (marketTickerSocket) marketTickerSocket.close();
     stopAllEdgeDevtoolsSessions();
     hideCaptureFreezeFrame();
@@ -7685,7 +7690,7 @@ function resolveWindowsCdTarget(cwd: string, target: string, root = '') {
 
 function extractOsc7Cwd(data: string) {
   let found = '';
-  const pattern = /\x1b]7;file:\/\/[^\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+  const pattern = /\x1b]7;file:\/\/[^/\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
   for (const match of data.matchAll(pattern)) {
     found = decodeTerminalPath(match[1]);
   }
@@ -7783,7 +7788,15 @@ function scheduleTerminalCwdSnapshotSave() {
   terminalCwdSaveTimer = window.setTimeout(() => {
     terminalCwdSaveTimer = 0;
     saveActiveWorkspaceSnapshot();
-  }, 900);
+  }, 150);
+}
+
+function flushTerminalCwdSnapshotSave() {
+  if (terminalCwdSaveTimer) {
+    window.clearTimeout(terminalCwdSaveTimer);
+    terminalCwdSaveTimer = 0;
+  }
+  saveActiveWorkspaceSnapshot();
 }
 
 async function openPort(port: number, source: 'manual' | 'auto') {
