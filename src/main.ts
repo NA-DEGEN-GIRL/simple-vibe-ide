@@ -482,7 +482,7 @@ const EXPLORER_DIRECTORY_PREFETCH_DELAY_MS = 120;
 const EXPLORER_DIRECTORY_PREFETCH_LIMIT = 6;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const USE_EDGE_CDP_BROWSER = false;
-const USE_PREVIEW_PROXY_BROWSER = false;
+const USE_PREVIEW_PROXY_BROWSER = true;
 const EDGE_SCREENCAST_QUALITY = 66;
 const EDGE_SCREENCAST_EVERY_NTH_FRAME = 2;
 const EDGE_SCREENCAST_MIN_DRAW_INTERVAL_MS = 58;
@@ -3248,7 +3248,11 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
 function normalizeBrowserTabForCurrentMode(tab: BrowserTab): BrowserTab {
   const normalized = { ...tab };
   if (!USE_EDGE_CDP_BROWSER) normalized.edge = undefined;
-  if (!USE_PREVIEW_PROXY_BROWSER) normalized.frameUrl = normalized.url;
+  if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(normalized.url)) {
+    normalized.frameUrl = undefined;
+  } else if (!USE_PREVIEW_PROXY_BROWSER) {
+    normalized.frameUrl = normalized.url;
+  }
   return normalized;
 }
 
@@ -7926,6 +7930,7 @@ function ensureBrowserFrame(tab: BrowserTab) {
   frame.classList.add('preview-frame', 'hidden');
   frame.dataset.browserTabId = tab.id;
   frame.dataset.browserWorkspaceId = workspaceId;
+  frame.dataset.displayUrl = tab.url;
   frame.title = tab.label;
   bindBrowserFrameEvents(frame);
   if (!frame.parentElement) el.browserShell.append(frame);
@@ -7938,8 +7943,8 @@ function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
   frame.dataset.browserFrameBound = 'true';
   frame.addEventListener('pointerdown', activateBrowserPanel);
   frame.addEventListener('focus', activateBrowserPanel);
-  frame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${frame.src || state.previewUrl}`));
-  frame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${frame.src || state.previewUrl}`));
+  frame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${frame.dataset.displayUrl || state.previewUrl}`));
+  frame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${frame.dataset.displayUrl || state.previewUrl}`));
 }
 
 function showBrowserFrame(tab: BrowserTab) {
@@ -7959,6 +7964,7 @@ function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean } = {}) {
   }
   const frame = showBrowserFrame(tab);
   const frameUrl = tab.frameUrl ?? tab.url;
+  frame.dataset.displayUrl = tab.url;
   if (!options.hard && frame.dataset.loadedUrl === frameUrl) return frame;
   frame.src = options.hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
   frame.dataset.loadedUrl = frameUrl;
@@ -8831,7 +8837,11 @@ function startBrowserConsoleResize(event: PointerEvent) {
   el.browserConsoleResizer.addEventListener('pointercancel', up);
 }
 
-function logBrowserConsole(level: BrowserConsoleLog['level'], message: string) {
+function logBrowserConsole(
+  level: BrowserConsoleLog['level'],
+  message: string,
+  options: { scanForLocalPorts?: boolean } = {}
+) {
   const entry = {
     id: makeBrowserTabId(),
     time: new Date().toTimeString().slice(0, 8),
@@ -8841,7 +8851,7 @@ function logBrowserConsole(level: BrowserConsoleLog['level'], message: string) {
   state.browserConsoleLogs.push(entry);
   if (state.browserConsoleLogs.length > 250) state.browserConsoleLogs.shift();
   if (state.browserConsoleVisible) renderBrowserConsole();
-  maybeAutoForwardBrowserLocalUrl(message);
+  if (options.scanForLocalPorts) maybeAutoForwardBrowserLocalUrl(message);
 }
 
 function renderBrowserConsole() {
@@ -8888,7 +8898,7 @@ function handleBrowserConsoleMessage(event: MessageEvent) {
   const record = payload as { level?: string; message?: unknown; args?: unknown[] };
   const level = record.level === 'warn' || record.level === 'error' ? record.level : 'info';
   const message = record.args?.map(formatConsoleValue).join(' ') ?? formatConsoleValue(record.message ?? '');
-  if (message) logBrowserConsole(level, message);
+  if (message) logBrowserConsole(level, message, { scanForLocalPorts: true });
 }
 
 function maybeAutoForwardBrowserLocalUrl(message: string) {
