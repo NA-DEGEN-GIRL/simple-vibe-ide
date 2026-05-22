@@ -40,12 +40,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
+
 #[derive(Default)]
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
     forwards: Mutex<HashMap<String, ForwardSession>>,
     exports: Mutex<HashMap<String, ExportSession>>,
-    edge_sessions: Mutex<HashMap<String, EdgeDevtoolsSessionState>>,
+    edge_sessions: EdgeSessionStore,
 }
 
 struct TerminalSession {
@@ -1333,14 +1335,25 @@ fn stop_port_forward(state: State<IdeState>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_edge_devtools_session(
-    state: State<IdeState>,
+async fn start_edge_devtools_session(
+    state: State<'_, IdeState>,
+    workspace_id: String,
+) -> Result<EdgeDevtoolsSession, String> {
+    let edge_sessions = Arc::clone(&state.edge_sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        start_edge_devtools_session_blocking(edge_sessions, workspace_id)
+    })
+    .await
+    .map_err(|err| format!("Edge startup task failed: {err}"))?
+}
+
+fn start_edge_devtools_session_blocking(
+    edge_sessions: EdgeSessionStore,
     workspace_id: String,
 ) -> Result<EdgeDevtoolsSession, String> {
     let id = normalized_edge_session_id(&workspace_id);
     {
-        let mut sessions = state
-            .edge_sessions
+        let mut sessions = edge_sessions
             .lock()
             .map_err(|_| "edge session state poisoned".to_string())?;
         if let Some(session) = sessions.get_mut(&id) {
@@ -1390,8 +1403,7 @@ fn start_edge_devtools_session(
         return Err(err);
     }
 
-    state
-        .edge_sessions
+    edge_sessions
         .lock()
         .map_err(|_| "edge session state poisoned".to_string())?
         .insert(
@@ -1406,43 +1418,58 @@ fn start_edge_devtools_session(
 }
 
 #[tauri::command]
-fn edge_devtools_new_page(
-    state: State<IdeState>,
+async fn edge_devtools_new_page(
+    state: State<'_, IdeState>,
     session_id: String,
     url: String,
 ) -> Result<EdgeDevtoolsPage, String> {
-    let port = edge_session_port(&state, &session_id)?;
-    let path = format!("/json/new?{}", percent_encode_component(&url));
-    let body = devtools_http_request(port, "PUT", &path)
-        .or_else(|_| devtools_http_request(port, "GET", &path))?;
-    let page: EdgeDevtoolsPage = serde_json::from_str(&body)
-        .map_err(|err| format!("failed to parse Edge target: {err}"))?;
-    if page.web_socket_debugger_url.trim().is_empty() {
-        return Err("Edge target did not expose a debugger websocket".to_string());
-    }
-    Ok(page)
+    let edge_sessions = Arc::clone(&state.edge_sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let port = edge_session_port(&edge_sessions, &session_id)?;
+        let path = format!("/json/new?{}", percent_encode_component(&url));
+        let body = devtools_http_request(port, "PUT", &path)
+            .or_else(|_| devtools_http_request(port, "GET", &path))?;
+        let page: EdgeDevtoolsPage = serde_json::from_str(&body)
+            .map_err(|err| format!("failed to parse Edge target: {err}"))?;
+        if page.web_socket_debugger_url.trim().is_empty() {
+            return Err("Edge target did not expose a debugger websocket".to_string());
+        }
+        Ok(page)
+    })
+    .await
+    .map_err(|err| format!("Edge page task failed: {err}"))?
 }
 
 #[tauri::command]
-fn edge_devtools_activate_page(
-    state: State<IdeState>,
+async fn edge_devtools_activate_page(
+    state: State<'_, IdeState>,
     session_id: String,
     target_id: String,
 ) -> Result<(), String> {
-    let port = edge_session_port(&state, &session_id)?;
-    let path = format!("/json/activate/{}", percent_encode_component(&target_id));
-    devtools_http_request(port, "GET", &path).map(|_| ())
+    let edge_sessions = Arc::clone(&state.edge_sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let port = edge_session_port(&edge_sessions, &session_id)?;
+        let path = format!("/json/activate/{}", percent_encode_component(&target_id));
+        devtools_http_request(port, "GET", &path).map(|_| ())
+    })
+    .await
+    .map_err(|err| format!("Edge activate task failed: {err}"))?
 }
 
 #[tauri::command]
-fn edge_devtools_close_page(
-    state: State<IdeState>,
+async fn edge_devtools_close_page(
+    state: State<'_, IdeState>,
     session_id: String,
     target_id: String,
 ) -> Result<(), String> {
-    let port = edge_session_port(&state, &session_id)?;
-    let path = format!("/json/close/{}", percent_encode_component(&target_id));
-    devtools_http_request(port, "GET", &path).map(|_| ())
+    let edge_sessions = Arc::clone(&state.edge_sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let port = edge_session_port(&edge_sessions, &session_id)?;
+        let path = format!("/json/close/{}", percent_encode_component(&target_id));
+        devtools_http_request(port, "GET", &path).map(|_| ())
+    })
+    .await
+    .map_err(|err| format!("Edge close task failed: {err}"))?
 }
 
 #[tauri::command]
@@ -1477,10 +1504,9 @@ fn edge_session_result(id: &str, port: u16) -> EdgeDevtoolsSession {
     }
 }
 
-fn edge_session_port(state: &State<IdeState>, session_id: &str) -> Result<u16, String> {
+fn edge_session_port(edge_sessions: &EdgeSessionStore, session_id: &str) -> Result<u16, String> {
     let id = normalized_edge_session_id(session_id);
-    state
-        .edge_sessions
+    edge_sessions
         .lock()
         .map_err(|_| "edge session state poisoned".to_string())?
         .get(&id)

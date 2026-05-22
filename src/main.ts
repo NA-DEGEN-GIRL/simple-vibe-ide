@@ -101,6 +101,14 @@ interface EdgeCdpState {
   viewportHeight: number;
   frameWidth: number;
   frameHeight: number;
+  screencastLatest: EdgeScreencastFrame | null;
+  screencastDrawPending: boolean;
+  screencastLastDrawAt: number;
+}
+
+interface EdgeScreencastFrame {
+  base64Data: string;
+  metadata: Record<string, unknown> | null;
 }
 
 interface BrowserConsoleLog {
@@ -460,7 +468,9 @@ const TEXT_FILE_CACHE_LIMIT = 64;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const USE_EDGE_CDP_BROWSER = true;
-const EDGE_SCREENCAST_QUALITY = 74;
+const EDGE_SCREENCAST_QUALITY = 66;
+const EDGE_SCREENCAST_EVERY_NTH_FRAME = 2;
+const EDGE_SCREENCAST_MIN_DRAW_INTERVAL_MS = 58;
 const EDGE_START_TIMEOUT_MS = 6500;
 const EDGE_PAGE_TIMEOUT_MS = 6500;
 const EDGE_CDP_CONNECT_TIMEOUT_MS = 6500;
@@ -3142,6 +3152,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
         reject(error);
       }
     );
+  });
+}
+
+function yieldToUi() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => window.setTimeout(resolve, 0));
   });
 }
 
@@ -7742,6 +7758,7 @@ function loadBrowserTabFallback(tab: BrowserTab) {
 async function loadEdgeBrowserTab(tab: BrowserTab) {
   setEdgePreviewVisible(true);
   showEdgePreviewStatus('Starting Edge browser...');
+  await yieldToUi();
   const session = await withTimeout(ensureEdgeDevtoolsSession(), EDGE_START_TIMEOUT_MS, 'Starting Edge browser');
   if (tab.edge && tab.edge.sessionId === session.id) {
     try {
@@ -7845,7 +7862,10 @@ function connectEdgeCdp(tab: BrowserTab) {
       viewportWidth: 0,
       viewportHeight: 0,
       frameWidth: 0,
-      frameHeight: 0
+      frameHeight: 0,
+      screencastLatest: null,
+      screencastDrawPending: false,
+      screencastLastDrawAt: 0
     };
     let opened = false;
     let settled = false;
@@ -7977,7 +7997,7 @@ function handleEdgeCdpMessage(cdp: EdgeCdpState, data: unknown) {
     if (typeof sessionId === 'number') {
       void edgeCdpSend('Page.screencastFrameAck', { sessionId }, cdp).catch(() => undefined);
     }
-    if (typeof params.data === 'string') drawEdgeScreencastFrame(cdp, params.data, asRecord(params.metadata));
+    if (typeof params.data === 'string') queueEdgeScreencastFrame(cdp, params.data, asRecord(params.metadata));
     return;
   }
   if (message.method === 'Runtime.consoleAPICalled') {
@@ -8045,23 +8065,69 @@ function updateEdgeTabUrl(tabId: string, params: Record<string, unknown>) {
   saveActiveWorkspaceSnapshot();
 }
 
-function drawEdgeScreencastFrame(cdp: EdgeCdpState, base64Data: string, metadata: Record<string, unknown> | null) {
+function queueEdgeScreencastFrame(cdp: EdgeCdpState, base64Data: string, metadata: Record<string, unknown> | null) {
+  cdp.screencastLatest = { base64Data, metadata };
+  if (cdp.screencastDrawPending) return;
+  scheduleEdgeScreencastDraw(cdp);
+}
+
+function scheduleEdgeScreencastDraw(cdp: EdgeCdpState) {
+  if (activeEdgeCdp !== cdp || !cdp.screencastLatest) {
+    cdp.screencastDrawPending = false;
+    return;
+  }
+
+  cdp.screencastDrawPending = true;
+  const waitMs = Math.max(0, EDGE_SCREENCAST_MIN_DRAW_INTERVAL_MS - (performance.now() - cdp.screencastLastDrawAt));
+  window.setTimeout(() => {
+    window.requestAnimationFrame(() => {
+      if (activeEdgeCdp !== cdp) {
+        cdp.screencastDrawPending = false;
+        return;
+      }
+      const frame = cdp.screencastLatest;
+      cdp.screencastLatest = null;
+      if (!frame) {
+        cdp.screencastDrawPending = false;
+        return;
+      }
+      drawEdgeScreencastFrame(cdp, frame.base64Data, frame.metadata, () => {
+        cdp.screencastLastDrawAt = performance.now();
+        cdp.screencastDrawPending = false;
+        if (cdp.screencastLatest) scheduleEdgeScreencastDraw(cdp);
+      });
+    });
+  }, waitMs);
+}
+
+function drawEdgeScreencastFrame(
+  cdp: EdgeCdpState,
+  base64Data: string,
+  metadata: Record<string, unknown> | null,
+  done: () => void
+) {
   const image = new Image();
+  image.decoding = 'async';
   image.onload = () => {
-    if (activeEdgeCdp !== cdp) return;
-    const width = Math.max(1, Math.round(Number(metadata?.deviceWidth) || cdp.viewportWidth || image.width));
-    const height = Math.max(1, Math.round(Number(metadata?.deviceHeight) || cdp.viewportHeight || image.height));
-    if (el.edgePreviewCanvas.width !== width || el.edgePreviewCanvas.height !== height) {
-      el.edgePreviewCanvas.width = width;
-      el.edgePreviewCanvas.height = height;
+    try {
+      if (activeEdgeCdp !== cdp) return;
+      const width = Math.max(1, Math.round(Number(metadata?.deviceWidth) || cdp.viewportWidth || image.width));
+      const height = Math.max(1, Math.round(Number(metadata?.deviceHeight) || cdp.viewportHeight || image.height));
+      if (el.edgePreviewCanvas.width !== width || el.edgePreviewCanvas.height !== height) {
+        el.edgePreviewCanvas.width = width;
+        el.edgePreviewCanvas.height = height;
+      }
+      cdp.frameWidth = width;
+      cdp.frameHeight = height;
+      const context = el.edgePreviewCanvas.getContext('2d');
+      if (!context) return;
+      context.drawImage(image, 0, 0, width, height);
+      el.edgePreviewStatus.classList.add('hidden');
+    } finally {
+      done();
     }
-    cdp.frameWidth = width;
-    cdp.frameHeight = height;
-    const context = el.edgePreviewCanvas.getContext('2d');
-    if (!context) return;
-    context.drawImage(image, 0, 0, width, height);
-    el.edgePreviewStatus.classList.add('hidden');
   };
+  image.onerror = done;
   image.src = `data:image/jpeg;base64,${base64Data}`;
 }
 
@@ -8101,6 +8167,7 @@ async function configureEdgeViewport(cdp = activeEdgeCdp) {
   await edgeCdpSend('Page.startScreencast', {
     format: 'jpeg',
     quality: EDGE_SCREENCAST_QUALITY,
+    everyNthFrame: EDGE_SCREENCAST_EVERY_NTH_FRAME,
     maxWidth: size.width,
     maxHeight: size.height
   }, cdp);
