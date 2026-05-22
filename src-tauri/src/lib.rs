@@ -3527,6 +3527,67 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
   window.addEventListener('unhandledrejection', function (event) {
     send('error', ['Unhandled promise rejection', event.reason]);
   });
+  var previewTargetOrigin = window.__simpleVibePreviewTargetOrigin || '';
+  function simpleVibeSocketIoUrl(url) {
+    try {
+      if (!previewTargetOrigin) return url;
+      if (url === undefined || url === null || url === '') return previewTargetOrigin;
+      if (typeof url !== 'string' && !(url instanceof URL)) return url;
+      var parsed = new URL(String(url), window.location.href);
+      if (parsed.origin !== window.location.origin) return url;
+      var target = new URL(previewTargetOrigin);
+      parsed.protocol = target.protocol;
+      parsed.host = target.host;
+      return parsed.href;
+    } catch (_) {
+      return url;
+    }
+  }
+  function copySocketIoStatics(source, target) {
+    try {
+      Object.getOwnPropertyNames(source).forEach(function (key) {
+        if (key === 'length' || key === 'name' || key === 'prototype') return;
+        try {
+          Object.defineProperty(target, key, Object.getOwnPropertyDescriptor(source, key));
+        } catch (_) {
+          try { target[key] = source[key]; } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  }
+  function patchSocketIoFactory(factory) {
+    if (typeof factory !== 'function' || factory.__simpleVibePreviewPatched) return factory;
+    function wrappedSocketIo(url, options) {
+      if (arguments.length === 1 && url && typeof url === 'object' && !(url instanceof URL)) {
+        send('info', ['Socket.IO preview target ' + String(previewTargetOrigin || window.location.origin)]);
+        return factory.call(this, previewTargetOrigin || undefined, url);
+      }
+      var mappedUrl = simpleVibeSocketIoUrl(url);
+      if (arguments.length === 0) return factory.call(this, mappedUrl);
+      if (mappedUrl !== url) send('info', ['Socket.IO preview target ' + String(mappedUrl)]);
+      return factory.call(this, mappedUrl, options);
+    }
+    copySocketIoStatics(factory, wrappedSocketIo);
+    wrappedSocketIo.__simpleVibePreviewPatched = true;
+    wrappedSocketIo.io = wrappedSocketIo;
+    wrappedSocketIo.connect = wrappedSocketIo;
+    return wrappedSocketIo;
+  }
+  function installSocketIoPatch() {
+    var current;
+    try { current = window.io; } catch (_) {}
+    try {
+      Object.defineProperty(window, 'io', {
+        configurable: true,
+        get: function () { return current; },
+        set: function (value) { current = patchSocketIoFactory(value); }
+      });
+      if (current) window.io = current;
+    } catch (_) {
+      if (current) window.io = patchSocketIoFactory(current);
+    }
+  }
+  installSocketIoPatch();
 })();
 </script>"#);
     script

@@ -27,6 +27,11 @@ kept with the repository.
   the proxy behave more like a transparent reverse proxy for local dev servers.
 - Removed the injected WebSocket URL rewrite shim because it could bypass the
   proxy and leave the browser-sent `Origin` on the preview proxy port.
+- Browser tabs now probe an existing preview proxy before reuse and reopen it
+  when the saved proxy port is stale.
+- HTML preview injection now patches the Socket.IO browser factory so same-origin
+  Socket.IO clients connect to the real loopback target origin while the page
+  itself can still render through the iframe-friendly preview proxy.
 
 #### Verified
 

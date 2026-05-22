@@ -8018,15 +8018,23 @@ function hideAllBrowserFrames() {
 function loadBrowserTabFallback(tab: BrowserTab) {
   disconnectActiveEdgeCdp();
   setEdgePreviewVisible(false);
-  if (USE_PREVIEW_PROXY_BROWSER && !tab.frameUrl && localHttpPreviewUrl(tab.url)) {
-    showBrowserFrame(tab);
-    void previewFrameUrl(tab.url).then((frameUrl) => {
-      tab.frameUrl = frameUrl;
-      if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab);
-    }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+  if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(tab.url)) {
+    loadBrowserTabThroughPreviewProxy(tab);
   } else {
     loadBrowserFrame(tab);
   }
+}
+
+function loadBrowserTabThroughPreviewProxy(tab: BrowserTab) {
+  showBrowserFrame(tab);
+  void previewFrameUrl(tab.url).then((frameUrl) => {
+    if (tab.frameUrl !== frameUrl) {
+      tab.frameUrl = frameUrl;
+      const frame = browserFrameForTab(tab.id);
+      if (frame) delete frame.dataset.loadedUrl;
+    }
+    if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab);
+  }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
 }
 
 async function loadEdgeBrowserTab(tab: BrowserTab) {
@@ -8643,7 +8651,16 @@ async function previewFrameUrl(url: string) {
 
 async function ensurePreviewProxy(targetOrigin: string) {
   const existing = state.previewProxies.find((proxy) => proxy.targetHost === targetOrigin);
-  if (existing) return existing;
+  if (existing) {
+    try {
+      if (await api.probeLocalHttpUrl(existing.url)) return existing;
+    } catch {
+      // Treat probe failures as stale proxy state and recreate below.
+    }
+    state.previewProxies = state.previewProxies.filter((proxy) => proxy.id !== existing.id);
+    void api.stopPortForward(existing.id).catch(() => undefined);
+    logBrowserConsole('warn', `Preview proxy ${existing.url} was stale; reopening ${targetOrigin}`);
+  }
   const proxy = await api.startPreviewProxy(targetOrigin);
   state.previewProxies.push(proxy);
   logBrowserConsole('info', `Preview proxy ${proxy.url} -> ${targetOrigin}`);
@@ -8713,12 +8730,8 @@ function activateBrowserTab(id: string) {
     saveActiveWorkspaceSnapshot();
     return;
   }
-  if (USE_PREVIEW_PROXY_BROWSER && !tab.frameUrl && localHttpPreviewUrl(tab.url)) {
-    showBrowserFrame(tab);
-    void previewFrameUrl(tab.url).then((frameUrl) => {
-      tab.frameUrl = frameUrl;
-      if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab);
-    }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+  if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(tab.url)) {
+    loadBrowserTabThroughPreviewProxy(tab);
   } else {
     loadBrowserFrame(tab);
   }
