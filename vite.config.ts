@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 
 const projectRoot = process.cwd();
+const enableSourceMaps = process.env.SVIDE_SOURCEMAP === '1';
 
 export default defineConfig({
   root: projectRoot,
@@ -18,6 +19,10 @@ export default defineConfig({
   build: {
     target: 'es2022',
     minify: 'esbuild',
-    sourcemap: true
+    sourcemap: enableSourceMaps,
+    reportCompressedSize: false,
+    modulePreload: {
+      polyfill: false
+    }
   }
 });

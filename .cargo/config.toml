@@ -1,0 +1,5 @@
+# Local Windows builds are intended to run on the same machine that built them.
+# This lets Rust tune backend code for the current CPU. Do not use the produced
+# executable as a portable release artifact for other PCs.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native"]

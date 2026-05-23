@@ -22,4 +22,15 @@ serde_json = "1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Ole", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+# Optimize the shipped Windows app for runtime responsiveness. This makes
+# release builds slower, but keeps the default dev loop unchanged.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

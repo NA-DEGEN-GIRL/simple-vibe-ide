@@ -4,12 +4,12 @@ import { Image as TauriImage } from '@tauri-apps/api/image';
 import type { Extension } from '@codemirror/state';
 import type { EditorView as CodeMirrorView } from '@codemirror/view';
 import { readImage, readText, writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
+import type { Terminal as XTermTerminal } from '@xterm/xterm';
+import type { FitAddon as XTermFitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { ConnectionProfile, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { ConnectionProfile, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 interface TerminalPane {
@@ -21,15 +21,20 @@ interface TerminalPane {
   command: string | null;
   profileId: string;
   cwd: string;
-  term: Terminal;
-  fit: FitAddon;
+  term: XTermTerminal;
+  fit: XTermFitAddon;
   element: HTMLElement;
   host: HTMLElement;
   outputBuffer: string;
+  writeBuffer: string;
   cwdOutputBuffer: string;
   inputBuffer: string;
   seenPorts: Set<number>;
   fitFrame?: number;
+  writeFrame?: number;
+  writeTimer?: number;
+  portScanTimer?: number;
+  cwdScanTimer?: number;
   lastRows?: number;
   lastCols?: number;
   resizeObserver?: ResizeObserver;
@@ -77,6 +82,16 @@ interface BrowserTab {
   label: string;
   frameUrl?: string;
   edge?: EdgeBrowserTarget;
+}
+
+type BrowserDialogKind = 'alert' | 'confirm' | 'prompt';
+
+interface BrowserDialogPayload {
+  id: string;
+  kind: BrowserDialogKind;
+  message: string;
+  defaultValue?: string;
+  url?: string;
 }
 
 interface EdgeBrowserTarget {
@@ -213,6 +228,7 @@ interface NoteTabState {
   content: string;
   dirty: boolean;
   saving: boolean;
+  loading?: boolean;
   lastSavedAt?: number;
 }
 
@@ -322,17 +338,27 @@ interface WorkspaceRuntimeCache {
 interface ExplorerRuntimeCache {
   currentDir: string;
   entries: FileEntry[];
-  expanded: string[];
-  children: Array<[string, FileEntry[]]>;
-  signatures: Array<[string, string]>;
+  expanded: Set<string>;
+  children: Map<string, FileEntry[]>;
+  signatures: Map<string, string>;
   selectedPath: string;
 }
 
 interface ExplorerVisibleRow {
   entry: FileEntry | null;
   path: string;
+  pathKey: string;
   depth: number;
   loading: boolean;
+  disclosureText: string;
+  sizeText: string;
+  staticSignature: string;
+}
+
+interface ExplorerTypeaheadCandidate {
+  entry: FileEntry;
+  pathKey: string;
+  nameKey: string;
 }
 
 interface EditorRuntime {
@@ -354,11 +380,19 @@ interface EditorRuntime {
   languageCompartment: import('@codemirror/state').Compartment;
 }
 
+interface TerminalRuntime {
+  Terminal: typeof import('@xterm/xterm').Terminal;
+  FitAddon: typeof import('@xterm/addon-fit').FitAddon;
+}
+
 type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'calculator' | 'settings';
 type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
 type BrowserConsolePosition = 'bottom' | 'right' | 'top' | 'left';
+type ForwardRenderKind = 'detected' | 'forward' | 'empty';
+type WorkspaceSnapshotPersistMode = 'flush' | 'defer' | 'none';
+type TerminalVisibility = 'visible' | 'inactive' | 'background';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
 type BrowserDevicePreset = {
@@ -394,6 +428,7 @@ type CreateTerminalOptions = {
   profile?: ConnectionProfile;
   cwd?: string;
   initialHeight?: number;
+  skipSnapshotSave?: boolean;
 };
 
 type LlmLauncherFlag = {
@@ -460,9 +495,18 @@ const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   settings: false
 };
 const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
+const WORKSPACE_STORE_PERSIST_LIMIT = 24;
+const DEFAULT_SHOW_FILE_SIZES = false;
+const WORKSPACE_IMAGE_STORE_KEY = 'simple-vibe-ide.workspaceImages.v1';
+const WORKSPACE_IMAGE_REF_PREFIX = 'simple-vibe-image:';
+const WORKSPACE_IMAGE_REF_CACHE_LIMIT = 512;
 const MARKET_TICKER_STORE_KEY = 'simple-vibe-ide.marketTicker.v1';
 const IDE_SETTINGS_KEY = 'simple-vibe-ide.settings.v1';
 const NOTES_DIR = '.vibe-ide-temp/notes';
+const WORKSPACE_SNAPSHOT_DEBOUNCE_MS = 260;
+const WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS = 900;
+const STRING_FINGERPRINT_MIN_LENGTH = 256;
+const STRING_FINGERPRINT_CACHE_LIMIT = 256;
 const NOTE_THEMES: Array<{ id: NoteThemeId; label: string }> = [
   { id: 'default', label: 'Default' },
   { id: 'sticky', label: 'Sticky' },
@@ -474,23 +518,80 @@ const PANEL_SNAP_DISTANCE = 14;
 const WIDGET_KEYBOARD_SCALE = 1.1;
 const TERMINAL_PORT_SCAN_LIMIT = 4000;
 const TERMINAL_CWD_SCAN_LIMIT = 6000;
+const TERMINAL_PORT_SCAN_DEBOUNCE_MS = 220;
+const TERMINAL_CWD_SCAN_DEBOUNCE_MS = 140;
+const TERMINAL_INACTIVE_WRITE_BATCH_MS = 240;
+const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
+const TERMINAL_BACKGROUND_SCAN_BATCH_MS = 900;
+const TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS = 1200;
+const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 128 * 1024;
+const TERMINAL_VISIBLE_WRITE_CHUNK_CHARS = 256 * 1024;
+const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 64 * 1024;
+const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
+const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
+const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
+const TERMINAL_PROMPT_CONTINUATION_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|^[#$>]\s*$)/;
+const TERMINAL_PREVIEW_PORT_HINT_PATTERN = /localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\b(?:listening|running|available|started|serving|server|port)\b|:\d{2,5}/i;
+const TERMINAL_OSC7_CWD_PATTERN = /\x1b]7;file:\/\/[^/\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+const LOCAL_PREVIEW_URL_PORT_PATTERN = /\b(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b/gi;
+const LOCAL_PREVIEW_LISTENING_PORT_PATTERN = /\b(?:listening|running|available|started|serving|server)\b[^\r\n]{0,80}\b(?:port\s*)?(\d{4,5})\b/gi;
+const TERMINAL_POWERSHELL_PROMPT_CWD_PATTERN = /(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*)>\s*$/;
+const TERMINAL_BASH_PROMPT_CWD_PATTERN = /(?:^|\s)[^@\s:]+@[^:\s]+:([^#$\r\n]+)[#$]\s*$/;
 const EXPLORER_TYPEAHEAD_TIMEOUT_MS = 900;
 const EXPLORER_WATCH_LOCAL_MS = 2500;
 const EXPLORER_WATCH_WSL_MS = 3500;
 const EXPLORER_WATCH_SSH_MS = 7000;
 const EXPLORER_WATCH_MAX_DIRS = 12;
-const EXPLORER_DIRECTORY_CACHE_LIMIT = 48;
+const EXPLORER_WATCH_LOCAL_DIRS = 8;
+const EXPLORER_WATCH_HIDDEN_FACTOR = 4;
+const EXPLORER_WATCH_SLOW_THRESHOLD_MS = 1400;
+const EXPLORER_WATCH_SLOW_BACKOFF_FACTOR = 2;
+const EXPLORER_DIRECTORY_CACHE_LIMIT = 160;
+const EXPLORER_DIRECTORY_CACHE_PRUNE_BATCH = 32;
+const EXPLORER_DIRECTORY_CACHE_BUSY_LIMIT = EXPLORER_DIRECTORY_CACHE_LIMIT + EXPLORER_DIRECTORY_CACHE_PRUNE_BATCH * 4;
+const EXPLORER_DIRECTORY_CACHE_TTL_LOCAL_MS = 3000;
+const EXPLORER_DIRECTORY_CACHE_TTL_WSL_MS = 6000;
+const EXPLORER_DIRECTORY_CACHE_TTL_SSH_MS = 9000;
 const NOTES_AUTOSAVE_DELAY_MS = 1800;
-const TEXT_FILE_CACHE_LIMIT = 64;
+const TEXT_FILE_CACHE_LIMIT = 128;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
 const SECRET_PARSE_CACHE_LIMIT = 32;
 const EDITOR_LOADING_DELAY_MS = 180;
 const EXPLORER_ROW_HEIGHT = 32;
-const EXPLORER_VIRTUAL_OVERSCAN = 12;
+const EXPLORER_VIRTUAL_OVERSCAN = 20;
+const EXPLORER_VIRTUAL_WINDOW_STEP = 16;
+const EXPLORER_VIRTUAL_SCROLL_OVERSCAN = 96;
+const EXPLORER_VIRTUAL_SCROLL_WINDOW_STEP = 128;
+const EXPLORER_ROW_ELEMENT_CACHE_LIMIT = 768;
+const EXPLORER_ROW_ELEMENT_CACHE_PRUNE_BATCH = 96;
+const EXPLORER_ROW_ELEMENT_CACHE_BUSY_LIMIT = EXPLORER_ROW_ELEMENT_CACHE_LIMIT + EXPLORER_ROW_ELEMENT_CACHE_PRUNE_BATCH * 4;
+const EXPLORER_ROW_RECYCLE_LIMIT = 256;
+const EXPLORER_PATH_KEY_CACHE_LIMIT = 8192;
+const EXPLORER_PATH_KEY_CACHE_PRUNE_BATCH = 1024;
+const EXPLORER_PATH_KEY_CACHE_BUSY_LIMIT = EXPLORER_PATH_KEY_CACHE_LIMIT + EXPLORER_PATH_KEY_CACHE_PRUNE_BATCH * 4;
 const EXPLORER_SCROLL_IDLE_MS = 180;
 const EXPLORER_HOVER_PREFETCH_DELAY_MS = 180;
 const EXPLORER_DIRECTORY_PREFETCH_DELAY_MS = 120;
 const EXPLORER_DIRECTORY_PREFETCH_LIMIT = 6;
+const EXPLORER_VISIBLE_PREFETCH_ROW_PADDING = 8;
+const PREVIEW_PROXY_PROBE_TTL_MS = 60_000;
+const BROWSER_CONSOLE_LOG_LIMIT = 250;
+const BROWSER_CONSOLE_HIDDEN_LOG_LIMIT = 80;
+const BROWSER_CONSOLE_RENDER_LIMIT = 120;
+const BROWSER_CONSOLE_ARG_LIMIT = 8;
+const BROWSER_CONSOLE_MESSAGE_MAX_CHARS = 2000;
+const BROWSER_CONSOLE_ARRAY_DETAIL_LIMIT = 40;
+const BROWSER_CONSOLE_OBJECT_DETAIL_KEY_LIMIT = 40;
+const BROWSER_CONSOLE_DETAIL_DEPTH_LIMIT = 2;
+const BROWSER_CONSOLE_STRUCTURED_VALUE_MAX_CHARS = 1800;
+const BROWSER_CONSOLE_PORT_SCAN_QUEUE_PRUNE_BATCH = 32;
+const BROWSER_CONSOLE_HIDDEN_FLUSH_DEBOUNCE_MS = 220;
+const BROWSER_CONSOLE_HIDDEN_FLUSH_IDLE_MS = 900;
+const BROWSER_CONSOLE_LOCAL_URL_PORT_PATTERN = /\b(?:https?|wss?):\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d{2,5})\b/gi;
+const BROWSER_INACTIVE_FRAME_SUSPEND_DELAY_MS = 3500;
+const BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS = 350;
+const BROWSER_FRAME_SUSPEND_IDLE_MS = 250;
+const WORKSPACE_RESTORE_BACKGROUND_DELAY_MS = 1800;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const USE_EDGE_CDP_BROWSER = false;
 const USE_PREVIEW_PROXY_BROWSER = true;
@@ -513,13 +614,18 @@ const BROWSER_DEVICE_PRESETS: BrowserDevicePreset[] = [
   { id: 'ipad-pro-11', label: 'iPad Pro 11', width: 834, height: 1194, kind: 'tablet' },
   { id: 'surface-pro-7', label: 'Surface Pro 7', width: 912, height: 1368, kind: 'tablet' }
 ];
+const BROWSER_DEVICE_PRESET_BY_ID = new Map(BROWSER_DEVICE_PRESETS.map((preset) => [preset.id, preset]));
 const DEFAULT_MARKET_TICKERS: MarketTickerConfig[] = [
   { id: 'btc', label: 'BTC', symbol: 'BTCUSDT' },
   { id: 'nas100', label: 'NAS100', symbol: 'QQQUSDT' }
 ];
 const MARKET_TICKER_WS_URL = 'wss://fstream.binance.com/market/stream?streams=';
 const MARKET_TICKER_REST_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=';
-const MARKET_TICKER_BOOT_DELAY_MS = 1200;
+const MARKET_TICKER_BOOT_DELAY_MS = 2200;
+const MARKET_TICKER_VISIBLE_RESUME_DELAY_MS = 900;
+const MARKET_TICKER_IDLE_TIMEOUT_MS = 2500;
+const MARKET_TICKER_RENDER_MIN_MS = 1000;
+const MARKET_TICKER_FETCH_TIMEOUT_MS = 8000;
 const MARKET_TICKER_FALLBACK_MS = 30000;
 const MARKET_TICKER_STALE_MS = 45000;
 const MARKET_TICKER_MAX_CUSTOM = 1;
@@ -542,6 +648,12 @@ const MONO_FONT_CHOICES: FontChoice[] = [
   { id: 'noto-mono', label: 'Noto Sans Mono (mono)', stack: '"Noto Sans Mono", "D2Coding", "Cascadia Mono", monospace' },
   { id: 'consolas', label: 'Consolas (mono)', stack: 'Consolas, "Cascadia Mono", monospace' }
 ];
+const TEXT_FILE_EXTENSIONS = new Set([
+  'bash', 'bat', 'cmd', 'conf', 'config', 'cpp', 'cs', 'css', 'csv', 'c', 'env', 'go',
+  'h', 'hpp', 'htm', 'html', 'ini', 'java', 'js', 'json', 'jsx', 'lock', 'log', 'lua',
+  'md', 'mjs', 'ps1', 'py', 'rs', 'scss', 'sh', 'sql', 'svelte', 'toml', 'ts', 'tsx',
+  'txt', 'vue', 'xml', 'yaml', 'yml'
+]);
 const EDITOR_THEME_CHOICES: EditorThemeChoice[] = [
   {
     id: 'simple-dark',
@@ -939,14 +1051,18 @@ const state = {
   marketQuotes: new Map<string, MarketTickerQuote>(),
   marketTickerConnected: false,
   ideSettings: { ...DEFAULT_IDE_SETTINGS } as IdeSettings,
-  showFileSizes: true
+  showFileSizes: DEFAULT_SHOW_FILE_SIZES
 };
 
 let codeView: CodeMirrorView | null = null;
+let codeViewFile: OpenFileState | null = null;
+let codeViewRenderSignature = '\0';
 let editorRenderToken = 0;
 let editorRuntimePromise: Promise<EditorRuntime> | null = null;
+let terminalRuntimePromise: Promise<TerminalRuntime> | null = null;
 let panelZ = 20;
 let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
+let keyboardResizeTargetElement: HTMLElement | null = null;
 let ideScale = 1;
 let editorFontSize = 13;
 let terminalFontSize = 13;
@@ -960,35 +1076,217 @@ const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
 const secretParseCache = new Map<string, SecretLine[]>();
+const editorLanguageCache = new Map<string, Promise<Extension>>();
+const stringFingerprintCache = new Map<string, string>();
+const profileById = new Map<string, ConnectionProfile>();
+const terminalPaneById = new Map<string, TerminalPane>();
+const terminalPaneByBackendId = new Map<string, TerminalPane>();
+const terminalPanesByWidgetId = new Map<string, TerminalPane[]>();
+const terminalWidgetById = new Map<string, TerminalWidget>();
+const terminalWidgetByElement = new WeakMap<HTMLElement, TerminalWidget>();
+const forwardById = new Map<string, PortForwardResult>();
+const forwardByRemotePort = new Map<number, PortForwardResult>();
+const detectedPortById = new Map<string, DetectedPortItem>();
+const workspaceSnapshotById = new Map<string, WorkspaceSnapshot>();
+const workspaceSnapshotIndexByIdLookup = new Map<string, number>();
+const panelElementCache = new Map<FloatingPanelId, HTMLElement>();
+const panelToggleCache = new Map<FloatingPanelId, HTMLButtonElement | null>();
+const workspaceTabElementCache = new Map<string, HTMLElement>();
+const workspaceTabPartCache = new WeakMap<HTMLElement, {
+  label: HTMLButtonElement;
+  security: HTMLButtonElement;
+  copy: HTMLButtonElement;
+  close: HTMLButtonElement;
+}>();
+const editorTabById = new Map<string, EditorTabState>();
+const editorTabByPath = new Map<string, EditorTabState>();
+const editorTabIndexByIdLookup = new Map<string, number>();
+const editorTabElementCache = new Map<string, HTMLElement>();
+const exportJobById = new Map<string, ExportJobState>();
+const exportJobElementCache = new Map<string, HTMLElement>();
+const exportJobPartCache = new WeakMap<HTMLElement, {
+  title: HTMLElement;
+  detail: HTMLElement;
+  progress: HTMLElement;
+  bar: HTMLElement;
+  actions: HTMLElement;
+}>();
+const imageHistoryElementCache = new Map<string, HTMLElement>();
+const imageHistoryPartCache = new WeakMap<HTMLElement, {
+  image: HTMLImageElement;
+  path: HTMLElement;
+  createdAt: HTMLElement;
+}>();
+const imageTabById = new Map<string, ImageTabState>();
+const imageTabBySourcePath = new Map<string, ImageTabState>();
+const imageTabIndexByIdLookup = new Map<string, number>();
+const imageTabElementCache = new Map<string, HTMLElement>();
+const noteTabById = new Map<string, NoteTabState>();
+const noteTabIndexByIdLookup = new Map<string, number>();
+const noteTabElementCache = new Map<string, HTMLElement>();
+const calculatorHistoryElementCache = new Map<string, HTMLElement>();
+const explorerDirectorySignatureCache = new WeakMap<FileEntry[], string>();
 const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
 const explorerDirectoryReads = new Map<string, Promise<FileEntry[]>>();
 const explorerDirectoryPrefetchTimers = new Map<string, number>();
+const explorerDirectoryPrefetchPending = new Set<string>();
 const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
 const edgeDevtoolsSessions = new Map<string, EdgeDevtoolsSession>();
 const noteSaveTimers = new Map<string, number>();
-const explorerVisibleEntryByPath = new Map<string, FileEntry>();
+const previewProxyProbeAt = new Map<string, number>();
+const previewProxyStarts = new Map<string, Promise<PortForwardResult>>();
+const previewProxyByTargetOrigin = new Map<string, PortForwardResult>();
+const previewProxyByLocalPort = new Map<number, PortForwardResult>();
+const previewProxyLocalPortMisses = new Set<number>();
+const browserFrameByTabId = new Map<string, HTMLIFrameElement>();
+const browserFramesByWorkspaceId = new Map<string, Set<HTMLIFrameElement>>();
+const browserWorkspaceSuspendTimers = new Map<string, number>();
+const browserTabById = new Map<string, BrowserTab>();
+const browserTabByUrl = new Map<string, BrowserTab>();
+const browserTabIndexByIdLookup = new Map<string, number>();
+const browserTabElementCache = new Map<string, HTMLElement>();
+const browserConsoleRowElementCache = new Map<string, HTMLElement>();
+const forwardRowElementCache = new Map<string, HTMLElement>();
+const forwardRowPartCache = new WeakMap<HTMLElement, {
+  load: HTMLButtonElement;
+  detail: HTMLElement;
+  stop: HTMLButtonElement;
+}>();
+const marketTickerElementCache = new Map<string, HTMLElement>();
+const marketTickerPartCache = new WeakMap<HTMLElement, {
+  label: HTMLElement;
+  price: HTMLElement;
+  change: HTMLElement;
+  remove?: HTMLButtonElement;
+}>();
+const selectOptionsRenderSignatures = new WeakMap<HTMLSelectElement, string>();
+const explorerRowElementCache = new Map<string, HTMLElement>();
+const explorerRowPartCache = new WeakMap<HTMLElement, {
+  disclosure: HTMLElement;
+  name: HTMLElement;
+  size: HTMLElement;
+}>();
+const explorerReusableRowElements: HTMLElement[] = [];
+const explorerPathKeyCache = new Map<string, string>();
+const explorerEntryByPath = new Map<string, FileEntry>();
+const explorerTopSpacer = createExplorerSpacerElement();
+const explorerBottomSpacer = createExplorerSpacerElement();
+const explorerVisibleIndexByPath = new Map<string, number>();
+const explorerRenderedRowByPath = new Map<string, HTMLElement>();
 let explorerVisibleRows: ExplorerVisibleRow[] = [];
-let explorerRenderedStart = 0;
-let explorerRenderedEnd = 0;
+let explorerTypeaheadCandidates: ExplorerTypeaheadCandidate[] = [];
+const explorerTypeaheadIndexByPath = new Map<string, number>();
+let explorerTypeaheadDirty = true;
+let explorerRenderedStart = -1;
+let explorerRenderedEnd = -1;
+let explorerRenderedTotal = -1;
 let explorerRenderFrame = 0;
+let explorerRenderDirty = false;
+let explorerViewportHeight = 0;
+let explorerPathRowRenderSignature = '\0';
+let explorerFileSizeModeRenderSignature = '\0';
+let explorerOpenModeRenderSignature = '\0';
 let explorerScrollIdleTimer = 0;
 let explorerScrollingUntil = 0;
+let explorerRowElementCachePruneTimer = 0;
+let explorerPathKeyCachePruneTimer = 0;
+let explorerDirectoryCachePruneTimer = 0;
 let explorerHoverPrefetchTimer = 0;
 let explorerHoverPrefetchPath = '';
 let explorerResizeObserver: ResizeObserver | null = null;
+let explorerDropTargetFrame = 0;
+let explorerPendingDropPosition: { x: number; y: number } | undefined;
 let explorerWatchTimer = 0;
+let explorerWatchIdleToken = 0;
 let explorerWatchInFlight = false;
+let explorerWatchLastDurationMs = 0;
+let explorerDirectoryPrefetchActive = 0;
+let explorerVisiblePrefetchTimer = 0;
+let explorerVisiblePrefetchDueAt = 0;
+let explorerCachedRefreshToken = 0;
+const explorerCachedRefreshTimers = new Set<number>();
+let explorerLastSelectedPath = '';
+let explorerEntryLookupDirty = true;
+let browserConsoleRenderFrame = 0;
+let browserConsoleLastRenderedLogId = '';
+let browserConsoleLastRenderedLogIndex = -1;
+let browserConsoleLogVersion = 0;
+let browserConsoleLogSequence = 0;
+let browserConsoleLastTimeSecond = -1;
+let browserConsoleLastTimeText = '';
+let browserConsolePortScanTimer = 0;
+let browserConsolePortScanQueue: string[] = [];
+let browserConsoleHiddenPayloadTimer = 0;
+let browserConsoleHiddenPayloadQueue: unknown[] = [];
+let activeBrowserFrameId = '';
+let browserInactiveFrameSuspendTimer = 0;
+let windowResizeFrame = 0;
+let workspaceSnapshotTimer = 0;
+let workspacePersistTimer = 0;
+let workspaceStorePersistSignature = '';
+let workspaceStorePersistWorkspacesSignature = '';
+let workspaceStorePersistWorkspacesJson = '[]';
+let workspaceImageStore: Record<string, string> = {};
+let workspaceImageStoreDirty = false;
+const workspaceImageRefCache = new Map<string, { dataUrl: string; key: string }>();
+const workspaceSnapshotSignatures = new Map<string, string>();
+let noteStatusRenderSignature = '\0';
+let workspaceTabsRenderSignature = '\0';
+let workspaceTabsOrderRenderSignature = '\0';
+let editorTabsRenderSignature = '\0';
+let editorTabsOrderRenderSignature = '\0';
+let noteTabsRenderSignature = '\0';
+let noteTabsOrderRenderSignature = '\0';
+let browserTabsRenderSignature = '\0';
+let browserTabsOrderRenderSignature = '\0';
+let browserConsoleRenderSignature = '\0';
+let shellTabsRenderSignature = '\0';
+let exportJobsRenderSignature = '\0';
+let exportJobsOrderRenderSignature = '\0';
+let forwardsRenderSignature = '\0';
+let forwardsOrderRenderSignature = '\0';
+let imageTabsRenderSignature = '\0';
+let imageTabsOrderRenderSignature = '\0';
+let imageHistoryRenderSignature = '\0';
+let imageHistoryOrderRenderSignature = '\0';
+let imagePreviewRenderedDataUrl = '\0';
+let imagePreviewRenderedLabel = '\0';
+let calculatorHistoryRenderSignature = '\0';
+let calculatorHistoryOrderRenderSignature = '\0';
+let calculatorKeysRendered = false;
+let profilesRenderSignature = '\0';
+let browserDeviceOptionsRenderSignature = '\0';
+let visibleTerminalWorkspaceId = '';
+const terminalWidgetTabsRenderSignatures = new WeakMap<TerminalWidget, string>();
+const terminalWidgetTabsOrderRenderSignatures = new WeakMap<TerminalWidget, string>();
+const terminalWidgetTabElementCaches = new WeakMap<TerminalWidget, Map<string, HTMLElement>>();
+let workspaceTerminalRestoreToken = 0;
+let inactiveEditorHydrationToken = 0;
+let noteHydrationToken = 0;
+let explorerVisiblePrefetchToken = 0;
 let terminalCwdSaveTimer = 0;
 let marketTickerSocket: WebSocket | null = null;
+let marketTickerStarted = false;
+let marketTickerStartTimer = 0;
 let marketTickerReconnectTimer = 0;
 let marketTickerFallbackTimer = 0;
 let marketTickerRenderFrame = 0;
+let marketTickerRenderTimer = 0;
+let marketTickerLastRenderAt = 0;
+let marketTickerRenderSignature = '\0';
+let marketTickerOrderRenderSignature = '\0';
 let marketTickerReconnectAttempt = 0;
+let marketTickerSnapshotInFlight = false;
+let marketTickerFetchAbort: AbortController | null = null;
+let wslProfilesLoadTimer = 0;
+let wslProfilesLoadInFlight = false;
+let wslProfilesLoaded = false;
 let workspaceDragState: WorkspaceDragState | null = null;
 let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
 let editorLoadingTimer = 0;
 let editorLoadingRequest = 0;
+let codeMeasureFrame = 0;
 let activeEdgeCdp: EdgeCdpState | null = null;
 let edgePreviewResizeObserver: ResizeObserver | null = null;
 let edgeViewportFrame = 0;
@@ -1073,7 +1371,7 @@ app.innerHTML = `
           <button id="refresh-explorer" class="panel-mode" title="Refresh Explorer">Refresh</button>
           <button id="export-selected" class="panel-mode" title="Export selected item for Windows drag-out">Export</button>
           <button id="toggle-explorer-open-mode" class="panel-mode" title="Toggle single/double click open">Open: 1x</button>
-          <button id="toggle-file-sizes" class="panel-mode active" title="Toggle file sizes" aria-pressed="true">Size</button>
+          <button id="toggle-file-sizes" class="panel-mode" title="Toggle file sizes" aria-pressed="false">Size</button>
           <button class="panel-close" data-close-panel="explorer" title="Close Explorer" aria-label="Close Explorer">x</button>
         </div>
         <div id="path-row" class="path-row"></div>
@@ -1143,11 +1441,12 @@ app.innerHTML = `
           <button class="panel-close" data-close-panel="browser" title="Close Browser" aria-label="Close Browser">x</button>
         </div>
         <div class="browser-form">
-          <button id="browser-back" title="Back">Back</button>
-          <button id="browser-forward" title="Forward">Forward</button>
+          <button id="browser-back" class="browser-nav-button" title="Back" aria-label="Back">&larr;</button>
+          <button id="browser-forward" class="browser-nav-button" title="Forward" aria-label="Forward">&rarr;</button>
           <input id="preview-url" placeholder="3000 or http://127.0.0.1:3000" />
-          <button id="load-preview">Go</button>
-          <button id="reload-preview" title="Reload preview">Reload</button>
+          <button id="load-preview" title="Load URL">Go</button>
+          <button id="reload-preview" class="browser-nav-button" title="Reload" aria-label="Reload">&#x21bb;</button>
+          <button id="clear-browser-cache" class="browser-cache-button" title="Clear preview cache and reload">Clear cache</button>
         </div>
         <div id="browser-tabs" class="browser-tabs"></div>
         <div class="device-form">
@@ -1166,6 +1465,7 @@ app.innerHTML = `
             <iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe>
             <canvas id="edge-preview-canvas" class="edge-preview-canvas hidden" tabindex="0" aria-label="Edge browser preview"></canvas>
             <div id="edge-preview-status" class="edge-preview-status hidden">Edge preview idle</div>
+            <div id="browser-dialog-layer" class="browser-dialog-layer hidden" aria-live="polite"></div>
           </div>
           <div id="browser-console-resizer" class="browser-console-resizer" aria-hidden="true"></div>
           <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
@@ -1234,6 +1534,9 @@ const el = {
   titlebar: document.querySelector<HTMLElement>('.titlebar')!,
   windowControlButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-window-action]')),
   windowResizeZones: Array.from(document.querySelectorAll<HTMLElement>('[data-window-resize-direction]')),
+  closePanelButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-close-panel]')),
+  togglePanelButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-toggle-panel]')),
+  llmButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-llm]')),
   titleContext: document.querySelector<HTMLSpanElement>('#title-context')!,
   status: document.querySelector<HTMLDivElement>('#status')!,
   appClock: document.querySelector<HTMLDivElement>('#app-clock')!,
@@ -1298,8 +1601,10 @@ const el = {
   browserBack: document.querySelector<HTMLButtonElement>('#browser-back')!,
   browserForward: document.querySelector<HTMLButtonElement>('#browser-forward')!,
   reloadPreview: document.querySelector<HTMLButtonElement>('#reload-preview')!,
+  clearBrowserCache: document.querySelector<HTMLButtonElement>('#clear-browser-cache')!,
   hardRefreshPreview: document.querySelector<HTMLButtonElement>('#hard-refresh-preview')!,
   browserTabs: document.querySelector<HTMLDivElement>('#browser-tabs')!,
+  browserPanel: document.querySelector<HTMLElement>('[data-panel="browser"]')!,
   desktopSize: document.querySelector<HTMLButtonElement>('#desktop-size'),
   deviceSelect: document.querySelector<HTMLSelectElement>('#device-select')!,
   rotateDevice: document.querySelector<HTMLButtonElement>('#rotate-device')!,
@@ -1308,6 +1613,7 @@ const el = {
   forwardList: document.querySelector<HTMLDivElement>('#forward-list')!,
   browserWorkspace: document.querySelector<HTMLDivElement>('#browser-workspace')!,
   browserShell: document.querySelector<HTMLDivElement>('#browser-shell')!,
+  browserDialogLayer: document.querySelector<HTMLDivElement>('#browser-dialog-layer')!,
   browserConsoleResizer: document.querySelector<HTMLDivElement>('#browser-console-resizer')!,
   browserConsole: document.querySelector<HTMLElement>('#browser-console')!,
   browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
@@ -1329,10 +1635,52 @@ const el = {
 };
 
 const currentWindow = getCurrentWindow();
+let appStatusRenderSignature = '\0';
+let appClockRenderSignature = '\0';
+let appTitleRenderSignature = '\0';
+let workspaceControlsRenderSignature = '\0';
 
 function setStatus(message: string, danger = false) {
-  el.status.textContent = message;
+  const signature = `${danger ? '1' : '0'}\t${message}`;
+  if (appStatusRenderSignature === signature) return;
+  appStatusRenderSignature = signature;
+  setTextContentIfChanged(el.status, message);
   el.status.classList.toggle('danger', danger);
+}
+
+function setTextContentIfChanged(element: HTMLElement, text: string) {
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setDisabledIfChanged(
+  element: HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement,
+  disabled: boolean
+) {
+  if (element.disabled !== disabled) element.disabled = disabled;
+}
+
+function setInputValueIfChanged(element: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, value: string) {
+  if (element.value !== value) element.value = value;
+}
+
+function setCheckedIfChanged(element: HTMLInputElement, checked: boolean) {
+  if (element.checked !== checked) element.checked = checked;
+}
+
+function setAttributeIfChanged(element: HTMLElement, name: string, value: string) {
+  if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+}
+
+function toggleClassIfChanged(element: HTMLElement, className: string, force: boolean) {
+  if (element.classList.contains(className) !== force) element.classList.toggle(className, force);
+}
+
+function setElementTextIfChanged(element: HTMLElement, text: string) {
+  setTextContentIfChanged(element, text);
+}
+
+function setDatasetValueIfChanged(element: HTMLElement, key: string, value: string) {
+  if (element.dataset[key] !== value) element.dataset[key] = value;
 }
 
 function startAppClock() {
@@ -1344,27 +1692,33 @@ function renderAppClock() {
   const now = new Date();
   const days = ['일', '월', '화', '수', '목', '금', '토'];
   const pad = (value: number) => String(value).padStart(2, '0');
-  el.appClock.textContent = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(now.getDate())} ${days[now.getDay()]} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const value = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(now.getDate())} ${days[now.getDay()]} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  if (appClockRenderSignature === value) return;
+  appClockRenderSignature = value;
+  setTextContentIfChanged(el.appClock, value);
 }
 
 function refreshTitle() {
   const profile = state.activeProfile;
   const location = profile ? `${profile.label} ${state.currentDir || state.workspaceRoot}` : 'no profile';
-  el.titleContext.textContent = location;
-  document.title = `Simple Vibe IDE — ${location}`;
+  if (appTitleRenderSignature === location) return;
+  appTitleRenderSignature = location;
+  setTextContentIfChanged(el.titleContext, location);
+  const title = `Simple Vibe IDE — ${location}`;
+  if (document.title !== title) document.title = title;
 }
 
 async function init() {
   await listen<TerminalDataEvent>('terminal-data', (event) => {
-    const pane = state.terminals.find((item) => item.backendId === event.payload.id);
+    const pane = terminalPaneByBackendId.get(event.payload.id);
     if (!pane) return;
-    pane.term.write(event.payload.data);
-    trackTerminalCwdFromOutput(pane, event.payload.data);
-    void scanTerminalOutputForPorts(pane, event.payload.data);
+    handleTerminalData(pane, event.payload.data);
   });
   await listen<TerminalExitEvent>('terminal-exit', (event) => {
-    const pane = state.terminals.find((item) => item.backendId === event.payload.id);
+    const pane = terminalPaneByBackendId.get(event.payload.id);
     if (pane) {
+      flushTerminalWriteBuffer(pane);
+      setTerminalBackendId(pane, undefined);
       pane.title = `${pane.title} (exited)`;
       const widget = terminalWidgetForPane(pane);
       if (widget) renderTerminalWidgetTabs(widget);
@@ -1388,7 +1742,7 @@ async function init() {
     handleExportProgress(event.payload);
   });
 
-  state.profiles = await api.listProfiles();
+  setProfiles(await api.listProfiles());
   loadIdeSettings();
   loadWorkspaceStore();
   loadMarketTickerConfig();
@@ -1404,9 +1758,8 @@ async function init() {
   renderNotePin();
   renderShellTabs();
   renderBrowserDeviceOptions();
-  renderCalculatorKeys();
-  renderCalculator();
-  renderSettings();
+  if (isPanelVisible('calculator')) renderCalculator();
+  if (isPanelVisible('settings')) renderSettings();
   renderMarketTicker();
   setBrowserMode('desktop');
   setBrowserConsolePosition(state.browserConsolePosition);
@@ -1417,16 +1770,20 @@ async function init() {
   applyCalculatorFontSize();
   applyBrowserZoom();
   scheduleEditorRuntimeWarmup();
+  scheduleTerminalRuntimeWarmup();
   bindEvents();
   startAppClock();
   selectProfile('');
   setWorkspaceOpen(false);
   setStatus('Ready');
-  window.setTimeout(startMarketTicker, MARKET_TICKER_BOOT_DELAY_MS);
-  void loadWslProfilesInBackground();
+  scheduleMarketTickerStart(MARKET_TICKER_BOOT_DELAY_MS);
+  scheduleWslProfilesBackgroundLoad();
 }
 
 function renderProfiles() {
+  const signature = profilesSignature();
+  if (profilesRenderSignature === signature) return;
+  profilesRenderSignature = signature;
   el.profileSelect.innerHTML = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
@@ -1440,41 +1797,375 @@ function renderProfiles() {
   }
 }
 
+function profilesSignature() {
+  let signature = '';
+  for (let index = 0; index < state.profiles.length; index += 1) {
+    const profile = state.profiles[index];
+    if (index) signature += '\n';
+    signature += `${profile.id}\t${profile.label}`;
+  }
+  return signature;
+}
+
+function clearProfileLookup() {
+  profileById.clear();
+}
+
+function rebuildProfileLookup() {
+  clearProfileLookup();
+  for (const profile of state.profiles) rememberProfile(profile);
+}
+
+function rememberProfile(profile: ConnectionProfile) {
+  profileById.set(profile.id, profile);
+}
+
+function setProfiles(profiles: ConnectionProfile[]) {
+  state.profiles = profiles;
+  rebuildProfileLookup();
+}
+
+function profileForId(id: string) {
+  if (!id) return null;
+  let profile = profileById.get(id) ?? null;
+  if (!profile) {
+    profile = state.profiles.find((item) => item.id === id) ?? null;
+    if (profile) rememberProfile(profile);
+  }
+  return profile;
+}
+
+function profileForIdWithWindowsFallback(id: string) {
+  return profileForId(id) ?? (id === 'windows-local' ? windowsLocalProfileFallback() : null);
+}
+
+function scheduleWslProfilesBackgroundLoad(delayMs = 900) {
+  if (wslProfilesLoaded || wslProfilesLoadInFlight) return;
+  if (wslProfilesLoadTimer) window.clearTimeout(wslProfilesLoadTimer);
+  wslProfilesLoadTimer = window.setTimeout(() => {
+    wslProfilesLoadTimer = 0;
+    runWhenUiIdle(() => {
+      if (document.hidden) {
+        scheduleWslProfilesBackgroundLoad(2000);
+        return;
+      }
+      void loadWslProfilesInBackground();
+    }, 1600);
+  }, delayMs);
+}
+
 async function loadWslProfilesInBackground() {
+  if (wslProfilesLoaded || wslProfilesLoadInFlight) return;
+  wslProfilesLoadInFlight = true;
   setStatus('Ready - loading WSL profiles...');
   try {
     const wslProfiles = await api.listWslProfiles();
-    const existing = new Map(state.profiles.map((profile) => [profile.id, profile]));
+    const existing = new Map<string, ConnectionProfile>();
+    for (const profile of state.profiles) existing.set(profile.id, profile);
     for (const profile of wslProfiles) existing.set(profile.id, profile);
-    state.profiles = [...existing.values()];
+    setProfiles([...existing.values()]);
     const selected = el.profileSelect.value;
     renderProfiles();
     el.profileSelect.value = selected;
     setStatus('Ready');
   } catch (error) {
     setStatus(`Ready - WSL profile scan failed: ${String(error)}`, true);
+  } finally {
+    wslProfilesLoadInFlight = false;
+    wslProfilesLoaded = true;
   }
 }
 
 function loadWorkspaceStore() {
+  loadWorkspaceImageStore();
   try {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACE_STORE_KEY) ?? '') as Partial<WorkspaceStore>;
-    state.workspaceSnapshots = Array.isArray(parsed.workspaces) ? parsed.workspaces.filter(isWorkspaceSnapshot) : [];
+    state.workspaceSnapshots = workspaceSnapshotsFromStore(parsed.workspaces);
     state.activeWorkspaceId = '';
   } catch {
     state.workspaceSnapshots = [];
     state.activeWorkspaceId = '';
   }
+  rebuildWorkspaceSnapshotLookup();
+  workspaceSnapshotSignatures.clear();
+  for (const snapshot of state.workspaceSnapshots) {
+    workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+  }
+  workspaceStorePersistWorkspacesSignature = workspaceStoreWorkspacesSignature();
+  workspaceStorePersistWorkspacesJson = workspaceStoreWorkspacesJsonForPersist(workspaceSnapshotsForStorePersist());
+  workspaceStorePersistSignature = workspaceStoreSignature(workspaceStorePersistWorkspacesSignature);
+}
+
+function workspaceSnapshotsFromStore(workspaces: unknown) {
+  const snapshots: WorkspaceSnapshot[] = [];
+  if (!Array.isArray(workspaces)) return snapshots;
+  for (const item of workspaces) {
+    if (isWorkspaceSnapshot(item)) snapshots.push(hydrateWorkspaceImageRefs(item));
+  }
+  return snapshots;
+}
+
+function loadWorkspaceImageStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(WORKSPACE_IMAGE_STORE_KEY) ?? '{}') as unknown;
+    workspaceImageStore = workspaceImageStoreFromParsed(parsed);
+  } catch {
+    workspaceImageStore = {};
+  }
+  workspaceImageStoreDirty = false;
+}
+
+function workspaceImageStoreFromParsed(parsed: unknown) {
+  const store: Record<string, string> = {};
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return store;
+  const record = parsed as Record<string, unknown>;
+  for (const key in record) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+    const value = record[key];
+    if (typeof value === 'string') store[key] = value;
+  }
+  return store;
 }
 
 function persistWorkspaceStore() {
-  const store: WorkspaceStore = {
-    version: 1,
-    activeId: state.activeWorkspaceId,
-    workspaces: state.workspaceSnapshots.slice(0, 24)
+  if (workspacePersistTimer) {
+    window.clearTimeout(workspacePersistTimer);
+    workspacePersistTimer = 0;
+  }
+  const workspacesSignature = workspaceStoreWorkspacesSignature();
+  const signature = workspaceStoreSignature(workspacesSignature);
+  if (signature === workspaceStorePersistSignature) return;
+  workspaceStorePersistSignature = signature;
+  localStorage.setItem(WORKSPACE_STORE_KEY, workspaceStoreJsonPayload(workspacesSignature));
+  if (workspaceTabsRenderNeeded()) renderWorkspaceTabs();
+}
+
+function workspaceStoreJsonPayload(workspacesSignature = workspaceStoreWorkspacesSignature()) {
+  if (workspacesSignature !== workspaceStorePersistWorkspacesSignature || workspaceImageStoreDirty) {
+    workspaceStorePersistWorkspacesSignature = workspacesSignature;
+    workspaceStorePersistWorkspacesJson = workspaceStoreWorkspacesJsonForPersist(workspaceSnapshotsForStorePersist());
+  }
+  return `{"version":1,"activeId":${JSON.stringify(state.activeWorkspaceId)},"workspaces":${workspaceStorePersistWorkspacesJson}}`;
+}
+
+function workspaceSnapshotsForStorePersist(snapshots = state.workspaceSnapshots) {
+  return snapshots.length > WORKSPACE_STORE_PERSIST_LIMIT
+    ? snapshots.slice(0, WORKSPACE_STORE_PERSIST_LIMIT)
+    : snapshots;
+}
+
+function workspaceStoreWorkspacesJsonForPersist(snapshots: WorkspaceSnapshot[]) {
+  const compactJson = JSON.stringify(compactWorkspaceSnapshotsForStore(snapshots));
+  if (persistWorkspaceImageStoreIfNeeded()) return compactJson;
+  return JSON.stringify(snapshots);
+}
+
+function compactWorkspaceSnapshotsForStore(snapshots: WorkspaceSnapshot[]) {
+  const usedImageRefs = new Set<string>();
+  const compact: WorkspaceSnapshot[] = [];
+  for (const snapshot of snapshots) compact.push(compactWorkspaceSnapshotForStore(snapshot, usedImageRefs));
+  pruneWorkspaceImageStore(usedImageRefs);
+  return compact;
+}
+
+function compactWorkspaceSnapshotForStore(snapshot: WorkspaceSnapshot, usedImageRefs: Set<string>): WorkspaceSnapshot {
+  return {
+    ...snapshot,
+    imageTabs: compactImageTabsForStore(snapshot, usedImageRefs)
   };
-  localStorage.setItem(WORKSPACE_STORE_KEY, JSON.stringify(store));
-  renderWorkspaceTabs();
+}
+
+function compactImageTabsForStore(snapshot: WorkspaceSnapshot, usedImageRefs: Set<string>) {
+  const tabs: ImageTabSnapshot[] = [];
+  for (const tab of snapshot.imageTabs ?? []) {
+    tabs.push({
+      ...tab,
+      dataUrl: imageDataRefForStore(snapshot.id, `tab:${tab.id}`, tab.dataUrl, usedImageRefs),
+      history: compactImageHistoryForStore(snapshot.id, tab, usedImageRefs)
+    });
+  }
+  return tabs;
+}
+
+function compactImageHistoryForStore(workspaceId: string, tab: ImageTabSnapshot, usedImageRefs: Set<string>) {
+  const history: PastedImageItem[] = [];
+  for (const item of tab.history ?? []) {
+    history.push({
+      ...item,
+      dataUrl: imageDataRefForStore(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl, usedImageRefs)
+    });
+  }
+  return history;
+}
+
+function imageDataRefForStore(workspaceId: string, scope: string, dataUrl: string, usedImageRefs: Set<string>) {
+  if (!dataUrl) return dataUrl;
+  if (dataUrl.startsWith(WORKSPACE_IMAGE_REF_PREFIX)) {
+    usedImageRefs.add(dataUrl.slice(WORKSPACE_IMAGE_REF_PREFIX.length));
+    return dataUrl;
+  }
+  if (!dataUrl.startsWith('data:image/')) return dataUrl;
+  const key = imageRefKeyForDataUrl(workspaceId, scope, dataUrl);
+  usedImageRefs.add(key);
+  if (workspaceImageStore[key] !== dataUrl) {
+    workspaceImageStore[key] = dataUrl;
+    workspaceImageStoreDirty = true;
+  }
+  return `${WORKSPACE_IMAGE_REF_PREFIX}${key}`;
+}
+
+function imageRefKeyForDataUrl(workspaceId: string, scope: string, dataUrl: string) {
+  const cacheKey = `${workspaceId}:${scope}`;
+  let cached = workspaceImageRefCache.get(cacheKey);
+  let key = cached?.dataUrl === dataUrl ? cached.key : '';
+  if (!key) {
+    key = `${cacheKey}:${dataUrl.length}:${hashText(dataUrl).toString(36)}`;
+    cached = { dataUrl, key };
+  }
+  const refEntry = cached ?? { dataUrl, key };
+  workspaceImageRefCache.delete(cacheKey);
+  workspaceImageRefCache.set(cacheKey, refEntry);
+  pruneWorkspaceImageRefCache();
+  return key;
+}
+
+function hydrateWorkspaceImageRefs(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
+  return {
+    ...snapshot,
+    imageTabs: hydrateWorkspaceImageTabs(snapshot)
+  };
+}
+
+function hydrateWorkspaceImageTabs(snapshot: WorkspaceSnapshot) {
+  const tabs: ImageTabSnapshot[] = [];
+  for (const tab of snapshot.imageTabs ?? []) {
+    tabs.push({
+      ...tab,
+      dataUrl: hydrateWorkspaceImageDataUrl(snapshot.id, `tab:${tab.id}`, tab.dataUrl),
+      history: hydrateWorkspaceImageHistory(snapshot.id, tab)
+    });
+  }
+  return tabs;
+}
+
+function hydrateWorkspaceImageHistory(workspaceId: string, tab: ImageTabSnapshot) {
+  const history: PastedImageItem[] = [];
+  for (const item of tab.history ?? []) {
+    history.push({
+      ...item,
+      dataUrl: hydrateWorkspaceImageDataUrl(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl)
+    });
+  }
+  return history;
+}
+
+function hydrateWorkspaceImageDataUrl(workspaceId: string, scope: string, dataUrl: string) {
+  if (!dataUrl?.startsWith(WORKSPACE_IMAGE_REF_PREFIX)) return dataUrl || '';
+  const key = dataUrl.slice(WORKSPACE_IMAGE_REF_PREFIX.length);
+  const stored = workspaceImageStore[key] ?? '';
+  if (stored) {
+    const cacheKey = `${workspaceId}:${scope}`;
+    workspaceImageRefCache.delete(cacheKey);
+    workspaceImageRefCache.set(cacheKey, { dataUrl: stored, key });
+    pruneWorkspaceImageRefCache();
+  }
+  return stored;
+}
+
+function pruneWorkspaceImageStore(usedImageRefs: Set<string>) {
+  for (const key of Object.keys(workspaceImageStore)) {
+    if (usedImageRefs.has(key)) continue;
+    delete workspaceImageStore[key];
+    workspaceImageStoreDirty = true;
+  }
+  for (const [scope, cached] of workspaceImageRefCache) {
+    if (usedImageRefs.has(cached.key)) continue;
+    workspaceImageRefCache.delete(scope);
+  }
+}
+
+function pruneWorkspaceImageRefCache() {
+  while (workspaceImageRefCache.size > WORKSPACE_IMAGE_REF_CACHE_LIMIT) {
+    const oldest = workspaceImageRefCache.keys().next().value;
+    if (oldest === undefined) break;
+    workspaceImageRefCache.delete(oldest);
+  }
+}
+
+function persistWorkspaceImageStoreIfNeeded() {
+  if (!workspaceImageStoreDirty) return true;
+  try {
+    localStorage.setItem(WORKSPACE_IMAGE_STORE_KEY, JSON.stringify(workspaceImageStore));
+    workspaceImageStoreDirty = false;
+    return true;
+  } catch {
+    // If the split image store cannot be written, fall back to full data URLs
+    // in the main workspace payload for this persist attempt.
+    return false;
+  }
+}
+
+function workspaceStoreSignature(workspacesSignature = workspaceStoreWorkspacesSignature()) {
+  return [
+    'v1',
+    workspaceSignaturePart(state.activeWorkspaceId),
+    workspacesSignature
+  ].join('\n');
+}
+
+function workspaceStoreWorkspacesSignature() {
+  const count = Math.min(state.workspaceSnapshots.length, WORKSPACE_STORE_PERSIST_LIMIT);
+  let signatureText = '';
+  for (let index = 0; index < count; index += 1) {
+    const snapshot = state.workspaceSnapshots[index];
+    let signature = workspaceSnapshotSignatures.get(snapshot.id);
+    if (!signature) {
+      signature = workspaceSnapshotSignature(snapshot);
+      workspaceSnapshotSignatures.set(snapshot.id, signature);
+    }
+    if (index) signatureText += '\n';
+    signatureText += `${index}:${workspaceSignaturePart(snapshot.id)}:${signature}`;
+  }
+  return signatureText;
+}
+
+function workspaceTabsRenderNeeded() {
+  return workspaceTabsRenderSignature !== workspaceTabsSignature()
+    || workspaceTabsOrderRenderSignature !== workspaceTabsOrderSignature()
+    || el.workspaceTabs.childElementCount !== state.workspaceSnapshots.length;
+}
+
+function scheduleWorkspaceStorePersist(delayMs = 180) {
+  if (workspacePersistTimer) return;
+  workspacePersistTimer = window.setTimeout(() => {
+    workspacePersistTimer = 0;
+    const delay = workspaceStorePersistDelayMs();
+    if (delay > 0) {
+      scheduleWorkspaceStorePersist(delay);
+      return;
+    }
+    persistWorkspaceStore();
+  }, delayMs);
+}
+
+function workspaceStorePersistDelayMs() {
+  return workspacePersistenceBusyDelayMs();
+}
+
+function workspacePersistenceBusyDelayMs() {
+  const scrollPause = explorerScrollingUntil - Date.now();
+  if (scrollPause > 0) return scrollPause + EXPLORER_SCROLL_IDLE_MS;
+  if (workspaceDragState?.dragging) return 240;
+  if (uiInputPending()) return 80;
+  return 0;
+}
+
+function flushWorkspaceStorePersist() {
+  if (workspacePersistTimer) {
+    window.clearTimeout(workspacePersistTimer);
+    workspacePersistTimer = 0;
+  }
+  persistWorkspaceStore();
 }
 
 function loadIdeSettings() {
@@ -1502,7 +2193,8 @@ function renderSettings() {
   renderFontOptions(el.settingsUiFont, UI_FONT_CHOICES, state.ideSettings.uiFont);
   renderFontOptions(el.settingsMonoFont, MONO_FONT_CHOICES, state.ideSettings.monoFont);
   renderChoiceOptions(el.settingsEditorTheme, EDITOR_THEME_CHOICES, state.ideSettings.editorTheme);
-  el.settingsMaskPatterns.value = state.ideSettings.extraMaskPatterns.join('\n');
+  const maskPatterns = state.ideSettings.extraMaskPatterns.join('\n');
+  if (el.settingsMaskPatterns.value !== maskPatterns) el.settingsMaskPatterns.value = maskPatterns;
 }
 
 function renderFontOptions(select: HTMLSelectElement, choices: FontChoice[], activeId: string) {
@@ -1510,14 +2202,29 @@ function renderFontOptions(select: HTMLSelectElement, choices: FontChoice[], act
 }
 
 function renderChoiceOptions(select: HTMLSelectElement, choices: Array<{ id: string; label: string }>, activeId: string) {
-  select.innerHTML = '';
-  for (const choice of choices) {
-    const option = document.createElement('option');
-    option.value = choice.id;
-    option.textContent = choice.label;
-    select.append(option);
+  const optionsSignature = choiceOptionsSignature(choices);
+  if (selectOptionsRenderSignatures.get(select) !== optionsSignature) {
+    selectOptionsRenderSignatures.set(select, optionsSignature);
+    select.innerHTML = '';
+    for (const choice of choices) {
+      const option = document.createElement('option');
+      option.value = choice.id;
+      option.textContent = choice.label;
+      select.append(option);
+    }
   }
-  select.value = choices.some((choice) => choice.id === activeId) ? activeId : choices[0].id;
+  const nextValue = choices.some((choice) => choice.id === activeId) ? activeId : choices[0].id;
+  if (select.value !== nextValue) select.value = nextValue;
+}
+
+function choiceOptionsSignature(choices: Array<{ id: string; label: string }>) {
+  let signature = '';
+  for (let index = 0; index < choices.length; index += 1) {
+    const choice = choices[index];
+    if (index) signature += '\n';
+    signature += `${choice.id}\t${choice.label}`;
+  }
+  return signature;
 }
 
 function saveSettingsFromForm() {
@@ -1536,8 +2243,8 @@ function saveSettingsFromForm() {
 function applyIdeSettings() {
   const uiFont = fontChoice(UI_FONT_CHOICES, state.ideSettings.uiFont).stack;
   const monoFont = fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack;
-  document.documentElement.style.setProperty('--ui-font', uiFont);
-  document.documentElement.style.setProperty('--mono-font', monoFont);
+  setRootStyleProperty('--ui-font', uiFont);
+  setRootStyleProperty('--mono-font', monoFont);
   applyEditorTheme(state.ideSettings.editorTheme);
   configurePrivacyPolicy(state.ideSettings.extraMaskPatterns);
   for (const pane of state.terminals) {
@@ -1545,7 +2252,7 @@ function applyIdeSettings() {
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
   }
-  codeView?.requestMeasure();
+  requestCodeEditorMeasure();
 }
 
 function fontChoice(choices: FontChoice[], id: string) {
@@ -1566,10 +2273,19 @@ function isEditorThemeId(id: unknown): id is EditorThemeId {
 
 function applyEditorTheme(id: string) {
   const theme = editorThemeChoice(id);
-  document.documentElement.dataset.editorTheme = theme.id;
-  for (const [name, value] of Object.entries(theme.vars)) {
-    document.documentElement.style.setProperty(name, value);
+  if (document.documentElement.dataset.editorTheme !== theme.id) {
+    document.documentElement.dataset.editorTheme = theme.id;
   }
+  for (const [name, value] of Object.entries(theme.vars)) {
+    setRootStyleProperty(name, value);
+  }
+}
+
+function setRootStyleProperty(name: string, value: string) {
+  const style = document.documentElement.style;
+  if (style.getPropertyValue(name) === value) return false;
+  style.setProperty(name, value);
+  return true;
 }
 
 function loadMarketTickerConfig() {
@@ -1590,55 +2306,165 @@ function loadMarketTickerConfig() {
 }
 
 function persistMarketTickerConfig() {
-  const custom = state.marketTickers
-    .filter((ticker) => ticker.removable)
-    .map((ticker) => ticker.symbol)
-    .slice(0, MARKET_TICKER_MAX_CUSTOM);
+  const custom: string[] = [];
+  for (const ticker of state.marketTickers) {
+    if (!ticker.removable) continue;
+    custom.push(ticker.symbol);
+    if (custom.length >= MARKET_TICKER_MAX_CUSTOM) break;
+  }
   localStorage.setItem(MARKET_TICKER_STORE_KEY, JSON.stringify({ custom }));
 }
 
+function marketTickerRenderStateSignature() {
+  let signature = '';
+  let customCount = 0;
+  for (let index = 0; index < state.marketTickers.length; index += 1) {
+    const ticker = state.marketTickers[index];
+    const quote = state.marketQuotes.get(ticker.symbol);
+    const updatedSecond = quote?.updatedAt ? Math.floor(quote.updatedAt / 1000) : 0;
+    if (ticker.removable) customCount += 1;
+    if (index) signature += '\n';
+    signature += `${ticker.id}|${ticker.label}|${ticker.symbol}|${ticker.removable ? 1 : 0}|${quote?.price ?? ''}|${quote?.changePercent ?? ''}|${updatedSecond}|${quote?.status ?? 'loading'}|${quote?.message ?? ''}`;
+  }
+  return `${customCount}/${MARKET_TICKER_MAX_CUSTOM}\n${signature}`;
+}
+
 function renderMarketTicker() {
-  el.marketTickerList.innerHTML = '';
-  const fragment = document.createDocumentFragment();
-  for (const ticker of state.marketTickers) {
-    const quote = state.marketQuotes.get(ticker.symbol) ?? {
-      symbol: ticker.symbol,
-      price: null,
-      changePercent: null,
-      updatedAt: 0,
-      status: 'loading' as const
-    };
-    const item = document.createElement('div');
-    item.className = `market-chip ${marketTrendClass(quote)}`;
-    item.title = marketTickerTitle(ticker, quote);
+  const signature = marketTickerRenderStateSignature();
+  if (signature === marketTickerRenderSignature) return;
+  const orderSignature = marketTickerOrderSignature();
+  const sameOrder = marketTickerOrderRenderSignature === orderSignature
+    && el.marketTickerList.childElementCount === state.marketTickers.length;
+  marketTickerRenderSignature = signature;
+  marketTickerLastRenderAt = Date.now();
 
-    const label = document.createElement('span');
-    label.className = 'market-label';
-    label.textContent = ticker.label;
-
-    const price = document.createElement('span');
-    price.className = 'market-price';
-    price.textContent = formatMarketPrice(quote.price);
-
-    const change = document.createElement('span');
-    change.className = 'market-change';
-    change.textContent = formatMarketChange(quote.changePercent);
-
-    item.append(label, price, change);
-    if (ticker.removable) {
-      const remove = document.createElement('button');
-      remove.type = 'button';
-      remove.className = 'market-remove';
-      remove.title = `Remove ${ticker.symbol}`;
-      remove.textContent = 'x';
-      remove.addEventListener('click', () => removeMarketTicker(ticker.symbol));
-      item.append(remove);
+  if (sameOrder) {
+    for (const ticker of state.marketTickers) {
+      updateMarketTickerElement(marketTickerElement(ticker.id), ticker);
     }
+    updateMarketTickerAddControls();
+    return;
+  }
+
+  marketTickerOrderRenderSignature = orderSignature;
+  const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
+  for (const ticker of state.marketTickers) {
+    seen.add(ticker.id);
+    const item = marketTickerElement(ticker.id);
+    updateMarketTickerElement(item, ticker);
     fragment.append(item);
   }
-  el.marketTickerList.append(fragment);
+  el.marketTickerList.replaceChildren(fragment);
+  pruneMarketTickerElementCache(seen);
+  updateMarketTickerAddControls();
+}
 
-  const customCount = state.marketTickers.filter((ticker) => ticker.removable).length;
+function marketTickerElement(id: string) {
+  const cached = marketTickerElementCache.get(id);
+  if (cached) return cached;
+  const item = document.createElement('div');
+  item.className = 'market-chip';
+
+  const label = document.createElement('span');
+  label.className = 'market-label';
+  const price = document.createElement('span');
+  price.className = 'market-price';
+  const change = document.createElement('span');
+  change.className = 'market-change';
+  item.append(label, price, change);
+  marketTickerPartCache.set(item, { label, price, change });
+  marketTickerElementCache.set(id, item);
+  return item;
+}
+
+function marketTickerParts(item: HTMLElement) {
+  const cached = marketTickerPartCache.get(item);
+  if (cached) return cached;
+  const parts: {
+    label: HTMLElement;
+    price: HTMLElement;
+    change: HTMLElement;
+    remove?: HTMLButtonElement;
+  } = {
+    label: item.querySelector<HTMLElement>('.market-label')!,
+    price: item.querySelector<HTMLElement>('.market-price')!,
+    change: item.querySelector<HTMLElement>('.market-change')!
+  };
+  const remove = item.querySelector<HTMLButtonElement>('.market-remove');
+  if (remove) parts.remove = remove;
+  marketTickerPartCache.set(item, parts);
+  return parts;
+}
+
+function updateMarketTickerElement(item: HTMLElement, ticker: MarketTickerConfig) {
+  const quote = state.marketQuotes.get(ticker.symbol) ?? {
+    symbol: ticker.symbol,
+    price: null,
+    changePercent: null,
+    updatedAt: 0,
+    status: 'loading' as const
+  };
+  const trend = marketTrendClass(quote);
+  const title = marketTickerTitle(ticker, quote);
+  const priceText = formatMarketPrice(quote.price);
+  const changeText = formatMarketChange(quote.changePercent);
+  const signature = `${ticker.id}\t${ticker.label}\t${ticker.symbol}\t${ticker.removable ? '1' : '0'}\t${trend}\t${title}\t${priceText}\t${changeText}`;
+  item.dataset.marketTickerId = ticker.id;
+  item.dataset.marketSymbol = ticker.symbol;
+  const parts = marketTickerParts(item);
+  if (item.dataset.renderSignature !== signature) {
+    item.dataset.renderSignature = signature;
+    item.className = `market-chip ${trend}`;
+    item.title = title;
+    setTextContentIfChanged(parts.label, ticker.label);
+    setTextContentIfChanged(parts.price, priceText);
+    setTextContentIfChanged(parts.change, changeText);
+  }
+
+  let remove = parts.remove;
+  if (ticker.removable) {
+    if (!remove || !remove.isConnected) {
+      remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'market-remove';
+      remove.textContent = 'x';
+      remove.addEventListener('click', () => {
+        const symbol = item.dataset.marketSymbol;
+        if (symbol) removeMarketTicker(symbol);
+      });
+      item.append(remove);
+      parts.remove = remove;
+    }
+    remove.title = `Remove ${ticker.symbol}`;
+  } else {
+    if (remove) {
+      remove.remove();
+      delete parts.remove;
+    }
+  }
+}
+
+function pruneMarketTickerElementCache(seen: Set<string>) {
+  for (const id of marketTickerElementCache.keys()) {
+    if (!seen.has(id)) marketTickerElementCache.delete(id);
+  }
+}
+
+function marketTickerOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.marketTickers.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.marketTickers[index].id;
+  }
+  return signature;
+}
+
+function updateMarketTickerAddControls() {
+  let customCount = 0;
+  for (const ticker of state.marketTickers) {
+    if (ticker.removable) customCount += 1;
+  }
   const canAdd = customCount < MARKET_TICKER_MAX_CUSTOM;
   el.marketSymbolInput.classList.toggle('hidden', !canAdd);
   el.marketAddSymbol.classList.toggle('hidden', !canAdd);
@@ -1665,31 +2491,93 @@ function marketTrendClass(quote: MarketTickerQuote) {
 }
 
 function scheduleMarketTickerRender() {
-  if (marketTickerRenderFrame) return;
+  if (document.hidden) return;
+  if (marketTickerRenderFrame || marketTickerRenderTimer) return;
+  const elapsed = Date.now() - marketTickerLastRenderAt;
+  if (elapsed < MARKET_TICKER_RENDER_MIN_MS) {
+    marketTickerRenderTimer = window.setTimeout(() => {
+      marketTickerRenderTimer = 0;
+      scheduleMarketTickerRender();
+    }, MARKET_TICKER_RENDER_MIN_MS - elapsed);
+    return;
+  }
   marketTickerRenderFrame = window.requestAnimationFrame(() => {
     marketTickerRenderFrame = 0;
     renderMarketTicker();
   });
 }
 
+function scheduleMarketTickerStart(delayMs = MARKET_TICKER_VISIBLE_RESUME_DELAY_MS) {
+  if (document.hidden) return;
+  if (marketTickerStarted && marketTickerSocket && (marketTickerSocket.readyState === WebSocket.CONNECTING || marketTickerSocket.readyState === WebSocket.OPEN)) {
+    scheduleMarketTickerRender();
+    return;
+  }
+  if (marketTickerStartTimer) window.clearTimeout(marketTickerStartTimer);
+  marketTickerStartTimer = window.setTimeout(() => {
+    marketTickerStartTimer = 0;
+    runWhenUiIdle(() => {
+      if (!document.hidden) startMarketTicker();
+    }, MARKET_TICKER_IDLE_TIMEOUT_MS);
+  }, delayMs);
+}
+
 function startMarketTicker() {
-  fetchMarketTickerSnapshot();
+  if (document.hidden) return;
+  marketTickerStarted = true;
+  void fetchMarketTickerSnapshot();
   connectMarketTickerSocket();
 }
 
 function restartMarketTicker() {
+  if (marketTickerStartTimer) window.clearTimeout(marketTickerStartTimer);
+  marketTickerStartTimer = 0;
   if (marketTickerReconnectTimer) window.clearTimeout(marketTickerReconnectTimer);
-  if (marketTickerSocket) marketTickerSocket.close();
+  marketTickerReconnectTimer = 0;
+  if (marketTickerFallbackTimer) window.clearTimeout(marketTickerFallbackTimer);
+  marketTickerFallbackTimer = 0;
+  marketTickerFetchAbort?.abort();
+  marketTickerFetchAbort = null;
+  const socket = marketTickerSocket;
   marketTickerSocket = null;
+  if (socket) socket.close();
   marketTickerReconnectAttempt = 0;
-  startMarketTicker();
+  marketTickerStarted = false;
+  scheduleMarketTickerStart(0);
+}
+
+function pauseMarketTickerForHidden() {
+  if (marketTickerStartTimer) window.clearTimeout(marketTickerStartTimer);
+  if (marketTickerReconnectTimer) window.clearTimeout(marketTickerReconnectTimer);
+  if (marketTickerFallbackTimer) window.clearTimeout(marketTickerFallbackTimer);
+  if (marketTickerRenderTimer) window.clearTimeout(marketTickerRenderTimer);
+  if (marketTickerRenderFrame) window.cancelAnimationFrame(marketTickerRenderFrame);
+  marketTickerStartTimer = 0;
+  marketTickerReconnectTimer = 0;
+  marketTickerFallbackTimer = 0;
+  marketTickerRenderTimer = 0;
+  marketTickerRenderFrame = 0;
+  marketTickerFetchAbort?.abort();
+  marketTickerFetchAbort = null;
+  const socket = marketTickerSocket;
+  marketTickerSocket = null;
+  if (socket) socket.close();
+  marketTickerStarted = false;
+  state.marketTickerConnected = false;
+  markMarketQuotesStale();
 }
 
 function connectMarketTickerSocket() {
+  if (document.hidden) return;
+  if (marketTickerSocket && (marketTickerSocket.readyState === WebSocket.CONNECTING || marketTickerSocket.readyState === WebSocket.OPEN)) return;
   const streams = state.marketTickers
     .map((ticker) => `${ticker.symbol.toLowerCase()}@ticker`)
     .join('/');
   if (!streams) return;
+  if (marketTickerReconnectTimer) {
+    window.clearTimeout(marketTickerReconnectTimer);
+    marketTickerReconnectTimer = 0;
+  }
   try {
     const socket = new WebSocket(`${MARKET_TICKER_WS_URL}${streams}`);
     marketTickerSocket = socket;
@@ -1706,6 +2594,7 @@ function connectMarketTickerSocket() {
     socket.addEventListener('close', () => {
       if (socket !== marketTickerSocket) return;
       state.marketTickerConnected = false;
+      if (document.hidden) return;
       markMarketQuotesStale();
       scheduleMarketTickerReconnect();
     });
@@ -1722,10 +2611,14 @@ function connectMarketTickerSocket() {
 }
 
 function scheduleMarketTickerReconnect() {
+  if (document.hidden) return;
   if (marketTickerReconnectTimer) window.clearTimeout(marketTickerReconnectTimer);
   const delay = Math.min(60000, 2500 * 2 ** Math.min(marketTickerReconnectAttempt, 5));
   marketTickerReconnectAttempt += 1;
-  marketTickerReconnectTimer = window.setTimeout(connectMarketTickerSocket, delay);
+  marketTickerReconnectTimer = window.setTimeout(() => {
+    marketTickerReconnectTimer = 0;
+    if (!document.hidden) connectMarketTickerSocket();
+  }, delay);
 }
 
 function handleMarketTickerMessage(raw: unknown) {
@@ -1753,19 +2646,35 @@ function updateMarketQuote(symbol: string, price: number, changePercent: number,
 }
 
 async function fetchMarketTickerSnapshot() {
+  if (document.hidden || marketTickerSnapshotInFlight) return;
   if (marketTickerFallbackTimer) window.clearTimeout(marketTickerFallbackTimer);
+  marketTickerFallbackTimer = 0;
   const tickers = state.marketTickers.slice();
-  await Promise.allSettled(tickers.map(async (ticker) => {
-    try {
-      const response = await fetch(`${MARKET_TICKER_REST_URL}${encodeURIComponent(ticker.symbol)}`, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json() as { lastPrice?: string; priceChangePercent?: string };
-      updateMarketQuote(ticker.symbol, Number(data.lastPrice), Number(data.priceChangePercent), state.marketTickerConnected ? 'live' : 'stale');
-    } catch (error) {
-      markMarketQuoteError(ticker.symbol, String(error));
+  if (!tickers.length) return;
+  marketTickerSnapshotInFlight = true;
+  const controller = new AbortController();
+  marketTickerFetchAbort = controller;
+  const abortTimer = window.setTimeout(() => controller.abort(), MARKET_TICKER_FETCH_TIMEOUT_MS);
+  try {
+    await Promise.allSettled(tickers.map(async (ticker) => {
+      try {
+        const response = await fetch(`${MARKET_TICKER_REST_URL}${encodeURIComponent(ticker.symbol)}`, { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json() as { lastPrice?: string; priceChangePercent?: string };
+        updateMarketQuote(ticker.symbol, Number(data.lastPrice), Number(data.priceChangePercent), state.marketTickerConnected ? 'live' : 'stale');
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        markMarketQuoteError(ticker.symbol, String(error));
+      }
+    }));
+  } finally {
+    window.clearTimeout(abortTimer);
+    if (marketTickerFetchAbort === controller) marketTickerFetchAbort = null;
+    marketTickerSnapshotInFlight = false;
+    if (!document.hidden) {
+      marketTickerFallbackTimer = window.setTimeout(() => void fetchMarketTickerSnapshot(), MARKET_TICKER_FALLBACK_MS);
     }
-  }));
-  marketTickerFallbackTimer = window.setTimeout(fetchMarketTickerSnapshot, MARKET_TICKER_FALLBACK_MS);
+  }
 }
 
 function markMarketQuotesStale() {
@@ -1805,7 +2714,11 @@ function addMarketTickerFromInput() {
     el.marketSymbolInput.value = '';
     return;
   }
-  if (state.marketTickers.filter((ticker) => ticker.removable).length >= MARKET_TICKER_MAX_CUSTOM) return;
+  let customCount = 0;
+  for (const ticker of state.marketTickers) {
+    if (ticker.removable) customCount += 1;
+  }
+  if (customCount >= MARKET_TICKER_MAX_CUSTOM) return;
   state.marketTickers.push({ id: `custom-${symbol.toLowerCase()}`, label: displaySymbol(symbol), symbol, removable: true });
   el.marketSymbolInput.value = '';
   persistMarketTickerConfig();
@@ -1846,62 +2759,284 @@ function isWorkspaceSnapshot(value: unknown): value is WorkspaceSnapshot {
   return Boolean(item && typeof item.id === 'string' && typeof item.profileId === 'string');
 }
 
+function clearWorkspaceSnapshotLookup() {
+  workspaceSnapshotById.clear();
+  workspaceSnapshotIndexByIdLookup.clear();
+}
+
+function rebuildWorkspaceSnapshotLookup() {
+  clearWorkspaceSnapshotLookup();
+  for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
+    rememberWorkspaceSnapshot(state.workspaceSnapshots[index], index);
+  }
+}
+
+function rememberWorkspaceSnapshot(snapshot: WorkspaceSnapshot, index?: number) {
+  workspaceSnapshotById.set(snapshot.id, snapshot);
+  if (index !== undefined) workspaceSnapshotIndexByIdLookup.set(snapshot.id, index);
+}
+
+function forgetWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
+  workspaceSnapshotById.delete(snapshot.id);
+  workspaceSnapshotIndexByIdLookup.delete(snapshot.id);
+}
+
+function workspaceSnapshotForId(id: string) {
+  if (!id) return null;
+  let snapshot = workspaceSnapshotById.get(id) ?? null;
+  if (!snapshot) {
+    for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
+      const candidate = state.workspaceSnapshots[index];
+      if (candidate.id !== id) continue;
+      snapshot = candidate;
+      rememberWorkspaceSnapshot(snapshot, index);
+      break;
+    }
+  }
+  return snapshot;
+}
+
+function workspaceSnapshotIndexById(id: string) {
+  const cachedIndex = workspaceSnapshotIndexByIdLookup.get(id);
+  if (cachedIndex !== undefined && state.workspaceSnapshots[cachedIndex]?.id === id) return cachedIndex;
+  for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
+    const snapshot = state.workspaceSnapshots[index];
+    if (snapshot.id !== id) continue;
+    rememberWorkspaceSnapshot(snapshot, index);
+    return index;
+  }
+  workspaceSnapshotIndexByIdLookup.delete(id);
+  return -1;
+}
+
+function insertWorkspaceSnapshot(index: number, snapshot: WorkspaceSnapshot) {
+  const insertIndex = clamp(index, 0, state.workspaceSnapshots.length);
+  state.workspaceSnapshots.splice(insertIndex, 0, snapshot);
+  refreshWorkspaceSnapshotIndexLookup(insertIndex);
+}
+
+function replaceWorkspaceSnapshot(index: number, snapshot: WorkspaceSnapshot) {
+  const previous = state.workspaceSnapshots[index];
+  if (previous && previous.id !== snapshot.id) forgetWorkspaceSnapshot(previous);
+  state.workspaceSnapshots[index] = snapshot;
+  rememberWorkspaceSnapshot(snapshot, index);
+}
+
+function removeWorkspaceSnapshotById(id: string) {
+  const index = workspaceSnapshotIndexById(id);
+  if (index < 0) return null;
+  const [snapshot] = state.workspaceSnapshots.splice(index, 1);
+  if (snapshot) forgetWorkspaceSnapshot(snapshot);
+  refreshWorkspaceSnapshotIndexLookup(index);
+  return snapshot ?? null;
+}
+
+function refreshWorkspaceSnapshotIndexLookup(startIndex = 0) {
+  const start = clamp(startIndex, 0, state.workspaceSnapshots.length);
+  for (let index = start; index < state.workspaceSnapshots.length; index += 1) {
+    rememberWorkspaceSnapshot(state.workspaceSnapshots[index], index);
+  }
+}
+
 function renderWorkspaceTabs() {
-  el.workspaceTabs.innerHTML = '';
+  const signature = workspaceTabsSignature();
+  if (workspaceTabsRenderSignature === signature) return;
+  const orderSignature = workspaceTabsOrderSignature();
+  const sameOrder = workspaceTabsOrderRenderSignature === orderSignature
+    && el.workspaceTabs.childElementCount === state.workspaceSnapshots.length;
+  workspaceTabsRenderSignature = signature;
+
+  if (sameOrder) {
+    for (const workspace of state.workspaceSnapshots) {
+      updateWorkspaceTabElement(workspaceTabElement(workspace.id), workspace);
+    }
+    return;
+  }
+
+  workspaceTabsOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const workspace of state.workspaceSnapshots) {
-    const tab = document.createElement('div');
-    const protectedWorkspace = Boolean(workspace.captureProtected);
-    tab.className = `workspace-tab${workspace.id === state.activeWorkspaceId ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
-    tab.draggable = false;
-    tab.dataset.workspaceId = workspace.id;
-    tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
-    const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
-    tab.innerHTML = `
-      <button class="workspace-tab-label" type="button">${escapeHtml(workspace.label)}</button>
-      <button class="workspace-tab-security${protectedWorkspace ? ' active' : ''}" type="button" title="${securityTitle}" aria-label="${securityTitle}" aria-pressed="${String(protectedWorkspace)}">
-        <svg viewBox="0 0 16 16" aria-hidden="true">
-          <path d="M5 7V5a3 3 0 0 1 6 0v2"></path>
-          <rect x="3.5" y="7" width="9" height="7" rx="1.5"></rect>
-        </svg>
-      </button>
-      <button class="workspace-tab-copy" type="button" title="Copy workspace" aria-label="Copy workspace">
-        <svg viewBox="0 0 16 16" aria-hidden="true">
-          <rect x="5" y="3" width="8" height="10" rx="1.5"></rect>
-          <path d="M3 11V5.5A1.5 1.5 0 0 1 4.5 4H10"></path>
-        </svg>
-      </button>
-      <button class="workspace-tab-close" type="button" title="Close workspace" aria-label="Close workspace">x</button>
-    `;
-    tab.querySelectorAll<HTMLButtonElement>('button').forEach((button) => {
-      button.draggable = false;
-    });
-    tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!.addEventListener('click', (event) => {
-      if (suppressWorkspaceTabClick) {
-        event.preventDefault();
-        return;
-      }
-      void activateWorkspaceTab(workspace.id);
-    });
-    tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void toggleWorkspaceCaptureProtection(workspace.id);
-    });
-    tab.querySelector<HTMLButtonElement>('.workspace-tab-copy')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void copyWorkspaceTab(workspace.id);
-    });
-    tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void closeWorkspaceTab(workspace.id);
-    });
-    tab.addEventListener('pointerdown', (event) => startWorkspaceTabPointerDrag(event, workspace.id, tab));
-    tab.addEventListener('pointermove', (event) => updateWorkspaceTabPointerDrag(event, tab));
-    tab.addEventListener('pointerup', (event) => finishWorkspaceTabPointerDrag(event, tab, true));
-    tab.addEventListener('pointercancel', (event) => finishWorkspaceTabPointerDrag(event, tab, false));
+    seen.add(workspace.id);
+    const tab = workspaceTabElement(workspace.id);
+    updateWorkspaceTabElement(tab, workspace);
     fragment.append(tab);
   }
-  el.workspaceTabs.append(fragment);
+  el.workspaceTabs.replaceChildren(fragment);
+  pruneWorkspaceTabElementCache(seen);
+}
+
+function renderWorkspaceTabActivation(previousActiveId: string, activeWorkspace: WorkspaceSnapshot) {
+  const orderSignature = workspaceTabsOrderSignature();
+  const previousChanged = Boolean(previousActiveId && previousActiveId !== activeWorkspace.id);
+  const previousWorkspace = previousChanged
+    ? workspaceSnapshotForId(previousActiveId)
+    : null;
+  const previousTab = previousChanged ? connectedWorkspaceTabElement(previousActiveId) : null;
+  const activeTab = connectedWorkspaceTabElement(activeWorkspace.id);
+  if (
+    workspaceTabsOrderRenderSignature !== orderSignature
+    || el.workspaceTabs.childElementCount !== state.workspaceSnapshots.length
+    || !activeTab
+    || (previousChanged && (!previousWorkspace || !previousTab))
+  ) {
+    renderWorkspaceTabs();
+    return;
+  }
+  if (previousWorkspace && previousTab) updateWorkspaceTabElement(previousTab, previousWorkspace);
+  updateWorkspaceTabElement(activeTab, activeWorkspace);
+  workspaceTabsRenderSignature = workspaceTabsSignature();
+}
+
+function connectedWorkspaceTabElement(id: string) {
+  const tab = workspaceTabElementCache.get(id);
+  return tab?.isConnected ? tab : null;
+}
+
+function workspaceTabElement(id: string) {
+  const cached = workspaceTabElementCache.get(id);
+  if (cached) return cached;
+  const tab = document.createElement('div');
+  tab.className = 'workspace-tab';
+  tab.draggable = false;
+  const label = document.createElement('button');
+  label.className = 'workspace-tab-label';
+  label.type = 'button';
+  const security = document.createElement('button');
+  security.className = 'workspace-tab-security';
+  security.type = 'button';
+  security.append(workspaceTabSvgIcon([
+    ['path', { d: 'M5 7V5a3 3 0 0 1 6 0v2' }],
+    ['rect', { x: '3.5', y: '7', width: '9', height: '7', rx: '1.5' }]
+  ]));
+  const copy = document.createElement('button');
+  copy.className = 'workspace-tab-copy';
+  copy.type = 'button';
+  copy.title = 'Copy workspace';
+  copy.setAttribute('aria-label', 'Copy workspace');
+  copy.append(workspaceTabSvgIcon([
+    ['rect', { x: '5', y: '3', width: '8', height: '10', rx: '1.5' }],
+    ['path', { d: 'M3 11V5.5A1.5 1.5 0 0 1 4.5 4H10' }]
+  ]));
+  const close = document.createElement('button');
+  close.className = 'workspace-tab-close';
+  close.type = 'button';
+  close.title = 'Close workspace';
+  close.setAttribute('aria-label', 'Close workspace');
+  close.textContent = 'x';
+  tab.append(label, security, copy, close);
+  const parts = { label, security, copy, close };
+  workspaceTabPartCache.set(tab, parts);
+  parts.label.draggable = false;
+  parts.security.draggable = false;
+  parts.copy.draggable = false;
+  parts.close.draggable = false;
+  parts.label.addEventListener('click', (event) => {
+    if (suppressWorkspaceTabClick) {
+      event.preventDefault();
+      return;
+    }
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) void activateWorkspaceTab(workspaceId);
+  });
+  parts.security.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) void toggleWorkspaceCaptureProtection(workspaceId);
+  });
+  parts.copy.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) void copyWorkspaceTab(workspaceId);
+  });
+  parts.close.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) void closeWorkspaceTab(workspaceId);
+  });
+  tab.addEventListener('pointerdown', (event) => {
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) startWorkspaceTabPointerDrag(event, workspaceId, tab);
+  });
+  tab.addEventListener('pointermove', (event) => updateWorkspaceTabPointerDrag(event, tab));
+  tab.addEventListener('pointerup', (event) => finishWorkspaceTabPointerDrag(event, tab, true));
+  tab.addEventListener('pointercancel', (event) => finishWorkspaceTabPointerDrag(event, tab, false));
+  workspaceTabElementCache.set(id, tab);
+  return tab;
+}
+
+function workspaceTabSvgIcon(children: Array<['path' | 'rect', Record<string, string>]>) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const [tag, attrs] of children) {
+    const child = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [name, value] of Object.entries(attrs)) child.setAttribute(name, value);
+    svg.append(child);
+  }
+  return svg;
+}
+
+function workspaceTabParts(tab: HTMLElement) {
+  const cached = workspaceTabPartCache.get(tab);
+  if (cached) return cached;
+  const parts = {
+    label: tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!,
+    security: tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!,
+    copy: tab.querySelector<HTMLButtonElement>('.workspace-tab-copy')!,
+    close: tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!
+  };
+  workspaceTabPartCache.set(tab, parts);
+  return parts;
+}
+
+function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapshot) {
+  const protectedWorkspace = Boolean(workspace.captureProtected);
+  const active = workspace.id === state.activeWorkspaceId;
+  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}`;
+  tab.dataset.workspaceId = workspace.id;
+  if (tab.dataset.renderSignature === signature) return;
+  tab.dataset.renderSignature = signature;
+  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
+  tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
+  const parts = workspaceTabParts(tab);
+  const label = parts.label;
+  setTextContentIfChanged(label, workspace.label);
+  const security = parts.security;
+  const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
+  toggleClassIfChanged(security, 'active', protectedWorkspace);
+  if (security.title !== securityTitle) security.title = securityTitle;
+  setAttributeIfChanged(security, 'aria-label', securityTitle);
+  setAttributeIfChanged(security, 'aria-pressed', String(protectedWorkspace));
+}
+
+function workspaceIdForTabElement(tab: HTMLElement) {
+  return tab.dataset.workspaceId || '';
+}
+
+function pruneWorkspaceTabElementCache(seen: Set<string>) {
+  for (const id of workspaceTabElementCache.keys()) {
+    if (!seen.has(id)) workspaceTabElementCache.delete(id);
+  }
+}
+
+function workspaceTabsSignature() {
+  let signature = '';
+  for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
+    const workspace = state.workspaceSnapshots[index];
+    if (index) signature += '\n';
+    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}`;
+  }
+  return signature;
+}
+
+function workspaceTabsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.workspaceSnapshots[index].id;
+  }
+  return signature;
 }
 
 function startWorkspaceTabPointerDrag(event: PointerEvent, id: string, tab: HTMLElement) {
@@ -1957,12 +3092,12 @@ function workspaceDropTargetAt(x: number, y: number, sourceId: string): Workspac
     return { targetId: direct.dataset.workspaceId, position: workspaceDropPosition(x, direct) };
   }
 
-  const tabs = Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab'))
-    .filter((tab) => tab.dataset.workspaceId && tab.dataset.workspaceId !== sourceId);
-  if (!tabs.length) return null;
-
   let best: { tab: HTMLElement; score: number } | null = null;
-  for (const tab of tabs) {
+  for (const child of el.workspaceTabs.children) {
+    if (!(child instanceof HTMLElement) || !child.classList.contains('workspace-tab')) continue;
+    const workspaceId = child.dataset.workspaceId;
+    if (!workspaceId || workspaceId === sourceId) continue;
+    const tab = child;
     const rect = tab.getBoundingClientRect();
     const verticalPenalty = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
     const horizontalPenalty = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
@@ -1983,36 +3118,40 @@ function setWorkspaceDropTarget(target: WorkspaceDropTarget | null) {
   workspaceDragState.target = target;
   clearWorkspaceDropMarkers();
   if (!target) return;
-  const tab = Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab'))
-    .find((item) => item.dataset.workspaceId === target.targetId);
+  const tab = connectedWorkspaceTabElement(target.targetId);
   tab?.classList.toggle('drop-before', target.position === 'before');
   tab?.classList.toggle('drop-after', target.position === 'after');
 }
 
 function clearWorkspaceDropMarkers() {
-  el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab').forEach((tab) => {
-    tab.classList.remove('drop-before', 'drop-after');
-  });
+  for (const child of el.workspaceTabs.children) {
+    if (child instanceof HTMLElement && child.classList.contains('workspace-tab')) {
+      child.classList.remove('drop-before', 'drop-after');
+    }
+  }
 }
 
 function reorderWorkspaceTab(sourceId: string, targetId: string, position: 'before' | 'after' = 'before') {
   if (!sourceId || !targetId || sourceId === targetId) return;
-  const sourceIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === sourceId);
+  const sourceIndex = workspaceSnapshotIndexById(sourceId);
   if (sourceIndex < 0) return;
   const [item] = state.workspaceSnapshots.splice(sourceIndex, 1);
-  const targetIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === targetId);
+  const targetIndex = workspaceSnapshotIndexById(targetId);
+  let refreshIndex = sourceIndex;
   if (targetIndex < 0) {
     state.workspaceSnapshots.push(item);
+    refreshIndex = Math.min(sourceIndex, state.workspaceSnapshots.length - 1);
   } else {
     const insertIndex = position === 'after' ? targetIndex + 1 : targetIndex;
     state.workspaceSnapshots.splice(insertIndex, 0, item);
+    refreshIndex = Math.min(sourceIndex, insertIndex);
   }
+  refreshWorkspaceSnapshotIndexLookup(refreshIndex);
   persistWorkspaceStore();
-  renderWorkspaceTabs();
 }
 
 async function toggleWorkspaceCaptureProtection(id: string) {
-  const snapshot = state.workspaceSnapshots.find((workspace) => workspace.id === id);
+  const snapshot = workspaceSnapshotForId(id);
   if (!snapshot) return;
 
   const enabled = !snapshot.captureProtected;
@@ -2071,15 +3210,17 @@ function delay(ms: number) {
 
 async function createBlankWorkspaceTab() {
   await saveAllDirtyNotes();
-  saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
   const previousId = state.activeWorkspaceId;
   const id = crypto.randomUUID();
   const insertIndex = previousId
-    ? state.workspaceSnapshots.findIndex((workspace) => workspace.id === previousId) + 1
+    ? workspaceSnapshotIndexById(previousId) + 1
     : state.workspaceSnapshots.length;
   state.workspaceCaptureProtected = false;
-  state.workspaceSnapshots.splice(clamp(insertIndex, 0, state.workspaceSnapshots.length), 0, blankWorkspaceSnapshot(id));
+  const snapshot = blankWorkspaceSnapshot(id);
+  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+  insertWorkspaceSnapshot(insertIndex, snapshot);
   state.activeWorkspaceId = id;
   await closeWorkspace();
   persistWorkspaceStore();
@@ -2089,13 +3230,14 @@ async function createBlankWorkspaceTab() {
 async function copyWorkspaceTab(id: string) {
   await saveAllDirtyNotes();
   if (id === state.activeWorkspaceId) {
-    saveActiveWorkspaceSnapshot();
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
     saveActiveWorkspaceRuntimeCache();
   }
-  const sourceIndex = state.workspaceSnapshots.findIndex((workspace) => workspace.id === id);
+  const sourceIndex = workspaceSnapshotIndexById(id);
   if (sourceIndex < 0) return;
   const clone = cloneWorkspaceSnapshotForCopy(state.workspaceSnapshots[sourceIndex]);
-  state.workspaceSnapshots.splice(sourceIndex + 1, 0, clone);
+  workspaceSnapshotSignatures.set(clone.id, workspaceSnapshotSignature(clone));
+  insertWorkspaceSnapshot(sourceIndex + 1, clone);
   state.activeWorkspaceId = clone.id;
   persistWorkspaceStore();
   if (!clone.profileId) {
@@ -2117,16 +3259,63 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
     updatedAt: new Date().toISOString(),
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
-    terminals: source.terminals.map((terminal) => ({ ...terminal, rect: terminal.rect ? { ...terminal.rect } : undefined })),
-    editorTabs: source.editorTabs.map((tab) => ({ ...tab })),
-    imageTabs: source.imageTabs.map((tab) => ({
-      ...tab,
-      history: tab.history.map((item) => ({ ...item }))
-    })),
-    noteTabs: source.noteTabs.map((tab) => ({ ...tab })),
-    browserTabs: source.browserTabs.map((tab) => ({ ...tab })),
-    calculatorHistory: source.calculatorHistory?.map((item) => ({ ...item })) ?? []
+    terminals: cloneTerminalSnapshots(source.terminals),
+    editorTabs: cloneEditorTabSnapshots(source.editorTabs),
+    imageTabs: cloneImageTabSnapshots(source.imageTabs),
+    noteTabs: cloneNoteTabSnapshots(source.noteTabs),
+    browserTabs: cloneBrowserTabSnapshots(source.browserTabs),
+    calculatorHistory: cloneCalculatorHistory(source.calculatorHistory)
   };
+}
+
+function cloneTerminalSnapshots(terminals: WorkspaceTerminalSnapshot[]) {
+  const cloned: WorkspaceTerminalSnapshot[] = [];
+  for (const terminal of terminals) {
+    cloned.push({ ...terminal, rect: terminal.rect ? { ...terminal.rect } : undefined });
+  }
+  return cloned;
+}
+
+function cloneEditorTabSnapshots(tabs: EditorTabSnapshot[]) {
+  const cloned: EditorTabSnapshot[] = [];
+  for (const tab of tabs) cloned.push({ ...tab });
+  return cloned;
+}
+
+function cloneImageTabSnapshots(tabs: ImageTabSnapshot[]) {
+  const cloned: ImageTabSnapshot[] = [];
+  for (const tab of tabs) {
+    cloned.push({
+      ...tab,
+      history: cloneImageHistoryItems(tab.history)
+    });
+  }
+  return cloned;
+}
+
+function cloneImageHistoryItems(history: PastedImageItem[] = []) {
+  const cloned: PastedImageItem[] = [];
+  for (const item of history) cloned.push({ ...item });
+  return cloned;
+}
+
+function cloneNoteTabSnapshots(tabs: NoteTabSnapshot[]) {
+  const cloned: NoteTabSnapshot[] = [];
+  for (const tab of tabs) cloned.push({ ...tab });
+  return cloned;
+}
+
+function cloneBrowserTabSnapshots(tabs: BrowserTab[]) {
+  const cloned: BrowserTab[] = [];
+  for (const tab of tabs) cloned.push({ ...tab });
+  return cloned;
+}
+
+function cloneCalculatorHistory(history: CalculatorHistoryItem[] | undefined) {
+  const cloned: CalculatorHistoryItem[] = [];
+  if (!history) return cloned;
+  for (const item of history) cloned.push({ ...item });
+  return cloned;
 }
 
 function cloneJson<T>(value: T): T {
@@ -2135,20 +3324,25 @@ function cloneJson<T>(value: T): T {
 
 async function closeWorkspaceTab(id: string) {
   const wasActive = state.activeWorkspaceId === id;
-  if (wasActive) saveActiveWorkspaceRuntimeCache();
+  if (wasActive) {
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
+    saveActiveWorkspaceRuntimeCache();
+  }
   await closeTerminalsForWorkspace(id);
   removeWorkspaceRuntimeCache(id);
-  state.workspaceSnapshots = state.workspaceSnapshots.filter((workspace) => workspace.id !== id);
+  workspaceSnapshotSignatures.delete(id);
+  removeWorkspaceSnapshotById(id);
   if (wasActive) {
     const next = state.workspaceSnapshots[0];
     if (next) {
       state.activeWorkspaceId = next.id;
-      persistWorkspaceStore();
+      renderWorkspaceTabs();
       if (!next.profileId) {
         await closeWorkspace();
         state.workspaceCaptureProtected = Boolean(next.captureProtected);
         await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
         renderWorkspaceTabs();
+        scheduleWorkspaceStorePersist();
         return;
       }
       await restoreWorkspaceSnapshot(next);
@@ -2162,18 +3356,20 @@ async function closeWorkspaceTab(id: string) {
 
 async function activateWorkspaceTab(id: string) {
   if (id === state.activeWorkspaceId && state.workspaceOpen) return;
+  const previousActiveId = state.activeWorkspaceId;
   await saveAllDirtyNotes();
-  saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
-  const snapshot = state.workspaceSnapshots.find((workspace) => workspace.id === id);
+  const snapshot = workspaceSnapshotForId(id);
   if (!snapshot) return;
   state.activeWorkspaceId = id;
-  persistWorkspaceStore();
+  renderWorkspaceTabActivation(previousActiveId, snapshot);
   if (!snapshot.profileId) {
     await closeWorkspace();
     state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
     await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
     renderWorkspaceTabs();
+    scheduleWorkspaceStorePersist();
     setStatus('Empty workspace');
     return;
   }
@@ -2216,7 +3412,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     calculatorExpression: '',
     calculatorHistory: [],
     explorerOpenMode: 'single',
-    showFileSizes: true,
+    showFileSizes: DEFAULT_SHOW_FILE_SIZES,
     editorFontSize: 13,
     terminalFontSize: 13,
     noteFontSize: 14,
@@ -2225,37 +3421,73 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
   };
 }
 
-function saveActiveWorkspaceSnapshot() {
+function saveActiveWorkspaceSnapshot(options: { immediate?: boolean; persist?: WorkspaceSnapshotPersistMode } = {}) {
   if (restoringWorkspace) return;
+  if (options.immediate) {
+    flushActiveWorkspaceSnapshotSave(options.persist ?? 'flush');
+    return;
+  }
+  scheduleActiveWorkspaceSnapshotSave();
+}
+
+function scheduleActiveWorkspaceSnapshotSave(delayMs = WORKSPACE_SNAPSHOT_DEBOUNCE_MS) {
+  if (workspaceSnapshotTimer) return;
+  workspaceSnapshotTimer = window.setTimeout(() => {
+    workspaceSnapshotTimer = 0;
+    const delay = workspaceSnapshotSaveDelayMs();
+    if (delay > 0) {
+      scheduleActiveWorkspaceSnapshotSave(delay);
+      return;
+    }
+    writeActiveWorkspaceSnapshot('defer');
+  }, delayMs);
+}
+
+function workspaceSnapshotSaveDelayMs() {
+  return workspacePersistenceBusyDelayMs();
+}
+
+function flushActiveWorkspaceSnapshotSave(persistMode: WorkspaceSnapshotPersistMode = 'flush') {
+  if (workspaceSnapshotTimer) {
+    window.clearTimeout(workspaceSnapshotTimer);
+    workspaceSnapshotTimer = 0;
+  }
+  writeActiveWorkspaceSnapshot(persistMode);
+}
+
+function writeActiveWorkspaceSnapshot(persistMode: WorkspaceSnapshotPersistMode) {
   if (!state.activeWorkspaceId || !state.activeProfile || !state.workspaceOpen) {
-    persistWorkspaceStore();
+    commitWorkspaceStorePersist(persistMode);
     return;
   }
 
-  syncActiveEditorTabFromView();
   syncActiveImageTabFromState();
-  const snapshot = createCurrentWorkspaceSnapshot(state.activeWorkspaceId);
-  const index = state.workspaceSnapshots.findIndex((workspace) => workspace.id === snapshot.id);
-  if (index >= 0) state.workspaceSnapshots[index] = snapshot;
-  else state.workspaceSnapshots.unshift(snapshot);
-  persistWorkspaceStore();
+  const index = workspaceSnapshotIndexById(state.activeWorkspaceId);
+  const snapshot = createCurrentWorkspaceSnapshot(state.activeWorkspaceId, state.workspaceSnapshots[index]?.updatedAt);
+  const signature = workspaceSnapshotSignature(snapshot);
+  if (workspaceSnapshotSignatures.get(snapshot.id) === signature) {
+    if (persistMode === 'flush' && workspacePersistTimer) flushWorkspaceStorePersist();
+    return;
+  }
+  snapshot.updatedAt = new Date().toISOString();
+  workspaceSnapshotSignatures.set(snapshot.id, signature);
+  if (index >= 0) replaceWorkspaceSnapshot(index, snapshot);
+  else insertWorkspaceSnapshot(0, snapshot);
+  commitWorkspaceStorePersist(persistMode);
 }
 
-function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): WorkspaceSnapshot {
+function commitWorkspaceStorePersist(persistMode: WorkspaceSnapshotPersistMode) {
+  if (persistMode === 'flush') flushWorkspaceStorePersist();
+  else if (persistMode === 'defer') scheduleWorkspaceStorePersist();
+}
+
+function createCurrentWorkspaceSnapshot(
+  id: string = crypto.randomUUID(),
+  updatedAt = activeWorkspaceSnapshot()?.updatedAt ?? new Date().toISOString()
+): WorkspaceSnapshot {
   const profile = state.activeProfile!;
-  const workspaceTerminals = activeWorkspaceTerminalPanes();
-  const activeTerminalIndex = Math.max(0, workspaceTerminals.findIndex((pane) => pane.paneId === state.activePaneId));
-  const editorTabs = state.editorTabs
-    .map((tab) => {
-      const path = tab.file?.path ?? tab.pendingPath;
-      if (!path) return null;
-      return {
-        id: tab.id,
-        path,
-        rawMode: tab.file?.rawMode ?? Boolean(tab.pendingRawMode)
-      };
-    })
-    .filter((tab): tab is EditorTabSnapshot => Boolean(tab));
+  const terminalSnapshotState = currentWorkspaceTerminalSnapshotState();
+  const editorTabs = currentEditorTabSnapshots();
   return {
     id,
     label: workspaceLabel(profile, state.workspaceRoot || state.currentDir || profile.root),
@@ -2264,48 +3496,32 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
     currentDir: state.currentDir || state.workspaceRoot,
     workspaceOpen: state.workspaceOpen,
     captureProtected: state.workspaceCaptureProtected,
-    updatedAt: new Date().toISOString(),
+    updatedAt,
     panels: snapshotPanels(),
-    terminalSpawnRect: currentTerminalSpawnRect(),
-    terminals: workspaceTerminals.map((pane) => ({
-      title: pane.title.replace(/\s+\(exited\)$/i, ''),
-      command: pane.command,
-      widgetId: pane.widgetId,
-      profileId: pane.profileId,
-      cwd: pane.cwd,
-      rect: elementLayoutRatio(pane.element)
-    })),
-    activeTerminalIndex,
+    terminalSpawnRect: terminalSnapshotState.terminalSpawnRect,
+    terminals: terminalSnapshotState.terminals,
+    activeTerminalIndex: terminalSnapshotState.activeTerminalIndex,
     editorTabs,
     activeEditorTabId: state.activeEditorTabId,
     editorOpenInNewTab: state.editorOpenInNewTab,
     editorWordWrap: state.editorWordWrap,
-    imageTabs: state.imageTabs
-      .filter((tab) => tab.dataUrl || tab.sourcePath)
-      .map((tab) => ({
-        id: tab.id,
-        sourcePath: tab.sourcePath,
-        dataUrl: tab.dataUrl,
-        label: tab.label,
-        history: tab.history.slice(0, 24),
-        historyVisible: tab.historyVisible
-      })),
+    imageTabs: currentImageTabSnapshots(),
     activeImageTabId: state.activeImageTabId,
     imageOpenInNewTab: state.imageOpenInNewTab,
-    noteTabs: state.noteTabs.map((tab) => ({ id: tab.id, path: tab.path, title: tab.title, theme: tab.theme })),
+    noteTabs: currentNoteTabSnapshots(),
     activeNoteTabId: state.activeNoteTabId,
     notePinned: state.notePinned,
     noteOpacity,
-    browserTabs: state.browserTabs.map((tab) => ({ id: tab.id, url: tab.url, label: tab.label })),
+    browserTabs: currentBrowserTabSnapshots(),
     activeBrowserTabId: state.activeBrowserTabId,
-    browserDeviceId: el.browserShell.classList.contains('desktop') ? 'desktop' : state.browserDeviceId,
+    browserDeviceId: state.browserDeviceId,
     browserOrientation: state.browserOrientation,
     browserConsoleVisible: state.browserConsoleVisible,
     browserConsolePosition: state.browserConsolePosition,
     browserConsoleSize: state.browserConsoleSize,
     browserZoom: state.browserZoom,
     calculatorExpression: state.calculatorExpression,
-    calculatorHistory: state.calculatorHistory.slice(0, 20),
+    calculatorHistory: currentCalculatorHistorySnapshot(),
     explorerOpenMode: state.explorerOpenMode,
     showFileSizes: state.showFileSizes,
     editorFontSize,
@@ -2316,42 +3532,309 @@ function createCurrentWorkspaceSnapshot(id: string = crypto.randomUUID()): Works
   };
 }
 
+function currentEditorTabSnapshots() {
+  const tabs: EditorTabSnapshot[] = [];
+  for (const tab of state.editorTabs) {
+    const path = tab.file?.path ?? tab.pendingPath;
+    if (!path) continue;
+    tabs.push({
+      id: tab.id,
+      path,
+      rawMode: tab.file?.rawMode ?? Boolean(tab.pendingRawMode)
+    });
+  }
+  return tabs;
+}
+
+function currentImageTabSnapshots() {
+  const tabs: ImageTabSnapshot[] = [];
+  for (const tab of state.imageTabs) {
+    if (!tab.dataUrl && !tab.sourcePath) continue;
+    tabs.push({
+      id: tab.id,
+      sourcePath: tab.sourcePath,
+      dataUrl: tab.dataUrl,
+      label: tab.label,
+      history: currentImageHistorySnapshot(tab.history),
+      historyVisible: tab.historyVisible
+    });
+  }
+  return tabs;
+}
+
+function currentImageHistorySnapshot(history: PastedImageItem[]) {
+  const snapshot: PastedImageItem[] = [];
+  const limit = Math.min(history.length, 24);
+  for (let index = 0; index < limit; index += 1) snapshot.push(history[index]);
+  return snapshot;
+}
+
+function currentNoteTabSnapshots() {
+  const tabs: NoteTabSnapshot[] = [];
+  for (const tab of state.noteTabs) {
+    tabs.push({ id: tab.id, path: tab.path, title: tab.title, theme: tab.theme });
+  }
+  return tabs;
+}
+
+function currentBrowserTabSnapshots() {
+  const tabs: BrowserTab[] = [];
+  for (const tab of state.browserTabs) {
+    tabs.push({ id: tab.id, url: tab.url, label: tab.label });
+  }
+  return tabs;
+}
+
+function currentCalculatorHistorySnapshot() {
+  const snapshot: CalculatorHistoryItem[] = [];
+  const limit = Math.min(state.calculatorHistory.length, 20);
+  for (let index = 0; index < limit; index += 1) snapshot.push(state.calculatorHistory[index]);
+  return snapshot;
+}
+
+function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
+  let signature = workspaceSignaturePart(snapshot.id);
+  signature += `|${workspaceSignaturePart(snapshot.label)}`;
+  signature += `|${workspaceSignaturePart(snapshot.profileId)}`;
+  signature += `|${workspaceSignaturePart(snapshot.root)}`;
+  signature += `|${workspaceSignaturePart(snapshot.currentDir)}`;
+  signature += `|${snapshot.workspaceOpen ? '1' : '0'}`;
+  signature += `|${snapshot.captureProtected ? '1' : '0'}`;
+  signature += `|${workspacePanelsSignature(snapshot.panels)}`;
+  signature += `|${layoutRatioSignature(snapshot.terminalSpawnRect)}`;
+  signature += `|${terminalSnapshotsSignature(snapshot.terminals)}`;
+  signature += `|${String(snapshot.activeTerminalIndex)}`;
+  signature += `|${editorTabSnapshotsSignature(snapshot.editorTabs)}`;
+  signature += `|${workspaceSignaturePart(snapshot.activeEditorTabId)}`;
+  signature += `|${snapshot.editorOpenInNewTab ? '1' : '0'}`;
+  signature += `|${snapshot.editorWordWrap ? '1' : '0'}`;
+  signature += `|${imageTabSnapshotsSignature(snapshot.id, snapshot.imageTabs)}`;
+  signature += `|${workspaceSignaturePart(snapshot.activeImageTabId)}`;
+  signature += `|${snapshot.imageOpenInNewTab ? '1' : '0'}`;
+  signature += `|${noteTabSnapshotsSignature(snapshot.noteTabs)}`;
+  signature += `|${workspaceSignaturePart(snapshot.activeNoteTabId)}`;
+  signature += `|${snapshot.notePinned ? '1' : '0'}`;
+  signature += `|${String(snapshot.noteOpacity)}`;
+  signature += `|${browserTabSnapshotsSignature(snapshot.browserTabs)}`;
+  signature += `|${workspaceSignaturePart(snapshot.activeBrowserTabId)}`;
+  signature += `|${workspaceSignaturePart(snapshot.browserDeviceId)}`;
+  signature += `|${workspaceSignaturePart(snapshot.browserOrientation)}`;
+  signature += `|${snapshot.browserConsoleVisible ? '1' : '0'}`;
+  signature += `|${workspaceSignaturePart(snapshot.browserConsolePosition)}`;
+  signature += `|${String(snapshot.browserConsoleSize ?? '')}`;
+  signature += `|${String(snapshot.browserZoom ?? '')}`;
+  signature += `|${workspaceSignaturePart(snapshot.calculatorExpression)}`;
+  signature += `|${calculatorSnapshotHistorySignature(snapshot.calculatorHistory)}`;
+  signature += `|${workspaceSignaturePart(snapshot.explorerOpenMode)}`;
+  signature += `|${snapshot.showFileSizes ? '1' : '0'}`;
+  signature += `|${String(snapshot.editorFontSize)}`;
+  signature += `|${String(snapshot.terminalFontSize)}`;
+  signature += `|${String(snapshot.noteFontSize)}`;
+  signature += `|${String(snapshot.calculatorFontSize)}`;
+  signature += `|${String(snapshot.ideScale)}`;
+  return signature;
+}
+
+function workspacePanelsSignature(panels: WorkspaceSnapshot['panels']) {
+  let signature = '';
+  for (let index = 0; index < FLOATING_PANELS.length; index += 1) {
+    const id = FLOATING_PANELS[index];
+    const panel = panels?.[id];
+    if (index) signature += ';';
+    signature += `${id}:${panel?.visible ? '1' : '0'}:${layoutRatioSignature(panel?.rect)}`;
+  }
+  return signature;
+}
+
+function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
+  let signature = '';
+  for (let index = 0; index < terminals.length; index += 1) {
+    if (index) signature += ';';
+    signature += terminalSnapshotSignature(terminals[index]);
+  }
+  return signature;
+}
+
+function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
+  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${layoutRatioSignature(terminal.rect)}`;
+}
+
+function editorTabSnapshotsSignature(tabs: WorkspaceSnapshot['editorTabs']) {
+  let signature = '';
+  for (let index = 0; index < tabs.length; index += 1) {
+    const tab = tabs[index];
+    if (index) signature += ';';
+    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.path)},${tab.rawMode ? '1' : '0'}`;
+  }
+  return signature;
+}
+
+function imageTabSnapshotsSignature(workspaceId: string, tabs: WorkspaceSnapshot['imageTabs']) {
+  let signature = '';
+  for (let index = 0; index < tabs.length; index += 1) {
+    if (index) signature += ';';
+    signature += imageSnapshotSignature(workspaceId, tabs[index]);
+  }
+  return signature;
+}
+
+function imageSnapshotSignature(workspaceId: string, tab: ImageTabSnapshot) {
+  return `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.sourcePath ?? '')},${workspaceImageSignaturePart(workspaceId, `tab:${tab.id}`, tab.dataUrl)},${workspaceSignaturePart(tab.label)},${imageSnapshotHistorySignature(workspaceId, tab)},${tab.historyVisible ? '1' : '0'}`;
+}
+
+function imageSnapshotHistorySignature(workspaceId: string, tab: ImageTabSnapshot) {
+  let signature = '';
+  for (let index = 0; index < tab.history.length; index += 1) {
+    const item = tab.history[index];
+    if (index) signature += ':';
+    signature += `${workspaceSignaturePart(item.id)},${workspaceSignaturePart(item.path)},${workspaceSignaturePart(item.tag)},${workspaceSignaturePart(item.createdAt)},${workspaceImageSignaturePart(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl)}`;
+  }
+  return signature;
+}
+
+function noteTabSnapshotsSignature(tabs: WorkspaceSnapshot['noteTabs']) {
+  let signature = '';
+  for (let index = 0; index < tabs.length; index += 1) {
+    const tab = tabs[index];
+    if (index) signature += ';';
+    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.path)},${workspaceSignaturePart(tab.title)},${workspaceSignaturePart(tab.theme)}`;
+  }
+  return signature;
+}
+
+function browserTabSnapshotsSignature(tabs: WorkspaceSnapshot['browserTabs']) {
+  let signature = '';
+  for (let index = 0; index < tabs.length; index += 1) {
+    const tab = tabs[index];
+    if (index) signature += ';';
+    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.url)},${workspaceSignaturePart(tab.label)}`;
+  }
+  return signature;
+}
+
+function calculatorSnapshotHistorySignature(history?: WorkspaceSnapshot['calculatorHistory']) {
+  if (!history?.length) return '';
+  let signature = '';
+  for (let index = 0; index < history.length; index += 1) {
+    const item = history[index];
+    if (index) signature += ';';
+    signature += `${workspaceSignaturePart(item.id)},${workspaceSignaturePart(item.expression)},${workspaceSignaturePart(item.result)}`;
+  }
+  return signature;
+}
+
+function workspaceImageSignaturePart(workspaceId: string, scope: string, dataUrl: string) {
+  if (!dataUrl) return '';
+  if (dataUrl.startsWith(WORKSPACE_IMAGE_REF_PREFIX)) return dataUrl.slice(WORKSPACE_IMAGE_REF_PREFIX.length);
+  if (!dataUrl.startsWith('data:image/')) return workspaceSignaturePart(dataUrl);
+  return imageRefKeyForDataUrl(workspaceId, scope, dataUrl);
+}
+
+function layoutRatioSignature(rect?: LayoutRatio) {
+  if (!rect) return '';
+  return `${rect.left.toFixed(5)},${rect.top.toFixed(5)},${rect.width.toFixed(5)},${rect.height.toFixed(5)}`;
+}
+
+function workspaceSignaturePart(value: unknown) {
+  const text = String(value ?? '');
+  if (text.length < STRING_FINGERPRINT_MIN_LENGTH) return JSON.stringify(text);
+  return stringFingerprint(text);
+}
+
+function stringFingerprint(value: string) {
+  const cached = stringFingerprintCache.get(value);
+  if (cached) return cached;
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  const signature = `${value.length}:${(hash >>> 0).toString(36)}`;
+  stringFingerprintCache.set(value, signature);
+  while (stringFingerprintCache.size > STRING_FINGERPRINT_CACHE_LIMIT) {
+    const oldest = stringFingerprintCache.keys().next().value;
+    if (oldest === undefined) break;
+    stringFingerprintCache.delete(oldest);
+  }
+  return signature;
+}
+
 function snapshotPanels() {
   const panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>> = {};
   for (const id of FLOATING_PANELS) {
     const panel = getPanel(id);
     panels[id] = {
       visible: !panel.classList.contains('hidden'),
-      rect: elementLayoutRatio(panel)
+      rect: elementLayoutRatio(panel, { preferCache: true })
     };
   }
   return panels;
 }
 
-function currentTerminalSpawnRect() {
-  const widget = activeTerminalWidget();
-  return widget ? elementLayoutRatio(widget.element) : activeWorkspaceSnapshot()?.terminalSpawnRect;
+function currentWorkspaceTerminalSnapshotState(): Pick<
+  WorkspaceSnapshot,
+  'terminals' | 'activeTerminalIndex' | 'terminalSpawnRect'
+> {
+  const terminals: WorkspaceSnapshot['terminals'] = [];
+  let activeTerminalIndex = -1;
+  let firstWidget: TerminalWidget | null = null;
+  let activeWidget: TerminalWidget | null = null;
+  for (const pane of state.terminals) {
+    if (pane.workspaceId !== state.activeWorkspaceId) continue;
+    if (!firstWidget) firstWidget = terminalWidgetForPane(pane);
+    if (pane.paneId === state.activePaneId) {
+      activeTerminalIndex = terminals.length;
+      activeWidget = terminalWidgetForPane(pane);
+    }
+    terminals.push({
+      title: pane.title.replace(/\s+\(exited\)$/i, ''),
+      command: pane.command,
+      widgetId: pane.widgetId,
+      profileId: pane.profileId,
+      cwd: pane.cwd,
+      rect: elementLayoutRatio(pane.element, { preferCache: true })
+    });
+  }
+  const spawnWidget = activeWidget ?? firstWidget ?? firstActiveWorkspaceTerminalWidget();
+  return {
+    terminals,
+    activeTerminalIndex: Math.max(0, activeTerminalIndex),
+    terminalSpawnRect: spawnWidget
+      ? elementLayoutRatio(spawnWidget.element, { preferCache: true })
+      : activeWorkspaceSnapshot()?.terminalSpawnRect
+  };
 }
 
 function activeWorkspaceSnapshot() {
-  return state.workspaceSnapshots.find((workspace) => workspace.id === state.activeWorkspaceId);
+  return workspaceSnapshotForId(state.activeWorkspaceId);
 }
 
 function saveActiveWorkspaceRuntimeCache() {
   if (!state.activeWorkspaceId || !state.workspaceOpen) return;
+  const workspaceId = state.activeWorkspaceId;
   syncActiveEditorTabFromView();
-  workspaceRuntimeCache.set(state.activeWorkspaceId, {
-    editorTabs: cloneEditorTabs(state.editorTabs),
+  workspaceRuntimeCache.set(workspaceId, {
+    editorTabs: snapshotEditorTabsForRuntime(state.editorTabs),
     activeEditorTabId: state.activeEditorTabId,
-    explorer: cloneExplorerRuntimeCache(),
-    browserTabs: state.browserTabs.map((tab) => normalizeBrowserTabForCurrentMode(tab)),
+    explorer: snapshotExplorerRuntimeCache(),
+    browserTabs: snapshotBrowserTabsForRuntime(),
     activeBrowserTabId: state.activeBrowserTabId,
     previewUrl: state.previewUrl,
-    previewProxies: USE_PREVIEW_PROXY_BROWSER ? state.previewProxies.map((proxy) => ({ ...proxy })) : [],
-    browserConsoleLogs: state.browserConsoleLogs.slice(-200).map((log) => ({ ...log }))
+    previewProxies: snapshotPreviewProxiesForRuntime(),
+    browserConsoleLogs: snapshotBrowserConsoleLogsForRuntime()
   });
-  hideBrowserFramesForWorkspace(state.activeWorkspaceId);
-  if (activeEdgeCdp && state.browserTabs.some((tab) => tab.id === activeEdgeCdp?.tabId)) {
+  clearExplorerBackgroundWork();
+  if (hasBrowserFramesForWorkspace(workspaceId)) {
+    hideBrowserFramesForWorkspace(workspaceId);
+    if (isBrowserPanelHidden() || document.hidden) {
+      suspendBrowserFramesForWorkspace(workspaceId, { includeActive: true });
+    } else {
+      scheduleBrowserWorkspaceFrameSuspend(workspaceId, {
+        includeActive: true
+      });
+    }
+  }
+  if (activeEdgeCdp && browserTabForId(activeEdgeCdp.tabId)) {
     disconnectActiveEdgeCdp();
     setEdgePreviewVisible(false);
   }
@@ -2362,9 +3845,11 @@ function restoreWorkspaceRuntimeCache(workspaceId: string) {
 }
 
 function removeWorkspaceRuntimeCache(workspaceId: string) {
+  cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
   const cached = workspaceRuntimeCache.get(workspaceId);
   if (cached) {
     for (const proxy of cached.previewProxies) {
+      previewProxyProbeAt.delete(proxy.id);
       void api.stopPortForward(proxy.id).catch(() => undefined);
     }
   }
@@ -2373,37 +3858,59 @@ function removeWorkspaceRuntimeCache(workspaceId: string) {
   clearBrowserFrames(workspaceId);
 }
 
-function cloneEditorTabs(tabs: EditorTabState[]) {
-  return tabs.map((tab) => ({
-    id: tab.id,
-    file: tab.file ? cloneOpenFile(tab.file) : null,
-    pendingPath: tab.pendingPath,
-    pendingRawMode: tab.pendingRawMode,
-    pendingProfileId: tab.pendingProfileId,
-    loading: false
-  }));
+function snapshotEditorTabsForRuntime(tabs: EditorTabState[]) {
+  const snapshot: EditorTabState[] = [];
+  for (const tab of tabs) snapshot.push(tab);
+  return snapshot;
 }
 
-function cloneOpenFile(file: OpenFileState): OpenFileState {
-  return {
-    path: file.path,
-    content: file.content,
-    draftContent: file.draftContent,
-    masked: file.masked,
-    rawMode: file.rawMode,
-    lines: file.lines.map((line) => ({ ...line })),
-    dirty: file.dirty
-  };
+function snapshotBrowserTabsForRuntime() {
+  if (!state.browserTabs.length) return [];
+  const tabs: BrowserTab[] = [];
+  for (const tab of state.browserTabs) tabs.push(normalizeBrowserTabForCurrentMode(tab));
+  return tabs;
 }
 
-function cloneExplorerRuntimeCache(): ExplorerRuntimeCache {
+function snapshotPreviewProxiesForRuntime() {
+  if (!USE_PREVIEW_PROXY_BROWSER || !state.previewProxies.length) return [];
+  const proxies: PortForwardResult[] = [];
+  for (const proxy of state.previewProxies) proxies.push({ ...proxy });
+  return proxies;
+}
+
+function snapshotBrowserConsoleLogsForRuntime() {
+  if (!state.browserConsoleLogs.length) return [];
+  return browserConsoleLogTail(state.browserConsoleLogs, browserConsoleRuntimeLogLimit());
+}
+
+function browserConsoleRuntimeLogLimit(visible = browserConsoleActuallyVisible()) {
+  return visible ? BROWSER_CONSOLE_LOG_LIMIT : BROWSER_CONSOLE_HIDDEN_LOG_LIMIT;
+}
+
+function browserConsoleLogTail(logs: BrowserConsoleLog[], limit: number) {
+  if (logs.length <= limit) {
+    const copied: BrowserConsoleLog[] = [];
+    for (const log of logs) copied.push(log);
+    return copied;
+  }
+  const copied: BrowserConsoleLog[] = [];
+  for (let index = logs.length - limit; index < logs.length; index += 1) {
+    copied.push(logs[index]);
+  }
+  return copied;
+}
+
+function appendBrowserConsoleLogEntries(target: BrowserConsoleLog[], entries: BrowserConsoleLog[]) {
+  for (let index = 0; index < entries.length; index += 1) target.push(entries[index]);
+}
+
+function snapshotExplorerRuntimeCache(): ExplorerRuntimeCache {
   return {
     currentDir: state.currentDir,
-    entries: cloneExplorerEntries(state.entries),
-    expanded: Array.from(state.explorerExpanded),
-    children: Array.from(state.explorerChildren.entries())
-      .map(([path, entries]) => [path, cloneExplorerEntries(entries)]),
-    signatures: Array.from(state.explorerSignatures.entries()),
+    entries: state.entries,
+    expanded: state.explorerExpanded,
+    children: state.explorerChildren,
+    signatures: state.explorerSignatures,
     selectedPath: state.explorerSelectedPath
   };
 }
@@ -2411,40 +3918,67 @@ function cloneExplorerRuntimeCache(): ExplorerRuntimeCache {
 function restoreExplorerRuntimeCache(workspaceId: string, currentDir: string) {
   const cached = restoreWorkspaceRuntimeCache(workspaceId)?.explorer;
   if (!cached || !sameExplorerPath(cached.currentDir, currentDir)) return false;
-  state.entries = cloneExplorerEntries(cached.entries);
+  state.entries = cached.entries;
   state.currentDir = cached.currentDir;
-  state.explorerExpanded = new Set(cached.expanded);
-  state.explorerChildren = new Map(cached.children.map(([path, entries]) => [path, cloneExplorerEntries(entries)]));
+  state.explorerExpanded = cached.expanded;
+  state.explorerChildren = cached.children;
+  markExplorerEntryLookupDirty();
   state.explorerLoading = new Set();
-  state.explorerSignatures = new Map(cached.signatures);
+  state.explorerSignatures = cached.signatures;
   state.explorerSelectedPath = cached.selectedPath;
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   renderExplorer();
   refreshTitle();
-  void refreshExplorerDirectory(currentDir, state.activeProfile?.id ?? '', state.activeWorkspaceId, true, true)
-    .catch(() => undefined);
+  if (!getPanel('explorer').classList.contains('hidden')) {
+    scheduleCachedExplorerDirectoryRefresh(currentDir, state.activeProfile?.id ?? '', state.activeWorkspaceId, {
+      force: true,
+      requireCurrentDir: true
+    });
+    queueVisibleExplorerDirectoryPrefetch(900);
+  }
   return true;
 }
 
+function deferExplorerDirectoryRestore(path: string, profileId: string, workspaceId: string) {
+  const cached = cachedExplorerDirectory(profileId, path, workspaceId);
+  if (cached) {
+    applyLoadedDirectory(path, cached);
+    return;
+  }
+  state.entries = [];
+  state.currentDir = path;
+  state.explorerExpanded = new Set();
+  state.explorerChildren = new Map();
+  markExplorerEntryLookupDirty();
+  state.explorerLoading = new Set();
+  state.explorerSignatures = new Map();
+  state.explorerSelectedPath = '';
+  state.explorerTypeahead = '';
+  state.explorerTypeaheadAt = 0;
+  explorerRenderDirty = true;
+  refreshTitle();
+}
+
 async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
-  const profile = state.profiles.find((item) => item.id === snapshot.profileId) ?? null;
+  const profile = profileForId(snapshot.profileId);
   if (!profile) {
     setStatus(`Workspace profile is unavailable: ${snapshot.label}`, true);
     return;
   }
 
+  const terminalRestoreToken = ++workspaceTerminalRestoreToken;
   restoringWorkspace = true;
   try {
     hideAllTerminalWidgets();
-    clearWorkspacePanels();
+    clearWorkspacePanels({ skipIntermediateRenders: true });
     state.activeProfile = profile;
     state.workspaceRoot = snapshot.root || profile.root;
     state.currentDir = snapshot.currentDir || state.workspaceRoot;
     state.workspaceOpen = true;
     state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
     state.explorerOpenMode = snapshot.explorerOpenMode ?? 'single';
-    state.showFileSizes = snapshot.showFileSizes ?? true;
+    state.showFileSizes = snapshot.showFileSizes ?? DEFAULT_SHOW_FILE_SIZES;
     state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
     state.editorWordWrap = Boolean(snapshot.editorWordWrap);
     state.imageOpenInNewTab = Boolean(snapshot.imageOpenInNewTab);
@@ -2460,27 +3994,32 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     noteFontSize = clamp(snapshot.noteFontSize || 14, 10, 28);
     calculatorFontSize = clamp(snapshot.calculatorFontSize || 15, 10, 28);
     ideScale = clamp(snapshot.ideScale || 1, 0.72, 1.45);
-    document.documentElement.style.setProperty('--editor-font-size', `${editorFontSize}px`);
-    document.documentElement.style.setProperty('--ide-scale', ideScale.toFixed(3));
+    setRootStyleProperty('--editor-font-size', `${editorFontSize}px`);
+    setRootStyleProperty('--ide-scale', ideScale.toFixed(3));
     applyNoteFontSize();
     applyNoteOpacity();
     applyCalculatorFontSize();
     applyBrowserConsoleSize();
     applyBrowserZoom();
-    el.profileSelect.value = profile.id;
-    el.rootInput.value = state.workspaceRoot;
-    el.rootInput.placeholder = profile.kind === 'ssh' ? 'remote working directory' : 'working directory';
-    el.editorOpenNewTab.checked = state.editorOpenInNewTab;
-    el.editorWordWrap.checked = state.editorWordWrap;
-    el.imageOpenNewTab.checked = state.imageOpenInNewTab;
+    setInputValueIfChanged(el.profileSelect, profile.id);
+    setInputValueIfChanged(el.rootInput, state.workspaceRoot);
+    const rootPlaceholder = profile.kind === 'ssh' ? 'remote working directory' : 'working directory';
+    if (el.rootInput.placeholder !== rootPlaceholder) el.rootInput.placeholder = rootPlaceholder;
+    setCheckedIfChanged(el.editorOpenNewTab, state.editorOpenInNewTab);
+    setCheckedIfChanged(el.editorWordWrap, state.editorWordWrap);
+    setCheckedIfChanged(el.imageOpenNewTab, state.imageOpenInNewTab);
     updateExplorerOpenMode();
     updateExplorerFileSizeMode();
     await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
 
     setWorkspaceOpen(true, { preserveVisibility: true });
     restorePanelSnapshots(snapshot.panels);
-    renderCalculator();
+    if (isPanelVisible('calculator')) renderCalculator();
+    if (isPanelVisible('settings')) renderSettings();
     refreshTitle();
+    setStatus(`Switching workspace: ${snapshot.label}`);
+    await yieldToUi();
+    if (state.activeWorkspaceId !== snapshot.id) return;
 
     const hasLiveTerminals = state.terminals.some((pane) => pane.workspaceId === snapshot.id);
     if (hasLiveTerminals) {
@@ -2488,64 +4027,110 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
       await nextAnimationFrame();
     }
 
-    if (!restoreExplorerRuntimeCache(snapshot.id, state.currentDir)) {
+    const explorerRuntimeRestored = restoreExplorerRuntimeCache(snapshot.id, state.currentDir);
+    if (!explorerRuntimeRestored && isPanelVisible('explorer')) {
       await openWorkspace(state.currentDir);
+    } else if (!explorerRuntimeRestored) {
+      deferExplorerDirectoryRestore(state.currentDir, profile.id, snapshot.id);
     }
+    await yieldToUi();
+    if (state.activeWorkspaceId !== snapshot.id) return;
     await restoreEditorTabs(snapshot);
     restoreImageTabs(snapshot);
     await restoreNoteTabs(snapshot);
     restoreBrowserState(snapshot);
 
-    if (!hasLiveTerminals) await restoreWorkspaceTerminals(snapshot, profile);
+    if (!hasLiveTerminals) scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken);
     refreshTitle();
-    setStatus(`Workspace loaded: ${snapshot.label}`);
+    setStatus(`Workspace loaded: ${snapshot.label}${hasLiveTerminals ? '' : ' (shells starting)'}`);
   } finally {
     restoringWorkspace = false;
-    saveActiveWorkspaceSnapshot();
+    scheduleActiveWorkspaceSnapshotSave(WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS);
   }
+}
+
+function scheduleWorkspaceTerminalRestore(
+  snapshot: WorkspaceSnapshot,
+  profile: ConnectionProfile,
+  token: number
+) {
+  runWhenUiIdle(() => {
+    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
+    void restoreWorkspaceTerminals(snapshot, profile, { token })
+      .then(() => {
+        if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
+        refreshTitle();
+        renderShellTabs();
+        saveActiveWorkspaceSnapshot();
+      })
+      .catch((error) => {
+        if (isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) {
+          setStatus(`Terminal restore failed: ${String(error)}`, true);
+        }
+      });
+  }, 650);
+}
+
+function isWorkspaceTerminalRestoreCurrent(workspaceId: string, token?: number) {
+  return token === undefined
+    || (token === workspaceTerminalRestoreToken && state.activeWorkspaceId === workspaceId && state.workspaceOpen);
 }
 
 function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
   for (const id of FLOATING_PANELS) {
     const panel = getPanel(id);
     const snapshot = panels?.[id];
-    if (snapshot?.rect) applyLayoutRatio(panel, snapshot.rect);
-    setPanelVisible(id, snapshot?.visible ?? DEFAULT_PANEL_VISIBILITY[id], { skipSave: true });
+    const wasHidden = panel.classList.contains('hidden');
+    const visible = snapshot?.visible ?? DEFAULT_PANEL_VISIBILITY[id];
+    if (snapshot?.rect) layoutRatios.set(panel, snapshot.rect);
+    setPanelVisible(id, visible, { skipSave: true, skipFocus: true });
+    if (visible && !wasHidden && snapshot?.rect) applyLayoutRatio(panel, snapshot.rect);
   }
 }
 
-async function restoreWorkspaceTerminals(snapshot: WorkspaceSnapshot, profile: ConnectionProfile) {
+async function restoreWorkspaceTerminals(
+  snapshot: WorkspaceSnapshot,
+  profile: ConnectionProfile,
+  options: { token?: number } = {}
+) {
+  if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
   showTerminalWidgetsForWorkspace(snapshot.id);
-  const livePanes = activeWorkspaceTerminalPanes();
-  if (!livePanes.length) {
+  if (!hasActiveWorkspaceTerminalPane()) {
     const terminalSnapshots = (snapshot.terminals ?? []).length
       ? snapshot.terminals
       : [{ title: 'shell', command: null, rect: undefined }];
     const widgetsBySnapshotId = new Map<string, TerminalWidget>();
     for (const terminal of terminalSnapshots) {
-      const terminalProfile = state.profiles.find((item) => item.id === terminal.profileId) ?? profile;
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+      const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
       const widgetKey = terminal.widgetId || crypto.randomUUID();
       const existingWidget = widgetsBySnapshotId.get(widgetKey);
       if (existingWidget) {
         await createTerminalTab(existingWidget, terminal.command, terminal.title || 'shell', {
           focus: false,
           profile: terminalProfile,
-          cwd: terminal.cwd || workspaceShellCwd()
+          cwd: terminal.cwd || workspaceShellCwd(),
+          skipSnapshotSave: true
         });
       } else {
         const widget = await createTerminal(terminal.command, terminal.title || 'shell', {
           rect: terminal.rect,
           focus: false,
           profile: terminalProfile,
-          cwd: terminal.cwd || workspaceShellCwd()
+          cwd: terminal.cwd || workspaceShellCwd(),
+          skipSnapshotSave: true
         });
         if (widget) widgetsBySnapshotId.set(widgetKey, widget);
       }
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
+        hideTerminalWidgetsForWorkspace(snapshot.id);
+        return;
+      }
+      await yieldToUi();
     }
   }
 
-  const panes = activeWorkspaceTerminalPanes();
-  const active = panes[clamp(snapshot.activeTerminalIndex || 0, 0, Math.max(0, panes.length - 1))];
+  const active = activeWorkspaceTerminalPaneAtClamped(snapshot.activeTerminalIndex || 0);
   if (active) {
     setActivePane(active.paneId);
     bringPanelToFront(active.element);
@@ -2558,33 +4143,81 @@ async function restoreWorkspaceTerminals(snapshot: WorkspaceSnapshot, profile: C
 async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
   if (runtime?.editorTabs.length) {
-    state.editorTabs = cloneEditorTabs(runtime.editorTabs);
-    state.activeEditorTabId = state.editorTabs.some((tab) => tab.id === runtime.activeEditorTabId)
+    state.editorTabs = snapshotEditorTabsForRuntime(runtime.editorTabs);
+    rebuildEditorTabLookup();
+    state.activeEditorTabId = editorTabForId(runtime.activeEditorTabId)
       ? runtime.activeEditorTabId
       : state.editorTabs[0].id;
     state.openFile = activeEditorTab().file;
-    renderEditorTabs();
-    renderEditor();
+    if (isEditorPanelVisible()) {
+      renderEditorTabs();
+      renderEditor();
+    } else {
+      destroyCodeEditorView();
+    }
     return;
   }
 
-  state.editorTabs = (snapshot.editorTabs ?? []).map((tab) => ({
-    id: tab.id || crypto.randomUUID(),
-    file: null,
-    pendingPath: tab.path,
-    pendingRawMode: tab.rawMode,
-    pendingProfileId: snapshot.profileId,
-    loading: false
-  }));
+  state.editorTabs = restoredEditorTabsFromSnapshot(snapshot);
+  rebuildEditorTabLookup();
   if (!state.editorTabs.length) createEditorTab(null, false);
-  state.activeEditorTabId = state.editorTabs.some((tab) => tab.id === snapshot.activeEditorTabId)
+  state.activeEditorTabId = editorTabForId(snapshot.activeEditorTabId)
     ? snapshot.activeEditorTabId
     : state.editorTabs[0].id;
   state.openFile = activeEditorTab().file;
+  if (isEditorPanelVisible()) {
+    renderEditorTabs();
+    renderEditor();
+    void hydrateVisibleEditorTab();
+    scheduleInactiveEditorHydration();
+  } else {
+    destroyCodeEditorView();
+  }
+}
+
+function restoredEditorTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
+  const tabs: EditorTabState[] = [];
+  for (const tab of snapshot.editorTabs ?? []) {
+    tabs.push({
+      id: tab.id || crypto.randomUUID(),
+      file: null,
+      pendingPath: tab.path,
+      pendingRawMode: tab.rawMode,
+      pendingProfileId: snapshot.profileId,
+      loading: false
+    });
+  }
+  return tabs;
+}
+
+function isEditorPanelVisible() {
+  return !getPanel('editor').classList.contains('hidden');
+}
+
+function destroyCodeEditorView() {
+  if (codeMeasureFrame) {
+    window.cancelAnimationFrame(codeMeasureFrame);
+    codeMeasureFrame = 0;
+  }
+  codeView?.destroy();
+  codeView = null;
+  codeViewFile = null;
+  codeViewRenderSignature = '\0';
+}
+
+function requestCodeEditorMeasure() {
+  if (!codeView || codeMeasureFrame) return;
+  codeMeasureFrame = window.requestAnimationFrame(() => {
+    codeMeasureFrame = 0;
+    codeView?.requestMeasure();
+  });
+}
+
+async function ensureEditorReady() {
   renderEditorTabs();
   renderEditor();
-  void hydrateVisibleEditorTab();
-  window.setTimeout(() => hydrateInactiveEditorTabs(), 80);
+  await hydrateVisibleEditorTab();
+  scheduleInactiveEditorHydration();
 }
 
 async function hydrateVisibleEditorTab() {
@@ -2592,10 +4225,18 @@ async function hydrateVisibleEditorTab() {
   await hydrateEditorTab(tab, true);
 }
 
-function hydrateInactiveEditorTabs() {
-  for (const tab of state.editorTabs) {
-    if (tab.id !== state.activeEditorTabId) void hydrateEditorTab(tab, false);
-  }
+function scheduleInactiveEditorHydration() {
+  const token = ++inactiveEditorHydrationToken;
+  runWhenUiIdle(() => hydrateInactiveEditorTabs(token), 900);
+}
+
+function hydrateInactiveEditorTabs(token = inactiveEditorHydrationToken) {
+  if (token !== inactiveEditorHydrationToken) return;
+  const tab = state.editorTabs.find((item) => item.id !== state.activeEditorTabId && item.pendingPath && !item.loading);
+  if (!tab) return;
+  void hydrateEditorTab(tab, false).finally(() => {
+    if (token === inactiveEditorHydrationToken) runWhenUiIdle(() => hydrateInactiveEditorTabs(token), 900);
+  });
 }
 
 async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
@@ -2605,21 +4246,21 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
   const rawMode = Boolean(tab.pendingRawMode);
   const profileId = tab.pendingProfileId;
   tab.loading = true;
-  renderEditorTabs();
+  if (!getPanel('editor').classList.contains('hidden')) renderEditorTabs();
   try {
     const content = await readTextFileCached(profileId, path);
     if (state.activeWorkspaceId !== workspaceId) return;
-    const liveTab = state.editorTabs.find((item) => item.id === tab.id);
+    const liveTab = editorTabForId(tab.id);
     if (!liveTab || liveTab.pendingPath !== path) return;
     const masked = shouldMaskFile(path);
-    liveTab.file = {
+    setEditorTabFile(liveTab, {
       path,
       content,
       masked,
       rawMode,
       lines: masked ? parseSecretLinesCached(content, path) : [],
       dirty: false
-    };
+    });
     liveTab.pendingPath = undefined;
     liveTab.pendingRawMode = undefined;
     liveTab.pendingProfileId = undefined;
@@ -2627,73 +4268,150 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
     if (renderWhenDone && state.activeEditorTabId === liveTab.id) {
       state.openFile = liveTab.file;
       renderEditor();
-    } else {
+    } else if (!getPanel('editor').classList.contains('hidden')) {
       renderEditorTabs();
     }
     saveActiveWorkspaceSnapshot();
   } catch {
     if (state.activeWorkspaceId !== workspaceId) return;
-    const liveTab = state.editorTabs.find((item) => item.id === tab.id);
+    const liveTab = editorTabForId(tab.id);
     if (liveTab) {
       liveTab.loading = false;
       if (renderWhenDone && state.activeEditorTabId === liveTab.id) renderEditor();
-      else renderEditorTabs();
+      else if (!getPanel('editor').classList.contains('hidden')) renderEditorTabs();
     }
   }
 }
 
 function restoreImageTabs(snapshot: WorkspaceSnapshot) {
-  state.imageTabs = (snapshot.imageTabs ?? []).map((tab) => ({
-    id: tab.id || crypto.randomUUID(),
-    sourcePath: tab.sourcePath,
-    dataUrl: tab.dataUrl || '',
-    label: tab.label || 'No image selected',
-    history: Array.isArray(tab.history) ? tab.history : [],
-    historyVisible: Boolean(tab.historyVisible)
-  }));
+  state.imageTabs = restoredImageTabsFromSnapshot(snapshot);
+  rebuildImageTabLookup();
   if (!state.imageTabs.length) createImageTab(undefined, false);
-  state.activeImageTabId = state.imageTabs.some((tab) => tab.id === snapshot.activeImageTabId)
+  state.activeImageTabId = imageTabForId(snapshot.activeImageTabId)
     ? snapshot.activeImageTabId
     : state.imageTabs[0].id;
   syncImageStateFromActiveTab();
+  if (getPanel('image').classList.contains('hidden')) return;
   renderImageTabs();
   renderImagePreview();
   renderImageHistory();
 }
 
+function restoredImageTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
+  const tabs: ImageTabState[] = [];
+  for (const tab of snapshot.imageTabs ?? []) {
+    tabs.push({
+      id: tab.id || crypto.randomUUID(),
+      sourcePath: tab.sourcePath,
+      dataUrl: tab.dataUrl || '',
+      label: tab.label || 'No image selected',
+      history: Array.isArray(tab.history) ? tab.history : [],
+      historyVisible: Boolean(tab.historyVisible)
+    });
+  }
+  return tabs;
+}
+
 async function restoreNoteTabs(snapshot: WorkspaceSnapshot) {
-  state.noteTabs = await Promise.all((snapshot.noteTabs ?? [])
-    .filter((tab) => Boolean(tab.path))
-    .map(async (tab) => {
-      let content = '';
-      try {
-        content = await api.readTextFile(snapshot.profileId, tab.path);
-      } catch {
-        content = '';
-      }
-      return {
-        id: tab.id || crypto.randomUUID(),
-        path: tab.path,
-        title: tab.title || noteTitleFromPath(tab.path),
-        theme: normalizeNoteTheme(tab.theme),
-        content,
-        dirty: false,
-        saving: false,
-        lastSavedAt: Date.now()
-      };
-    }));
-  state.activeNoteTabId = state.noteTabs.some((tab) => tab.id === snapshot.activeNoteTabId)
+  const notesVisible = !getPanel('notes').classList.contains('hidden');
+  state.noteTabs = restoredNoteTabsFromSnapshot(snapshot);
+  rebuildNoteTabLookup();
+  state.activeNoteTabId = noteTabForId(snapshot.activeNoteTabId)
     ? snapshot.activeNoteTabId
     : state.noteTabs[0]?.id ?? '';
+  if (!notesVisible) return;
   renderNoteTabs();
   renderNotes();
-  if (!getPanel('notes').classList.contains('hidden') && !state.noteTabs.length) {
+  if (!state.noteTabs.length) {
     await createNoteTab({ focus: false });
+  } else {
+    scheduleDeferredNoteHydration(snapshot.id, snapshot.profileId, 200);
   }
+}
+
+function restoredNoteTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
+  const tabs: NoteTabState[] = [];
+  for (const tab of snapshot.noteTabs ?? []) {
+    if (!tab.path) continue;
+    tabs.push({
+      id: tab.id || crypto.randomUUID(),
+      path: tab.path,
+      title: tab.title || noteTitleFromPath(tab.path),
+      theme: normalizeNoteTheme(tab.theme),
+      content: '',
+      dirty: false,
+      saving: false,
+      loading: true
+    });
+  }
+  return tabs;
+}
+
+function scheduleDeferredNoteHydration(workspaceId: string, profileId: string, timeout = 700) {
+  const token = ++noteHydrationToken;
+  runWhenUiIdle(() => {
+    if (token !== noteHydrationToken) return;
+    void hydrateDeferredNoteTabs(workspaceId, profileId, token);
+  }, timeout);
+}
+
+async function hydrateDeferredNoteTabs(workspaceId: string, profileId: string, token = ++noteHydrationToken) {
+  if (state.activeWorkspaceId !== workspaceId) return;
+  const pending = noteTabsInHydrationOrder();
+  if (!pending.length) return;
+
+  for (const tab of pending) {
+    if (token !== noteHydrationToken || state.activeWorkspaceId !== workspaceId) return;
+    await hydrateNoteTabContent(tab, workspaceId, profileId);
+    if (state.activeWorkspaceId !== workspaceId) return;
+    if (!getPanel('notes').classList.contains('hidden') && tab.id === state.activeNoteTabId) {
+      renderNoteTabs();
+      renderNotes();
+    }
+    await yieldToUi();
+  }
+
+  if (state.activeWorkspaceId !== workspaceId) return;
+  if (!getPanel('notes').classList.contains('hidden')) {
+    renderNoteTabs();
+    renderNotes();
+  }
+  saveActiveWorkspaceSnapshot();
+}
+
+function noteTabsInHydrationOrder() {
+  const pending: NoteTabState[] = [];
+  let active: NoteTabState | null = null;
+  for (const tab of state.noteTabs) {
+    if (!tab.loading) continue;
+    if (tab.id === state.activeNoteTabId) active = tab;
+    else pending.push(tab);
+  }
+  if (active) pending.unshift(active);
+  return pending;
+}
+
+async function hydrateNoteTabContent(tab: NoteTabState, workspaceId: string, profileId: string) {
+  if (!tab.loading) return;
+  let content = '';
+  try {
+    content = await api.readTextFile(profileId, tab.path);
+  } catch {
+    content = '';
+  }
+  if (state.activeWorkspaceId !== workspaceId) return;
+  const live = noteTabForId(tab.id);
+  if (!live || live.dirty) return;
+  live.content = content;
+  live.loading = false;
+  live.lastSavedAt = Date.now();
 }
 
 async function ensureNotesReady() {
   if (!state.workspaceOpen || !state.activeProfile) return;
+  if (state.noteTabs.some((tab) => tab.loading)) {
+    await hydrateDeferredNoteTabs(state.activeWorkspaceId, state.activeProfile.id);
+  }
   if (!state.noteTabs.length) await createNoteTab({ focus: true });
   else {
     renderNoteTabs();
@@ -2713,7 +4431,9 @@ async function createNoteTab(options: { focus?: boolean } = {}) {
     dirty: true,
     saving: false
   };
+  const index = state.noteTabs.length;
   state.noteTabs.push(tab);
+  rememberNoteTab(tab, index);
   state.activeNoteTabId = tab.id;
   renderNoteTabs();
   renderNotes();
@@ -2723,26 +4443,93 @@ async function createNoteTab(options: { focus?: boolean } = {}) {
   return tab;
 }
 
+function clearNoteTabLookup() {
+  noteTabById.clear();
+  noteTabIndexByIdLookup.clear();
+}
+
+function rebuildNoteTabLookup() {
+  clearNoteTabLookup();
+  for (let index = 0; index < state.noteTabs.length; index += 1) {
+    rememberNoteTab(state.noteTabs[index], index);
+  }
+}
+
+function rememberNoteTab(tab: NoteTabState, index?: number) {
+  noteTabById.set(tab.id, tab);
+  if (index !== undefined) noteTabIndexByIdLookup.set(tab.id, index);
+}
+
+function forgetNoteTab(tab: NoteTabState) {
+  noteTabById.delete(tab.id);
+  noteTabIndexByIdLookup.delete(tab.id);
+}
+
+function noteTabForId(id: string) {
+  if (!id) return null;
+  let tab = noteTabById.get(id) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.noteTabs.length; index += 1) {
+      const candidate = state.noteTabs[index];
+      if (candidate.id !== id) continue;
+      tab = candidate;
+      rememberNoteTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function noteTabIndexById(id: string) {
+  const cachedIndex = noteTabIndexByIdLookup.get(id);
+  if (cachedIndex !== undefined && state.noteTabs[cachedIndex]?.id === id) return cachedIndex;
+  for (let index = 0; index < state.noteTabs.length; index += 1) {
+    const tab = state.noteTabs[index];
+    if (tab.id !== id) continue;
+    rememberNoteTab(tab, index);
+    return index;
+  }
+  noteTabIndexByIdLookup.delete(id);
+  return -1;
+}
+
+function refreshNoteTabIndexLookup(startIndex = 0) {
+  const start = clamp(startIndex, 0, state.noteTabs.length);
+  for (let index = start; index < state.noteTabs.length; index += 1) {
+    noteTabIndexByIdLookup.set(state.noteTabs[index].id, index);
+  }
+}
+
 function activeNoteTab() {
-  return state.noteTabs.find((tab) => tab.id === state.activeNoteTabId) ?? null;
+  return noteTabForId(state.activeNoteTabId);
 }
 
 function activateNoteTab(id: string) {
   void saveActiveNoteNow();
-  state.activeNoteTabId = id;
-  renderNoteTabs();
+  const previousActiveId = state.activeNoteTabId;
+  const tab = noteTabForId(id);
+  if (!tab) return;
+  state.activeNoteTabId = tab.id;
+  renderNoteTabActivation(previousActiveId, tab);
   renderNotes();
-  saveActiveWorkspaceSnapshot();
+  if (tab.loading && state.activeProfile) {
+    scheduleDeferredNoteHydration(state.activeWorkspaceId, state.activeProfile.id, 120);
+  }
+  if (previousActiveId !== id) saveActiveWorkspaceSnapshot();
   el.notesBody.focus();
 }
 
 function closeNoteTab(id: string) {
-  const tab = state.noteTabs.find((item) => item.id === id);
-  if (tab) void saveNoteTabNow(tab);
+  const index = noteTabIndexById(id);
+  if (index < 0) return;
+  const tab = state.noteTabs[index];
+  void saveNoteTabNow(tab);
   const timer = noteSaveTimers.get(id);
   if (timer) window.clearTimeout(timer);
   noteSaveTimers.delete(id);
-  state.noteTabs = state.noteTabs.filter((item) => item.id !== id);
+  forgetNoteTab(tab);
+  state.noteTabs.splice(index, 1);
+  refreshNoteTabIndexLookup(index);
   if (state.activeNoteTabId === id) state.activeNoteTabId = state.noteTabs[0]?.id ?? '';
   renderNoteTabs();
   renderNotes();
@@ -2750,37 +4537,141 @@ function closeNoteTab(id: string) {
 }
 
 function renderNoteTabs() {
-  el.notesTabs.innerHTML = '';
+  if (getPanel('notes').classList.contains('hidden')) return;
+  const signature = noteTabsSignature();
+  if (noteTabsRenderSignature === signature) return;
+  const orderSignature = noteTabsOrderSignature();
+  const sameOrder = noteTabsOrderRenderSignature === orderSignature
+    && el.notesTabs.childElementCount === state.noteTabs.length;
+  noteTabsRenderSignature = signature;
+
+  if (sameOrder) {
+    for (const tab of state.noteTabs) {
+      updateNoteTabElement(noteTabElement(tab.id), tab);
+    }
+    return;
+  }
+
+  noteTabsOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const tab of state.noteTabs) {
-    const row = document.createElement('div');
-    row.className = `widget-tab note-tab note-tab-${tab.theme}${tab.id === state.activeNoteTabId ? ' active' : ''}`;
-    const label = document.createElement('button');
-    label.className = 'widget-tab-label';
-    label.title = tab.path;
-    label.textContent = `${noteTabLabel(tab)}${tab.dirty ? ' *' : ''}`;
-    label.addEventListener('click', () => activateNoteTab(tab.id));
-    const close = document.createElement('button');
-    close.className = 'widget-tab-close';
-    close.textContent = 'x';
-    close.title = 'Close note tab';
-    close.addEventListener('click', (event) => {
-      event.stopPropagation();
-      closeNoteTab(tab.id);
-    });
-    row.append(label, close);
+    seen.add(tab.id);
+    const row = noteTabElement(tab.id);
+    updateNoteTabElement(row, tab);
     fragment.append(row);
   }
-  el.notesTabs.append(fragment);
+  el.notesTabs.replaceChildren(fragment);
+  pruneNoteTabElementCache(seen);
+}
+
+function renderNoteTabActivation(previousActiveId: string, activeTab: NoteTabState) {
+  if (getPanel('notes').classList.contains('hidden')) return;
+  const orderSignature = noteTabsOrderSignature();
+  const previousChanged = Boolean(previousActiveId && previousActiveId !== activeTab.id);
+  const previousTab = previousChanged ? noteTabForId(previousActiveId) : null;
+  const previousElement = previousChanged ? connectedNoteTabElement(previousActiveId) : null;
+  const activeElement = connectedNoteTabElement(activeTab.id);
+  if (
+    noteTabsOrderRenderSignature !== orderSignature
+    || el.notesTabs.childElementCount !== state.noteTabs.length
+    || !activeElement
+    || (previousChanged && (!previousTab || !previousElement))
+  ) {
+    renderNoteTabs();
+    return;
+  }
+  if (previousTab && previousElement) updateNoteTabElement(previousElement, previousTab);
+  updateNoteTabElement(activeElement, activeTab);
+  noteTabsRenderSignature = noteTabsSignature();
+}
+
+function noteTabElement(id: string) {
+  const cached = noteTabElementCache.get(id);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.className = 'widget-tab note-tab';
+  const labelButton = document.createElement('button');
+  labelButton.className = 'widget-tab-label';
+  labelButton.type = 'button';
+  labelButton.addEventListener('click', () => {
+    const id = row.dataset.noteTabId ?? '';
+    if (id) activateNoteTab(id);
+  });
+  const closeButton = document.createElement('button');
+  closeButton.className = 'widget-tab-close';
+  closeButton.type = 'button';
+  closeButton.title = 'Close note tab';
+  closeButton.setAttribute('aria-label', 'Close note tab');
+  closeButton.textContent = 'x';
+  closeButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const id = row.dataset.noteTabId ?? '';
+    if (id) closeNoteTab(id);
+  });
+  row.append(labelButton, closeButton);
+  noteTabElementCache.set(id, row);
+  return row;
+}
+
+function connectedNoteTabElement(id: string) {
+  const row = noteTabElementCache.get(id);
+  return row?.isConnected ? row : null;
+}
+
+function updateNoteTabElement(row: HTMLElement, tab: NoteTabState) {
+  const theme = tab.theme ?? 'default';
+  const active = tab.id === state.activeNoteTabId;
+  const label = `${noteTabLabel(tab)}${tab.dirty ? ' *' : ''}`;
+  const signature = `${tab.id}\t${active ? '1' : '0'}\t${theme}\t${label}\t${tab.path}`;
+  row.dataset.noteTabId = tab.id;
+  if (row.dataset.renderSignature === signature) return;
+  row.dataset.renderSignature = signature;
+  row.className = `widget-tab note-tab note-tab-${theme}${active ? ' active' : ''}`;
+  const labelButton = noteTabLabelButton(row);
+  if (labelButton.title !== tab.path) labelButton.title = tab.path;
+  setTextContentIfChanged(labelButton, label);
+}
+
+function noteTabLabelButton(row: HTMLElement) {
+  return row.firstElementChild as HTMLButtonElement;
+}
+
+function pruneNoteTabElementCache(seen: Set<string>) {
+  for (const id of noteTabElementCache.keys()) {
+    if (!seen.has(id)) noteTabElementCache.delete(id);
+  }
+}
+
+function noteTabsSignature() {
+  let signature = '';
+  for (let index = 0; index < state.noteTabs.length; index += 1) {
+    const tab = state.noteTabs[index];
+    if (index) signature += '\n';
+    signature += `${tab.id}\t${tab.id === state.activeNoteTabId ? '1' : '0'}\t${tab.theme}\t${noteTabLabel(tab)}\t${tab.dirty ? '1' : '0'}\t${tab.loading ? '1' : '0'}`;
+  }
+  return signature;
+}
+
+function noteTabsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.noteTabs.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.noteTabs[index].id;
+  }
+  return signature;
 }
 
 function renderNotes() {
   const tab = activeNoteTab();
-  el.notesBody.disabled = !tab;
-  el.notesBody.value = tab?.content ?? '';
-  el.notesTheme.disabled = !tab;
-  el.notesTheme.value = tab?.theme ?? 'default';
-  el.notesPath.textContent = tab ? noteRelativePath(tab.path) : 'Notes are saved under .vibe-ide-temp/notes in this workspace.';
+  setDisabledIfChanged(el.notesBody, !tab || Boolean(tab.loading));
+  setInputValueIfChanged(el.notesBody, tab?.content ?? '');
+  setDisabledIfChanged(el.notesTheme, !tab);
+  setInputValueIfChanged(el.notesTheme, tab?.theme ?? 'default');
+  setTextContentIfChanged(
+    el.notesPath,
+    tab ? noteRelativePath(tab.path) : 'Notes are saved under .vibe-ide-temp/notes in this workspace.'
+  );
   applyNoteTheme(tab?.theme ?? 'default');
   renderNotePin();
   renderNoteStatus();
@@ -2810,9 +4701,13 @@ function normalizeNoteTheme(theme: unknown): NoteThemeId {
 }
 
 function applyNoteTheme(theme: NoteThemeId) {
+  const normalized = normalizeNoteTheme(theme);
   const panel = getPanel('notes');
+  const className = `note-theme-${normalized}`;
+  if (panel.dataset.noteThemeClass === className && panel.classList.contains(className)) return;
   for (const item of NOTE_THEMES) panel.classList.remove(`note-theme-${item.id}`);
-  panel.classList.add(`note-theme-${normalizeNoteTheme(theme)}`);
+  panel.classList.add(className);
+  panel.dataset.noteThemeClass = className;
 }
 
 function toggleNotePin() {
@@ -2823,10 +4718,11 @@ function toggleNotePin() {
 
 function renderNotePin() {
   const panel = getPanel('notes');
-  panel.classList.toggle('pinned', state.notePinned);
-  el.notesPin.classList.toggle('active', state.notePinned);
-  el.notesPin.setAttribute('aria-pressed', String(state.notePinned));
-  el.notesPin.title = state.notePinned ? 'Unpin Notes' : 'Keep Notes above other widgets';
+  toggleClassIfChanged(panel, 'pinned', state.notePinned);
+  toggleClassIfChanged(el.notesPin, 'active', state.notePinned);
+  setAttributeIfChanged(el.notesPin, 'aria-pressed', String(state.notePinned));
+  const title = state.notePinned ? 'Unpin Notes' : 'Keep Notes above other widgets';
+  if (el.notesPin.title !== title) el.notesPin.title = title;
   if (state.notePinned && !panel.classList.contains('hidden')) bringPanelToFront(panel);
 }
 
@@ -2853,23 +4749,31 @@ function scheduleNoteSave(tab: NoteTabState, delayMs: number) {
 
 async function saveActiveNoteNow() {
   const tab = activeNoteTab();
-  if (tab) await saveNoteTabNow(tab);
+  if (tab && shouldSaveNoteTabNow(tab)) await saveNoteTabNow(tab);
 }
 
 async function saveAllDirtyNotes() {
-  await Promise.all(state.noteTabs.map((tab) => saveNoteTabNow(tab)));
+  const pending: Promise<void>[] = [];
+  for (const tab of state.noteTabs) {
+    if (shouldSaveNoteTabNow(tab)) pending.push(saveNoteTabNow(tab));
+  }
+  if (!pending.length) return;
+  await Promise.all(pending);
 }
 
 async function saveNoteTabNow(tab: NoteTabState) {
   const timer = noteSaveTimers.get(tab.id);
   if (timer) window.clearTimeout(timer);
   noteSaveTimers.delete(tab.id);
-  if (!state.activeProfile || !tab.dirty && tab.lastSavedAt) return;
+  if (tab.loading && !tab.dirty) return;
+  if (!state.activeProfile || !tab.dirty) return;
+  const profileId = state.activeProfile.id;
   const content = tab.content;
   tab.saving = true;
   renderNoteStatus();
   try {
-    await api.writeTextFile(state.activeProfile.id, tab.path, content);
+    await api.writeTextFile(profileId, tab.path, content);
+    invalidateExplorerParentDirectoryCache(profileId, tab.path);
     tab.saving = false;
     tab.lastSavedAt = Date.now();
     if (tab.content === content) tab.dirty = false;
@@ -2882,20 +4786,30 @@ async function saveNoteTabNow(tab: NoteTabState) {
   }
 }
 
+function shouldSaveNoteTabNow(tab: NoteTabState) {
+  return tab.dirty || noteSaveTimers.has(tab.id);
+}
+
 function renderNoteStatus(message?: string, danger = false) {
   const tab = activeNoteTab();
+  const text = message
+    ? message
+    : !tab
+      ? 'No note'
+      : tab.saving
+        ? 'Saving...'
+        : tab.loading
+          ? 'Loading...'
+          : tab.dirty
+            ? 'Unsaved'
+            : tab.lastSavedAt
+              ? `Saved ${new Date(tab.lastSavedAt).toLocaleTimeString()}`
+              : 'Autosaved';
+  const signature = `${danger ? '1' : '0'}\t${text}`;
+  if (noteStatusRenderSignature === signature) return;
+  noteStatusRenderSignature = signature;
   el.notesStatus.classList.toggle('danger', danger);
-  if (message) {
-    el.notesStatus.textContent = message;
-  } else if (!tab) {
-    el.notesStatus.textContent = 'No note';
-  } else if (tab.saving) {
-    el.notesStatus.textContent = 'Saving...';
-  } else if (tab.dirty) {
-    el.notesStatus.textContent = 'Unsaved';
-  } else {
-    el.notesStatus.textContent = tab.lastSavedAt ? `Saved ${new Date(tab.lastSavedAt).toLocaleTimeString()}` : 'Autosaved';
-  }
+  setTextContentIfChanged(el.notesStatus, text);
 }
 
 function newNotePath() {
@@ -2918,14 +4832,26 @@ function joinProfilePath(base: string, ...parts: string[]) {
   return [prefix, ...cleanParts].join(sep);
 }
 
+function pathBasename(path: string, fallback = path) {
+  let end = path.length;
+  while (end > 0 && isPathSeparator(path.charCodeAt(end - 1))) end -= 1;
+  let start = end;
+  while (start > 0 && !isPathSeparator(path.charCodeAt(start - 1))) start -= 1;
+  return start < end ? path.slice(start, end) : fallback;
+}
+
+function isPathSeparator(code: number) {
+  return code === 47 || code === 92;
+}
+
 function noteTabLabel(tab: NoteTabState) {
-  const firstLine = tab.content.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  const firstLine = tab.content.match(/[^\s][^\r\n]*/)?.[0].trim();
   if (firstLine) return firstLine.slice(0, 40);
   return tab.title || noteTitleFromPath(tab.path);
 }
 
 function noteTitleFromPath(path: string) {
-  return path.split(/[\\/]/).filter(Boolean).pop()?.replace(/\.txt$/i, '') || 'Quick note';
+  return pathBasename(path, '').replace(/\.txt$/i, '') || 'Quick note';
 }
 
 function noteRelativePath(path: string) {
@@ -2936,6 +4862,8 @@ function noteRelativePath(path: string) {
 }
 
 function renderCalculatorKeys() {
+  if (calculatorKeysRendered) return;
+  calculatorKeysRendered = true;
   const keys = [
     '(', ')', '%', '⌫',
     '7', '8', '9', '/',
@@ -2957,6 +4885,7 @@ function renderCalculatorKeys() {
 }
 
 function renderCalculator() {
+  renderCalculatorKeys();
   el.calculatorExpression.value = state.calculatorExpression;
   updateCalculatorPreview();
   renderCalculatorHistory();
@@ -3134,24 +5063,91 @@ function evaluateCalculator(options: { commit: boolean }) {
 }
 
 function renderCalculatorHistory() {
+  const signature = calculatorHistorySignature();
+  if (calculatorHistoryRenderSignature === signature) return;
+  const orderSignature = calculatorHistoryOrderSignature();
+  const sameOrder = calculatorHistoryOrderRenderSignature === orderSignature
+    && el.calculatorHistory.childElementCount === state.calculatorHistory.length;
+  calculatorHistoryRenderSignature = signature;
   if (!state.calculatorHistory.length) {
+    calculatorHistoryOrderRenderSignature = '';
+    calculatorHistoryElementCache.clear();
     el.calculatorHistory.innerHTML = '<div class="calculator-empty">No calculations yet</div>';
     return;
   }
-  el.calculatorHistory.innerHTML = '';
-  for (const item of state.calculatorHistory) {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'calculator-history-row';
-    row.innerHTML = `<span>${escapeHtml(item.expression)}</span><strong>${escapeHtml(item.result)}</strong>`;
-    row.addEventListener('click', () => {
-      state.calculatorExpression = item.result;
-      renderCalculator();
-      saveActiveWorkspaceSnapshot();
-      el.calculatorExpression.focus();
-    });
-    el.calculatorHistory.append(row);
+  const seen = new Set<string>();
+
+  if (sameOrder) {
+    for (const item of state.calculatorHistory) {
+      seen.add(item.id);
+      updateCalculatorHistoryElement(calculatorHistoryElement(item.id), item);
+    }
+    pruneCalculatorHistoryElementCache(seen);
+    return;
   }
+
+  calculatorHistoryOrderRenderSignature = orderSignature;
+  const fragment = document.createDocumentFragment();
+  for (const item of state.calculatorHistory) {
+    seen.add(item.id);
+    const row = calculatorHistoryElement(item.id);
+    updateCalculatorHistoryElement(row, item);
+    fragment.append(row);
+  }
+  el.calculatorHistory.replaceChildren(fragment);
+  pruneCalculatorHistoryElementCache(seen);
+}
+
+function calculatorHistoryElement(id: string) {
+  const cached = calculatorHistoryElementCache.get(id);
+  if (cached) return cached;
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'calculator-history-row';
+  row.innerHTML = '<span></span><strong></strong>';
+  row.addEventListener('click', () => {
+    state.calculatorExpression = row.dataset.calculatorResult ?? '';
+    renderCalculator();
+    saveActiveWorkspaceSnapshot();
+    el.calculatorExpression.focus();
+  });
+  calculatorHistoryElementCache.set(id, row);
+  return row;
+}
+
+function updateCalculatorHistoryElement(row: HTMLElement, item: CalculatorHistoryItem) {
+  row.dataset.calculatorHistoryId = item.id;
+  row.dataset.calculatorResult = item.result;
+  const signature = `${item.expression}\t${item.result}`;
+  if (row.dataset.renderSignature === signature) return;
+  row.dataset.renderSignature = signature;
+  setTextContentIfChanged(row.querySelector<HTMLElement>('span')!, item.expression);
+  setTextContentIfChanged(row.querySelector<HTMLElement>('strong')!, item.result);
+}
+
+function pruneCalculatorHistoryElementCache(seen: Set<string>) {
+  for (const id of calculatorHistoryElementCache.keys()) {
+    if (!seen.has(id)) calculatorHistoryElementCache.delete(id);
+  }
+}
+
+function calculatorHistorySignature() {
+  let signature = '';
+  for (let index = 0; index < state.calculatorHistory.length; index += 1) {
+    const item = state.calculatorHistory[index];
+    if (index) signature += '\n';
+    signature += `${item.id}\t${item.expression}\t${item.result}`;
+  }
+  return signature;
+}
+
+function calculatorHistoryOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.calculatorHistory.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.calculatorHistory[index].id;
+  }
+  return signature;
 }
 
 function evaluateExpression(expression: string) {
@@ -3236,34 +5232,111 @@ function yieldToUi() {
   });
 }
 
+function runWhenUiIdle(callback: () => void, timeout = 700) {
+  const idleWindow = window as Window & {
+    requestIdleCallback?: (handler: IdleRequestCallback, options?: IdleRequestOptions) => number;
+  };
+  const run = () => {
+    const delay = uiBusyDelayMs();
+    if (delay > 0) {
+      window.setTimeout(() => runWhenUiIdle(callback, timeout), delay);
+      return;
+    }
+    callback();
+  };
+  if (idleWindow.requestIdleCallback) {
+    idleWindow.requestIdleCallback(run, { timeout });
+    return;
+  }
+  window.setTimeout(() => window.requestAnimationFrame(run), Math.min(timeout, 160));
+}
+
+function uiBusyDelayMs() {
+  const scrollPause = explorerScrollingUntil - Date.now();
+  if (scrollPause > 0) return scrollPause + EXPLORER_SCROLL_IDLE_MS;
+  if (workspaceDragState?.dragging) return 240;
+  return uiInputPending() ? 80 : 0;
+}
+
+function uiInputPending() {
+  const maybeNavigator = navigator as Navigator & {
+    scheduling?: { isInputPending?: (options?: { includeContinuous?: boolean }) => boolean };
+  };
+  try {
+    return Boolean(maybeNavigator.scheduling?.isInputPending?.({ includeContinuous: true }));
+  } catch {
+    return false;
+  }
+}
+
+function normalizedBrowserConsolePosition(value: unknown): BrowserConsolePosition {
+  return value === 'bottom' || value === 'right' || value === 'top' || value === 'left'
+    ? value
+    : 'bottom';
+}
+
+function normalizedBrowserDeviceId(value: unknown) {
+  return value === 'desktop' || (typeof value === 'string' && BROWSER_DEVICE_PRESET_BY_ID.has(value))
+    ? String(value)
+    : DEFAULT_BROWSER_DEVICE_ID;
+}
+
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
-  state.browserTabs = runtime?.browserTabs.length
-    ? runtime.browserTabs.map((tab) => normalizeBrowserTabForCurrentMode(tab))
-    : Array.isArray(snapshot.browserTabs)
-      ? snapshot.browserTabs
-      .filter((tab) => tab && typeof tab.url === 'string')
-      .map((tab) => normalizeBrowserTabForCurrentMode({ id: tab.id || makeBrowserTabId(), url: tab.url, label: tab.label || browserTabLabel(tab.url) }))
-      : [];
-  state.previewProxies = USE_PREVIEW_PROXY_BROWSER && runtime ? runtime.previewProxies.map((proxy) => ({ ...proxy })) : [];
-  state.browserConsoleLogs = runtime ? runtime.browserConsoleLogs.map((log) => ({ ...log })) : state.browserConsoleLogs;
+  const browserVisible = !isBrowserPanelHidden();
+  const browserConsoleVisible = Boolean(snapshot.browserConsoleVisible);
+  state.browserTabs = restoredBrowserTabs(snapshot, runtime);
+  rebuildBrowserTabLookup();
+  state.previewProxies = USE_PREVIEW_PROXY_BROWSER && runtime ? restoredPreviewProxies(runtime.previewProxies) : [];
+  rebuildPreviewProxyLookup();
+  state.browserConsoleLogs = browserConsoleLogTail(
+    runtime ? runtime.browserConsoleLogs : state.browserConsoleLogs,
+    browserConsoleRuntimeLogLimit(browserConsoleVisible && browserVisible)
+  );
+  clearBrowserConsoleRowElementCache();
+  markBrowserConsoleLogsChanged();
   state.activeBrowserTabId = runtime?.activeBrowserTabId ?? '';
   state.previewUrl = runtime?.previewUrl ?? '';
-  state.browserDeviceId = snapshot.browserDeviceId || DEFAULT_BROWSER_DEVICE_ID;
-  state.browserOrientation = snapshot.browserOrientation || 'portrait';
-  setBrowserConsolePosition(snapshot.browserConsolePosition || 'bottom');
-  setBrowserConsoleVisible(Boolean(snapshot.browserConsoleVisible));
-  if (state.browserDeviceId === 'desktop') setBrowserMode('desktop');
-  else if (state.browserDeviceId) setBrowserDevice(state.browserDeviceId);
+  state.browserDeviceId = normalizedBrowserDeviceId(snapshot.browserDeviceId);
+  state.browserOrientation = snapshot.browserOrientation === 'landscape' ? 'landscape' : 'portrait';
+  state.browserConsolePosition = normalizedBrowserConsolePosition(snapshot.browserConsolePosition);
+  state.browserConsoleVisible = browserConsoleVisible;
+  if (browserVisible) applyVisibleBrowserLayout();
   if (state.browserTabs.length) {
-    const active = state.browserTabs.find((tab) => tab.id === (runtime?.activeBrowserTabId || snapshot.activeBrowserTabId)) ?? state.browserTabs[0];
+    const active = browserTabForId(runtime?.activeBrowserTabId || snapshot.activeBrowserTabId) ?? state.browserTabs[0];
     state.activeBrowserTabId = active.id;
     state.previewUrl = active.url;
-    el.previewUrl.value = active.url;
-    if (!getPanel('browser').classList.contains('hidden')) showRestoredBrowserIdle(active);
+    setInputValueIfChanged(el.previewUrl, active.url);
+    if (browserVisible) showRestoredBrowserIdle(active);
   }
-  renderBrowserTabs();
-  renderBrowserConsole();
+  if (browserVisible) {
+    renderBrowserTabs();
+    if (state.browserConsoleVisible) renderBrowserConsole();
+  }
+}
+
+function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRuntimeCache | null | undefined) {
+  const tabs: BrowserTab[] = [];
+  if (runtime?.browserTabs.length) {
+    for (const tab of runtime.browserTabs) tabs.push(normalizeBrowserTabForCurrentMode(tab));
+    return tabs;
+  }
+  if (!Array.isArray(snapshot.browserTabs)) return tabs;
+  for (const tab of snapshot.browserTabs) {
+    if (!tab || typeof tab.url !== 'string') continue;
+    tabs.push(normalizeBrowserTabForCurrentMode({
+      id: tab.id || makeBrowserTabId(),
+      url: tab.url,
+      label: tab.label || browserTabLabel(tab.url)
+    }));
+  }
+  return tabs;
+}
+
+function restoredPreviewProxies(proxies: PortForwardResult[]) {
+  const restored: PortForwardResult[] = [];
+  for (const proxy of proxies) restored.push({ ...proxy });
+  return restored;
 }
 
 function normalizeBrowserTabForCurrentMode(tab: BrowserTab): BrowserTab {
@@ -3281,7 +5354,12 @@ function showRestoredBrowserIdle(tab: BrowserTab) {
   disconnectActiveEdgeCdp();
   if (!USE_EDGE_CDP_BROWSER) {
     setEdgePreviewVisible(false);
-    loadBrowserTabFallback(tab);
+    if (browserTabFrameReady(tab)) showBrowserFrame(tab);
+    else {
+      hideAllBrowserFrames();
+      toggleClassIfChanged(el.browserShell, 'has-preview', false);
+      logBrowserConsole('info', `Browser preview idle for ${tab.label}; click the tab or Reload to resume.`);
+    }
     return;
   }
   hideAllBrowserFrames();
@@ -3290,12 +5368,12 @@ function showRestoredBrowserIdle(tab: BrowserTab) {
 }
 
 function workspaceLabel(profile: ConnectionProfile, root: string) {
-  const tail = root.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || root || 'workspace';
+  const tail = pathBasename(root, '') || root || 'workspace';
   return `${profile.label}: ${tail}`;
 }
 
 function selectProfile(profileId: string): boolean {
-  const profile = state.profiles.find((item) => item.id === profileId) ?? null;
+  const profile = profileForId(profileId);
   state.activeProfile = profile;
   if (!profile) {
     state.workspaceRoot = '';
@@ -3391,18 +5469,24 @@ function bindEvents() {
     state.imageOpenInNewTab = el.imageOpenNewTab.checked;
     saveActiveWorkspaceSnapshot();
   });
-  document.querySelectorAll<HTMLButtonElement>('[data-llm]').forEach((button) => {
+  for (const button of el.llmButtons) {
     button.addEventListener('click', () => launchLlm(button.dataset.llm ?? 'llm'));
-  });
+  }
   bindWindowChrome();
   bindFloatingPanels();
   el.saveFile.addEventListener('click', saveOpenFile);
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
   el.loadPreview.addEventListener('click', () => void openPreviewValue(el.previewUrl.value.trim()));
+  el.previewUrl.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    void openPreviewValue(el.previewUrl.value.trim());
+  });
   el.browserBack.addEventListener('click', () => navigateBrowserHistory(-1));
   el.browserForward.addEventListener('click', () => navigateBrowserHistory(1));
   el.reloadPreview.addEventListener('click', () => refreshPreview(false));
+  el.clearBrowserCache.addEventListener('click', () => void clearBrowserCacheAndReload());
   el.hardRefreshPreview.addEventListener('click', () => refreshPreview(true));
   el.newFile.addEventListener('click', () => void createExplorerItem('file'));
   el.newFolder.addEventListener('click', () => void createExplorerItem('dir'));
@@ -3415,6 +5499,9 @@ function bindEvents() {
   el.fileSizeToggle.addEventListener('click', () => {
     state.showFileSizes = !state.showFileSizes;
     updateExplorerFileSizeMode();
+    if (state.showFileSizes) void refreshExplorerTree({ manual: true });
+    else renderExplorer();
+    saveActiveWorkspaceSnapshot();
   });
   bindExplorerListEvents();
   el.autoPasteImageTag.addEventListener('change', () => {
@@ -3444,6 +5531,9 @@ function bindEvents() {
   el.browserConsoleResizer.addEventListener('pointerdown', startBrowserConsoleResize);
   el.browserConsoleClear.addEventListener('click', () => {
     state.browserConsoleLogs = [];
+    clearBrowserConsoleRowElementCache();
+    clearBrowserConsoleHiddenPayloadQueue();
+    markBrowserConsoleLogsChanged();
     renderBrowserConsole();
   });
   el.browserShell.addEventListener('pointerdown', activateBrowserPanel);
@@ -3470,25 +5560,38 @@ function bindEvents() {
   document.addEventListener('contextmenu', handleContextMenu, true);
   document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
   document.addEventListener('keydown', handleContextMenuKeydown, true);
-  window.addEventListener('resize', () => {
-    hideContextMenu();
-    FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));
-    state.terminalWidgets.forEach((widget) => {
-      applyStoredLayoutRatio(widget.element);
-      scheduleFitTerminalWidget(widget);
-    });
-    scheduleExplorerVirtualRender();
-    codeView?.requestMeasure();
-    scheduleConfigureEdgeViewport();
-  });
+  window.addEventListener('resize', scheduleWindowResizeWork);
   window.addEventListener('blur', hideContextMenu);
   window.addEventListener('pagehide', flushTerminalCwdSnapshotSave);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushTerminalCwdSnapshotSave();
+    if (document.visibilityState === 'hidden') {
+      flushTerminalCwdSnapshotSave();
+      flushWorkspaceStorePersist();
+      clearExplorerBackgroundWork();
+      pauseMarketTickerForHidden();
+      cancelBrowserFrameSuspend();
+      suspendBrowserFramesForAllWorkspaces();
+    } else if (state.workspaceOpen) {
+      cancelBrowserFrameSuspend();
+      scheduleExplorerWatch(1200);
+      queueVisibleExplorerDirectoryPrefetch(900);
+      forEachActiveWorkspaceTerminalWidget((widget) => scheduleFitTerminalWidget(widget, { activeOnly: true }));
+      scheduleMarketTickerStart(MARKET_TICKER_VISIBLE_RESUME_DELAY_MS);
+      scheduleMarketTickerRender();
+      scheduleWslProfilesBackgroundLoad(1200);
+      if (!isBrowserPanelHidden()) ensureActiveBrowserFrame();
+    } else {
+      cancelBrowserFrameSuspend();
+      scheduleMarketTickerStart(MARKET_TICKER_VISIBLE_RESUME_DELAY_MS);
+      scheduleMarketTickerRender();
+      scheduleWslProfilesBackgroundLoad(1200);
+    }
   });
   window.addEventListener('beforeunload', () => {
     flushTerminalCwdSnapshotSave();
-    if (marketTickerSocket) marketTickerSocket.close();
+    flushWorkspaceStorePersist();
+    pauseMarketTickerForHidden();
+    suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
     stopAllEdgeDevtoolsSessions();
     hideCaptureFreezeFrame();
     if (state.captureProtectionApplied) void api.setCaptureProtection(false);
@@ -3505,6 +5608,26 @@ function handleContextMenu(event: MouseEvent) {
     return;
   }
   showContextMenu(event.clientX, event.clientY, items);
+}
+
+function scheduleWindowResizeWork() {
+  if (windowResizeFrame) return;
+  windowResizeFrame = window.requestAnimationFrame(() => {
+    windowResizeFrame = 0;
+    hideContextMenu();
+    FLOATING_PANELS.forEach((id) => {
+      const panel = getPanel(id);
+      if (!panel.classList.contains('hidden')) applyStoredLayoutRatio(panel);
+    });
+    state.terminalWidgets.forEach((widget) => {
+      if (widget.element.classList.contains('hidden')) return;
+      applyStoredLayoutRatio(widget.element);
+      scheduleFitTerminalWidget(widget);
+    });
+    scheduleExplorerVirtualRender();
+    requestCodeEditorMeasure();
+    scheduleConfigureEdgeViewport();
+  });
 }
 
 function handleContextMenuPointerDown(event: PointerEvent) {
@@ -3577,7 +5700,7 @@ function hideContextMenu() {
 }
 
 function workspaceTabContextMenu(id: string): ContextMenuItem[] {
-  const workspace = state.workspaceSnapshots.find((item) => item.id === id);
+  const workspace = workspaceSnapshotForId(id);
   if (!workspace) return [];
   return [
     { label: 'Open workspace', action: () => activateWorkspaceTab(id), disabled: id === state.activeWorkspaceId && state.workspaceOpen },
@@ -3621,7 +5744,7 @@ function editorContextMenuItems(): ContextMenuItem[] {
 function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMenuItem[] {
   const host = target.closest<HTMLElement>('.terminal-host');
   const pane = host?.dataset.paneId
-    ? state.terminals.find((item) => item.paneId === host.dataset.paneId) ?? activePaneForElement(card)
+    ? terminalPaneById.get(host.dataset.paneId) ?? activePaneForElement(card)
     : activePaneForElement(card);
   if (pane) setActivePane(pane.paneId);
   const widget = terminalWidgetForElement(card);
@@ -3644,10 +5767,11 @@ function browserContextMenuItems(): ContextMenuItem[] {
     { label: 'Forward', action: () => navigateBrowserHistory(1), disabled: !tab },
     { label: 'Reload', action: () => refreshPreview(false), disabled: !tab },
     { label: 'Hard refresh', action: () => refreshPreview(true), disabled: !tab },
+    { label: 'Clear cache and reload', action: () => { void clearBrowserCacheAndReload(); }, disabled: !tab },
     { label: 'Copy URL', action: () => { if (tab) void copyTextToClipboard(tab.url, 'Copied browser URL'); }, disabled: !tab },
     { separator: true },
     { label: state.browserConsoleVisible ? 'Hide console' : 'Show console', action: () => setBrowserConsoleVisible(!state.browserConsoleVisible) },
-    { label: 'Clear console', action: () => { state.browserConsoleLogs = []; renderBrowserConsole(); } },
+    { label: 'Clear console', action: () => { state.browserConsoleLogs = []; clearBrowserConsoleRowElementCache(); clearBrowserConsoleHiddenPayloadQueue(); markBrowserConsoleLogsChanged(); renderBrowserConsole(); } },
     { separator: true },
     { label: 'Close browser tab', action: () => { if (tab) closeBrowserTab(tab.id); }, disabled: !tab, danger: true }
   ];
@@ -3777,7 +5901,7 @@ async function copyCurrentFolderCdCommand() {
     return;
   }
   const profile = activePane
-    ? state.profiles.find((item) => item.id === activePane.profileId) ?? state.activeProfile
+    ? profileForId(activePane.profileId) ?? state.activeProfile
     : state.activeProfile;
   await writeText(cdCommandForPath(dir, profile?.kind ?? 'wsl'));
   setStatus('Copied cd command for current folder');
@@ -3902,13 +6026,7 @@ function powershellQuote(value: string) {
 }
 
 async function createWindowsShell() {
-  const profile = state.profiles.find((item) => item.id === 'windows-local') ?? {
-    id: 'windows-local',
-    label: 'Windows Local',
-    kind: 'windows' as const,
-    root: 'C:\\Windows\\Temp\\simple-vibe-ide-shell',
-    shell: 'powershell.exe -NoLogo -NoProfile'
-  };
+  const profile = profileForIdWithWindowsFallback('windows-local')!;
   const cwd = await api.windowsShellRoot().catch(() => 'C:\\Windows\\Temp\\simple-vibe-ide-shell');
   await createTerminal(null, 'Windows PowerShell', { profile, cwd });
 }
@@ -4038,21 +6156,22 @@ function resizeKeyboardTarget(direction: number) {
     return;
   }
 
-  const pane = state.terminals.find((item) => item.paneId === target.paneId);
+  const pane = terminalPaneById.get(target.paneId);
   if (pane) resizeTerminalFont(direction);
 }
 
 function resizeIde(direction: number) {
   const factor = direction > 0 ? 1.05 : 1 / 1.05;
   ideScale = clamp(ideScale * factor, 0.72, 1.45);
-  document.documentElement.style.setProperty('--ide-scale', ideScale.toFixed(3));
+  setRootStyleProperty('--ide-scale', ideScale.toFixed(3));
   requestAnimationFrame(() => {
     FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));
     state.terminalWidgets.forEach((widget) => {
+      if (widget.element.classList.contains('hidden')) return;
       applyStoredLayoutRatio(widget.element);
-      scheduleFitTerminalWidget(widget);
+      scheduleFitTerminalWidget(widget, { activeOnly: true });
     });
-    codeView?.requestMeasure();
+    requestCodeEditorMeasure();
   });
   saveActiveWorkspaceSnapshot();
 }
@@ -4073,7 +6192,7 @@ function resizeFloatingPanelByKeyboard(panel: HTMLElement, direction: number) {
     ? snapPanelRect(panel, rawRect, { resizeX: true, resizeY: true })
     : clampPanelRect(panel, rawRect);
   applyPanelRect(panel, next);
-  if (panel.dataset.panel === 'editor') codeView?.requestMeasure();
+  if (panel.dataset.panel === 'editor') requestCodeEditorMeasure();
   saveActiveWorkspaceSnapshot();
 }
 
@@ -4098,8 +6217,8 @@ function resizeTerminalByKeyboard(pane: TerminalPane, direction: number) {
 
 function resizeEditorFont(direction: number) {
   editorFontSize = clamp(editorFontSize + direction, 10, 24);
-  document.documentElement.style.setProperty('--editor-font-size', `${editorFontSize}px`);
-  codeView?.requestMeasure();
+  setRootStyleProperty('--editor-font-size', `${editorFontSize}px`);
+  requestCodeEditorMeasure();
   saveActiveWorkspaceSnapshot();
 }
 
@@ -4120,7 +6239,7 @@ function resizeNoteFont(direction: number) {
 }
 
 function applyNoteFontSize() {
-  document.documentElement.style.setProperty('--notes-font-size', `${noteFontSize}px`);
+  setRootStyleProperty('--notes-font-size', `${noteFontSize}px`);
 }
 
 function setNoteOpacity(value: number, options: { save: boolean }) {
@@ -4131,9 +6250,9 @@ function setNoteOpacity(value: number, options: { save: boolean }) {
 
 function applyNoteOpacity() {
   const percent = `${Math.round(noteOpacity)}%`;
-  document.documentElement.style.setProperty('--notes-opacity', percent);
-  el.notesOpacity.value = String(Math.round(noteOpacity));
-  el.notesOpacityValue.textContent = percent;
+  setRootStyleProperty('--notes-opacity', percent);
+  setInputValueIfChanged(el.notesOpacity, String(Math.round(noteOpacity)));
+  setTextContentIfChanged(el.notesOpacityValue, percent);
 }
 
 function resizeBrowserZoom(direction: number) {
@@ -4144,7 +6263,7 @@ function resizeBrowserZoom(direction: number) {
 }
 
 function applyBrowserZoom() {
-  document.documentElement.style.setProperty('--browser-preview-zoom', state.browserZoom.toFixed(2));
+  setRootStyleProperty('--browser-preview-zoom', state.browserZoom.toFixed(2));
 }
 
 function resizeCalculatorFont(direction: number) {
@@ -4154,7 +6273,7 @@ function resizeCalculatorFont(direction: number) {
 }
 
 function applyCalculatorFontSize() {
-  document.documentElement.style.setProperty('--calculator-font-size', `${calculatorFontSize}px`);
+  setRootStyleProperty('--calculator-font-size', `${calculatorFontSize}px`);
 }
 
 function terminalMinWidth() {
@@ -4167,16 +6286,23 @@ function terminalMinHeight() {
 
 function setKeyboardResizeTarget(target: ResizeTarget) {
   keyboardResizeTarget = target;
-  el.titlebar.classList.toggle('keyboard-target', target.kind === 'ide');
-  document.querySelectorAll<HTMLElement>('.floating-panel.keyboard-target, .terminal-card.keyboard-target')
-    .forEach((element) => element.classList.remove('keyboard-target'));
-
-  if (target.kind === 'panel') {
-    getPanel(target.id).classList.add('keyboard-target');
-  } else if (target.kind === 'terminal') {
-    const pane = state.terminals.find((item) => item.paneId === target.paneId);
-    pane?.element.classList.add('keyboard-target');
+  const nextElement = keyboardResizeElementForTarget(target);
+  if (keyboardResizeTargetElement && keyboardResizeTargetElement !== nextElement) {
+    keyboardResizeTargetElement.classList.remove('keyboard-target');
   }
+  el.titlebar.classList.toggle('keyboard-target', target.kind === 'ide');
+  if (target.kind === 'panel') {
+    nextElement?.classList.add('keyboard-target');
+  } else if (target.kind === 'terminal') {
+    nextElement?.classList.add('keyboard-target');
+  }
+  keyboardResizeTargetElement = nextElement;
+}
+
+function keyboardResizeElementForTarget(target: ResizeTarget) {
+  if (target.kind === 'panel') return getPanel(target.id);
+  if (target.kind === 'terminal') return terminalPaneById.get(target.paneId)?.element ?? null;
+  return null;
 }
 
 type WidgetFocusItem =
@@ -4200,7 +6326,8 @@ function cycleWidgetFocus(direction: number, fromPaneId = '') {
 function focusableWidgets(): WidgetFocusItem[] {
   const items: WidgetFocusItem[] = [];
   addPanelFocusItem(items, 'explorer');
-  for (const widget of activeWorkspaceTerminalWidgets()) {
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId !== state.activeWorkspaceId) continue;
     const pane = activePaneForWidget(widget);
     if (pane && widget.element.isConnected) items.push({ kind: 'terminal', pane, element: widget.element });
   }
@@ -4292,28 +6419,46 @@ function bindFloatingPanels() {
     });
 
     if (id === 'editor') {
-      new ResizeObserver(() => codeView?.requestMeasure()).observe(panel);
+      new ResizeObserver(requestCodeEditorMeasure).observe(panel);
     }
   }
 
-  document.querySelectorAll<HTMLButtonElement>('[data-close-panel]').forEach((button) => {
+  for (const button of el.closePanelButtons) {
     button.addEventListener('click', () => setPanelVisible(button.dataset.closePanel as FloatingPanelId, false));
-  });
-  document.querySelectorAll<HTMLButtonElement>('[data-toggle-panel]').forEach((button) => {
+  }
+  for (const button of el.togglePanelButtons) {
     button.addEventListener('click', () => {
       const id = button.dataset.togglePanel as FloatingPanelId;
       setPanelVisible(id, getPanel(id).classList.contains('hidden'));
     });
-  });
+  }
   el.resetLayout.addEventListener('click', resetFloatingLayout);
 }
 
 function getPanel(id: FloatingPanelId) {
-  return document.querySelector<HTMLElement>(`[data-panel="${id}"]`)!;
+  const cached = panelElementCache.get(id);
+  if (cached?.isConnected) return cached;
+  const panel = document.querySelector<HTMLElement>(`[data-panel="${id}"]`)!;
+  panelElementCache.set(id, panel);
+  return panel;
+}
+
+function isBrowserPanelHidden() {
+  return el.browserPanel.classList.contains('hidden');
+}
+
+function isPanelVisible(id: FloatingPanelId) {
+  return !getPanel(id).classList.contains('hidden');
 }
 
 function getPanelToggle(id: FloatingPanelId) {
-  return document.querySelector<HTMLButtonElement>(`[data-toggle-panel="${id}"]`);
+  if (panelToggleCache.has(id)) {
+    const cached = panelToggleCache.get(id) ?? null;
+    if (!cached || cached.isConnected) return cached;
+  }
+  const toggle = document.querySelector<HTMLButtonElement>(`[data-toggle-panel="${id}"]`);
+  panelToggleCache.set(id, toggle);
+  return toggle;
 }
 
 function ensureResizeGrips(panel: HTMLElement, label: string) {
@@ -4335,26 +6480,67 @@ function ensureResizeGrips(panel: HTMLElement, label: string) {
   return grips;
 }
 
-function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipSave?: boolean } = {}) {
+function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipSave?: boolean; skipFocus?: boolean } = {}) {
   const panel = getPanel(id);
-  panel.classList.toggle('hidden', !visible);
-  getPanelToggle(id)?.classList.toggle('active', visible);
-  getPanelToggle(id)?.setAttribute('aria-pressed', String(visible));
+  const wasHidden = panel.classList.contains('hidden');
+  const visibilityChanged = wasHidden === visible;
+  if (visibilityChanged) panel.classList.toggle('hidden', !visible);
+  const toggle = getPanelToggle(id);
+  if (toggle) {
+    toggleClassIfChanged(toggle, 'active', visible);
+    setAttributeIfChanged(toggle, 'aria-pressed', String(visible));
+  }
   if (visible) {
-    bringPanelToFront(panel);
-    pinPanelToWorkspace(panel);
-    setKeyboardResizeTarget({ kind: 'panel', id });
-    if (id === 'notes' && !restoringWorkspace) void ensureNotesReady();
-    if (id === 'explorer' && state.workspaceOpen && !restoringWorkspace) {
-      void refreshExplorerTree({ silent: true });
+    if (wasHidden) applyStoredLayoutRatio(panel);
+    if (!options.skipFocus) {
+      bringPanelToFront(panel);
+      if (!wasHidden) pinPanelToWorkspace(panel);
+      setKeyboardResizeTarget({ kind: 'panel', id });
+    }
+    if (id === 'editor' && wasHidden && !restoringWorkspace) void ensureEditorReady();
+    if (id === 'notes' && wasHidden && !restoringWorkspace) void ensureNotesReady();
+    if (id === 'image' && wasHidden && !restoringWorkspace) {
+      renderImageTabs();
+      renderImagePreview();
+      renderImageHistory();
+    }
+    if (id === 'calculator' && wasHidden && !restoringWorkspace) renderCalculator();
+    if (id === 'settings' && wasHidden && !restoringWorkspace) renderSettings();
+    if (id === 'explorer' && wasHidden && state.workspaceOpen && !restoringWorkspace) {
+      if (shouldLoadExplorerDirectoryOnShow()) {
+        void loadDirectory(state.currentDir);
+      } else {
+        if (explorerRenderDirty || !el.fileList.childElementCount) renderExplorer();
+        void refreshExplorerTree({ silent: true });
+      }
       scheduleExplorerWatch();
     }
-    if (id === 'browser' && !restoringWorkspace) ensureActiveBrowserFrame();
-    codeView?.requestMeasure();
-  } else if (keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
-    setKeyboardResizeTarget({ kind: 'ide' });
+    if (id === 'browser' && !restoringWorkspace) {
+      cancelBrowserFrameSuspend();
+      if (wasHidden) {
+        applyVisibleBrowserLayout();
+        renderForwards();
+        if (!ensureActiveBrowserFrame()) renderBrowserTabs();
+        if (state.browserConsoleVisible) renderBrowserConsole();
+      }
+    }
+    if (id === 'editor') requestCodeEditorMeasure();
+  } else {
+    if (id === 'editor' && !wasHidden) {
+      syncActiveEditorTabFromView();
+      destroyCodeEditorView();
+    }
+    if (id === 'browser' && !wasHidden && !restoringWorkspace) {
+      syncBrowserConsoleCaptureForActiveFrame();
+      trimBrowserConsoleLogs();
+      cancelBrowserFrameSuspend();
+      suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
+    }
+    if (!wasHidden && keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
+      setKeyboardResizeTarget({ kind: 'ide' });
+    }
   }
-  if (!options.skipSave) saveActiveWorkspaceSnapshot();
+  if (visibilityChanged && !options.skipSave) saveActiveWorkspaceSnapshot();
 }
 
 function resetFloatingLayout() {
@@ -4367,7 +6553,7 @@ function resetFloatingLayout() {
     panel.style.zIndex = '';
     setPanelVisible(id, DEFAULT_PANEL_VISIBILITY[id]);
   }
-  codeView?.requestMeasure();
+  requestCodeEditorMeasure();
   saveActiveWorkspaceSnapshot();
 }
 
@@ -4392,20 +6578,25 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
   const startY = event.clientY;
   const startLeft = panelRect.left - workspaceRect.left;
   const startTop = panelRect.top - workspaceRect.top;
+  const workspaceWidth = workspace.clientWidth;
+  const workspaceHeight = workspace.clientHeight;
+  const panelWidth = panelRect.width;
+  const panelHeight = panelRect.height;
+  const snapGuides = collectSnapGuides(panel, workspace);
 
   panel.setPointerCapture(event.pointerId);
   panel.classList.add('dragging');
 
   const move = (moveEvent: PointerEvent) => {
-    const maxLeft = Math.max(0, workspace.clientWidth - panel.offsetWidth);
-    const maxTop = Math.max(0, workspace.clientHeight - panel.offsetHeight);
+    const maxLeft = Math.max(0, workspaceWidth - panelWidth);
+    const maxTop = Math.max(0, workspaceHeight - panelHeight);
     const rawRect = {
       left: clamp(startLeft + moveEvent.clientX - startX, 0, maxLeft),
       top: clamp(startTop + moveEvent.clientY - startY, 0, maxTop),
-      width: panel.offsetWidth,
-      height: panel.offsetHeight
+      width: panelWidth,
+      height: panelHeight
     };
-    applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }));
+    applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }, snapGuides));
   };
 
   const up = (upEvent: PointerEvent) => {
@@ -4446,6 +6637,9 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
   const startY = event.clientY;
   const minWidth = panelMinWidth(panel);
   const minHeight = panelMinHeight(panel);
+  const workspaceWidth = workspace.clientWidth;
+  const workspaceHeight = workspace.clientHeight;
+  const snapGuides = collectSnapGuides(panel, workspace);
 
   grip.setPointerCapture(event.pointerId);
   panel.classList.add('resizing');
@@ -4459,10 +6653,10 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     let height = panelRect.height;
 
     if (resizeEast) {
-      width = clamp(panelRect.width + deltaX, minWidth, workspace.clientWidth - panelRect.left);
+      width = clamp(panelRect.width + deltaX, minWidth, workspaceWidth - panelRect.left);
     }
     if (resizeSouth) {
-      height = clamp(panelRect.height + deltaY, minHeight, workspace.clientHeight - panelRect.top);
+      height = clamp(panelRect.height + deltaY, minHeight, workspaceHeight - panelRect.top);
     }
     if (resizeWest) {
       const boundedDelta = clamp(deltaX, -panelRect.left, panelRect.width - minWidth);
@@ -4480,8 +6674,8 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
       resizeRight: resizeEast,
       resizeTop: resizeNorth,
       resizeBottom: resizeSouth
-    }));
-    if (panel.dataset.panel === 'editor') codeView?.requestMeasure();
+    }, snapGuides));
+    if (panel.dataset.panel === 'editor') requestCodeEditorMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
   };
@@ -4492,7 +6686,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     grip.removeEventListener('pointermove', move);
     grip.removeEventListener('pointerup', up);
     grip.removeEventListener('pointercancel', up);
-    codeView?.requestMeasure();
+    requestCodeEditorMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
     saveActiveWorkspaceSnapshot();
@@ -4552,10 +6746,9 @@ function snapPanelRect(
     resizeRight?: boolean;
     resizeTop?: boolean;
     resizeBottom?: boolean;
-  }
+  },
+  guides = collectSnapGuides(panel, panel.parentElement as HTMLElement)
 ) {
-  const workspace = panel.parentElement as HTMLElement;
-  const guides = collectSnapGuides(panel, workspace);
   const next = { ...rect };
 
   if (mode.moveX) {
@@ -4591,19 +6784,27 @@ function snapPanelRect(
 function collectSnapGuides(panel: HTMLElement, workspace: HTMLElement) {
   const x = [0, workspace.clientWidth];
   const y = [0, workspace.clientHeight];
-  const guideElements = [
-    ...document.querySelectorAll<HTMLElement>('.floating-panel:not(.hidden)'),
-    ...document.querySelectorAll<HTMLElement>('.terminal-card'),
-    document.querySelector<HTMLElement>('#terminal-grid')
-  ].filter((element): element is HTMLElement => Boolean(element) && element !== panel);
-
-  for (const element of guideElements) {
-    const rect = currentPanelRect(element, workspace);
-    x.push(rect.left, rect.left + rect.width);
-    y.push(rect.top, rect.top + rect.height);
+  for (const id of FLOATING_PANELS) {
+    const element = getPanel(id);
+    if (element === panel || element.classList.contains('hidden')) continue;
+    addSnapGuidesForElement(element, workspace, x, y);
+  }
+  for (const widget of state.terminalWidgets) {
+    const element = widget.element;
+    if (element === panel || !element.isConnected) continue;
+    addSnapGuidesForElement(element, workspace, x, y);
+  }
+  if (el.terminalGrid !== panel && el.terminalGrid.isConnected) {
+    addSnapGuidesForElement(el.terminalGrid, workspace, x, y);
   }
 
   return { x, y };
+}
+
+function addSnapGuidesForElement(element: HTMLElement, workspace: HTMLElement, x: number[], y: number[]) {
+  const rect = currentPanelRect(element, workspace);
+  x.push(rect.left, rect.left + rect.width);
+  y.push(rect.top, rect.top + rect.height);
 }
 
 function snapMovingAxis(start: number, size: number, guides: number[]) {
@@ -4653,10 +6854,12 @@ function currentPanelRect(element: HTMLElement, workspace: HTMLElement): PanelRe
   };
 }
 
-function elementLayoutRatio(element: HTMLElement): LayoutRatio | undefined {
+function elementLayoutRatio(element: HTMLElement, options: { preferCache?: boolean } = {}): LayoutRatio | undefined {
+  const cached = layoutRatios.get(element);
+  if (options.preferCache && cached) return cached;
   const workspace = element.parentElement as HTMLElement | null;
-  if (!workspace?.clientWidth || !workspace.clientHeight) return layoutRatios.get(element);
-  if (element.classList.contains('hidden')) return layoutRatios.get(element);
+  if (!workspace?.clientWidth || !workspace.clientHeight) return cached;
+  if (element.classList.contains('hidden')) return cached;
   const ratio = rectToLayoutRatio(currentPanelRect(element, workspace), workspace);
   layoutRatios.set(element, ratio);
   return ratio;
@@ -4717,7 +6920,7 @@ async function switchWorkspace(path: string) {
     return;
   }
   await saveAllDirtyNotes();
-  saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   state.workspaceRoot = path;
   state.currentDir = path;
   el.rootInput.value = path;
@@ -4728,14 +6931,17 @@ async function switchWorkspace(path: string) {
   await openWorkspace(path);
   setWorkspaceOpen(true);
   await createTerminal(null, 'shell');
-  saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
 }
 
 function discardWorkspacePreviewRuntime(workspaceId: string) {
+  cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
   for (const proxy of state.previewProxies) {
+    previewProxyProbeAt.delete(proxy.id);
     void api.stopPortForward(proxy.id).catch(() => undefined);
   }
   state.previewProxies = [];
+  clearPreviewProxyLookup();
   stopEdgeDevtoolsForWorkspace(workspaceId);
   removeWorkspaceRuntimeCache(workspaceId);
 }
@@ -4750,9 +6956,9 @@ async function closeWorkspace(options: { killTerminals?: boolean } = {}) {
   state.workspaceRoot = '';
   state.currentDir = '';
   state.entries = [];
-  el.profileSelect.value = '';
-  el.rootInput.value = '';
-  el.rootInput.placeholder = 'select a profile first';
+  setInputValueIfChanged(el.profileSelect, '');
+  setInputValueIfChanged(el.rootInput, '');
+  if (el.rootInput.placeholder !== 'select a profile first') el.rootInput.placeholder = 'select a profile first';
   if (options.killTerminals && workspaceId) await closeTerminalsForWorkspace(workspaceId);
   hideAllTerminalWidgets();
   clearWorkspacePanels();
@@ -4767,24 +6973,36 @@ async function closeAllTerminals() {
   state.terminals = [];
   state.terminalWidgets = [];
   state.activePaneId = '';
+  terminalPaneById.clear();
+  terminalPaneByBackendId.clear();
+  terminalPanesByWidgetId.clear();
+  terminalWidgetById.clear();
   for (const pane of terminals) {
     if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
+    cleanupTerminalWriteBuffer(pane);
     if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
     pane.resizeObserver?.disconnect();
     pane.term.dispose();
     pane.host.remove();
   }
-  for (const widget of widgets) widget.element.remove();
+  for (const widget of widgets) {
+    forgetTerminalWidget(widget);
+    widget.element.remove();
+  }
   syncActivePaneClass();
   renderShellTabs();
 }
 
 async function closeTerminalsForWorkspace(workspaceId: string) {
-  const widgets = state.terminalWidgets.filter((widget) => widget.workspaceId === workspaceId);
-  for (const widget of widgets) {
-    await closeTerminalWidget(widget.widgetId);
+  const widgetIds: string[] = [];
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId === workspaceId) widgetIds.push(widget.widgetId);
   }
-  if (state.activePaneId && !activeWorkspaceTerminalPanes().some((pane) => pane.paneId === state.activePaneId)) {
+  for (const widgetId of widgetIds) {
+    await closeTerminalWidget(widgetId);
+  }
+  const activePane = state.activePaneId ? terminalPaneById.get(state.activePaneId) : null;
+  if (state.activePaneId && activePane?.workspaceId !== state.activeWorkspaceId) {
     state.activePaneId = '';
   }
   syncActivePaneClass();
@@ -4792,28 +7010,54 @@ async function closeTerminalsForWorkspace(workspaceId: string) {
 }
 
 function hideAllTerminalWidgets() {
-  for (const widget of state.terminalWidgets) widget.element.classList.add('hidden');
+  hideTerminalWidgetsForWorkspace(visibleTerminalWorkspaceId);
+  visibleTerminalWorkspaceId = '';
   state.activePaneId = '';
   syncActivePaneClass();
   renderShellTabs();
 }
 
-function showTerminalWidgetsForWorkspace(workspaceId: string) {
+function hideTerminalWidgetsForWorkspace(workspaceId: string) {
   for (const widget of state.terminalWidgets) {
-    widget.element.classList.toggle('hidden', widget.workspaceId !== workspaceId);
-    if (widget.workspaceId === workspaceId) {
-      applyStoredLayoutRatio(widget.element);
-      scheduleFitTerminalWidget(widget);
-    }
+    if (workspaceId && widget.workspaceId !== workspaceId) continue;
+    if (!workspaceId && widget.element.classList.contains('hidden')) continue;
+    toggleClassIfChanged(widget.element, 'hidden', true);
   }
 }
 
-function clearWorkspacePanels() {
-  codeView?.destroy();
-  codeView = null;
+function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined) {
+  if (pane.backendId) terminalPaneByBackendId.delete(pane.backendId);
+  pane.backendId = backendId;
+  if (backendId) terminalPaneByBackendId.set(backendId, pane);
+}
+
+function showTerminalWidgetsForWorkspace(workspaceId: string) {
+  if (visibleTerminalWorkspaceId && visibleTerminalWorkspaceId !== workspaceId) {
+    hideTerminalWidgetsForWorkspace(visibleTerminalWorkspaceId);
+  }
+  visibleTerminalWorkspaceId = workspaceId;
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId !== workspaceId) continue;
+    const wasHidden = widget.element.classList.contains('hidden');
+    if (wasHidden) {
+      widget.element.classList.remove('hidden');
+      applyStoredLayoutRatio(widget.element);
+      syncTerminalWidgetActiveState(widget);
+      scheduleFitTerminalWidget(widget, { activeOnly: true });
+    }
+    const activePane = activePaneForWidget(widget);
+    if (activePane) flushTerminalWriteBuffer(activePane);
+  }
+}
+
+function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {}) {
+  const renderIntermediate = !options.skipIntermediateRenders;
+  clearExplorerBackgroundWork();
+  destroyCodeEditorView();
   state.entries = [];
   state.explorerExpanded = new Set();
   state.explorerChildren = new Map();
+  markExplorerEntryLookupDirty();
   state.explorerLoading = new Set();
   state.explorerSignatures = new Map();
   state.explorerSelectedPath = '';
@@ -4821,71 +7065,110 @@ function clearWorkspacePanels() {
   state.explorerTypeaheadAt = 0;
   state.explorerDropTargetDir = '';
   state.exportJobs = [];
-  renderExportJobs();
+  exportJobById.clear();
+  if (renderIntermediate) renderExportJobs();
   state.openFile = null;
   state.editorTabs = [];
+  clearEditorTabLookup();
   state.activeEditorTabId = '';
-  ensureEditorTab();
+  if (renderIntermediate) ensureEditorTab();
   state.imagePreviewDataUrl = '';
   state.imagePreviewLabel = 'No image selected';
   state.imageHistory = [];
   state.imageHistoryVisible = false;
   state.imageTabs = [];
+  clearImageTabLookup();
   state.activeImageTabId = '';
-  ensureImageTab();
+  if (renderIntermediate) ensureImageTab();
   for (const timer of noteSaveTimers.values()) window.clearTimeout(timer);
   noteSaveTimers.clear();
+  noteHydrationToken += 1;
   state.noteTabs = [];
+  clearNoteTabLookup();
   state.activeNoteTabId = '';
   state.notePinned = false;
   noteOpacity = 100;
   applyNoteOpacity();
-  renderNoteTabs();
-  renderNotes();
-  renderNotePin();
+  if (renderIntermediate && isPanelVisible('notes')) {
+    renderNoteTabs();
+    renderNotes();
+    renderNotePin();
+  }
   state.calculatorExpression = '';
   state.calculatorResult = '';
   state.calculatorHistory = [];
-  renderCalculator();
+  if (renderIntermediate && isPanelVisible('calculator')) renderCalculator();
   state.previewProxies = [];
+  clearPreviewProxyLookup();
   state.previewUrl = '';
   state.forwards = [];
+  clearForwardLookup();
   state.detectedPorts = [];
+  clearDetectedPortLookup();
   state.browserTabs = [];
+  clearBrowserTabLookup();
   state.activeBrowserTabId = '';
   state.browserConsoleLogs = [];
-  el.previewUrl.value = '';
-  hideAllBrowserFrames();
+  clearBrowserConsoleRowElementCache();
+  clearBrowserConsoleHiddenPayloadQueue();
+  clearBrowserConsoleLocalPortScanQueue();
+  markBrowserConsoleLogsChanged();
+  setInputValueIfChanged(el.previewUrl, '');
+  if (state.activeWorkspaceId) hideBrowserFramesForWorkspace(state.activeWorkspaceId);
+  else hideAllBrowserFrames();
   disconnectActiveEdgeCdp();
   setEdgePreviewVisible(false);
-  el.browserShell.classList.remove('has-preview');
-  renderEditorTabs();
-  renderImageTabs();
-  renderImagePreview();
-  renderImageHistory();
-  renderForwards();
-  renderBrowserTabs();
-  renderBrowserConsole();
-  renderEditor();
+  toggleClassIfChanged(el.browserShell, 'has-preview', false);
+  if (renderIntermediate && isPanelVisible('editor')) {
+    renderEditorTabs();
+    renderEditor();
+  }
+  if (renderIntermediate && isPanelVisible('image')) {
+    renderImageTabs();
+    renderImagePreview();
+    renderImageHistory();
+  }
+  if (renderIntermediate && !isBrowserPanelHidden()) {
+    renderForwards();
+    renderBrowserTabs();
+    renderBrowserConsole();
+  }
+}
+
+function clearExplorerBackgroundWork() {
+  cancelExplorerWatchSchedule();
+  cancelExplorerHoverPrefetch();
+  cancelVisibleExplorerDirectoryPrefetch();
+  cancelCachedExplorerDirectoryRefreshes();
+  toggleClassIfChanged(el.fileList, 'scrolling', false);
+  explorerScrollingUntil = 0;
+  if (explorerScrollIdleTimer) window.clearTimeout(explorerScrollIdleTimer);
+  explorerScrollIdleTimer = 0;
+  if (explorerRenderFrame) window.cancelAnimationFrame(explorerRenderFrame);
+  explorerRenderFrame = 0;
+  for (const timer of explorerDirectoryPrefetchTimers.values()) window.clearTimeout(timer);
+  explorerDirectoryPrefetchTimers.clear();
+  explorerDirectoryPrefetchPending.clear();
+  for (const timer of textFilePrefetchTimers.values()) window.clearTimeout(timer);
+  textFilePrefetchTimers.clear();
+  explorerDirectoryPrefetchActive = 0;
+}
+
+function cancelExplorerWatchSchedule() {
+  if (explorerWatchTimer) window.clearTimeout(explorerWatchTimer);
+  explorerWatchTimer = 0;
+  explorerWatchIdleToken += 1;
+}
+
+function cancelCachedExplorerDirectoryRefreshes() {
+  explorerCachedRefreshToken += 1;
+  for (const timer of explorerCachedRefreshTimers) window.clearTimeout(timer);
+  explorerCachedRefreshTimers.clear();
 }
 
 function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean } = {}) {
   state.workspaceOpen = open;
-  el.copyCurrentCd.disabled = !open;
-  el.newShell.disabled = !open;
-  el.shellNewTab.disabled = !open;
-  el.shellTabs.classList.add('hidden');
-  el.resetLayout.disabled = !open;
-  document.querySelectorAll<HTMLButtonElement>('[data-llm]').forEach((button) => {
-    button.disabled = !open;
-  });
-  document.querySelectorAll<HTMLButtonElement>('[data-toggle-panel]').forEach((button) => {
-    button.disabled = !open && button.dataset.togglePanel !== 'settings';
-  });
-  el.newFile.disabled = !open;
-  el.newFolder.disabled = !open;
-  el.refreshExplorer.disabled = !open;
-  el.exportSelected.disabled = !open;
+  renderWorkspaceControls(open);
 
   if (!options.preserveVisibility) {
     for (const id of FLOATING_PANELS) {
@@ -4898,16 +7181,53 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
   renderShellTabs();
 }
 
-function explorerDirectoryCacheKey(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
-  return `${workspaceId || 'workspace'}\0${profileId}\0${path}`;
+function renderWorkspaceControls(open: boolean) {
+  const signature = open ? '1' : '0';
+  if (workspaceControlsRenderSignature === signature) return;
+  workspaceControlsRenderSignature = signature;
+  setDisabledIfChanged(el.copyCurrentCd, !open);
+  setDisabledIfChanged(el.newShell, !open);
+  setDisabledIfChanged(el.shellNewTab, !open);
+  el.shellTabs.classList.add('hidden');
+  setDisabledIfChanged(el.resetLayout, !open);
+  for (const button of el.llmButtons) {
+    setDisabledIfChanged(button, !open);
+  }
+  for (const button of el.togglePanelButtons) {
+    setDisabledIfChanged(button, !open && button.dataset.togglePanel !== 'settings');
+  }
+  setDisabledIfChanged(el.newFile, !open);
+  setDisabledIfChanged(el.newFolder, !open);
+  setDisabledIfChanged(el.refreshExplorer, !open);
+  setDisabledIfChanged(el.exportSelected, !open);
+}
+
+function explorerDirectoryCacheKey(
+  profileId: string,
+  path: string,
+  workspaceId = state.activeWorkspaceId,
+  includeSizes = state.showFileSizes
+) {
+  return `${workspaceId || 'workspace'}\0${profileId}\0${includeSizes ? 'size' : 'nosize'}\0${path}`;
 }
 
 function hasCachedExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
-  return explorerDirectoryCache.has(explorerDirectoryCacheKey(profileId, path, workspaceId));
+  return hasCachedExplorerDirectoryKey(explorerDirectoryCacheKey(profileId, path, workspaceId));
+}
+
+function hasCachedExplorerDirectoryKey(key: string) {
+  return explorerDirectoryCache.has(key);
 }
 
 function cloneExplorerEntries(entries: FileEntry[]) {
-  return entries.map((entry) => ({ ...entry }));
+  // Directory listings are treated as immutable snapshots throughout the
+  // Explorer pipeline. Returning the same array avoids hot-path shallow copies
+  // when cache hits, watcher polls, and prefetches pass large directory lists
+  // between cache, state, and render code.
+  const clone = entries;
+  const signature = explorerDirectorySignatureCache.get(entries);
+  if (signature) explorerDirectorySignatureCache.set(clone, signature);
+  return clone;
 }
 
 function cachedExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
@@ -4919,15 +7239,82 @@ function cachedExplorerDirectory(profileId: string, path: string, workspaceId = 
   return cloneExplorerEntries(cached.entries);
 }
 
+function cachedFreshExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  return cachedFreshExplorerDirectoryByKey(key, profileId);
+}
+
+function cachedFreshExplorerDirectoryByKey(key: string, profileId: string) {
+  const cached = explorerDirectoryCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.cachedAt > explorerDirectoryCacheTtl(profileId)) return null;
+  explorerDirectoryCache.delete(key);
+  explorerDirectoryCache.set(key, cached);
+  return cloneExplorerEntries(cached.entries);
+}
+
 function cacheExplorerDirectory(profileId: string, path: string, entries: FileEntry[], workspaceId = state.activeWorkspaceId) {
   const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  const signature = explorerDirectorySignature(entries);
+  const cachedEntries = cloneExplorerEntries(entries);
+  explorerDirectorySignatureCache.set(cachedEntries, signature);
   explorerDirectoryCache.delete(key);
-  explorerDirectoryCache.set(key, { entries: cloneExplorerEntries(entries), cachedAt: Date.now() });
-  while (explorerDirectoryCache.size > EXPLORER_DIRECTORY_CACHE_LIMIT) {
+  explorerDirectoryCache.set(key, { entries: cachedEntries, cachedAt: Date.now() });
+  pruneExplorerDirectoryCache();
+}
+
+function pruneExplorerDirectoryCache() {
+  if (explorerDirectoryCache.size <= EXPLORER_DIRECTORY_CACHE_LIMIT + EXPLORER_DIRECTORY_CACHE_PRUNE_BATCH) return;
+  if (explorerCachePruneBusy()) {
+    scheduleExplorerDirectoryCachePrune();
+    if (explorerDirectoryCache.size <= EXPLORER_DIRECTORY_CACHE_BUSY_LIMIT) return;
+    pruneExplorerDirectoryCacheEntries(EXPLORER_DIRECTORY_CACHE_PRUNE_BATCH);
+    return;
+  }
+  pruneExplorerDirectoryCacheEntries();
+}
+
+function pruneExplorerDirectoryCacheEntries(maxDeletes = Number.POSITIVE_INFINITY) {
+  let deleted = 0;
+  while (explorerDirectoryCache.size > EXPLORER_DIRECTORY_CACHE_LIMIT && deleted < maxDeletes) {
     const oldest = explorerDirectoryCache.keys().next().value;
     if (!oldest) break;
     explorerDirectoryCache.delete(oldest);
+    deleted += 1;
   }
+}
+
+function scheduleExplorerDirectoryCachePrune() {
+  if (explorerDirectoryCachePruneTimer) return;
+  const delay = Math.max(160, explorerScrollingUntil - Date.now() + EXPLORER_SCROLL_IDLE_MS);
+  explorerDirectoryCachePruneTimer = window.setTimeout(() => {
+    explorerDirectoryCachePruneTimer = 0;
+    runWhenUiIdle(pruneExplorerDirectoryCache, 720);
+  }, delay);
+}
+
+function invalidateExplorerDirectoryCache(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  const sizeKey = explorerDirectoryCacheKey(profileId, path, workspaceId, true);
+  explorerDirectoryCache.delete(sizeKey);
+  explorerDirectoryReads.delete(sizeKey);
+  const noSizeKey = explorerDirectoryCacheKey(profileId, path, workspaceId, false);
+  explorerDirectoryCache.delete(noSizeKey);
+  explorerDirectoryReads.delete(noSizeKey);
+}
+
+function invalidateExplorerParentDirectoryCache(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
+  invalidateExplorerDirectoryCache(profileId, parentPath(path), workspaceId);
+}
+
+function createExplorerDirectoryPendingRead() {
+  let resolve!: (entries: FileEntry[]) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<FileEntry[]>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  promise.catch(() => undefined);
+  return { promise, resolve, reject };
 }
 
 async function readExplorerDirectoryCached(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
@@ -4938,11 +7325,15 @@ async function readExplorerDirectoryCached(profileId: string, path: string, work
 
 async function fetchExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId, force = false) {
   const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  if (!force) {
+    const cached = cachedFreshExplorerDirectoryByKey(key, profileId);
+    if (cached) return cached;
+  }
   const pending = explorerDirectoryReads.get(key);
   if (pending && !force) return cloneExplorerEntries(await pending);
 
   let read: Promise<FileEntry[]>;
-  read = api.listDirectory(profileId, path)
+  read = api.listDirectory(profileId, path, state.showFileSizes)
     .then((entries) => {
       cacheExplorerDirectory(profileId, path, entries, workspaceId);
       return cloneExplorerEntries(entries);
@@ -4954,18 +7345,122 @@ async function fetchExplorerDirectory(profileId: string, path: string, workspace
   return cloneExplorerEntries(await read);
 }
 
+async function fetchExplorerDirectories(
+  profileId: string,
+  paths: string[],
+  workspaceId = state.activeWorkspaceId,
+  force = false
+) {
+  const results = new Map<string, DirectoryListingResult>();
+  const misses: string[] = [];
+  const missKeys = new Set<string>();
+  const pendingReads: Array<Promise<void>> = [];
+
+  for (const path of paths) {
+    const resultKey = explorerPathKey(path);
+    const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId);
+    if (!force) {
+      const cached = cachedFreshExplorerDirectoryByKey(cacheKey, profileId);
+      if (cached) {
+        results.set(resultKey, { path, entries: cached, error: null });
+        continue;
+      }
+      const pending = explorerDirectoryReads.get(cacheKey);
+      if (pending) {
+        pendingReads.push(pending
+          .then((entries) => {
+            results.set(resultKey, { path, entries: cloneExplorerEntries(entries), error: null });
+          })
+          .catch((error) => {
+            results.set(resultKey, { path, entries: [], error: String(error) });
+          }));
+        continue;
+      }
+    }
+    if (!missKeys.has(cacheKey)) {
+      missKeys.add(cacheKey);
+      misses.push(path);
+    }
+  }
+
+  if (pendingReads.length) await Promise.all(pendingReads);
+  if (misses.length) {
+    const batchReads = new Map<string, ReturnType<typeof createExplorerDirectoryPendingRead>>();
+    for (const path of misses) {
+      const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+      if (explorerDirectoryReads.has(key)) continue;
+      const pending = createExplorerDirectoryPendingRead();
+      explorerDirectoryReads.set(key, pending.promise);
+      batchReads.set(key, pending);
+    }
+    try {
+      const listings = await api.listDirectories(profileId, misses, state.showFileSizes);
+      const completedKeys = new Set<string>();
+      for (const listing of listings) {
+        const key = explorerPathKey(listing.path);
+        const cacheKey = explorerDirectoryCacheKey(profileId, listing.path, workspaceId);
+        completedKeys.add(cacheKey);
+        const pending = batchReads.get(cacheKey);
+        if (listing.error) {
+          results.set(key, { path: listing.path, entries: [], error: listing.error });
+          pending?.reject(new Error(listing.error));
+        } else {
+          const entries = cloneExplorerEntries(listing.entries);
+          cacheExplorerDirectory(profileId, listing.path, entries, workspaceId);
+          results.set(key, { path: listing.path, entries, error: null });
+          pending?.resolve(cloneExplorerEntries(entries));
+        }
+      }
+      for (const [key, pending] of batchReads) {
+        if (completedKeys.has(key)) continue;
+        pending.reject(new Error('Directory listing was unavailable'));
+      }
+    } catch (error) {
+      for (const [key, pending] of batchReads) {
+        if (explorerDirectoryReads.get(key) === pending.promise) explorerDirectoryReads.delete(key);
+      }
+      await Promise.all(misses.map(async (path) => {
+        const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId);
+        const pending = batchReads.get(cacheKey);
+        try {
+          const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force);
+          results.set(explorerPathKey(path), { path, entries, error: null });
+          pending?.resolve(cloneExplorerEntries(entries));
+        } catch (readError) {
+          results.set(explorerPathKey(path), { path, entries: [], error: String(readError || error) });
+          pending?.reject(readError || error);
+        }
+      }));
+    } finally {
+      for (const [key, pending] of batchReads) {
+        if (explorerDirectoryReads.get(key) === pending.promise) explorerDirectoryReads.delete(key);
+      }
+    }
+  }
+
+  return results;
+}
+
+function explorerDirectoryCacheTtl(profileId: string) {
+  const profile = profileForId(profileId) ?? state.activeProfile;
+  if (profile?.kind === 'ssh') return EXPLORER_DIRECTORY_CACHE_TTL_SSH_MS;
+  if (profile?.kind === 'wsl') return EXPLORER_DIRECTORY_CACHE_TTL_WSL_MS;
+  return EXPLORER_DIRECTORY_CACHE_TTL_LOCAL_MS;
+}
+
 function applyLoadedDirectory(path: string, entries: FileEntry[]) {
   state.entries = cloneExplorerEntries(entries);
   state.currentDir = path;
   state.explorerExpanded = new Set([path]);
   state.explorerChildren = new Map();
+  markExplorerEntryLookupDirty();
   state.explorerLoading = new Set();
   state.explorerSignatures = new Map([[path, explorerDirectorySignature(state.entries)]]);
   state.explorerSelectedPath = '';
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   renderExplorer();
-  scheduleVisibleExplorerDirectoryPrefetch();
+  queueVisibleExplorerDirectoryPrefetch(900);
   refreshTitle();
 }
 
@@ -4978,15 +7473,16 @@ async function loadDirectory(path: string) {
     applyLoadedDirectory(path, cached);
     setStatus('Directory loaded from cache');
     saveActiveWorkspaceSnapshot();
-    void refreshExplorerDirectory(path, profileId, workspaceId, true, true)
-      .then(() => saveActiveWorkspaceSnapshot())
-      .catch(() => undefined);
+    scheduleCachedExplorerDirectoryRefresh(path, profileId, workspaceId, {
+      force: true,
+      requireCurrentDir: true,
+      saveAfter: true
+    });
     return;
   }
   setStatus(`Loading ${path}...`);
   try {
     const entries = await fetchExplorerDirectory(profileId, path, workspaceId);
-    cacheExplorerDirectory(profileId, path, entries, workspaceId);
     if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
     applyLoadedDirectory(path, entries);
     setStatus('Directory loaded');
@@ -4996,11 +7492,67 @@ async function loadDirectory(path: string) {
   }
 }
 
+function shouldLoadExplorerDirectoryOnShow() {
+  return Boolean(
+    state.activeProfile
+    && state.workspaceOpen
+    && state.currentDir
+    && !state.explorerSignatures.has(state.currentDir)
+  );
+}
+
+function scheduleCachedExplorerDirectoryRefresh(
+  path: string,
+  profileId: string,
+  workspaceId: string,
+  options: { force?: boolean; requireCurrentDir?: boolean; requireExpanded?: boolean; saveAfter?: boolean; delayMs?: number } = {}
+) {
+  const token = explorerCachedRefreshToken;
+  const runRefresh = () => runWhenUiIdle(() => {
+    if (token !== explorerCachedRefreshToken) return;
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    if (getPanel('explorer').classList.contains('hidden')) return;
+    if (options.requireCurrentDir && !sameExplorerPath(state.currentDir, path)) return;
+    if (options.requireExpanded && !state.explorerExpanded.has(path)) return;
+    void refreshExplorerDirectory(path, profileId, workspaceId, true, Boolean(options.force))
+      .then(() => {
+        if (options.saveAfter) saveActiveWorkspaceSnapshot();
+      })
+      .catch(() => undefined);
+  }, 1300);
+  const delayMs = options.delayMs ?? (restoringWorkspace ? WORKSPACE_RESTORE_BACKGROUND_DELAY_MS : 0);
+  if (delayMs > 0) {
+    const timer = window.setTimeout(() => {
+      explorerCachedRefreshTimers.delete(timer);
+      if (token === explorerCachedRefreshToken) runRefresh();
+    }, delayMs);
+    explorerCachedRefreshTimers.add(timer);
+  }
+  else runRefresh();
+}
+
 function renderExplorer() {
+  if (getPanel('explorer').classList.contains('hidden')) {
+    explorerRenderDirty = true;
+    return;
+  }
+  explorerRenderDirty = false;
   const scrollTop = el.fileList.scrollTop;
-  el.pathRow.innerHTML = '';
   updateExplorerFileSizeMode();
   updateExplorerOpenMode();
+  renderExplorerPathRow();
+
+  rebuildExplorerVisibleRows();
+  renderVirtualExplorerRows(scrollTop, { force: true });
+  renderExportJobs();
+  queueVisibleExplorerDirectoryPrefetch(900);
+}
+
+function renderExplorerPathRow() {
+  const signature = `${state.currentDir}\t${state.workspaceOpen ? 1 : 0}`;
+  if (explorerPathRowRenderSignature === signature) return;
+  explorerPathRowRenderSignature = signature;
+  el.pathRow.innerHTML = '';
   const up = document.createElement('button');
   up.textContent = '..';
   up.title = 'Parent directory';
@@ -5013,12 +7565,6 @@ function renderExplorer() {
     void switchWorkspace(selected?.kind === 'dir' ? selected.path : state.currentDir);
   });
   el.pathRow.append(up, pathBadge(state.currentDir), useFolder);
-
-  rebuildExplorerVisibleRows();
-  renderVirtualExplorerRows(scrollTop);
-  updateExplorerSelection(false);
-  renderExportJobs();
-  scheduleVisibleExplorerDirectoryPrefetch();
 }
 
 function openExplorerEntry(entry: FileEntry) {
@@ -5040,108 +7586,463 @@ function openSelectedExplorerEntry() {
 }
 
 function rebuildExplorerVisibleRows() {
-  explorerVisibleRows = [];
-  explorerVisibleEntryByPath.clear();
+  explorerVisibleRows.length = 0;
+  explorerTypeaheadCandidates.length = 0;
+  explorerVisibleIndexByPath.clear();
+  explorerTypeaheadIndexByPath.clear();
+  explorerTypeaheadDirty = true;
+  explorerRenderedStart = -1;
+  explorerRenderedEnd = -1;
+  explorerRenderedTotal = -1;
   appendExplorerVisibleRows(state.entries, 0);
 }
 
 function appendExplorerVisibleRows(entries: FileEntry[], depth: number) {
   for (const entry of entries) {
-    explorerVisibleRows.push({ entry, path: entry.path, depth, loading: false });
-    explorerVisibleEntryByPath.set(explorerPathKey(entry.path), entry);
+    const index = explorerVisibleRows.length;
+    const pathKey = explorerPathKey(entry.path);
+    const expanded = entry.kind === 'dir' && state.explorerExpanded.has(entry.path);
+    const disclosureText = entry.kind === 'dir' ? expanded ? 'v' : '>' : '';
+    const sizeText = explorerFileSizeText(entry);
+    explorerVisibleRows.push({
+      entry,
+      path: entry.path,
+      pathKey,
+      depth,
+      loading: false,
+      disclosureText,
+      sizeText,
+      staticSignature: explorerRowStaticSignature(pathKey, entry, depth, disclosureText, sizeText)
+    });
+    explorerVisibleIndexByPath.set(pathKey, index);
 
-    if (entry.kind === 'dir' && state.explorerExpanded.has(entry.path)) {
+    if (expanded) {
       const children = state.explorerChildren.get(entry.path);
       if (children) appendExplorerVisibleRows(children, depth + 1);
       else if (state.explorerLoading.has(entry.path)) {
+        const loadingPath = `${entry.path}::loading`;
+        const loadingPathKey = explorerPathKey(loadingPath);
         explorerVisibleRows.push({
           entry: null,
-          path: `${entry.path}::loading`,
+          path: loadingPath,
+          pathKey: loadingPathKey,
           depth: depth + 1,
-          loading: true
+          loading: true,
+          disclosureText: '',
+          sizeText: '',
+          staticSignature: `loading\t${depth + 1}`
         });
       }
     }
   }
 }
 
-function renderVirtualExplorerRows(scrollTop = el.fileList.scrollTop) {
-  const total = explorerVisibleRows.length;
-  const viewportHeight = Math.max(el.fileList.clientHeight, EXPLORER_ROW_HEIGHT * 8);
-  const maxScrollTop = Math.max(0, total * EXPLORER_ROW_HEIGHT - viewportHeight);
-  const nextScrollTop = clamp(scrollTop, 0, maxScrollTop);
-  const visibleCount = Math.ceil(viewportHeight / EXPLORER_ROW_HEIGHT) + EXPLORER_VIRTUAL_OVERSCAN * 2;
-  explorerRenderedStart = clamp(Math.floor(nextScrollTop / EXPLORER_ROW_HEIGHT) - EXPLORER_VIRTUAL_OVERSCAN, 0, total);
-  explorerRenderedEnd = clamp(explorerRenderedStart + visibleCount, explorerRenderedStart, total);
-
-  const fragment = document.createDocumentFragment();
-  appendExplorerSpacer(fragment, explorerRenderedStart * EXPLORER_ROW_HEIGHT);
-  for (let index = explorerRenderedStart; index < explorerRenderedEnd; index += 1) {
-    const item = explorerVisibleRows[index];
-    fragment.append(item.loading ? createExplorerLoadingRow(item.depth) : createExplorerRow(item.entry!, item.depth));
-  }
-  appendExplorerSpacer(fragment, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT);
-  el.fileList.replaceChildren(fragment);
-  el.fileList.scrollTop = nextScrollTop;
+function explorerRowStaticSignature(
+  pathKey: string,
+  entry: FileEntry,
+  depth: number,
+  disclosureText: string,
+  sizeText: string
+) {
+  return `${pathKey}\t${entry.name}\t${entry.kind}\t${sizeText}\t${depth}\t${disclosureText}`;
 }
 
-function appendExplorerSpacer(fragment: DocumentFragment, height: number) {
-  if (height <= 0) return;
+function rebuildExplorerTypeaheadCandidates() {
+  explorerTypeaheadCandidates.length = 0;
+  explorerTypeaheadIndexByPath.clear();
+  appendExplorerTypeaheadCandidates('dir');
+  appendExplorerTypeaheadCandidates('file');
+  explorerTypeaheadDirty = false;
+}
+
+function appendExplorerTypeaheadCandidates(kind: 'dir' | 'file') {
+  for (const row of explorerVisibleRows) {
+    const entry = row.entry;
+    if (!entry || entry.kind !== kind) continue;
+    explorerTypeaheadIndexByPath.set(row.pathKey, explorerTypeaheadCandidates.length);
+    explorerTypeaheadCandidates.push({
+      entry,
+      pathKey: row.pathKey,
+      nameKey: entry.name.toLowerCase()
+    });
+  }
+}
+
+function explorerVirtualWindowMetrics(scrollTop = el.fileList.scrollTop) {
+  const total = explorerVisibleRows.length;
+  const viewportHeight = Math.max(explorerViewportHeight || el.fileList.clientHeight, EXPLORER_ROW_HEIGHT * 8);
+  const maxScrollTop = Math.max(0, total * EXPLORER_ROW_HEIGHT - viewportHeight);
+  const nextScrollTop = clamp(scrollTop, 0, maxScrollTop);
+  const scrolling = Date.now() < explorerScrollingUntil;
+  const overscan = scrolling ? EXPLORER_VIRTUAL_SCROLL_OVERSCAN : EXPLORER_VIRTUAL_OVERSCAN;
+  const windowStep = scrolling ? EXPLORER_VIRTUAL_SCROLL_WINDOW_STEP : EXPLORER_VIRTUAL_WINDOW_STEP;
+  const visibleCount = Math.ceil(viewportHeight / EXPLORER_ROW_HEIGHT) + overscan * 2 + windowStep;
+  const viewportStart = Math.floor(nextScrollTop / EXPLORER_ROW_HEIGHT);
+  const viewportEnd = Math.ceil((nextScrollTop + viewportHeight) / EXPLORER_ROW_HEIGHT);
+  const neededStart = clamp(viewportStart - overscan, 0, total);
+  const neededEnd = clamp(viewportEnd + overscan, neededStart, total);
+  const rawStart = Math.max(0, viewportStart - overscan);
+  const nextStart = clamp(Math.floor(rawStart / windowStep) * windowStep, 0, total);
+  const nextEnd = clamp(Math.max(nextStart + visibleCount, neededEnd), nextStart, total);
+  return { total, nextScrollTop, neededStart, neededEnd, nextStart, nextEnd };
+}
+
+function explorerRenderedWindowCoversScroll(scrollTop = el.fileList.scrollTop) {
+  if (explorerRenderDirty || !el.fileList.childElementCount) return false;
+  const metrics = explorerVirtualWindowMetrics(scrollTop);
+  return explorerRenderedTotal === metrics.total
+    && explorerRenderedStart <= metrics.neededStart
+    && explorerRenderedEnd >= metrics.neededEnd;
+}
+
+function renderVirtualExplorerRows(
+  scrollTop = el.fileList.scrollTop,
+  options: { force?: boolean; shrink?: boolean } = {}
+) {
+  const {
+    total,
+    nextScrollTop,
+    neededStart,
+    neededEnd,
+    nextStart,
+    nextEnd
+  } = explorerVirtualWindowMetrics(scrollTop);
+  const sameWindow = !options.force
+    && !options.shrink
+    && explorerRenderedTotal === total
+    && explorerRenderedStart <= neededStart
+    && explorerRenderedEnd >= neededEnd
+    && el.fileList.childElementCount > 0;
+
+  if (sameWindow) {
+    if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
+    return;
+  }
+
+  const selectedKey = state.explorerSelectedPath ? explorerPathKey(state.explorerSelectedPath) : '';
+  const dropTargetKey = state.explorerDropTargetDir ? explorerPathKey(state.explorerDropTargetDir) : '';
+  const renameKey = activeExplorerRename ? explorerPathKey(activeExplorerRename.path) : '';
+
+  if (!options.force && patchVirtualExplorerRows({
+    total,
+    nextScrollTop,
+    nextStart,
+    nextEnd,
+    selectedKey,
+    dropTargetKey,
+    renameKey
+  })) {
+    return;
+  }
+
+  explorerRenderedStart = nextStart;
+  explorerRenderedEnd = nextEnd;
+  explorerRenderedTotal = total;
+
+  explorerRenderedRowByPath.clear();
+  const fragment = document.createDocumentFragment();
+  appendExplorerSpacer(fragment, explorerRenderedStart * EXPLORER_ROW_HEIGHT, explorerTopSpacer);
+  for (let index = explorerRenderedStart; index < explorerRenderedEnd; index += 1) {
+    fragment.append(explorerRowForWindowIndex(index, selectedKey, dropTargetKey, renameKey));
+  }
+  appendExplorerSpacer(fragment, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT, explorerBottomSpacer);
+  el.fileList.replaceChildren(fragment);
+  if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
+  explorerLastSelectedPath = state.explorerSelectedPath;
+}
+
+function patchVirtualExplorerRows(options: {
+  total: number;
+  nextScrollTop: number;
+  nextStart: number;
+  nextEnd: number;
+  selectedKey: string;
+  dropTargetKey: string;
+  renameKey: string;
+}) {
+  const { total, nextScrollTop, nextStart, nextEnd, selectedKey, dropTargetKey, renameKey } = options;
+  const oldStart = explorerRenderedStart;
+  const oldEnd = explorerRenderedEnd;
+  if (
+    explorerRenderedTotal !== total
+    || oldStart < 0
+    || oldEnd < oldStart
+    || !explorerTopSpacer.isConnected
+    || !explorerBottomSpacer.isConnected
+    || nextEnd <= oldStart
+    || nextStart >= oldEnd
+  ) {
+    return false;
+  }
+
+  for (let index = oldStart; index < nextStart; index += 1) {
+    removeExplorerRenderedChild(el.fileList.children[1]);
+  }
+  for (let index = nextEnd; index < oldEnd; index += 1) {
+    removeExplorerRenderedChild(explorerBottomSpacer.previousElementSibling);
+  }
+
+  if (nextStart < oldStart) {
+    const fragment = document.createDocumentFragment();
+    for (let index = nextStart; index < oldStart; index += 1) {
+      fragment.append(explorerRowForWindowIndex(index, selectedKey, dropTargetKey, renameKey));
+    }
+    el.fileList.insertBefore(fragment, explorerTopSpacer.nextSibling);
+  }
+
+  if (nextEnd > oldEnd) {
+    const fragment = document.createDocumentFragment();
+    for (let index = oldEnd; index < nextEnd; index += 1) {
+      fragment.append(explorerRowForWindowIndex(index, selectedKey, dropTargetKey, renameKey));
+    }
+    el.fileList.insertBefore(fragment, explorerBottomSpacer);
+  }
+
+  explorerRenderedStart = nextStart;
+  explorerRenderedEnd = nextEnd;
+  explorerRenderedTotal = total;
+  updateExplorerSpacerHeight(explorerTopSpacer, explorerRenderedStart * EXPLORER_ROW_HEIGHT);
+  updateExplorerSpacerHeight(explorerBottomSpacer, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT);
+  if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
+  explorerLastSelectedPath = state.explorerSelectedPath;
+  return true;
+}
+
+function explorerRowForWindowIndex(
+  index: number,
+  selectedKey: string,
+  dropTargetKey: string,
+  renameKey: string
+) {
+  const item = explorerVisibleRows[index];
+  return item.loading
+    ? cachedExplorerLoadingRow(item)
+    : cachedExplorerRow(item, selectedKey, dropTargetKey, renameKey);
+}
+
+function removeExplorerRenderedChild(child: Element | null) {
+  if (!(child instanceof HTMLElement) || child === explorerTopSpacer || child === explorerBottomSpacer) return;
+  const key = child.dataset.pathKey;
+  if (key && explorerRenderedRowByPath.get(key) === child) explorerRenderedRowByPath.delete(key);
+  child.remove();
+}
+
+function createExplorerSpacerElement() {
   const spacer = document.createElement('div');
   spacer.className = 'explorer-spacer';
-  spacer.style.height = `${height}px`;
+  return spacer;
+}
+
+function appendExplorerSpacer(fragment: DocumentFragment, height: number, spacer: HTMLElement) {
+  updateExplorerSpacerHeight(spacer, height);
   fragment.append(spacer);
 }
 
-function createExplorerRow(entry: FileEntry, depth: number) {
-  const row = document.createElement('div');
-  row.className = `file-row ${entry.kind}`;
-  row.dataset.path = entry.path;
-  if (sameExplorerPath(entry.path, state.explorerDropTargetDir)) row.classList.add('drop-target');
-  row.tabIndex = 0;
-  row.style.setProperty('--depth', String(depth));
-  row.setAttribute('role', 'option');
-  row.setAttribute('aria-selected', String(sameExplorerPath(entry.path, state.explorerSelectedPath)));
+function updateExplorerSpacerHeight(spacer: HTMLElement, height: number) {
+  const heightText = `${height}px`;
+  if (spacer.style.height !== heightText) spacer.style.height = heightText;
+}
 
-  const disclosure = document.createElement('span');
-  disclosure.className = 'file-disclosure';
-  disclosure.textContent = entry.kind === 'dir'
-    ? state.explorerExpanded.has(entry.path) ? 'v' : '>'
-    : '';
-
-  const name = document.createElement('span');
-  name.className = 'file-name';
-  if (activeExplorerRename && sameExplorerPath(activeExplorerRename.path, entry.path)) {
-    attachExplorerRenameInput(name, entry);
-  } else {
-    name.textContent = entry.name;
-  }
-
-  const size = document.createElement('small');
-  size.textContent = entry.kind === 'file' ? formatBytes(entry.size) : '';
-
-  row.append(disclosure, name, size);
+function cachedExplorerRow(
+  item: ExplorerVisibleRow,
+  selectedKey: string,
+  dropTargetKey: string,
+  renameKey: string
+) {
+  const key = `row:${item.pathKey}`;
+  const row = cachedExplorerRowElement(key);
+  updateExplorerRowElement(row, item, selectedKey, dropTargetKey, renameKey);
+  explorerRenderedRowByPath.set(item.pathKey, row);
   return row;
 }
 
-function createExplorerLoadingRow(depth: number) {
-  const row = document.createElement('div');
-  row.className = 'file-row loading';
-  row.style.setProperty('--depth', String(depth));
-  row.setAttribute('role', 'option');
-  row.innerHTML = '<span class="file-disclosure"></span><span class="file-name">Loading...</span><small></small>';
+function cachedExplorerLoadingRow(item: ExplorerVisibleRow) {
+  const row = cachedExplorerRowElement(`loading:${item.pathKey}`);
+  updateExplorerLoadingRowElement(row, item.depth);
   return row;
+}
+
+function cachedExplorerRowElement(key: string) {
+  const cached = explorerRowElementCache.get(key);
+  if (cached) {
+    explorerRowElementCache.delete(key);
+    explorerRowElementCache.set(key, cached);
+    return cached;
+  }
+  const row = takeReusableExplorerRowElement() ?? createExplorerRowElement();
+  explorerRowElementCache.set(key, row);
+  pruneExplorerRowElementCache();
+  return row;
+}
+
+function takeReusableExplorerRowElement() {
+  while (explorerReusableRowElements.length) {
+    const row = explorerReusableRowElements.pop()!;
+    if (!row.isConnected) return row;
+  }
+  return null;
+}
+
+function createExplorerRowElement() {
+  const row = document.createElement('div');
+  row.tabIndex = 0;
+  row.setAttribute('role', 'option');
+
+  const disclosure = document.createElement('span');
+  disclosure.className = 'file-disclosure';
+  const name = document.createElement('span');
+  name.className = 'file-name';
+  const size = document.createElement('small');
+  row.append(disclosure, name, size);
+  explorerRowPartCache.set(row, { disclosure, name, size });
+  return row;
+}
+
+function explorerRowParts(row: HTMLElement) {
+  const cached = explorerRowPartCache.get(row);
+  if (cached) return cached;
+  const parts = {
+    disclosure: row.children[0] as HTMLElement,
+    name: row.children[1] as HTMLElement,
+    size: row.children[2] as HTMLElement
+  };
+  explorerRowPartCache.set(row, parts);
+  return parts;
+}
+
+function updateExplorerRowElement(
+  row: HTMLElement,
+  item: ExplorerVisibleRow,
+  selectedKey: string,
+  dropTargetKey: string,
+  renameKey: string
+) {
+  const entry = item.entry!;
+  const selected = item.pathKey === selectedKey;
+  const dropTarget = item.pathKey === dropTargetKey;
+  const renameActive = item.pathKey === renameKey;
+  const stateSignature = `${selected ? '1' : '0'}${dropTarget ? '1' : '0'}${renameActive ? '1' : '0'}`;
+  const staticChanged = row.dataset.staticSignature !== item.staticSignature;
+  const stateChanged = row.dataset.stateSignature !== stateSignature;
+  if (!staticChanged && !stateChanged) return;
+
+  const renameChanged = row.dataset.renameActive !== (renameActive ? '1' : '0');
+  row.dataset.staticSignature = item.staticSignature;
+  row.dataset.stateSignature = stateSignature;
+  row.dataset.renameActive = renameActive ? '1' : '0';
+  if (staticChanged) {
+    row.className = `file-row ${entry.kind}`;
+    row.dataset.path = entry.path;
+    row.dataset.pathKey = item.pathKey;
+    if (row.tabIndex !== 0) row.tabIndex = 0;
+    const depthText = String(item.depth);
+    if (row.style.getPropertyValue('--depth') !== depthText) row.style.setProperty('--depth', depthText);
+    setAttributeIfChanged(row, 'role', 'option');
+  }
+  if (staticChanged || stateChanged) {
+    toggleClassIfChanged(row, 'selected', selected);
+    toggleClassIfChanged(row, 'drop-target', dropTarget);
+    setAttributeIfChanged(row, 'aria-selected', String(selected));
+  }
+  const { disclosure, name, size } = explorerRowParts(row);
+  if (staticChanged) {
+    setTextContentIfChanged(disclosure, item.disclosureText);
+    setTextContentIfChanged(size, item.sizeText);
+  }
+  if (staticChanged || renameChanged) {
+    if (renameActive) {
+      name.replaceChildren();
+      attachExplorerRenameInput(name, entry);
+    } else {
+      if (name.childElementCount) name.replaceChildren();
+      setTextContentIfChanged(name, entry.name);
+    }
+  }
+}
+
+function explorerFileSizeText(entry: FileEntry) {
+  return state.showFileSizes && entry.kind === 'file' ? formatBytes(entry.size) : '';
+}
+
+function updateExplorerLoadingRowElement(row: HTMLElement, depth: number) {
+  const signature = `loading\t${depth}`;
+  if (row.dataset.staticSignature === signature) return;
+  row.dataset.staticSignature = signature;
+  row.dataset.stateSignature = '';
+  row.dataset.renameActive = '0';
+  row.className = 'file-row loading';
+  delete row.dataset.path;
+  delete row.dataset.pathKey;
+  const depthText = String(depth);
+  if (row.style.getPropertyValue('--depth') !== depthText) row.style.setProperty('--depth', depthText);
+  row.removeAttribute('aria-selected');
+  if (row.tabIndex !== -1) row.tabIndex = -1;
+  setAttributeIfChanged(row, 'role', 'option');
+  const { disclosure, name, size } = explorerRowParts(row);
+  setTextContentIfChanged(disclosure, '');
+  if (name.childElementCount) name.replaceChildren();
+  setTextContentIfChanged(name, 'Loading...');
+  setTextContentIfChanged(size, '');
+}
+
+function pruneExplorerRowElementCache() {
+  if (explorerRowElementCache.size <= EXPLORER_ROW_ELEMENT_CACHE_LIMIT + EXPLORER_ROW_ELEMENT_CACHE_PRUNE_BATCH) return;
+  if (explorerCachePruneBusy()) {
+    scheduleExplorerRowElementCachePrune();
+    if (explorerRowElementCache.size <= EXPLORER_ROW_ELEMENT_CACHE_BUSY_LIMIT) return;
+    pruneExplorerRowElementCacheEntries(EXPLORER_ROW_ELEMENT_CACHE_PRUNE_BATCH);
+    return;
+  }
+  pruneExplorerRowElementCacheEntries();
+}
+
+function pruneExplorerRowElementCacheEntries(maxDeletes = Number.POSITIVE_INFINITY) {
+  let deleted = 0;
+  while (explorerRowElementCache.size > EXPLORER_ROW_ELEMENT_CACHE_LIMIT && deleted < maxDeletes) {
+    const oldest = explorerRowElementCache.keys().next().value;
+    if (oldest === undefined) break;
+    const row = explorerRowElementCache.get(oldest);
+    explorerRowElementCache.delete(oldest);
+    recycleExplorerRowElement(row);
+    deleted += 1;
+  }
+}
+
+function scheduleExplorerRowElementCachePrune() {
+  if (explorerRowElementCachePruneTimer) return;
+  const delay = Math.max(80, explorerScrollingUntil - Date.now() + EXPLORER_SCROLL_IDLE_MS);
+  explorerRowElementCachePruneTimer = window.setTimeout(() => {
+    explorerRowElementCachePruneTimer = 0;
+    runWhenUiIdle(pruneExplorerRowElementCache, 520);
+  }, delay);
+}
+
+function explorerCachePruneBusy() {
+  return Date.now() < explorerScrollingUntil || uiInputPending();
+}
+
+function recycleExplorerRowElement(row?: HTMLElement) {
+  if (!row || row.isConnected || explorerReusableRowElements.length >= EXPLORER_ROW_RECYCLE_LIMIT) return;
+  row.dataset.staticSignature = '';
+  row.dataset.stateSignature = '';
+  row.dataset.renameActive = '0';
+  delete row.dataset.path;
+  delete row.dataset.pathKey;
+  row.className = 'file-row';
+  explorerReusableRowElements.push(row);
 }
 
 function bindExplorerListEvents() {
   el.fileList.addEventListener('scroll', handleExplorerScroll, { passive: true });
-  el.fileList.addEventListener('wheel', markExplorerScrolling, { passive: true });
   el.fileList.addEventListener('pointerover', handleExplorerPointerOver);
   el.fileList.addEventListener('pointerdown', handleExplorerPointerDown);
   el.fileList.addEventListener('focusin', handleExplorerFocusIn);
   el.fileList.addEventListener('click', handleExplorerClick);
   el.fileList.addEventListener('dblclick', handleExplorerDoubleClick);
-  explorerResizeObserver = new ResizeObserver(scheduleExplorerVirtualRender);
+  explorerResizeObserver = new ResizeObserver((entries) => {
+    explorerViewportHeight = Math.round(entries[0]?.contentRect.height ?? el.fileList.clientHeight);
+    scheduleExplorerVirtualRender();
+  });
   explorerResizeObserver.observe(el.fileList);
 }
 
@@ -5151,25 +8052,61 @@ function handleExplorerScroll() {
 }
 
 function scheduleExplorerVirtualRender() {
+  if (getPanel('explorer').classList.contains('hidden')) {
+    explorerRenderDirty = true;
+    return;
+  }
   if (explorerRenderFrame) return;
+  if (explorerRenderedWindowCoversScroll()) return;
   explorerRenderFrame = window.requestAnimationFrame(() => {
     explorerRenderFrame = 0;
     renderVirtualExplorerRows();
-    updateExplorerSelection(false);
   });
 }
 
 function markExplorerScrolling() {
-  explorerScrollingUntil = Date.now() + EXPLORER_SCROLL_IDLE_MS;
-  cancelExplorerHoverPrefetch();
-  if (explorerScrollIdleTimer) window.clearTimeout(explorerScrollIdleTimer);
-  explorerScrollIdleTimer = window.setTimeout(() => {
+  const now = Date.now();
+  const scrollTimerActive = explorerScrollIdleTimer !== 0;
+  const alreadyScrolling = scrollTimerActive || now < explorerScrollingUntil;
+  explorerScrollingUntil = now + EXPLORER_SCROLL_IDLE_MS;
+  if (!scrollTimerActive) toggleClassIfChanged(el.fileList, 'scrolling', true);
+  if (!alreadyScrolling) {
+    cancelExplorerHoverPrefetch();
+    cancelVisibleExplorerDirectoryPrefetch();
+  }
+  if (scrollTimerActive) return;
+  const waitForScrollIdle = () => {
+    const remaining = explorerScrollingUntil - Date.now();
+    if (remaining > 0) {
+      explorerScrollIdleTimer = window.setTimeout(waitForScrollIdle, remaining);
+      return;
+    }
     explorerScrollIdleTimer = 0;
-    scheduleVisibleExplorerDirectoryPrefetch();
-  }, EXPLORER_SCROLL_IDLE_MS);
+    toggleClassIfChanged(el.fileList, 'scrolling', false);
+    if (explorerRenderDirty && !getPanel('explorer').classList.contains('hidden')) {
+      renderExplorer();
+    } else {
+      shrinkExplorerVirtualWindowAfterScrollIdle();
+    }
+    queueVisibleExplorerDirectoryPrefetch(700);
+  };
+  explorerScrollIdleTimer = window.setTimeout(waitForScrollIdle, EXPLORER_SCROLL_IDLE_MS);
+}
+
+function shrinkExplorerVirtualWindowAfterScrollIdle() {
+  runWhenUiIdle(() => {
+    if (Date.now() < explorerScrollingUntil) return;
+    if (getPanel('explorer').classList.contains('hidden')) return;
+    if (explorerRenderDirty) {
+      renderExplorer();
+      return;
+    }
+    renderVirtualExplorerRows(el.fileList.scrollTop, { shrink: true });
+  }, 260);
 }
 
 function handleExplorerPointerOver(event: PointerEvent) {
+  if (Date.now() < explorerScrollingUntil) return;
   const row = explorerRowFromEvent(event);
   if (!row || row.contains(event.relatedTarget as Node | null)) return;
   const entry = explorerEntryForRow(row);
@@ -5222,7 +8159,13 @@ function explorerRowFromEvent(event: Event) {
 
 function explorerEntryForRow(row: HTMLElement) {
   const path = row.dataset.path ?? '';
-  return explorerVisibleEntryByPath.get(explorerPathKey(path)) ?? findExplorerEntry(path);
+  const pathKey = row.dataset.pathKey || explorerPathKey(path);
+  return explorerVisibleEntryForPathKey(pathKey) ?? findExplorerEntry(path);
+}
+
+function explorerVisibleEntryForPathKey(pathKey: string) {
+  const index = explorerVisibleIndexByPath.get(pathKey);
+  return index === undefined ? null : explorerVisibleRows[index]?.entry ?? null;
 }
 
 function scheduleExplorerHoverPrefetch(entry: FileEntry) {
@@ -5272,6 +8215,7 @@ async function startExportSelectedExplorerEntry() {
 }
 
 function handleExportProgress(payload: ExportProgressEvent) {
+  const existing = exportJobById.get(payload.id);
   upsertExportJob({
     id: payload.id,
     name: payload.name,
@@ -5280,7 +8224,7 @@ function handleExportProgress(payload: ExportProgressEvent) {
     outputPath: payload.outputPath ?? null,
     message: payload.message ?? null,
     directory: payload.directory,
-    createdAt: state.exportJobs.find((job) => job.id === payload.id)?.createdAt ?? Date.now()
+    createdAt: existing?.createdAt ?? Date.now()
   });
   if (payload.status === 'completed') setStatus(`${payload.name} ready to drag out`);
   else if (payload.status === 'failed') setStatus(`Export failed: ${payload.message ?? payload.name}`, true);
@@ -5288,60 +8232,190 @@ function handleExportProgress(payload: ExportProgressEvent) {
 }
 
 function upsertExportJob(job: ExportJobState) {
-  const existing = state.exportJobs.findIndex((item) => item.id === job.id);
-  if (existing >= 0) state.exportJobs[existing] = { ...state.exportJobs[existing], ...job };
-  else state.exportJobs.unshift(job);
-  state.exportJobs = state.exportJobs.slice(0, 8);
+  const existing = exportJobById.get(job.id);
+  if (existing) {
+    Object.assign(existing, job);
+  } else {
+    state.exportJobs.unshift(job);
+    exportJobById.set(job.id, job);
+    while (state.exportJobs.length > 8) {
+      const removed = state.exportJobs.pop();
+      if (removed) exportJobById.delete(removed.id);
+    }
+  }
   renderExportJobs();
 }
 
 function renderExportJobs() {
+  const signature = exportJobsSignature();
+  if (exportJobsRenderSignature === signature) return;
+  const orderSignature = exportJobsOrderSignature();
+  const sameOrder = exportJobsOrderRenderSignature === orderSignature
+    && el.exportList.childElementCount === state.exportJobs.length;
+  exportJobsRenderSignature = signature;
   el.exportList.classList.toggle('hidden', state.exportJobs.length === 0);
-  el.exportList.innerHTML = '';
+
+  if (sameOrder) {
+    for (const job of state.exportJobs) {
+      updateExportJobElement(exportJobElement(job.id), job);
+    }
+    return;
+  }
+
+  exportJobsOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const job of state.exportJobs) {
-    const row = document.createElement('div');
-    row.className = `export-job ${job.status}`;
+    seen.add(job.id);
+    const row = exportJobElement(job.id);
+    updateExportJobElement(row, job);
+    fragment.append(row);
+  }
+  el.exportList.replaceChildren(fragment);
+  pruneExportJobElementCache(seen);
+}
 
-    const meta = document.createElement('div');
-    meta.className = 'export-meta';
-    const title = document.createElement('strong');
-    title.textContent = job.name;
-    const detail = document.createElement('span');
-    detail.textContent = exportJobDetail(job);
-    meta.append(title, detail);
+function exportJobElement(id: string) {
+  const cached = exportJobElementCache.get(id);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.dataset.exportJobId = id;
+  const meta = document.createElement('div');
+  meta.className = 'export-meta';
+  const title = document.createElement('strong');
+  const detail = document.createElement('span');
+  meta.append(title, detail);
+  const progress = document.createElement('div');
+  progress.className = 'export-progress';
+  const bar = document.createElement('div');
+  progress.append(bar);
+  const actions = document.createElement('div');
+  actions.className = 'export-actions';
+  row.append(meta, progress, actions);
+  exportJobPartCache.set(row, { title, detail, progress, bar, actions });
+  exportJobElementCache.set(id, row);
+  return row;
+}
 
-    const progress = document.createElement('div');
-    progress.className = 'export-progress';
-    const bar = document.createElement('div');
-    bar.style.width = `${Math.round((job.progress ?? 0) * 100)}%`;
-    progress.classList.toggle('indeterminate', job.status === 'running' && job.progress == null);
-    progress.append(bar);
+function exportJobParts(row: HTMLElement) {
+  const cached = exportJobPartCache.get(row);
+  if (cached) return cached;
+  const meta = row.querySelector<HTMLElement>('.export-meta');
+  const progress = row.querySelector<HTMLElement>('.export-progress');
+  const actions = row.querySelector<HTMLElement>('.export-actions');
+  if (meta && progress && actions) {
+    let bar = progress.firstElementChild as HTMLElement | null;
+    if (!bar) {
+      bar = document.createElement('div');
+      progress.append(bar);
+    }
+    const parts = {
+      title: meta.querySelector<HTMLElement>('strong')!,
+      detail: meta.querySelector<HTMLElement>('span')!,
+      progress,
+      bar,
+      actions
+    };
+    exportJobPartCache.set(row, parts);
+    return parts;
+  }
+  row.replaceChildren();
+  const rebuiltMeta = document.createElement('div');
+  rebuiltMeta.className = 'export-meta';
+  const title = document.createElement('strong');
+  const detail = document.createElement('span');
+  rebuiltMeta.append(title, detail);
+  const rebuiltProgress = document.createElement('div');
+  rebuiltProgress.className = 'export-progress';
+  const bar = document.createElement('div');
+  rebuiltProgress.append(bar);
+  const rebuiltActions = document.createElement('div');
+  rebuiltActions.className = 'export-actions';
+  row.append(rebuiltMeta, rebuiltProgress, rebuiltActions);
+  const parts = { title, detail, progress: rebuiltProgress, bar, actions: rebuiltActions };
+  exportJobPartCache.set(row, parts);
+  return parts;
+}
 
-    const actions = document.createElement('div');
-    actions.className = 'export-actions';
+function updateExportJobElement(row: HTMLElement, job: ExportJobState) {
+  const detailText = exportJobDetail(job);
+  const progressPercent = `${Math.round((job.progress ?? 0) * 100)}%`;
+  const actionSignature = job.status === 'running'
+    ? 'cancel'
+    : job.status === 'completed' && job.outputPath
+      ? 'drag-open'
+      : '';
+  const signature = `${job.id}\t${job.name}\t${job.status}\t${progressPercent}\t${job.progress == null ? '1' : '0'}\t${detailText}\t${job.outputPath ?? ''}\t${actionSignature}`;
+  row.dataset.exportJobId = job.id;
+  if (row.dataset.renderSignature === signature) return;
+  row.dataset.renderSignature = signature;
+  row.className = `export-job ${job.status}`;
+
+  const parts = exportJobParts(row);
+  setTextContentIfChanged(parts.title, job.name);
+  setTextContentIfChanged(parts.detail, detailText);
+  parts.progress.classList.toggle('indeterminate', job.status === 'running' && job.progress == null);
+  if (parts.bar.style.width !== progressPercent) parts.bar.style.width = progressPercent;
+
+  if (row.dataset.actionSignature !== actionSignature) {
+    row.dataset.actionSignature = actionSignature;
+    parts.actions.replaceChildren();
     if (job.status === 'running') {
       const cancel = document.createElement('button');
       cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', () => void cancelExportJob(job.id));
-      actions.append(cancel);
+      cancel.addEventListener('click', () => {
+        const id = row.dataset.exportJobId;
+        if (id) void cancelExportJob(id);
+      });
+      parts.actions.append(cancel);
     } else if (job.status === 'completed' && job.outputPath) {
       const drag = document.createElement('button');
       drag.textContent = 'Drag out';
       drag.className = 'export-drag';
       drag.draggable = true;
       drag.title = 'Drag this to Windows Explorer';
-      drag.addEventListener('dragstart', (event) => prepareExportDrag(event, job));
+      drag.addEventListener('dragstart', (event) => {
+        const current = exportJobForRow(row);
+        if (current) prepareExportDrag(event, current);
+      });
       const open = document.createElement('button');
       open.textContent = 'Open';
-      open.addEventListener('click', () => void api.openExportPath(job.outputPath!));
-      actions.append(drag, open);
+      open.addEventListener('click', () => {
+        const current = exportJobForRow(row);
+        if (current?.outputPath) void api.openExportPath(current.outputPath);
+      });
+      parts.actions.append(drag, open);
     }
-
-    row.append(meta, progress, actions);
-    fragment.append(row);
   }
-  el.exportList.append(fragment);
+}
+
+function exportJobForRow(row: HTMLElement) {
+  return exportJobById.get(row.dataset.exportJobId ?? '') ?? null;
+}
+
+function pruneExportJobElementCache(seen: Set<string>) {
+  for (const id of exportJobElementCache.keys()) {
+    if (!seen.has(id)) exportJobElementCache.delete(id);
+  }
+}
+
+function exportJobsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.exportJobs.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.exportJobs[index].id;
+  }
+  return signature;
+}
+
+function exportJobsSignature() {
+  let signature = '';
+  for (let index = 0; index < state.exportJobs.length; index += 1) {
+    const job = state.exportJobs[index];
+    if (index) signature += '\n';
+    signature += `${job.id}\t${job.status}\t${job.progress ?? ''}\t${job.outputPath ?? ''}\t${job.message ?? ''}\t${job.directory ? '1' : '0'}`;
+  }
+  return signature;
 }
 
 function exportJobDetail(job: ExportJobState) {
@@ -5401,6 +8475,7 @@ async function handleExplorerFileDrop(payload: TauriDragDropPayload) {
   try {
     setStatus(`Copying ${sourcePaths.length} dropped item${sourcePaths.length === 1 ? '' : 's'}...`);
     const copied = await api.copyDroppedFiles(state.activeProfile.id, targetDir, sourcePaths);
+    invalidateExplorerDirectoryCache(state.activeProfile.id, targetDir);
     await reloadExplorerDirectory(targetDir);
     selectExplorerEntry(targetDir, false);
     setStatus(`Copied ${copied} dropped item${copied === 1 ? '' : 's'}`);
@@ -5410,20 +8485,40 @@ async function handleExplorerFileDrop(payload: TauriDragDropPayload) {
 }
 
 function updateExplorerDropTarget(position?: { x: number; y: number }) {
+  explorerPendingDropPosition = position;
+  if (explorerDropTargetFrame) return;
+  explorerDropTargetFrame = window.requestAnimationFrame(() => {
+    explorerDropTargetFrame = 0;
+    applyExplorerDropTarget(explorerPendingDropPosition);
+  });
+}
+
+function applyExplorerDropTarget(position?: { x: number; y: number }) {
   const targetDir = explorerDropTargetDirectory(position);
   const explorer = getPanel('explorer');
+  if (state.explorerDropTargetDir === (targetDir ?? '')) return;
   explorer.classList.toggle('drop-active', Boolean(targetDir));
+  if (state.explorerDropTargetDir) {
+    explorerRowForPath(state.explorerDropTargetDir)?.classList.remove('drop-target');
+  }
   state.explorerDropTargetDir = targetDir ?? '';
-  el.fileList.querySelectorAll<HTMLElement>('.file-row.drop-target')
-    .forEach((row) => row.classList.remove('drop-target'));
   if (targetDir) explorerRowForPath(targetDir)?.classList.add('drop-target');
 }
 
 function clearExplorerDropTarget() {
+  explorerPendingDropPosition = undefined;
+  if (explorerDropTargetFrame) {
+    window.cancelAnimationFrame(explorerDropTargetFrame);
+    explorerDropTargetFrame = 0;
+  }
+  if (!state.explorerDropTargetDir) {
+    getPanel('explorer').classList.remove('drop-active');
+    return;
+  }
+  const previous = state.explorerDropTargetDir;
   state.explorerDropTargetDir = '';
   getPanel('explorer').classList.remove('drop-active');
-  el.fileList.querySelectorAll<HTMLElement>('.file-row.drop-target')
-    .forEach((row) => row.classList.remove('drop-target'));
+  explorerRowForPath(previous)?.classList.remove('drop-target');
 }
 
 function explorerDropTargetDirectory(position?: { x: number; y: number }) {
@@ -5435,7 +8530,7 @@ function explorerDropTargetDirectory(position?: { x: number; y: number }) {
 
   const row = target.closest<HTMLElement>('.file-row');
   if (row?.dataset.path) {
-    const entry = findExplorerEntry(row.dataset.path);
+    const entry = explorerEntryForRow(row);
     if (entry?.kind === 'dir') return entry.path;
     if (entry) return parentPath(entry.path);
   }
@@ -5467,12 +8562,13 @@ async function toggleExplorerDirectory(entry: FileEntry) {
   const cached = state.explorerChildren.get(entry.path) ?? cachedExplorerDirectory(profileId, entry.path, workspaceId);
   if (cached) {
     state.explorerChildren.set(entry.path, cached);
+    markExplorerEntryLookupDirty();
     state.explorerSignatures.set(entry.path, explorerDirectorySignature(cached));
     state.explorerExpanded.add(entry.path);
     state.explorerLoading.delete(entry.path);
     renderExplorer();
     saveActiveWorkspaceSnapshot();
-    void refreshExplorerDirectory(entry.path, profileId, workspaceId).catch(() => undefined);
+    scheduleCachedExplorerDirectoryRefresh(entry.path, profileId, workspaceId, { requireExpanded: true });
     return;
   }
 
@@ -5484,9 +8580,10 @@ async function toggleExplorerDirectory(entry: FileEntry) {
     const children = await fetchExplorerDirectory(profileId, entry.path, workspaceId);
     if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
     state.explorerChildren.set(entry.path, children);
+    markExplorerEntryLookupDirty();
     state.explorerSignatures.set(entry.path, explorerDirectorySignature(children));
     state.explorerExpanded.add(entry.path);
-    scheduleVisibleExplorerDirectoryPrefetch();
+    queueVisibleExplorerDirectoryPrefetch(700);
     setStatus(`Expanded ${entry.name}`);
   } catch (error) {
     state.explorerExpanded.delete(entry.path);
@@ -5523,6 +8620,7 @@ async function createExplorerItem(kind: 'file' | 'dir') {
     if (kind === 'file') await api.createFile(state.activeProfile.id, path);
     else await api.createDirectory(state.activeProfile.id, path);
     if (kind === 'file') cacheTextFile(state.activeProfile.id, path, '');
+    invalidateExplorerDirectoryCache(state.activeProfile.id, targetDir);
     await reloadExplorerDirectory(targetDir);
     selectExplorerEntry(path);
     startInlineExplorerRename(path, { created: true });
@@ -5566,6 +8664,10 @@ async function finishInlineExplorerRename(input: HTMLInputElement, commit: boole
     await api.renamePath(state.activeProfile.id, entry.path, newPath);
     invalidateTextFileCache(state.activeProfile.id, entry.path);
     invalidateTextFileCache(state.activeProfile.id, newPath);
+    invalidateExplorerParentDirectoryCache(state.activeProfile.id, entry.path);
+    invalidateExplorerParentDirectoryCache(state.activeProfile.id, newPath);
+    invalidateExplorerDirectoryCache(state.activeProfile.id, entry.path);
+    invalidateExplorerDirectoryCache(state.activeProfile.id, newPath);
     moveExplorerChildCache(entry.path, newPath);
     renameOpenReferences(entry.path, newPath);
     renderEditorTabs();
@@ -5641,13 +8743,36 @@ function selectRenameText(input: HTMLInputElement, name: string, kind: FileEntry
 }
 
 function explorerRowForPath(path: string) {
-  return Array.from(el.fileList.querySelectorAll<HTMLElement>('.file-row'))
-    .find((row) => sameExplorerPath(row.dataset.path ?? '', path)) ?? null;
+  return explorerRenderedRowByPath.get(explorerPathKey(path)) ?? null;
+}
+
+function markExplorerEntryLookupDirty() {
+  explorerEntryLookupDirty = true;
+}
+
+function ensureExplorerEntryLookup() {
+  if (!explorerEntryLookupDirty) return;
+  explorerEntryByPath.clear();
+  rememberExplorerEntries(state.entries);
+  for (const entries of state.explorerChildren.values()) rememberExplorerEntries(entries);
+  explorerEntryLookupDirty = false;
+}
+
+function rememberExplorerEntries(entries: FileEntry[]) {
+  for (const entry of entries) explorerEntryByPath.set(explorerPathKey(entry.path), entry);
 }
 
 function findExplorerEntry(path: string) {
   if (!path) return null;
-  return findExplorerEntryIn(path, state.entries);
+  const pathKey = explorerPathKey(path);
+  const visible = explorerVisibleEntryForPathKey(pathKey);
+  if (visible) return visible;
+  ensureExplorerEntryLookup();
+  const cached = explorerEntryByPath.get(pathKey);
+  if (cached) return cached;
+  const found = findExplorerEntryIn(path, state.entries);
+  if (found) explorerEntryByPath.set(pathKey, found);
+  return found;
 }
 
 function findExplorerEntryIn(path: string, entries: FileEntry[]): FileEntry | null {
@@ -5673,6 +8798,7 @@ async function ensureExplorerDirectoryChildren(path: string) {
   if (cached) return cached;
   const children = await readExplorerDirectoryCached(state.activeProfile.id, path);
   state.explorerChildren.set(path, children);
+  markExplorerEntryLookupDirty();
   state.explorerExpanded.add(path);
   return children;
 }
@@ -5699,6 +8825,7 @@ async function refreshExplorerDirectory(
 
   if (path === state.currentDir) {
     state.entries = entries;
+    markExplorerEntryLookupDirty();
     state.explorerSignatures.set(path, signature);
     state.explorerSelectedPath = selected;
     renderExplorer();
@@ -5706,6 +8833,7 @@ async function refreshExplorerDirectory(
   }
 
   state.explorerChildren.set(path, entries);
+  markExplorerEntryLookupDirty();
   state.explorerSignatures.set(path, signature);
   state.explorerExpanded.add(path);
   state.explorerSelectedPath = selected;
@@ -5724,7 +8852,7 @@ async function refreshExplorerTree(options: { manual?: boolean; silent?: boolean
   }
 
   try {
-    const changed = await pollExplorerDirectories();
+    const changed = await pollExplorerDirectories({ manual: options.manual });
     if (options.manual) setStatus(changed ? 'Explorer refreshed' : 'Explorer already up to date');
     else if (changed && !options.silent) setStatus('Explorer updated');
   } catch (error) {
@@ -5740,21 +8868,50 @@ async function refreshExplorerTree(options: { manual?: boolean; silent?: boolean
 
 function scheduleExplorerWatch(delayMs = explorerWatchInterval()) {
   if (explorerWatchTimer) window.clearTimeout(explorerWatchTimer);
+  explorerWatchIdleToken += 1;
   if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
   explorerWatchTimer = window.setTimeout(() => void runExplorerWatch(), delayMs);
 }
 
 function stopExplorerWatch() {
-  if (explorerWatchTimer) window.clearTimeout(explorerWatchTimer);
-  explorerWatchTimer = 0;
+  cancelExplorerWatchSchedule();
   explorerWatchInFlight = false;
 }
 
-async function runExplorerWatch() {
+function runExplorerWatch() {
   explorerWatchTimer = 0;
   if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  if (document.hidden) {
+    scheduleExplorerWatch(explorerWatchInterval() * EXPLORER_WATCH_HIDDEN_FACTOR);
+    return;
+  }
+  const scrollPause = explorerScrollingUntil - Date.now();
+  if (scrollPause > 0) {
+    scheduleExplorerWatch(scrollPause + EXPLORER_SCROLL_IDLE_MS);
+    return;
+  }
   if (getPanel('explorer').classList.contains('hidden')) {
     scheduleExplorerWatch(explorerWatchInterval() * 2);
+    return;
+  }
+  const token = ++explorerWatchIdleToken;
+  runWhenUiIdle(() => void runExplorerWatchWhenIdle(token), explorerWatchIdleTimeout());
+}
+
+async function runExplorerWatchWhenIdle(token: number) {
+  if (token !== explorerWatchIdleToken) return;
+  if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  if (document.hidden) {
+    if (token === explorerWatchIdleToken) scheduleExplorerWatch(explorerWatchInterval() * EXPLORER_WATCH_HIDDEN_FACTOR);
+    return;
+  }
+  const scrollPause = explorerScrollingUntil - Date.now();
+  if (scrollPause > 0) {
+    if (token === explorerWatchIdleToken) scheduleExplorerWatch(scrollPause + EXPLORER_SCROLL_IDLE_MS);
+    return;
+  }
+  if (getPanel('explorer').classList.contains('hidden')) {
+    if (token === explorerWatchIdleToken) scheduleExplorerWatch(explorerWatchInterval() * 2);
     return;
   }
   try {
@@ -5762,70 +8919,211 @@ async function runExplorerWatch() {
   } catch {
     // Background Explorer watching must never interrupt terminal/editor work.
   } finally {
-    scheduleExplorerWatch();
+    if (token === explorerWatchIdleToken) scheduleExplorerWatch();
   }
 }
 
-async function pollExplorerDirectories() {
+async function pollExplorerDirectories(options: { manual?: boolean } = {}) {
   if (!state.activeProfile || explorerWatchInFlight) return false;
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
   explorerWatchInFlight = true;
+  const startedAt = performance.now();
   let changed = false;
   const previousSelection = state.explorerSelectedPath;
   try {
-    for (const path of explorerWatchPaths()) {
+    const paths = explorerWatchPaths(options.manual ? EXPLORER_WATCH_MAX_DIRS : explorerWatchPathLimit());
+    const pathsNeedingListings = options.manual
+      ? paths
+      : await changedExplorerWatchPaths(profileId, paths, workspaceId);
+    if (!pathsNeedingListings.length) return false;
+    if (!options.manual && shouldPauseExplorerBackgroundWork()) return false;
+    const listings = await fetchExplorerDirectories(profileId, pathsNeedingListings, workspaceId, Boolean(options.manual));
+    for (const path of pathsNeedingListings) {
+      if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) break;
+      if (!options.manual && shouldPauseExplorerBackgroundWork()) break;
+      const listing = listings.get(explorerPathKey(path));
       try {
-        const entries = await fetchExplorerDirectory(state.activeProfile.id, path);
+        if (!listing) throw new Error('Directory listing was unavailable');
+        if (listing.error) throw new Error(listing.error);
+        const entries = listing.entries;
+        if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) break;
         const signature = explorerDirectorySignature(entries);
         const previous = state.explorerSignatures.get(path);
         if (previous !== signature) {
           state.explorerSignatures.set(path, signature);
           if (path === state.currentDir) state.entries = entries;
           else state.explorerChildren.set(path, entries);
+          markExplorerEntryLookupDirty();
           changed = true;
         }
       } catch (error) {
         if (sameExplorerPath(path, state.currentDir)) throw error;
         state.explorerExpanded.delete(path);
         state.explorerChildren.delete(path);
+        markExplorerEntryLookupDirty();
         state.explorerSignatures.delete(path);
         changed = true;
       }
+      if (!options.manual) {
+        if (shouldPauseExplorerBackgroundWork()) break;
+        await yieldToUi();
+        if (!state.workspaceOpen || state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) break;
+      }
     }
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return changed;
     if (changed) {
       state.explorerSelectedPath = previousSelection;
+      if (!options.manual && shouldPauseExplorerBackgroundWork()) {
+        explorerRenderDirty = true;
+        return changed;
+      }
       renderExplorer();
     }
   } finally {
+    if (!options.manual) explorerWatchLastDurationMs = performance.now() - startedAt;
     explorerWatchInFlight = false;
   }
   return changed;
 }
 
-function explorerWatchPaths() {
+async function changedExplorerWatchPaths(profileId: string, paths: string[], workspaceId: string) {
+  const changedPaths: string[] = [];
+  const signaturePaths: string[] = [];
+  for (const path of paths) {
+    if (shouldPauseExplorerBackgroundWork()) return changedPaths;
+    const cached = cachedFreshExplorerDirectory(profileId, path, workspaceId);
+    if (cached) {
+      const previous = state.explorerSignatures.get(path);
+      if (previous !== explorerDirectorySignature(cached)) changedPaths.push(path);
+      continue;
+    }
+    signaturePaths.push(path);
+  }
+  if (!signaturePaths.length) return changedPaths;
+  if (shouldPauseExplorerBackgroundWork()) return changedPaths;
+
+  const signatures = await api.directorySignatures(profileId, signaturePaths, state.showFileSizes);
+  const signatureKeys: string[] = [];
+  for (const result of signatures) signatureKeys.push(explorerPathKey(result.path));
+
+  for (const path of signaturePaths) {
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) break;
+    if (shouldPauseExplorerBackgroundWork()) break;
+    const pathKey = explorerPathKey(path);
+    let result: (typeof signatures)[number] | undefined;
+    for (let index = 0; index < signatureKeys.length; index += 1) {
+      if (signatureKeys[index] !== pathKey) continue;
+      result = signatures[index];
+      break;
+    }
+    try {
+      if (!result) throw new Error('Directory signature was unavailable');
+      if (result.error) throw new Error(result.error);
+      const previous = state.explorerSignatures.get(path);
+      if (previous !== result.signature) changedPaths.push(path);
+    } catch (error) {
+      if (sameExplorerPath(path, state.currentDir)) throw error;
+      state.explorerExpanded.delete(path);
+      state.explorerChildren.delete(path);
+      markExplorerEntryLookupDirty();
+      state.explorerSignatures.delete(path);
+      changedPaths.push(path);
+    }
+    if (shouldPauseExplorerBackgroundWork()) break;
+    await yieldToUi();
+  }
+  return changedPaths;
+}
+
+function shouldPauseExplorerBackgroundWork() {
+  return document.hidden
+    || getPanel('explorer').classList.contains('hidden')
+    || Date.now() < explorerScrollingUntil
+    || Boolean(workspaceDragState?.dragging)
+    || uiInputPending();
+}
+
+function explorerWatchPaths(maxPaths = EXPLORER_WATCH_MAX_DIRS) {
   const paths: string[] = [];
-  const add = (path: string) => {
-    if (!path || paths.some((item) => sameExplorerPath(item, path))) return;
-    paths.push(path);
-  };
-  add(state.currentDir);
+  const keys: string[] = [];
+  appendExplorerWatchPath(paths, keys, state.currentDir);
   for (const path of state.explorerExpanded) {
-    if (paths.length >= EXPLORER_WATCH_MAX_DIRS) break;
-    if (path === state.currentDir || state.explorerChildren.has(path)) add(path);
+    if (paths.length >= maxPaths) break;
+    if (path === state.currentDir || state.explorerChildren.has(path)) appendExplorerWatchPath(paths, keys, path);
   }
   return paths;
 }
 
+function appendExplorerWatchPath(paths: string[], keys: string[], path: string) {
+  if (!path) return;
+  const key = explorerPathKey(path);
+  for (let index = 0; index < keys.length; index += 1) {
+    if (keys[index] === key) return;
+  }
+  keys.push(key);
+  paths.push(path);
+}
+
+function explorerWatchPathLimit() {
+  if (document.hidden) return 1;
+  if (state.activeProfile?.kind === 'ssh') return 4;
+  const slowPoll = explorerWatchLastDurationMs > EXPLORER_WATCH_SLOW_THRESHOLD_MS;
+  if (state.activeProfile?.kind === 'wsl') return slowPoll ? 4 : 6;
+  return slowPoll ? Math.max(4, Math.floor(EXPLORER_WATCH_LOCAL_DIRS / 2)) : EXPLORER_WATCH_LOCAL_DIRS;
+}
+
 function explorerWatchInterval() {
-  if (state.activeProfile?.kind === 'ssh') return EXPLORER_WATCH_SSH_MS;
-  if (state.activeProfile?.kind === 'wsl') return EXPLORER_WATCH_WSL_MS;
-  return EXPLORER_WATCH_LOCAL_MS;
+  const base = state.activeProfile?.kind === 'ssh'
+    ? EXPLORER_WATCH_SSH_MS
+    : state.activeProfile?.kind === 'wsl'
+      ? EXPLORER_WATCH_WSL_MS
+      : EXPLORER_WATCH_LOCAL_MS;
+  return explorerWatchLastDurationMs > EXPLORER_WATCH_SLOW_THRESHOLD_MS
+    ? base * EXPLORER_WATCH_SLOW_BACKOFF_FACTOR
+    : base;
+}
+
+function explorerWatchIdleTimeout() {
+  if (state.activeProfile?.kind === 'ssh') return 2500;
+  if (state.activeProfile?.kind === 'wsl') return 1800;
+  return 1100;
 }
 
 function explorerDirectorySignature(entries: FileEntry[]) {
-  return entries
-    .map((entry) => `${entry.name}\t${entry.kind}\t${entry.size}\t${entry.hidden ? 1 : 0}`)
-    .sort()
-    .join('\n');
+  const cached = explorerDirectorySignatureCache.get(entries);
+  if (cached) return cached;
+  let hash = 2166136261;
+  let totalNameLength = 0;
+  let totalSize = 0;
+  for (const entry of entries) {
+    totalNameLength += entry.name.length;
+    totalSize += entry.size || 0;
+    hash = hashExplorerSignatureString(hash, entry.name);
+    hash = hashExplorerSignatureString(hash, entry.kind);
+    hash = hashExplorerSignatureNumber(hash, entry.size);
+    hash = hashExplorerSignatureNumber(hash, entry.hidden ? 1 : 0);
+  }
+  const signature = `${entries.length}:${totalNameLength}:${totalSize}:${(hash >>> 0).toString(36)}`;
+  explorerDirectorySignatureCache.set(entries, signature);
+  return signature;
+}
+
+function hashExplorerSignatureString(hash: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  hash ^= 31;
+  return Math.imul(hash, 16777619);
+}
+
+function hashExplorerSignatureNumber(hash: number, value: number) {
+  const normalized = Number.isFinite(value) ? Math.trunc(value) : 0;
+  hash ^= normalized & 0xffff;
+  hash = Math.imul(hash, 16777619);
+  hash ^= (normalized >>> 16) & 0xffff;
+  return Math.imul(hash, 16777619);
 }
 
 function moveExplorerChildCache(oldPath: string, newPath: string) {
@@ -5833,6 +9131,7 @@ function moveExplorerChildCache(oldPath: string, newPath: string) {
   if (children) {
     state.explorerChildren.delete(oldPath);
     state.explorerChildren.set(newPath, children);
+    markExplorerEntryLookupDirty();
   }
   const signature = state.explorerSignatures.get(oldPath);
   if (signature) {
@@ -5844,12 +9143,12 @@ function moveExplorerChildCache(oldPath: string, newPath: string) {
 
 function renameOpenReferences(oldPath: string, newPath: string) {
   for (const tab of state.editorTabs) {
-    if (tab.file?.path === oldPath) tab.file.path = newPath;
+    if (tab.file?.path === oldPath) renameEditorTabPath(tab, newPath);
   }
   if (state.openFile?.path === oldPath) state.openFile.path = newPath;
   for (const tab of state.imageTabs) {
     if (tab.sourcePath === oldPath) {
-      tab.sourcePath = newPath;
+      setImageTabSourcePath(tab, newPath);
       tab.label = tab.label.replace(oldPath, newPath);
     }
   }
@@ -5866,8 +9165,10 @@ function normalizeExplorerName(value: string | null) {
 }
 
 function uniqueExplorerName(baseName: string, entries: FileEntry[] = state.entries) {
-  const existing = new Set(entries.map((entry) => entry.name.toLocaleLowerCase()));
-  if (!existing.has(baseName.toLocaleLowerCase())) return baseName;
+  const existing = new Set<string>();
+  for (const entry of entries) existing.add(entry.name.toLocaleLowerCase());
+  const baseNameKey = baseName.toLocaleLowerCase();
+  if (!existing.has(baseNameKey)) return baseName;
   const dot = baseName.lastIndexOf('.');
   const stem = dot > 0 ? baseName.slice(0, dot) : baseName;
   const ext = dot > 0 ? baseName.slice(dot) : '';
@@ -5880,6 +9181,7 @@ function uniqueExplorerName(baseName: string, entries: FileEntry[] = state.entri
 
 function selectExplorerEntry(path: string, scrollIntoView = true) {
   if (state.explorerSelectedPath === path) {
+    if (!scrollIntoView) return;
     updateExplorerSelection(scrollIntoView);
     return;
   }
@@ -5887,26 +9189,44 @@ function selectExplorerEntry(path: string, scrollIntoView = true) {
   updateExplorerSelection(scrollIntoView);
 }
 
-function updateExplorerSelection(scrollIntoView = true) {
+function updateExplorerSelection(scrollIntoView = true, forceFull = false) {
   if (scrollIntoView) scrollExplorerPathIntoView(state.explorerSelectedPath);
-  el.fileList.querySelectorAll<HTMLElement>('.file-row').forEach((row) => {
-    const selected = sameExplorerPath(row.dataset.path ?? '', state.explorerSelectedPath);
-    row.classList.toggle('selected', selected);
-    row.setAttribute('aria-selected', String(selected));
-  });
+  const selectedKey = state.explorerSelectedPath ? explorerPathKey(state.explorerSelectedPath) : '';
+  const syncRow = (path: string, selected: boolean) => {
+    if (!path) return;
+    const row = explorerRowForPath(path);
+    if (!row) return;
+    toggleClassIfChanged(row, 'selected', selected);
+    setAttributeIfChanged(row, 'aria-selected', String(selected));
+  };
+
+  if (forceFull || !explorerLastSelectedPath) {
+    explorerRenderedRowByPath.forEach((row) => {
+      const selected = (row.dataset.pathKey || explorerPathKey(row.dataset.path ?? '')) === selectedKey;
+      toggleClassIfChanged(row, 'selected', selected);
+      setAttributeIfChanged(row, 'aria-selected', String(selected));
+    });
+  } else if (explorerPathKey(explorerLastSelectedPath) !== selectedKey) {
+    syncRow(explorerLastSelectedPath, false);
+    syncRow(state.explorerSelectedPath, true);
+  } else {
+    syncRow(state.explorerSelectedPath, true);
+  }
+  explorerLastSelectedPath = state.explorerSelectedPath;
 }
 
 function scrollExplorerPathIntoView(path: string) {
   if (!path) return;
-  const index = explorerVisibleRows.findIndex((row) => !row.loading && sameExplorerPath(row.path, path));
-  if (index < 0) return;
+  const index = explorerVisibleIndexByPath.get(explorerPathKey(path));
+  if (index === undefined) return;
   const top = index * EXPLORER_ROW_HEIGHT;
   const bottom = top + EXPLORER_ROW_HEIGHT;
   const currentTop = el.fileList.scrollTop;
-  const currentBottom = currentTop + el.fileList.clientHeight;
+  const viewportHeight = Math.max(explorerViewportHeight || el.fileList.clientHeight, EXPLORER_ROW_HEIGHT * 8);
+  const currentBottom = currentTop + viewportHeight;
   let nextTop = currentTop;
   if (top < currentTop) nextTop = top;
-  else if (bottom > currentBottom) nextTop = bottom - el.fileList.clientHeight;
+  else if (bottom > currentBottom) nextTop = bottom - viewportHeight;
   if (nextTop === currentTop) return;
   renderVirtualExplorerRows(nextTop);
 }
@@ -5914,6 +9234,7 @@ function scrollExplorerPathIntoView(path: string) {
 function scheduleTextFilePrefetch(entry: FileEntry, delay = 80) {
   if (!state.activeProfile || !shouldPrefetchTextFile(entry)) return;
   const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
   const key = textFileCacheKey(profileId, entry.path);
   if (textFileCache.has(key) || textFileReads.has(key)) return;
   const existing = textFilePrefetchTimers.get(key);
@@ -5921,15 +9242,36 @@ function scheduleTextFilePrefetch(entry: FileEntry, delay = 80) {
 
   const timer = window.setTimeout(() => {
     textFilePrefetchTimers.delete(key);
-    if (state.activeProfile?.id !== profileId) return;
-    warmEditorForPath(entry.path);
-    void readTextFileCached(profileId, entry.path).catch(() => undefined);
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    if (getPanel('explorer').classList.contains('hidden')) return;
+    if (document.hidden) return;
+    const scrollPause = explorerScrollingUntil - Date.now();
+    if (scrollPause > 0) {
+      scheduleTextFilePrefetch(entry, scrollPause + EXPLORER_SCROLL_IDLE_MS);
+      return;
+    }
+    runWhenUiIdle(() => {
+      if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+      if (getPanel('explorer').classList.contains('hidden') || document.hidden) return;
+      if (textFileCache.has(key) || textFileReads.has(key)) return;
+      const idleScrollPause = explorerScrollingUntil - Date.now();
+      if (idleScrollPause > 0) {
+        scheduleTextFilePrefetch(entry, idleScrollPause + EXPLORER_SCROLL_IDLE_MS);
+        return;
+      }
+      void readTextFileCached(profileId, entry.path).catch(() => undefined);
+    }, 500);
   }, delay);
   textFilePrefetchTimers.set(key, timer);
 }
 
 function shouldPrefetchTextFile(entry: FileEntry) {
   if (entry.kind !== 'file') return false;
+  // When file sizes are hidden, directory listings intentionally skip backend
+  // metadata calls and report size as 0. Avoid speculative reads in that mode
+  // so a large log or bundle is not pulled into the UI just because the cursor
+  // hovered over it.
+  if (!state.showFileSizes) return false;
   if (entry.size > TEXT_FILE_PREFETCH_MAX_BYTES) return false;
   if (isImagePath(entry.path)) return false;
   if (shouldMaskFile(entry.path)) return false;
@@ -5938,28 +9280,78 @@ function shouldPrefetchTextFile(entry: FileEntry) {
 
 function scheduleExplorerDirectoryPrefetch(entry: FileEntry, delay = EXPLORER_DIRECTORY_PREFETCH_DELAY_MS) {
   if (!state.activeProfile || entry.kind !== 'dir') return;
+  if (document.hidden) return;
   if (state.explorerChildren.has(entry.path) || state.explorerLoading.has(entry.path)) return;
   const profileId = state.activeProfile.id;
   const workspaceId = state.activeWorkspaceId;
   const key = explorerDirectoryCacheKey(profileId, entry.path, workspaceId);
-  if (hasCachedExplorerDirectory(profileId, entry.path, workspaceId) || explorerDirectoryReads.has(key)) return;
+  if (hasCachedExplorerDirectoryKey(key) || explorerDirectoryReads.has(key)) return;
+  if (explorerDirectoryPrefetchPending.has(key)) return;
   const existing = explorerDirectoryPrefetchTimers.get(key);
   if (existing) window.clearTimeout(existing);
 
   const timer = window.setTimeout(() => {
     explorerDirectoryPrefetchTimers.delete(key);
-    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
-    void fetchExplorerDirectory(profileId, entry.path, workspaceId).catch(() => undefined);
+    runExplorerDirectoryPrefetchWhenReady(profileId, workspaceId, entry, key);
   }, delay);
   explorerDirectoryPrefetchTimers.set(key, timer);
 }
 
+function runExplorerDirectoryPrefetchWhenReady(profileId: string, workspaceId: string, entry: FileEntry, key: string) {
+  if (!canStartExplorerDirectoryPrefetch(profileId, workspaceId, entry, key)) return;
+  const scrollPause = explorerScrollingUntil - Date.now();
+  if (scrollPause > 0) {
+    scheduleExplorerDirectoryPrefetch(entry, scrollPause + EXPLORER_SCROLL_IDLE_MS);
+    return;
+  }
+  if (explorerDirectoryPrefetchActive >= explorerDirectoryPrefetchConcurrency()) {
+    scheduleExplorerDirectoryPrefetch(entry, EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + 180);
+    return;
+  }
+  if (explorerDirectoryPrefetchPending.has(key)) return;
+  explorerDirectoryPrefetchPending.add(key);
+  runWhenUiIdle(() => {
+    explorerDirectoryPrefetchPending.delete(key);
+    if (!canStartExplorerDirectoryPrefetch(profileId, workspaceId, entry, key)) return;
+    const idleScrollPause = explorerScrollingUntil - Date.now();
+    if (idleScrollPause > 0) {
+      scheduleExplorerDirectoryPrefetch(entry, idleScrollPause + EXPLORER_SCROLL_IDLE_MS);
+      return;
+    }
+    if (explorerDirectoryPrefetchActive >= explorerDirectoryPrefetchConcurrency()) {
+      scheduleExplorerDirectoryPrefetch(entry, EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + 180);
+      return;
+    }
+    explorerDirectoryPrefetchActive += 1;
+    void fetchExplorerDirectory(profileId, entry.path, workspaceId)
+      .catch(() => undefined)
+      .finally(() => {
+        explorerDirectoryPrefetchActive = Math.max(0, explorerDirectoryPrefetchActive - 1);
+      });
+  }, 650);
+}
+
+function canStartExplorerDirectoryPrefetch(profileId: string, workspaceId: string, entry: FileEntry, key: string) {
+  if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return false;
+  if (document.hidden || getPanel('explorer').classList.contains('hidden')) return false;
+  if (entry.kind !== 'dir') return false;
+  if (state.explorerChildren.has(entry.path) || state.explorerLoading.has(entry.path)) return false;
+  return !hasCachedExplorerDirectoryKey(key) && !explorerDirectoryReads.has(key);
+}
+
 function scheduleVisibleExplorerDirectoryPrefetch() {
-  if (!state.activeProfile || !state.workspaceOpen || getPanel('explorer').classList.contains('hidden')) return;
+  if (!state.activeProfile || !state.workspaceOpen || document.hidden || getPanel('explorer').classList.contains('hidden')) return;
   if (Date.now() < explorerScrollingUntil) return;
+  if (explorerDirectoryPrefetchActive > 0) {
+    queueVisibleExplorerDirectoryPrefetch(EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + 420);
+    return;
+  }
   const limit = explorerDirectoryPrefetchLimit();
   let count = 0;
-  for (const entry of visibleExplorerViewportEntries()) {
+  const { start, end } = explorerVisibleDirectoryPrefetchRange();
+  for (let index = start; index < end; index += 1) {
+    const entry = explorerVisibleRows[index]?.entry;
+    if (!entry) continue;
     if (count >= limit) break;
     if (entry.kind !== 'dir' || state.explorerExpanded.has(entry.path)) continue;
     scheduleExplorerDirectoryPrefetch(entry, EXPLORER_DIRECTORY_PREFETCH_DELAY_MS + count * 90);
@@ -5967,11 +9359,42 @@ function scheduleVisibleExplorerDirectoryPrefetch() {
   }
 }
 
-function visibleExplorerViewportEntries() {
-  return explorerVisibleRows
-    .slice(explorerRenderedStart, explorerRenderedEnd)
-    .map((row) => row.entry)
-    .filter((entry): entry is FileEntry => Boolean(entry));
+function explorerVisibleDirectoryPrefetchRange() {
+  const total = explorerVisibleRows.length;
+  if (!total) return { start: 0, end: 0 };
+  const viewportHeight = Math.max(explorerViewportHeight || el.fileList.clientHeight, EXPLORER_ROW_HEIGHT * 8);
+  const viewportStart = Math.floor(el.fileList.scrollTop / EXPLORER_ROW_HEIGHT);
+  const viewportEnd = Math.ceil((el.fileList.scrollTop + viewportHeight) / EXPLORER_ROW_HEIGHT);
+  const start = clamp(viewportStart - EXPLORER_VISIBLE_PREFETCH_ROW_PADDING, 0, total);
+  const end = clamp(viewportEnd + EXPLORER_VISIBLE_PREFETCH_ROW_PADDING, start, total);
+  return { start, end };
+}
+
+function queueVisibleExplorerDirectoryPrefetch(timeout = 900) {
+  if (!state.activeProfile || !state.workspaceOpen || document.hidden || getPanel('explorer').classList.contains('hidden')) return;
+  const effectiveTimeout = restoringWorkspace ? Math.max(timeout, WORKSPACE_RESTORE_BACKGROUND_DELAY_MS) : timeout;
+  const dueAt = Date.now() + effectiveTimeout;
+  if (explorerVisiblePrefetchTimer) {
+    if (dueAt >= explorerVisiblePrefetchDueAt - 50) return;
+    window.clearTimeout(explorerVisiblePrefetchTimer);
+  }
+  const token = ++explorerVisiblePrefetchToken;
+  explorerVisiblePrefetchDueAt = dueAt;
+  explorerVisiblePrefetchTimer = window.setTimeout(() => {
+    explorerVisiblePrefetchTimer = 0;
+    explorerVisiblePrefetchDueAt = 0;
+    runWhenUiIdle(() => {
+      if (token === explorerVisiblePrefetchToken) scheduleVisibleExplorerDirectoryPrefetch();
+    }, 700);
+  }, Math.max(0, effectiveTimeout));
+}
+
+function cancelVisibleExplorerDirectoryPrefetch() {
+  explorerVisiblePrefetchToken += 1;
+  explorerVisiblePrefetchDueAt = 0;
+  if (!explorerVisiblePrefetchTimer) return;
+  window.clearTimeout(explorerVisiblePrefetchTimer);
+  explorerVisiblePrefetchTimer = 0;
 }
 
 function explorerDirectoryPrefetchLimit() {
@@ -5980,18 +9403,18 @@ function explorerDirectoryPrefetchLimit() {
   return EXPLORER_DIRECTORY_PREFETCH_LIMIT;
 }
 
+function explorerDirectoryPrefetchConcurrency() {
+  if (state.activeProfile?.kind === 'ssh') return 1;
+  if (state.activeProfile?.kind === 'wsl') return 2;
+  return 3;
+}
+
 function isLikelyTextPath(path: string) {
-  const name = path.split(/[\\/]/).filter(Boolean).pop()?.toLowerCase() ?? path.toLowerCase();
+  const name = pathBasename(path, path).toLowerCase();
   if (/^(readme|license|dockerfile|makefile|gemfile|rakefile|procfile|cargo\.toml|package\.json|tsconfig\.json)$/i.test(name)) return true;
   const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
   if (!extension) return true;
-  const textExtensions = new Set([
-    'bash', 'bat', 'cmd', 'conf', 'config', 'cpp', 'cs', 'css', 'csv', 'c', 'env', 'go',
-    'h', 'hpp', 'htm', 'html', 'ini', 'java', 'js', 'json', 'jsx', 'lock', 'log', 'lua',
-    'md', 'mjs', 'ps1', 'py', 'rs', 'scss', 'sh', 'sql', 'svelte', 'toml', 'ts', 'tsx',
-    'txt', 'vue', 'xml', 'yaml', 'yml'
-  ]);
-  return textExtensions.has(extension);
+  return TEXT_FILE_EXTENSIONS.has(extension);
 }
 
 function selectExplorerByTypeahead(key: string) {
@@ -5999,11 +9422,11 @@ function selectExplorerByTypeahead(key: string) {
   const previous = now - state.explorerTypeaheadAt <= EXPLORER_TYPEAHEAD_TIMEOUT_MS
     ? state.explorerTypeahead
     : '';
-  let query = `${previous}${key}`.toLocaleLowerCase();
+  let query = `${previous}${key}`.toLowerCase();
   let entry = findExplorerTypeaheadMatch(query);
 
   if (!entry && previous) {
-    query = key.toLocaleLowerCase();
+    query = key.toLowerCase();
     entry = findExplorerTypeaheadMatch(query);
   }
 
@@ -6013,48 +9436,49 @@ function selectExplorerByTypeahead(key: string) {
 }
 
 function findExplorerTypeaheadMatch(query: string) {
-  const visible = visibleExplorerEntries();
-  const candidates = [
-    ...visible.filter((entry) => entry.kind === 'dir'),
-    ...visible.filter((entry) => entry.kind !== 'dir')
-  ];
+  ensureExplorerTypeaheadCandidates();
+  const selectedKey = state.explorerSelectedPath ? explorerPathKey(state.explorerSelectedPath) : '';
+  const candidates = explorerTypeaheadCandidates;
   if (!candidates.length) return null;
+  const selectedIndex = selectedKey ? explorerTypeaheadIndexByPath.get(selectedKey) ?? -1 : -1;
 
-  const selectedIndex = candidates.findIndex((entry) => entry.path === state.explorerSelectedPath);
   const start = query.length === 1 && selectedIndex >= 0 ? selectedIndex + 1 : 0;
-  for (let offset = 0; offset < candidates.length; offset += 1) {
-    const entry = candidates[(start + offset) % candidates.length];
-    if (entry.name.toLocaleLowerCase().startsWith(query)) return entry;
+  let wrappedMatch: FileEntry | null = null;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (candidate.nameKey.startsWith(query)) {
+      if (index >= start) return candidate.entry;
+      if (!wrappedMatch) wrappedMatch = candidate.entry;
+    }
   }
-  return null;
+  return wrappedMatch;
+}
+
+function ensureExplorerTypeaheadCandidates() {
+  if (!explorerTypeaheadDirty) return;
+  rebuildExplorerTypeaheadCandidates();
 }
 
 function moveExplorerSelection(direction: number) {
-  const entries = visibleExplorerEntries();
-  if (!entries.length) return;
-  const current = entries.findIndex((entry) => entry.path === state.explorerSelectedPath);
-  const next = current < 0
-    ? direction > 0 ? 0 : entries.length - 1
-    : (current + direction + entries.length) % entries.length;
-  selectExplorerEntry(entries[next].path);
-}
-
-function visibleExplorerEntries() {
-  const result: FileEntry[] = [];
-  appendVisibleExplorerEntries(result, state.entries);
-  return result;
-}
-
-function appendVisibleExplorerEntries(result: FileEntry[], entries: FileEntry[]) {
-  for (const entry of entries) {
-    result.push(entry);
-    if (entry.kind === 'dir' && state.explorerExpanded.has(entry.path)) {
-      appendVisibleExplorerEntries(result, state.explorerChildren.get(entry.path) ?? []);
+  if (!explorerVisibleRows.length) return;
+  const selectedIndex = explorerVisibleIndexByPath.get(explorerPathKey(state.explorerSelectedPath));
+  let next = selectedIndex === undefined
+    ? direction > 0 ? 0 : explorerVisibleRows.length - 1
+    : selectedIndex;
+  for (let offset = 0; offset < explorerVisibleRows.length; offset += 1) {
+    next = (next + direction + explorerVisibleRows.length) % explorerVisibleRows.length;
+    const entry = explorerVisibleRows[next]?.entry;
+    if (entry) {
+      selectExplorerEntry(entry.path);
+      return;
     }
   }
 }
 
 function updateExplorerFileSizeMode() {
+  const signature = state.showFileSizes ? '1' : '0';
+  if (explorerFileSizeModeRenderSignature === signature) return;
+  explorerFileSizeModeRenderSignature = signature;
   const explorer = getPanel('explorer');
   explorer.classList.toggle('hide-file-sizes', !state.showFileSizes);
   el.fileSizeToggle.classList.toggle('active', state.showFileSizes);
@@ -6062,6 +9486,9 @@ function updateExplorerFileSizeMode() {
 }
 
 function updateExplorerOpenMode() {
+  const signature = state.explorerOpenMode;
+  if (explorerOpenModeRenderSignature === signature) return;
+  explorerOpenModeRenderSignature = signature;
   const single = state.explorerOpenMode === 'single';
   el.explorerOpenModeToggle.textContent = single ? 'Open: 1x' : 'Open: 2x';
   el.explorerOpenModeToggle.title = single ? 'Single click opens items' : 'Double click opens items';
@@ -6082,19 +9509,134 @@ function pathBadge(path: string): HTMLElement {
   return span;
 }
 
+function clearEditorTabLookup() {
+  editorTabById.clear();
+  editorTabByPath.clear();
+  editorTabIndexByIdLookup.clear();
+}
+
+function rebuildEditorTabLookup() {
+  clearEditorTabLookup();
+  for (let index = 0; index < state.editorTabs.length; index += 1) {
+    rememberEditorTab(state.editorTabs[index], index);
+  }
+}
+
+function rememberEditorTab(tab: EditorTabState, index?: number) {
+  editorTabById.set(tab.id, tab);
+  const path = tab.file?.path;
+  if (path && !editorTabByPath.has(path)) editorTabByPath.set(path, tab);
+  if (index !== undefined) editorTabIndexByIdLookup.set(tab.id, index);
+}
+
+function forgetEditorTab(tab: EditorTabState) {
+  editorTabById.delete(tab.id);
+  editorTabIndexByIdLookup.delete(tab.id);
+  const path = tab.file?.path;
+  if (!path || editorTabByPath.get(path) !== tab) return;
+  editorTabByPath.delete(path);
+  for (let index = 0; index < state.editorTabs.length; index += 1) {
+    const candidate = state.editorTabs[index];
+    if (candidate === tab || candidate.file?.path !== path) continue;
+    rememberEditorTab(candidate, index);
+    return;
+  }
+}
+
+function editorTabForId(id: string) {
+  if (!id) return null;
+  let tab = editorTabById.get(id) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.editorTabs.length; index += 1) {
+      const candidate = state.editorTabs[index];
+      if (candidate.id !== id) continue;
+      tab = candidate;
+      rememberEditorTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function editorTabForPath(path: string) {
+  if (!path) return null;
+  let tab = editorTabByPath.get(path) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.editorTabs.length; index += 1) {
+      const candidate = state.editorTabs[index];
+      if (candidate.file?.path !== path) continue;
+      tab = candidate;
+      rememberEditorTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function editorTabIndexById(id: string) {
+  const cachedIndex = editorTabIndexByIdLookup.get(id);
+  if (cachedIndex !== undefined && state.editorTabs[cachedIndex]?.id === id) return cachedIndex;
+  for (let index = 0; index < state.editorTabs.length; index += 1) {
+    const tab = state.editorTabs[index];
+    if (tab.id !== id) continue;
+    rememberEditorTab(tab, index);
+    return index;
+  }
+  editorTabIndexByIdLookup.delete(id);
+  return -1;
+}
+
+function refreshEditorTabIndexLookup(startIndex = 0) {
+  const start = clamp(startIndex, 0, state.editorTabs.length);
+  for (let index = start; index < state.editorTabs.length; index += 1) {
+    editorTabIndexByIdLookup.set(state.editorTabs[index].id, index);
+  }
+}
+
+function setEditorTabFile(tab: EditorTabState, file: OpenFileState | null) {
+  const previousPath = tab.file?.path;
+  if (previousPath && editorTabByPath.get(previousPath) === tab) editorTabByPath.delete(previousPath);
+  tab.file = file;
+  rememberEditorTab(tab);
+  if (previousPath && previousPath !== file?.path && !editorTabByPath.has(previousPath)) {
+    for (const candidate of state.editorTabs) {
+      if (candidate === tab || candidate.file?.path !== previousPath) continue;
+      editorTabByPath.set(previousPath, candidate);
+      break;
+    }
+  }
+}
+
+function renameEditorTabPath(tab: EditorTabState, newPath: string) {
+  if (!tab.file) return;
+  const previousPath = tab.file.path;
+  if (previousPath && editorTabByPath.get(previousPath) === tab) editorTabByPath.delete(previousPath);
+  tab.file.path = newPath;
+  if (!editorTabByPath.has(newPath)) editorTabByPath.set(newPath, tab);
+  if (previousPath && previousPath !== newPath && !editorTabByPath.has(previousPath)) {
+    for (const candidate of state.editorTabs) {
+      if (candidate === tab || candidate.file?.path !== previousPath) continue;
+      editorTabByPath.set(previousPath, candidate);
+      break;
+    }
+  }
+}
+
 function ensureEditorTab() {
   return activeEditorTab();
 }
 
 function activeEditorTab() {
-  let tab = state.editorTabs.find((item) => item.id === state.activeEditorTabId);
+  let tab = editorTabForId(state.activeEditorTabId);
   if (!tab) tab = createEditorTab(null, false);
   return tab;
 }
 
 function createEditorTab(file: OpenFileState | null, activate = true, id: string = crypto.randomUUID()) {
   const tab = { id, file };
+  const index = state.editorTabs.length;
   state.editorTabs.push(tab);
+  rememberEditorTab(tab, index);
   if (!state.activeEditorTabId) state.activeEditorTabId = tab.id;
   if (activate) {
     syncActiveEditorTabFromView();
@@ -6108,21 +9650,25 @@ function createEditorTab(file: OpenFileState | null, activate = true, id: string
 
 function activateEditorTab(id: string) {
   syncActiveEditorTabFromView();
-  const tab = state.editorTabs.find((item) => item.id === id);
+  const previousActiveId = state.activeEditorTabId;
+  const tab = editorTabForId(id);
   if (!tab) return;
   state.activeEditorTabId = tab.id;
   state.openFile = tab.file;
-  renderEditorTabs();
-  renderEditor();
+  renderEditorTabActivation(previousActiveId, tab);
+  if (previousActiveId !== tab.id) renderEditor();
   void hydrateVisibleEditorTab();
-  saveActiveWorkspaceSnapshot();
+  if (previousActiveId !== tab.id) saveActiveWorkspaceSnapshot();
 }
 
 function closeEditorTab(id: string) {
   syncActiveEditorTabFromView();
-  const index = state.editorTabs.findIndex((tab) => tab.id === id);
+  const index = editorTabIndexById(id);
   if (index < 0) return;
+  const closingTab = state.editorTabs[index];
+  forgetEditorTab(closingTab);
   state.editorTabs.splice(index, 1);
+  refreshEditorTabIndexLookup(index);
   if (!state.editorTabs.length) createEditorTab(null, false);
   if (state.activeEditorTabId === id) {
     const next = state.editorTabs[index] ?? state.editorTabs[index - 1] ?? state.editorTabs[0];
@@ -6135,37 +9681,142 @@ function closeEditorTab(id: string) {
 }
 
 function renderEditorTabs() {
-  el.editorTabs.innerHTML = '';
-  el.editorOpenNewTab.checked = state.editorOpenInNewTab;
-  el.editorWordWrap.checked = state.editorWordWrap;
+  if (!isEditorPanelVisible()) return;
+  const signature = editorTabsSignature();
+  if (editorTabsRenderSignature === signature) return;
+  const orderSignature = editorTabsOrderSignature();
+  const sameOrder = editorTabsOrderRenderSignature === orderSignature
+    && el.editorTabs.childElementCount === state.editorTabs.length;
+  editorTabsRenderSignature = signature;
+  setCheckedIfChanged(el.editorOpenNewTab, state.editorOpenInNewTab);
+  setCheckedIfChanged(el.editorWordWrap, state.editorWordWrap);
+
+  if (sameOrder) {
+    for (const tab of state.editorTabs) {
+      updateEditorTabElement(editorTabElement(tab.id), tab);
+    }
+    return;
+  }
+
+  editorTabsOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const tab of state.editorTabs) {
-    const item = document.createElement('div');
-    item.className = `widget-tab${tab.id === state.activeEditorTabId ? ' active' : ''}`;
-    item.title = tab.file?.path ?? tab.pendingPath ?? 'Empty editor';
-    item.innerHTML = `<button class="widget-tab-label">${escapeHtml(editorTabLabel(tab))}</button><button class="widget-tab-close" title="Close editor tab" aria-label="Close editor tab">x</button>`;
-    item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => activateEditorTab(tab.id));
-    item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      closeEditorTab(tab.id);
-    });
+    seen.add(tab.id);
+    const item = editorTabElement(tab.id);
+    updateEditorTabElement(item, tab);
     fragment.append(item);
   }
-  el.editorTabs.append(fragment);
+  el.editorTabs.replaceChildren(fragment);
+  pruneEditorTabElementCache(seen);
+}
+
+function renderEditorTabActivation(previousActiveId: string, activeTab: EditorTabState) {
+  if (!isEditorPanelVisible()) return;
+  const orderSignature = editorTabsOrderSignature();
+  const previousChanged = Boolean(previousActiveId && previousActiveId !== activeTab.id);
+  const previousTab = previousChanged ? editorTabForId(previousActiveId) : null;
+  const previousElement = previousChanged ? connectedEditorTabElement(previousActiveId) : null;
+  const activeElement = connectedEditorTabElement(activeTab.id);
+  if (
+    editorTabsOrderRenderSignature !== orderSignature
+    || el.editorTabs.childElementCount !== state.editorTabs.length
+    || !activeElement
+    || (previousChanged && (!previousTab || !previousElement))
+  ) {
+    renderEditorTabs();
+    return;
+  }
+  if (previousTab && previousElement) updateEditorTabElement(previousElement, previousTab);
+  updateEditorTabElement(activeElement, activeTab);
+  editorTabsRenderSignature = editorTabsSignature();
+}
+
+function editorTabElement(id: string) {
+  const cached = editorTabElementCache.get(id);
+  if (cached) return cached;
+  const item = document.createElement('div');
+  item.className = 'widget-tab';
+  const labelButton = document.createElement('button');
+  labelButton.className = 'widget-tab-label';
+  labelButton.type = 'button';
+  labelButton.addEventListener('click', () => {
+    const id = item.dataset.editorTabId ?? '';
+    if (id) activateEditorTab(id);
+  });
+  const closeButton = document.createElement('button');
+  closeButton.className = 'widget-tab-close';
+  closeButton.type = 'button';
+  closeButton.title = 'Close editor tab';
+  closeButton.setAttribute('aria-label', 'Close editor tab');
+  closeButton.textContent = 'x';
+  closeButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const id = item.dataset.editorTabId ?? '';
+    if (id) closeEditorTab(id);
+  });
+  item.append(labelButton, closeButton);
+  editorTabElementCache.set(id, item);
+  return item;
+}
+
+function connectedEditorTabElement(id: string) {
+  const item = editorTabElementCache.get(id);
+  return item?.isConnected ? item : null;
+}
+
+function updateEditorTabElement(item: HTMLElement, tab: EditorTabState) {
+  const active = tab.id === state.activeEditorTabId;
+  const label = editorTabLabel(tab);
+  const title = tab.file?.path ?? tab.pendingPath ?? 'Empty editor';
+  const signature = `${tab.id}\t${active ? '1' : '0'}\t${label}\t${title}`;
+  item.dataset.editorTabId = tab.id;
+  if (item.dataset.renderSignature === signature) return;
+  item.dataset.renderSignature = signature;
+  item.className = `widget-tab${active ? ' active' : ''}`;
+  if (item.title !== title) item.title = title;
+  setTextContentIfChanged(editorTabLabelButton(item), label);
+}
+
+function editorTabLabelButton(item: HTMLElement) {
+  return item.firstElementChild as HTMLButtonElement;
+}
+
+function pruneEditorTabElementCache(seen: Set<string>) {
+  for (const id of editorTabElementCache.keys()) {
+    if (!seen.has(id)) editorTabElementCache.delete(id);
+  }
+}
+
+function editorTabsSignature() {
+  let signature = `${state.editorOpenInNewTab ? '1' : '0'}\n${state.editorWordWrap ? '1' : '0'}`;
+  for (const tab of state.editorTabs) {
+    signature += `\n${tab.id}\t${tab.id === state.activeEditorTabId ? '1' : '0'}\t${editorTabLabel(tab)}\t${tab.file?.path ?? tab.pendingPath ?? ''}\t${tab.file?.rawMode ? '1' : '0'}`;
+  }
+  return signature;
+}
+
+function editorTabsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.editorTabs.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.editorTabs[index].id;
+  }
+  return signature;
 }
 
 function editorTabLabel(tab: EditorTabState) {
   const path = tab.file?.path ?? tab.pendingPath;
   if (!path) return 'Empty';
-  const name = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  const name = pathBasename(path, path);
   const suffix = tab.file?.dirty ? ' *' : tab.loading ? ' ...' : '';
   return `${name}${suffix}`;
 }
 
 function syncActiveEditorTabFromView() {
-  const tab = state.editorTabs.find((item) => item.id === state.activeEditorTabId);
+  const tab = editorTabForId(state.activeEditorTabId);
   if (!tab?.file) return;
-  if (codeView && state.openFile === tab.file && !(tab.file.masked && !tab.file.rawMode)) {
+  if (codeView && codeViewFile === tab.file && state.openFile === tab.file && !(tab.file.masked && !tab.file.rawMode)) {
     tab.file.draftContent = codeView.state.doc.toString();
     tab.file.dirty = !sameEditorContent(tab.file.draftContent, tab.file.content);
   }
@@ -6182,7 +9833,7 @@ async function openFile(path: string) {
 
   try {
     syncActiveEditorTabFromView();
-    const existing = state.editorTabs.find((tab) => tab.file?.path === path);
+    const existing = editorTabForPath(path);
     if (existing) {
       activateEditorTab(existing.id);
       setStatus('File opened');
@@ -6206,7 +9857,7 @@ async function openFile(path: string) {
     const tab = state.editorOpenInNewTab && activeEditorTab().file
       ? createEditorTab(file, true)
       : activeEditorTab();
-    tab.file = file;
+    setEditorTabFile(tab, file);
     state.activeEditorTabId = tab.id;
     state.openFile = file;
     renderEditorTabs();
@@ -6332,12 +9983,109 @@ function hashText(value: string) {
   return hash >>> 0;
 }
 
+function clearImageTabLookup() {
+  imageTabById.clear();
+  imageTabBySourcePath.clear();
+  imageTabIndexByIdLookup.clear();
+}
+
+function rebuildImageTabLookup() {
+  clearImageTabLookup();
+  for (let index = 0; index < state.imageTabs.length; index += 1) {
+    rememberImageTab(state.imageTabs[index], index);
+  }
+}
+
+function rememberImageTab(tab: ImageTabState, index?: number) {
+  imageTabById.set(tab.id, tab);
+  if (tab.sourcePath && !imageTabBySourcePath.has(tab.sourcePath)) imageTabBySourcePath.set(tab.sourcePath, tab);
+  if (index !== undefined) imageTabIndexByIdLookup.set(tab.id, index);
+}
+
+function forgetImageTab(tab: ImageTabState) {
+  imageTabById.delete(tab.id);
+  imageTabIndexByIdLookup.delete(tab.id);
+  const path = tab.sourcePath;
+  if (!path || imageTabBySourcePath.get(path) !== tab) return;
+  imageTabBySourcePath.delete(path);
+  for (let index = 0; index < state.imageTabs.length; index += 1) {
+    const candidate = state.imageTabs[index];
+    if (candidate === tab || candidate.sourcePath !== path) continue;
+    rememberImageTab(candidate, index);
+    return;
+  }
+}
+
+function imageTabForId(id: string) {
+  if (!id) return null;
+  let tab = imageTabById.get(id) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.imageTabs.length; index += 1) {
+      const candidate = state.imageTabs[index];
+      if (candidate.id !== id) continue;
+      tab = candidate;
+      rememberImageTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function imageTabForSourcePath(path: string) {
+  if (!path) return null;
+  let tab = imageTabBySourcePath.get(path) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.imageTabs.length; index += 1) {
+      const candidate = state.imageTabs[index];
+      if (candidate.sourcePath !== path) continue;
+      tab = candidate;
+      rememberImageTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function imageTabIndexById(id: string) {
+  const cachedIndex = imageTabIndexByIdLookup.get(id);
+  if (cachedIndex !== undefined && state.imageTabs[cachedIndex]?.id === id) return cachedIndex;
+  for (let index = 0; index < state.imageTabs.length; index += 1) {
+    const tab = state.imageTabs[index];
+    if (tab.id !== id) continue;
+    rememberImageTab(tab, index);
+    return index;
+  }
+  imageTabIndexByIdLookup.delete(id);
+  return -1;
+}
+
+function refreshImageTabIndexLookup(startIndex = 0) {
+  const start = clamp(startIndex, 0, state.imageTabs.length);
+  for (let index = start; index < state.imageTabs.length; index += 1) {
+    imageTabIndexByIdLookup.set(state.imageTabs[index].id, index);
+  }
+}
+
+function setImageTabSourcePath(tab: ImageTabState, sourcePath: string | undefined) {
+  const previousPath = tab.sourcePath;
+  if (previousPath && imageTabBySourcePath.get(previousPath) === tab) imageTabBySourcePath.delete(previousPath);
+  tab.sourcePath = sourcePath;
+  rememberImageTab(tab);
+  if (previousPath && previousPath !== sourcePath && !imageTabBySourcePath.has(previousPath)) {
+    for (const candidate of state.imageTabs) {
+      if (candidate === tab || candidate.sourcePath !== previousPath) continue;
+      imageTabBySourcePath.set(previousPath, candidate);
+      break;
+    }
+  }
+}
+
 function ensureImageTab() {
   return activeImageTab();
 }
 
 function activeImageTab() {
-  let tab = state.imageTabs.find((item) => item.id === state.activeImageTabId);
+  let tab = imageTabForId(state.activeImageTabId);
   if (!tab) tab = createImageTab(undefined, false);
   return tab;
 }
@@ -6352,7 +10100,9 @@ function createImageTab(seed?: Partial<ImageTabState>, activate = true, id: stri
     history: seed?.history ?? [],
     historyVisible: seed?.historyVisible ?? false
   };
+  const index = state.imageTabs.length;
   state.imageTabs.push(tab);
+  rememberImageTab(tab, index);
   if (!state.activeImageTabId) state.activeImageTabId = tab.id;
   if (activate) {
     state.activeImageTabId = tab.id;
@@ -6367,21 +10117,27 @@ function createImageTab(seed?: Partial<ImageTabState>, activate = true, id: stri
 
 function activateImageTab(id: string) {
   syncActiveImageTabFromState();
-  const tab = state.imageTabs.find((item) => item.id === id);
+  const previousActiveId = state.activeImageTabId;
+  const tab = imageTabForId(id);
   if (!tab) return;
   state.activeImageTabId = tab.id;
   syncImageStateFromActiveTab();
-  renderImageTabs();
-  renderImagePreview();
-  renderImageHistory();
-  saveActiveWorkspaceSnapshot();
+  renderImageTabActivation(previousActiveId, tab);
+  if (previousActiveId !== tab.id) {
+    renderImagePreview();
+    renderImageHistory();
+    saveActiveWorkspaceSnapshot();
+  }
 }
 
 function closeImageTab(id: string) {
   syncActiveImageTabFromState();
-  const index = state.imageTabs.findIndex((tab) => tab.id === id);
+  const index = imageTabIndexById(id);
   if (index < 0) return;
+  const closingTab = state.imageTabs[index];
+  forgetImageTab(closingTab);
   state.imageTabs.splice(index, 1);
+  refreshImageTabIndexLookup(index);
   if (!state.imageTabs.length) createImageTab(undefined, false);
   if (state.activeImageTabId === id) {
     const next = state.imageTabs[index] ?? state.imageTabs[index - 1] ?? state.imageTabs[0];
@@ -6395,26 +10151,131 @@ function closeImageTab(id: string) {
 }
 
 function renderImageTabs() {
-  el.imageTabs.innerHTML = '';
-  el.imageOpenNewTab.checked = state.imageOpenInNewTab;
+  if (getPanel('image').classList.contains('hidden')) return;
+  const signature = imageTabsSignature();
+  if (imageTabsRenderSignature === signature) return;
+  const orderSignature = imageTabsOrderSignature();
+  const sameOrder = imageTabsOrderRenderSignature === orderSignature
+    && el.imageTabs.childElementCount === state.imageTabs.length;
+  imageTabsRenderSignature = signature;
+  setCheckedIfChanged(el.imageOpenNewTab, state.imageOpenInNewTab);
+
+  if (sameOrder) {
+    for (const tab of state.imageTabs) {
+      updateImageTabElement(imageTabElement(tab.id), tab);
+    }
+    return;
+  }
+
+  imageTabsOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const tab of state.imageTabs) {
-    const item = document.createElement('div');
-    item.className = `widget-tab${tab.id === state.activeImageTabId ? ' active' : ''}`;
-    item.title = tab.sourcePath ?? tab.label;
-    item.innerHTML = `<button class="widget-tab-label">${escapeHtml(imageTabLabel(tab))}</button><button class="widget-tab-close" title="Close image tab" aria-label="Close image tab">x</button>`;
-    item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => activateImageTab(tab.id));
-    item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      closeImageTab(tab.id);
-    });
+    seen.add(tab.id);
+    const item = imageTabElement(tab.id);
+    updateImageTabElement(item, tab);
     fragment.append(item);
   }
-  el.imageTabs.append(fragment);
+  el.imageTabs.replaceChildren(fragment);
+  pruneImageTabElementCache(seen);
+}
+
+function renderImageTabActivation(previousActiveId: string, activeTab: ImageTabState) {
+  if (getPanel('image').classList.contains('hidden')) return;
+  const orderSignature = imageTabsOrderSignature();
+  const previousChanged = Boolean(previousActiveId && previousActiveId !== activeTab.id);
+  const previousTab = previousChanged ? imageTabForId(previousActiveId) : null;
+  const previousElement = previousChanged ? connectedImageTabElement(previousActiveId) : null;
+  const activeElement = connectedImageTabElement(activeTab.id);
+  if (
+    imageTabsOrderRenderSignature !== orderSignature
+    || el.imageTabs.childElementCount !== state.imageTabs.length
+    || !activeElement
+    || (previousChanged && (!previousTab || !previousElement))
+  ) {
+    renderImageTabs();
+    return;
+  }
+  if (previousTab && previousElement) updateImageTabElement(previousElement, previousTab);
+  updateImageTabElement(activeElement, activeTab);
+  imageTabsRenderSignature = imageTabsSignature();
+}
+
+function imageTabElement(id: string) {
+  const cached = imageTabElementCache.get(id);
+  if (cached) return cached;
+  const item = document.createElement('div');
+  item.className = 'widget-tab';
+  const labelButton = document.createElement('button');
+  labelButton.className = 'widget-tab-label';
+  labelButton.type = 'button';
+  labelButton.addEventListener('click', () => {
+    const id = item.dataset.imageTabId ?? '';
+    if (id) activateImageTab(id);
+  });
+  const closeButton = document.createElement('button');
+  closeButton.className = 'widget-tab-close';
+  closeButton.type = 'button';
+  closeButton.title = 'Close image tab';
+  closeButton.setAttribute('aria-label', 'Close image tab');
+  closeButton.textContent = 'x';
+  closeButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const id = item.dataset.imageTabId ?? '';
+    if (id) closeImageTab(id);
+  });
+  item.append(labelButton, closeButton);
+  imageTabElementCache.set(id, item);
+  return item;
+}
+
+function connectedImageTabElement(id: string) {
+  const item = imageTabElementCache.get(id);
+  return item?.isConnected ? item : null;
+}
+
+function updateImageTabElement(item: HTMLElement, tab: ImageTabState) {
+  const active = tab.id === state.activeImageTabId;
+  const label = imageTabLabel(tab);
+  const title = tab.sourcePath ?? tab.label;
+  const signature = `${tab.id}\t${active ? '1' : '0'}\t${label}\t${title}\t${tab.dataUrl ? '1' : '0'}`;
+  item.dataset.imageTabId = tab.id;
+  if (item.dataset.renderSignature === signature) return;
+  item.dataset.renderSignature = signature;
+  item.className = `widget-tab${active ? ' active' : ''}`;
+  if (item.title !== title) item.title = title;
+  setTextContentIfChanged(imageTabLabelButton(item), label);
+}
+
+function imageTabLabelButton(item: HTMLElement) {
+  return item.firstElementChild as HTMLButtonElement;
+}
+
+function pruneImageTabElementCache(seen: Set<string>) {
+  for (const id of imageTabElementCache.keys()) {
+    if (!seen.has(id)) imageTabElementCache.delete(id);
+  }
+}
+
+function imageTabsSignature() {
+  let signature = state.imageOpenInNewTab ? '1' : '0';
+  for (const tab of state.imageTabs) {
+    signature += `\n${tab.id}\t${tab.id === state.activeImageTabId ? '1' : '0'}\t${imageTabLabel(tab)}\t${tab.sourcePath ?? ''}\t${tab.dataUrl ? '1' : '0'}`;
+  }
+  return signature;
+}
+
+function imageTabsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.imageTabs.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.imageTabs[index].id;
+  }
+  return signature;
 }
 
 function imageTabLabel(tab: ImageTabState) {
-  if (tab.sourcePath) return tab.sourcePath.split(/[\\/]/).filter(Boolean).pop() ?? tab.sourcePath;
+  if (tab.sourcePath) return pathBasename(tab.sourcePath, tab.sourcePath);
   if (tab.dataUrl) return 'Pasted image';
   return 'Empty';
 }
@@ -6428,7 +10289,7 @@ function syncImageStateFromActiveTab() {
 }
 
 function syncActiveImageTabFromState() {
-  const tab = state.imageTabs.find((item) => item.id === state.activeImageTabId);
+  const tab = imageTabForId(state.activeImageTabId);
   if (!tab) return;
   tab.dataUrl = state.imagePreviewDataUrl;
   tab.label = state.imagePreviewLabel;
@@ -6440,7 +10301,7 @@ async function openImageFile(path: string) {
   if (!state.activeProfile) return;
   setStatus(`Opening image ${path}...`);
   try {
-    const existing = state.imageTabs.find((tab) => tab.sourcePath === path);
+    const existing = imageTabForSourcePath(path);
     if (existing) {
       activateImageTab(existing.id);
       setPanelVisible('image', true);
@@ -6452,7 +10313,7 @@ async function openImageFile(path: string) {
     const tab = state.imageOpenInNewTab && activeImageTab().dataUrl
       ? createImageTab(undefined, true)
       : activeImageTab();
-    tab.sourcePath = path;
+    setImageTabSourcePath(tab, path);
     tab.dataUrl = dataUrl;
     tab.label = `Image selected: ${path}`;
     state.activeImageTabId = tab.id;
@@ -6468,18 +10329,18 @@ async function openImageFile(path: string) {
 }
 
 function renderEditor() {
-  const renderToken = ++editorRenderToken;
-  codeView?.destroy();
-  codeView = null;
+  if (codeView) syncActiveEditorTabFromView();
   const activeTab = activeEditorTab();
   state.openFile = activeTab.file;
   const file = state.openFile;
-  el.editorBody.innerHTML = '';
   el.editorBody.classList.remove('empty');
   el.toggleRaw.classList.toggle('hidden', !file?.masked);
   el.saveFile.disabled = !file;
 
   if (!file) {
+    editorRenderToken += 1;
+    destroyCodeEditorView();
+    el.editorBody.innerHTML = '';
     el.editorLabel.textContent = activeTab.pendingPath ?? 'Editor';
     el.editorBody.textContent = activeTab.pendingPath ? 'Opening file...' : 'Open a file from Explorer.';
     el.editorBody.classList.add('empty');
@@ -6492,6 +10353,9 @@ function renderEditor() {
   renderEditorTabs();
 
   if (file.masked && !file.rawMode) {
+    editorRenderToken += 1;
+    destroyCodeEditorView();
+    el.editorBody.innerHTML = '';
     const form = document.createElement('div');
     form.className = 'secure-form';
     const banner = document.createElement('div');
@@ -6513,10 +10377,28 @@ function renderEditor() {
     return;
   }
 
+  const viewSignature = editorCodeViewSignature(file);
+  if (
+    codeView
+    && codeViewFile === file
+    && codeViewRenderSignature === viewSignature
+    && el.editorBody.querySelector('.code-mount')
+  ) {
+    requestCodeEditorMeasure();
+    return;
+  }
+
+  const renderToken = ++editorRenderToken;
+  destroyCodeEditorView();
+  el.editorBody.innerHTML = '';
   const mount = document.createElement('div');
   mount.className = 'code-mount';
   el.editorBody.append(mount);
-  void mountCodeEditor(file, mount, renderToken);
+  void mountCodeEditor(file, mount, renderToken, viewSignature);
+}
+
+function editorCodeViewSignature(file: OpenFileState) {
+  return `${file.path}\t${file.masked ? '1' : '0'}\t${file.rawMode ? '1' : '0'}\t${state.editorWordWrap ? '1' : '0'}`;
 }
 
 function appendSecureKeyRow(form: HTMLElement, line: SecretLine) {
@@ -6658,7 +10540,7 @@ function insertSecureKey(file: OpenFileState, key: string, value: string) {
   file.lines.push(line);
 }
 
-async function mountCodeEditor(file: OpenFileState, mount: HTMLElement, renderToken: number) {
+async function mountCodeEditor(file: OpenFileState, mount: HTMLElement, renderToken: number, viewSignature: string) {
   const runtime = await ensureEditorRuntime();
   if (renderToken !== editorRenderToken || state.openFile !== file) return;
 
@@ -6669,6 +10551,8 @@ async function mountCodeEditor(file: OpenFileState, mount: HTMLElement, renderTo
     }),
     parent: mount
   });
+  codeViewFile = file;
+  codeViewRenderSignature = viewSignature;
   void hydrateEditorLanguage(file.path, renderToken, runtime);
 }
 
@@ -6696,8 +10580,7 @@ function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
     runtime.languageCompartment.of([]),
     runtime.EditorView.updateListener.of((update) => {
       if (update.docChanged && state.openFile) {
-        state.openFile.draftContent = update.state.doc.toString();
-        setEditorDirtyFromContent(state.openFile.draftContent);
+        markOpenFileDirtyFromEditorEdit();
       }
     })
   ];
@@ -6815,6 +10698,23 @@ function scheduleEditorRuntimeWarmup() {
   else window.setTimeout(warm, 350);
 }
 
+function ensureTerminalRuntime() {
+  terminalRuntimePromise ??= Promise.all([
+    import('@xterm/xterm'),
+    import('@xterm/addon-fit')
+  ]).then(([terminalModule, fitModule]) => ({
+    Terminal: terminalModule.Terminal,
+    FitAddon: fitModule.FitAddon
+  }));
+  return terminalRuntimePromise;
+}
+
+function scheduleTerminalRuntimeWarmup() {
+  runWhenUiIdle(() => {
+    void ensureTerminalRuntime().catch(() => undefined);
+  }, 1400);
+}
+
 function warmEditorForPath(path: string) {
   void ensureEditorRuntime()
     .then(() => languageFor(path))
@@ -6830,40 +10730,65 @@ async function hydrateEditorLanguage(path: string, renderToken: number, runtime:
 }
 
 async function languageFor(path: string): Promise<Extension> {
+  const key = editorLanguageKey(path);
+  if (!key) return [];
+  const cached = editorLanguageCache.get(key);
+  if (cached) return cached;
+  const load = loadEditorLanguage(key);
+  editorLanguageCache.set(key, load);
+  return load;
+}
+
+function editorLanguageKey(path: string) {
   const lower = path.toLowerCase();
-  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) {
+  if (lower.endsWith('.tsx')) return 'tsx';
+  if (lower.endsWith('.ts')) return 'ts';
+  if (lower.endsWith('.jsx')) return 'jsx';
+  if (lower.endsWith('.js') || lower.endsWith('.mjs')) return 'js';
+  if (lower.endsWith('.json')) return 'json';
+  if (lower.endsWith('.css')) return 'css';
+  if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'html';
+  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown';
+  if (lower.endsWith('.py')) return 'python';
+  if (lower.endsWith('.rs')) return 'rust';
+  if (lower.endsWith('.yml') || lower.endsWith('.yaml')) return 'yaml';
+  return '';
+}
+
+async function loadEditorLanguage(key: string): Promise<Extension> {
+  if (key === 'ts' || key === 'tsx') {
     const { javascript } = await import('@codemirror/lang-javascript');
-    return javascript({ typescript: true, jsx: lower.endsWith('.tsx') });
+    return javascript({ typescript: true, jsx: key === 'tsx' });
   }
-  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs')) {
+  if (key === 'js' || key === 'jsx') {
     const { javascript } = await import('@codemirror/lang-javascript');
-    return javascript({ jsx: lower.endsWith('.jsx') });
+    return javascript({ jsx: key === 'jsx' });
   }
-  if (lower.endsWith('.json')) {
+  if (key === 'json') {
     const { json } = await import('@codemirror/lang-json');
     return json();
   }
-  if (lower.endsWith('.css')) {
+  if (key === 'css') {
     const { css } = await import('@codemirror/lang-css');
     return css();
   }
-  if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+  if (key === 'html') {
     const { html } = await import('@codemirror/lang-html');
     return html();
   }
-  if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+  if (key === 'markdown') {
     const { markdown } = await import('@codemirror/lang-markdown');
     return markdown();
   }
-  if (lower.endsWith('.py')) {
+  if (key === 'python') {
     const { python } = await import('@codemirror/lang-python');
     return python();
   }
-  if (lower.endsWith('.rs')) {
+  if (key === 'rust') {
     const { rust } = await import('@codemirror/lang-rust');
     return rust();
   }
-  if (lower.endsWith('.yml') || lower.endsWith('.yaml')) {
+  if (key === 'yaml') {
     const { yaml } = await import('@codemirror/lang-yaml');
     return yaml();
   }
@@ -6878,6 +10803,16 @@ function markDirty() {
   setEditorDirtyFromContent(current);
 }
 
+function markOpenFileDirtyFromEditorEdit() {
+  const file = state.openFile;
+  if (!file) return;
+  file.dirty = true;
+  file.draftContent = undefined;
+  updateEditorLabel();
+  renderEditorTabs();
+  el.saveFile.disabled = false;
+}
+
 function setEditorDirtyFromContent(currentContent: string) {
   if (!state.openFile) return;
   state.openFile.dirty = !sameEditorContent(currentContent, state.openFile.content);
@@ -6887,6 +10822,8 @@ function setEditorDirtyFromContent(currentContent: string) {
 }
 
 function sameEditorContent(left: string, right: string) {
+  if (left === right) return true;
+  if (!left.includes('\r') && !right.includes('\r')) return false;
   return normalizeEditorContent(left) === normalizeEditorContent(right);
 }
 
@@ -6897,10 +10834,10 @@ function normalizeEditorContent(value: string) {
 function updateEditorLabel() {
   const file = state.openFile;
   if (!file) {
-    el.editorLabel.textContent = 'Editor';
+    setTextContentIfChanged(el.editorLabel, 'Editor');
     return;
   }
-  el.editorLabel.textContent = `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`;
+  setTextContentIfChanged(el.editorLabel, `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`);
 }
 
 async function saveOpenFile() {
@@ -6913,6 +10850,7 @@ async function saveOpenFile() {
   try {
     await api.writeTextFile(profile.id, file.path, content);
     cacheTextFile(profile.id, file.path, content);
+    invalidateExplorerParentDirectoryCache(profile.id, file.path);
     file.content = content;
     file.draftContent = undefined;
     file.lines = file.masked ? parseSecretLinesCached(content, file.path) : [];
@@ -6961,20 +10899,44 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   const card = document.createElement('section');
   card.className = 'terminal-card panel';
   card.dataset.widgetId = widgetId;
-  card.innerHTML = `
-    <div class="terminal-title panel-drag-handle">
-      <button class="focus-dot" title="Active prompt target"></button>
-      <strong class="terminal-widget-title">${escapeHtml(title)}</strong>
-      <span class="muted terminal-widget-cwd">${escapeHtml(cwd)}</span>
-      <span class="spacer"></span>
-      <button class="close-pane" title="Close shell widget" aria-label="Close shell widget">x</button>
-    </div>
-    <div class="terminal-widget-tabbar">
-      <div class="terminal-tab-list widget-tabs"></div>
-      <button class="terminal-new-tab tab-add" title="New tab in this shell" aria-label="New tab in this shell">+</button>
-    </div>
-    <div class="terminal-host-stack"></div>
-  `;
+
+  const titlebar = document.createElement('div');
+  titlebar.className = 'terminal-title panel-drag-handle';
+  const focusDot = document.createElement('button');
+  focusDot.className = 'focus-dot';
+  focusDot.type = 'button';
+  focusDot.title = 'Active prompt target';
+  const titleEl = document.createElement('strong');
+  titleEl.className = 'terminal-widget-title';
+  titleEl.textContent = title;
+  const cwdEl = document.createElement('span');
+  cwdEl.className = 'muted terminal-widget-cwd';
+  cwdEl.textContent = cwd;
+  const spacer = document.createElement('span');
+  spacer.className = 'spacer';
+  const closeButton = document.createElement('button');
+  closeButton.className = 'close-pane';
+  closeButton.type = 'button';
+  closeButton.title = 'Close shell widget';
+  closeButton.setAttribute('aria-label', 'Close shell widget');
+  closeButton.textContent = 'x';
+  titlebar.append(focusDot, titleEl, cwdEl, spacer, closeButton);
+
+  const tabbar = document.createElement('div');
+  tabbar.className = 'terminal-widget-tabbar';
+  const tabList = document.createElement('div');
+  tabList.className = 'terminal-tab-list widget-tabs';
+  const newTabButton = document.createElement('button');
+  newTabButton.className = 'terminal-new-tab tab-add';
+  newTabButton.type = 'button';
+  newTabButton.title = 'New tab in this shell';
+  newTabButton.setAttribute('aria-label', 'New tab in this shell');
+  newTabButton.textContent = '+';
+  tabbar.append(tabList, newTabButton);
+
+  const hostStack = document.createElement('div');
+  hostStack.className = 'terminal-host-stack';
+  card.append(titlebar, tabbar, hostStack);
   el.mainGrid.append(card);
   const grips = ensureResizeGrips(card, 'terminal');
   if (options.rect) applyLayoutRatio(card, options.rect);
@@ -6984,29 +10946,31 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     widgetId,
     workspaceId,
     element: card,
-    title: card.querySelector<HTMLElement>('.terminal-widget-title')!,
-    cwd: card.querySelector<HTMLElement>('.terminal-widget-cwd')!,
-    tabList: card.querySelector<HTMLElement>('.terminal-tab-list')!,
-    hostStack: card.querySelector<HTMLElement>('.terminal-host-stack')!,
+    title: titleEl,
+    cwd: cwdEl,
+    tabList,
+    hostStack,
     activePaneId: ''
   };
   state.terminalWidgets.push(widget);
+  terminalWidgetById.set(widget.widgetId, widget);
+  terminalWidgetByElement.set(widget.element, widget);
+  if (workspaceId === state.activeWorkspaceId) visibleTerminalWorkspaceId = workspaceId;
 
   card.addEventListener('pointerdown', () => {
     const pane = activePaneForWidget(widget);
     if (pane) setActivePane(pane.paneId);
     bringPanelToFront(card);
   });
-  card.querySelector<HTMLElement>('.terminal-title')!
-    .addEventListener('pointerdown', (event) => startPanelDrag(event, card));
+  titlebar.addEventListener('pointerdown', (event) => startPanelDrag(event, card));
   grips.forEach((grip) => {
     grip.addEventListener('pointerdown', (event) => {
       startPanelResize(event, card, grip);
       scheduleFitTerminalWidget(widget);
     });
   });
-  card.querySelector<HTMLButtonElement>('.close-pane')!.addEventListener('click', () => void closeTerminalWidget(widget.widgetId));
-  card.querySelector<HTMLButtonElement>('.terminal-new-tab')!.addEventListener('click', (event) => {
+  closeButton.addEventListener('click', () => void closeTerminalWidget(widget.widgetId));
+  newTabButton.addEventListener('click', (event) => {
     event.stopPropagation();
     void createShellTabInWidget(widget);
   });
@@ -7028,15 +10992,16 @@ async function createTerminalTab(
   host.className = 'terminal-host hidden';
   host.dataset.paneId = paneId;
   widget.hostStack.append(host);
+  const runtime = await ensureTerminalRuntime();
 
-  const term = new Terminal({
+  const term = new runtime.Terminal({
     cursorBlink: true,
     convertEol: true,
     fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
     fontSize: terminalFontSize,
     theme: { background: '#080b10', foreground: '#d8e0ea' }
   });
-  const fit = new FitAddon();
+  const fit = new runtime.FitAddon();
   term.loadAddon(fit);
   term.open(host);
 
@@ -7053,6 +11018,7 @@ async function createTerminalTab(
     element: widget.element,
     host,
     outputBuffer: '',
+    writeBuffer: '',
     cwdOutputBuffer: '',
     inputBuffer: '',
     seenPorts: new Set(),
@@ -7060,6 +11026,8 @@ async function createTerminalTab(
     lastCols: term.cols
   };
   state.terminals.push(pane);
+  terminalPaneById.set(pane.paneId, pane);
+  rememberTerminalPane(pane);
   if (options.focus !== false) {
     setActivePane(paneId);
     bringPanelToFront(widget.element);
@@ -7077,24 +11045,27 @@ async function createTerminalTab(
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
 
-  pane.resizeObserver = new ResizeObserver(() => scheduleFitTerminal(pane));
+  pane.resizeObserver = new ResizeObserver(() => {
+    if (terminalPaneCanFit(pane)) scheduleFitTerminal(pane);
+  });
   pane.resizeObserver.observe(host);
 
   try {
-    await settleTerminalInitialFit(pane);
+    const initiallyVisible = isTerminalPaneVisible(pane);
+    if (initiallyVisible) await settleTerminalInitialFit(pane);
     const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd);
     if (spawnCwd !== pane.cwd) {
       pane.cwd = spawnCwd;
       updateTerminalWidgetTitle(widget);
     }
-    pane.backendId = await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols);
+    setTerminalBackendId(pane, await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols));
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
       bringPanelToFront(widget.element);
       term.focus();
     }
     setStatus(`Terminal started: ${title}`);
-    saveActiveWorkspaceSnapshot();
+    if (!options.skipSnapshotSave) saveActiveWorkspaceSnapshot();
   } catch (error) {
     term.write(`\r\nFailed to start terminal: ${String(error)}\r\n`);
     setStatus(String(error), true);
@@ -7103,25 +11074,32 @@ async function createTerminalTab(
 }
 
 async function closeTerminalPane(paneId: string) {
-  const pane = state.terminals.find((item) => item.paneId === paneId);
+  const pane = terminalPaneById.get(paneId) ?? state.terminals.find((item) => item.paneId === paneId);
   if (!pane) return;
   const widget = terminalWidgetForPane(pane);
   if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
+  setTerminalBackendId(pane, undefined);
+  terminalPaneById.delete(pane.paneId);
+  forgetTerminalPane(pane);
+  cleanupTerminalWriteBuffer(pane);
   if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
   pane.resizeObserver?.disconnect();
   pane.term.dispose();
-  state.terminals = state.terminals.filter((item) => item.paneId !== paneId);
+  const terminalIndex = state.terminals.findIndex((item) => item.paneId === paneId);
+  if (terminalIndex >= 0) state.terminals.splice(terminalIndex, 1);
   pane.host.remove();
-  const remainingInWidget = widget ? terminalPanesForWidget(widget) : [];
-  if (widget && !remainingInWidget.length) {
-    state.terminalWidgets = state.terminalWidgets.filter((item) => item.widgetId !== widget.widgetId);
+  const nextInWidget = widget ? firstTerminalPaneForWidget(widget) : null;
+  if (widget && !nextInWidget) {
+    const widgetIndex = state.terminalWidgets.findIndex((item) => item.widgetId === widget.widgetId);
+    if (widgetIndex >= 0) state.terminalWidgets.splice(widgetIndex, 1);
+    forgetTerminalWidget(widget);
     widget.element.remove();
   } else if (widget && widget.activePaneId === paneId) {
-    widget.activePaneId = remainingInWidget[0]?.paneId ?? '';
+    widget.activePaneId = nextInWidget?.paneId ?? '';
   }
 
   if (state.activePaneId === paneId) {
-    const next = remainingInWidget[0] ?? activeWorkspaceTerminalPanes()[0];
+    const next = nextInWidget ?? firstActiveWorkspaceTerminalPane();
     state.activePaneId = '';
     if (next) setActivePane(next.paneId);
     else setKeyboardResizeTarget({ kind: 'ide' });
@@ -7132,73 +11110,258 @@ async function closeTerminalPane(paneId: string) {
 }
 
 async function closeTerminalWidget(widgetId: string) {
-  const paneIds = state.terminals
-    .filter((pane) => pane.widgetId === widgetId)
-    .map((pane) => pane.paneId);
+  const paneIds: string[] = [];
+  for (const pane of terminalPanesForWidgetId(widgetId)) paneIds.push(pane.paneId);
   for (const paneId of paneIds) {
     await closeTerminalPane(paneId);
   }
 }
 
 function renderShellTabs() {
+  const signature = shellTabsSignature();
+  if (shellTabsRenderSignature === signature) return;
+  shellTabsRenderSignature = signature;
   el.shellTabs.classList.add('hidden');
-  el.shellTabList.innerHTML = '';
-  for (const widget of activeWorkspaceTerminalWidgets()) renderTerminalWidgetTabs(widget);
+  el.shellTabList.replaceChildren();
+  forEachActiveWorkspaceTerminalWidget(renderTerminalWidgetTabs);
+}
+
+function shellTabsSignature() {
+  let signature = '';
+  let count = 0;
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId !== state.activeWorkspaceId) continue;
+    if (count) signature += '\n';
+    signature += `${widget.widgetId}\t${widget.activePaneId}`;
+    count += 1;
+  }
+  return signature;
 }
 
 function renderTerminalWidgetTabs(widget: TerminalWidget) {
-  widget.tabList.innerHTML = '';
   const panes = terminalPanesForWidget(widget);
+  const renderState = terminalWidgetTabsRenderState(widget, panes);
+  if (terminalWidgetTabsRenderSignatures.get(widget) === renderState.signature) {
+    updateTerminalWidgetTitle(widget);
+    return;
+  }
+  terminalWidgetTabsRenderSignatures.set(widget, renderState.signature);
+  const sameOrder = terminalWidgetTabsOrderRenderSignatures.get(widget) === renderState.orderSignature
+    && widget.tabList.childElementCount === renderState.count;
+
+  if (sameOrder) {
+    for (const pane of panes) {
+      updateTerminalWidgetTabElement(terminalWidgetTabElement(widget, pane.paneId), widget, pane);
+    }
+    updateTerminalWidgetTitle(widget);
+    return;
+  }
+
+  terminalWidgetTabsOrderRenderSignatures.set(widget, renderState.orderSignature);
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const pane of panes) {
-    const item = document.createElement('div');
-    item.className = `widget-tab${pane.paneId === widget.activePaneId ? ' active' : ''}`;
-    item.title = pane.command || pane.title;
-    item.innerHTML = `<button class="widget-tab-label">${escapeHtml(pane.title)}</button><button class="widget-tab-close" title="Close shell" aria-label="Close shell">x</button>`;
-    item.querySelector<HTMLButtonElement>('.widget-tab-label')!.addEventListener('click', () => {
-      setActivePane(pane.paneId);
-      bringPanelToFront(pane.element);
-      pane.term.focus();
-    });
-    item.querySelector<HTMLButtonElement>('.widget-tab-close')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void closeTerminalPane(pane.paneId);
-    });
+    seen.add(pane.paneId);
+    const item = terminalWidgetTabElement(widget, pane.paneId);
+    updateTerminalWidgetTabElement(item, widget, pane);
     fragment.append(item);
   }
-  widget.tabList.append(fragment);
+  widget.tabList.replaceChildren(fragment);
+  pruneTerminalWidgetTabElementCache(widget, seen);
   updateTerminalWidgetTitle(widget);
 }
 
+function terminalWidgetTabElement(widget: TerminalWidget, paneId: string) {
+  const cache = terminalWidgetTabCache(widget);
+  const cached = cache.get(paneId);
+  if (cached) return cached;
+  const item = document.createElement('div');
+  item.className = 'widget-tab';
+  const labelButton = document.createElement('button');
+  labelButton.className = 'widget-tab-label';
+  labelButton.type = 'button';
+  labelButton.addEventListener('click', () => {
+    const pane = terminalPaneById.get(item.dataset.paneId ?? '');
+    if (!pane) return;
+    setActivePane(pane.paneId);
+    bringPanelToFront(pane.element);
+    pane.term.focus();
+  });
+  const closeButton = document.createElement('button');
+  closeButton.className = 'widget-tab-close';
+  closeButton.type = 'button';
+  closeButton.title = 'Close shell';
+  closeButton.setAttribute('aria-label', 'Close shell');
+  closeButton.textContent = 'x';
+  closeButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const paneId = item.dataset.paneId ?? '';
+    if (paneId) void closeTerminalPane(paneId);
+  });
+  item.append(labelButton, closeButton);
+  cache.set(paneId, item);
+  return item;
+}
+
+function terminalWidgetTabCache(widget: TerminalWidget) {
+  let cache = terminalWidgetTabElementCaches.get(widget);
+  if (!cache) {
+    cache = new Map<string, HTMLElement>();
+    terminalWidgetTabElementCaches.set(widget, cache);
+  }
+  return cache;
+}
+
+function updateTerminalWidgetTabElement(item: HTMLElement, widget: TerminalWidget, pane: TerminalPane) {
+  const active = pane.paneId === widget.activePaneId;
+  const signature = `${pane.paneId}\t${active ? '1' : '0'}\t${pane.title}\t${pane.command ?? ''}`;
+  item.dataset.paneId = pane.paneId;
+  if (item.dataset.renderSignature === signature) return;
+  item.dataset.renderSignature = signature;
+  item.className = `widget-tab${active ? ' active' : ''}`;
+  item.title = pane.command || pane.title;
+  setTextContentIfChanged(terminalWidgetTabLabelButton(item), pane.title);
+}
+
+function terminalWidgetTabLabelButton(item: HTMLElement) {
+  return item.firstElementChild as HTMLButtonElement;
+}
+
+function pruneTerminalWidgetTabElementCache(widget: TerminalWidget, seen: Set<string>) {
+  const cache = terminalWidgetTabElementCaches.get(widget);
+  if (!cache) return;
+  for (const paneId of cache.keys()) {
+    if (!seen.has(paneId)) cache.delete(paneId);
+  }
+}
+
+function terminalWidgetTabsRenderState(widget: TerminalWidget, panes = terminalPanesForWidget(widget)) {
+  let signature = '';
+  let orderSignature = '';
+  let count = 0;
+  for (const pane of panes) {
+    if (count) {
+      signature += '\n';
+      orderSignature += '\n';
+    }
+    signature += `${pane.paneId}\t${pane.paneId === widget.activePaneId ? '1' : '0'}\t${pane.title}\t${pane.command ?? ''}`;
+    orderSignature += pane.paneId;
+    count += 1;
+  }
+  return { signature, orderSignature, count };
+}
+
+function rememberTerminalPane(pane: TerminalPane) {
+  let panes = terminalPanesByWidgetId.get(pane.widgetId);
+  if (!panes) {
+    panes = [];
+    terminalPanesByWidgetId.set(pane.widgetId, panes);
+  }
+  if (!panes.includes(pane)) panes.push(pane);
+}
+
+function forgetTerminalPane(pane: TerminalPane) {
+  const panes = terminalPanesByWidgetId.get(pane.widgetId);
+  if (!panes) return;
+  const index = panes.indexOf(pane);
+  if (index >= 0) panes.splice(index, 1);
+  if (!panes.length) terminalPanesByWidgetId.delete(pane.widgetId);
+}
+
 function terminalPanesForWidget(widget: TerminalWidget) {
-  return state.terminals.filter((pane) => pane.widgetId === widget.widgetId);
+  return terminalPanesForWidgetId(widget.widgetId);
 }
 
-function activeWorkspaceTerminalWidgets() {
-  return state.terminalWidgets.filter((widget) => widget.workspaceId === state.activeWorkspaceId);
+function terminalPanesForWidgetId(widgetId: string) {
+  const panes = terminalPanesByWidgetId.get(widgetId);
+  if (panes) return panes;
+  const rebuilt: TerminalPane[] = [];
+  for (const pane of state.terminals) {
+    if (pane.widgetId === widgetId) rebuilt.push(pane);
+  }
+  if (rebuilt.length) terminalPanesByWidgetId.set(widgetId, rebuilt);
+  return rebuilt;
 }
 
-function activeWorkspaceTerminalPanes() {
-  return state.terminals.filter((pane) => pane.workspaceId === state.activeWorkspaceId);
+function firstTerminalPaneForWidget(widget: TerminalWidget) {
+  return terminalPanesForWidget(widget)[0] ?? null;
+}
+
+function forEachActiveWorkspaceTerminalWidget(callback: (widget: TerminalWidget) => void) {
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId === state.activeWorkspaceId) callback(widget);
+  }
+}
+
+function firstActiveWorkspaceTerminalWidget() {
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId === state.activeWorkspaceId) return widget;
+  }
+  return null;
+}
+
+function hasActiveWorkspaceTerminalPane() {
+  for (const pane of state.terminals) {
+    if (pane.workspaceId === state.activeWorkspaceId) return true;
+  }
+  return false;
+}
+
+function firstActiveWorkspaceTerminalPane() {
+  for (const pane of state.terminals) {
+    if (pane.workspaceId === state.activeWorkspaceId) return pane;
+  }
+  return null;
+}
+
+function activeWorkspaceTerminalPaneAtClamped(index: number) {
+  const targetIndex = Math.max(0, index);
+  let activeIndex = 0;
+  let selected: TerminalPane | null = null;
+  let last: TerminalPane | null = null;
+  for (const pane of state.terminals) {
+    if (pane.workspaceId !== state.activeWorkspaceId) continue;
+    if (activeIndex === targetIndex) selected = pane;
+    last = pane;
+    activeIndex += 1;
+  }
+  return selected ?? last;
+}
+
+function forgetTerminalWidget(widget: TerminalWidget) {
+  terminalWidgetById.delete(widget.widgetId);
+  terminalWidgetByElement.delete(widget.element);
 }
 
 function terminalWidgetForPane(pane: TerminalPane) {
-  return state.terminalWidgets.find((widget) => widget.widgetId === pane.widgetId) ?? null;
+  let widget = terminalWidgetById.get(pane.widgetId) ?? null;
+  if (!widget) {
+    widget = state.terminalWidgets.find((item) => item.widgetId === pane.widgetId) ?? null;
+    if (widget) terminalWidgetById.set(widget.widgetId, widget);
+  }
+  return widget;
 }
 
 function terminalWidgetForElement(element: HTMLElement) {
-  return state.terminalWidgets.find((widget) => widget.element === element) ?? null;
+  let widget = terminalWidgetByElement.get(element) ?? null;
+  if (!widget) {
+    widget = state.terminalWidgets.find((item) => item.element === element) ?? null;
+    if (widget) terminalWidgetByElement.set(widget.element, widget);
+  }
+  return widget;
 }
 
 function activePaneForWidget(widget: TerminalWidget) {
-  return state.terminals.find((pane) => pane.paneId === widget.activePaneId)
-    ?? terminalPanesForWidget(widget)[0]
-    ?? null;
+  const pane = terminalPaneById.get(widget.activePaneId);
+  return pane?.widgetId === widget.widgetId ? pane : firstTerminalPaneForWidget(widget);
 }
 
 function activeTerminalWidget() {
-  const pane = activeWorkspaceTerminalPanes().find((item) => item.paneId === state.activePaneId);
-  return pane ? terminalWidgetForPane(pane) : activeWorkspaceTerminalWidgets()[0] ?? null;
+  const pane = terminalPaneById.get(state.activePaneId);
+  if (pane?.workspaceId !== state.activeWorkspaceId) {
+    return firstActiveWorkspaceTerminalWidget();
+  }
+  return pane ? terminalWidgetForPane(pane) : firstActiveWorkspaceTerminalWidget();
 }
 
 function activePaneForElement(element: HTMLElement) {
@@ -7209,8 +11372,7 @@ function activePaneForElement(element: HTMLElement) {
 function profileForTerminalWidget(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   if (!pane) return null;
-  return state.profiles.find((profile) => profile.id === pane.profileId)
-    ?? (pane.profileId === 'windows-local' ? windowsLocalProfileFallback() : null);
+  return profileForIdWithWindowsFallback(pane.profileId);
 }
 
 function windowsLocalProfileFallback(): ConnectionProfile {
@@ -7244,7 +11406,7 @@ async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: strin
   ].filter(Boolean);
   for (const candidate of candidates) {
     try {
-      await api.listDirectory(profile.id, candidate);
+      await api.listDirectory(profile.id, candidate, false);
       return candidate;
     } catch {
       // Try the next likely folder without surfacing private paths.
@@ -7253,14 +11415,20 @@ async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: strin
   return profile.kind === 'windows' ? '' : '~';
 }
 
-function updateTerminalWidgetTitle(widget: TerminalWidget) {
+function updateTerminalWidgetTitle(widget: TerminalWidget, options: { force?: boolean } = {}) {
   const pane = activePaneForWidget(widget);
   widget.activePaneId = pane?.paneId ?? '';
-  widget.title.textContent = pane?.title ?? 'shell';
-  widget.cwd.textContent = pane?.cwd ?? '';
+  if (!options.force && widget.element.classList.contains('hidden')) return;
+  setTextContentIfChanged(widget.title, pane?.title ?? 'shell');
+  setTextContentIfChanged(widget.cwd, pane?.cwd ?? '');
 }
 
-function scheduleFitTerminalWidget(widget: TerminalWidget) {
+function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly?: boolean } = {}) {
+  if (options.activeOnly) {
+    const pane = activePaneForWidget(widget);
+    if (pane) scheduleFitTerminal(pane);
+    return;
+  }
   for (const pane of terminalPanesForWidget(widget)) scheduleFitTerminal(pane);
 }
 
@@ -7359,6 +11527,7 @@ function rememberedTerminalSpawnSize() {
 }
 
 function scheduleFitTerminal(pane: TerminalPane) {
+  if (!terminalPaneCanFit(pane)) return;
   if (pane.fitFrame) return;
   pane.fitFrame = requestAnimationFrame(() => {
     pane.fitFrame = undefined;
@@ -7382,7 +11551,14 @@ function queueTerminalFitBurst(pane: TerminalPane) {
   window.setTimeout(() => scheduleFitTerminal(pane), 160);
 }
 
+function terminalPaneCanFit(pane: TerminalPane) {
+  return pane.workspaceId === state.activeWorkspaceId
+    && !pane.element.classList.contains('hidden')
+    && !pane.host.classList.contains('hidden');
+}
+
 function fitTerminal(pane: TerminalPane) {
+  if (!terminalPaneCanFit(pane)) return;
   try {
     pane.fit.fit();
     if (pane.lastRows === pane.term.rows && pane.lastCols === pane.term.cols) return;
@@ -7395,29 +11571,61 @@ function fitTerminal(pane: TerminalPane) {
 }
 
 function setActivePane(paneId: string) {
-  const pane = state.terminals.find((item) => item.paneId === paneId);
+  const pane = terminalPaneById.get(paneId);
   if (!pane) return;
   if (pane.workspaceId !== state.activeWorkspaceId) return;
+  const previousPaneId = state.activePaneId;
   const widget = terminalWidgetForPane(pane);
+  if (previousPaneId === paneId) {
+    setKeyboardResizeTarget({ kind: 'terminal', paneId });
+    flushTerminalWriteBuffer(pane);
+    scheduleFitTerminal(pane);
+    return;
+  }
+  const previousPane = previousPaneId ? terminalPaneById.get(previousPaneId) ?? null : null;
+  const previousWidget = previousPane ? terminalWidgetForPane(previousPane) : null;
   if (widget) widget.activePaneId = paneId;
   state.activePaneId = paneId;
   setKeyboardResizeTarget({ kind: 'terminal', paneId });
-  syncActivePaneClass();
-  renderShellTabs();
+  if (previousWidget && previousWidget !== widget) {
+    syncTerminalWidgetActiveState(previousWidget);
+    renderTerminalWidgetTabs(previousWidget);
+  }
+  if (widget) {
+    syncTerminalWidgetActiveState(widget);
+    renderTerminalWidgetTabs(widget);
+  }
+  shellTabsRenderSignature = shellTabsSignature();
+  flushTerminalWriteBuffer(pane);
   scheduleFitTerminal(pane);
   saveActiveWorkspaceSnapshot();
 }
 
-function syncActivePaneClass() {
+function syncActivePaneClass(options: { workspaceId?: string } = {}) {
+  const workspaceId = options.workspaceId ?? state.activeWorkspaceId;
   for (const widget of state.terminalWidgets) {
-    const activePane = activePaneForWidget(widget);
-    widget.activePaneId = activePane?.paneId ?? '';
-    widget.element.classList.toggle('active', widget.activePaneId === state.activePaneId);
-    for (const pane of terminalPanesForWidget(widget)) {
-      pane.host.classList.toggle('hidden', pane.paneId !== widget.activePaneId);
-    }
-    updateTerminalWidgetTitle(widget);
+    if (workspaceId && widget.workspaceId !== workspaceId) continue;
+    syncTerminalWidgetActiveState(widget);
   }
+}
+
+function syncTerminalWidgetActiveState(widget: TerminalWidget) {
+  const current = terminalPaneById.get(widget.activePaneId);
+  const activePane = current?.widgetId === widget.widgetId ? current : firstTerminalPaneForWidget(widget);
+  widget.activePaneId = activePane?.paneId ?? '';
+  toggleClassIfChanged(
+    widget.element,
+    'active',
+    widget.workspaceId === state.activeWorkspaceId && widget.activePaneId === state.activePaneId
+  );
+  if (widget.element.classList.contains('hidden')) {
+    updateTerminalWidgetTitle(widget);
+    return;
+  }
+  for (const pane of terminalPanesForWidget(widget)) {
+    toggleClassIfChanged(pane.host, 'hidden', pane.paneId !== widget.activePaneId);
+  }
+  updateTerminalWidgetTitle(widget);
 }
 
 async function handlePaste(event: ClipboardEvent) {
@@ -7451,6 +11659,7 @@ async function pasteClipboardIntoExplorer(event: ClipboardEvent) {
     if (sourcePaths.length > 0) {
       setStatus(`Pasting ${sourcePaths.length} file${sourcePaths.length === 1 ? '' : 's'} into Explorer...`);
       const copied = await api.copyDroppedFiles(state.activeProfile.id, state.currentDir, sourcePaths);
+      invalidateExplorerDirectoryCache(state.activeProfile.id, state.currentDir);
       await reloadExplorerDirectory(state.currentDir);
       setStatus(`Pasted ${copied} file${copied === 1 ? '' : 's'} into Explorer`);
       return;
@@ -7470,6 +11679,7 @@ async function pasteClipboardIntoExplorer(event: ClipboardEvent) {
       nextImageName(),
       dataUrl
     );
+    invalidateExplorerDirectoryCache(state.activeProfile.id, state.currentDir);
     await reloadExplorerDirectory(state.currentDir);
     selectExplorerEntry(savedPath);
     setStatus(`Pasted image file into Explorer`);
@@ -7568,21 +11778,56 @@ async function pasteImageFromNativeClipboard() {
 }
 
 async function imageDataUrlFromClipboardEvent(event: ClipboardEvent) {
-  const item = [...(event.clipboardData?.items ?? [])].find((candidate) => candidate.type.startsWith('image/'));
-  const file = item?.getAsFile()
-    ?? [...(event.clipboardData?.files ?? [])].find((candidate) => candidate.type.startsWith('image/') || isImagePath(candidate.name));
+  const file = firstImageClipboardFile(event.clipboardData);
   return file ? blobToDataUrl(file) : null;
 }
 
 function clipboardEventMayContainImage(event: ClipboardEvent) {
   const data = event.clipboardData;
   if (!data) return true;
-  if ([...data.items].some((item) => item.type.startsWith('image/'))) return true;
-  if ([...data.files].some((file) => file.type.startsWith('image/') || isImagePath(file.name))) return true;
-  if ([...data.types].includes('Files')) return true;
+  if (clipboardItemsMayContainImage(data.items)) return true;
+  if (clipboardFilesMayContainImage(data.files)) return true;
+  if (clipboardTypesContainFiles(data.types)) return true;
   const html = data.getData('text/html');
   if (/<img\b|data:image\//i.test(html)) return true;
   return data.types.length === 0 && !data.getData('text/plain');
+}
+
+function firstImageClipboardFile(data: DataTransfer | null) {
+  if (!data) return null;
+  for (let index = 0; index < data.items.length; index += 1) {
+    const item = data.items[index];
+    if (!item.type.startsWith('image/')) continue;
+    const file = item.getAsFile();
+    if (file) return file;
+  }
+  for (let index = 0; index < data.files.length; index += 1) {
+    const file = data.files[index];
+    if (file.type.startsWith('image/') || isImagePath(file.name)) return file;
+  }
+  return null;
+}
+
+function clipboardItemsMayContainImage(items: DataTransferItemList) {
+  for (let index = 0; index < items.length; index += 1) {
+    if (items[index].type.startsWith('image/')) return true;
+  }
+  return false;
+}
+
+function clipboardFilesMayContainImage(files: FileList) {
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    if (file.type.startsWith('image/') || isImagePath(file.name)) return true;
+  }
+  return false;
+}
+
+function clipboardTypesContainFiles(types: readonly string[]) {
+  for (let index = 0; index < types.length; index += 1) {
+    if (types[index] === 'Files') return true;
+  }
+  return false;
 }
 
 async function nativeClipboardImageToDataUrl() {
@@ -7614,6 +11859,7 @@ async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteIm
     nextImageName(),
     dataUrl
   );
+  invalidateExplorerDirectoryCache(state.activeProfile.id, state.currentDir);
   const item: PastedImageItem = {
     id: crypto.randomUUID(),
     path: result.path,
@@ -7623,7 +11869,7 @@ async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteIm
   };
   state.imageHistory = [item, ...state.imageHistory].slice(0, 24);
   state.imagePreviewDataUrl = dataUrl;
-  targetTab.sourcePath = result.path;
+  setImageTabSourcePath(targetTab, result.path);
   const pasted = pasteToShell ? await pasteImageTagToActiveTerminal(result.tag) : false;
   state.imagePreviewLabel = pasted ? `${result.tag} copied into active prompt` : `${result.tag} saved`;
   syncActiveImageTabFromState();
@@ -7635,14 +11881,22 @@ async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteIm
 }
 
 function renderImagePreview() {
-  el.imageLabel.textContent = state.imagePreviewLabel;
-  if (state.imagePreviewDataUrl) {
-    el.imagePreview.src = state.imagePreviewDataUrl;
-    el.imagePreview.classList.add('visible');
-  } else {
-    el.imagePreview.removeAttribute('src');
-    el.imagePreview.classList.remove('visible');
+  const label = state.imagePreviewLabel;
+  const dataUrl = state.imagePreviewDataUrl;
+  const visible = Boolean(dataUrl);
+  const labelChanged = imagePreviewRenderedLabel !== label;
+  const dataChanged = imagePreviewRenderedDataUrl !== dataUrl;
+  const visibleChanged = el.imagePreview.classList.contains('visible') !== visible;
+  if (!labelChanged && !dataChanged && !visibleChanged) return;
+
+  imagePreviewRenderedLabel = label;
+  imagePreviewRenderedDataUrl = dataUrl;
+  if (labelChanged) setTextContentIfChanged(el.imageLabel, label);
+  if (dataChanged) {
+    if (dataUrl) el.imagePreview.src = dataUrl;
+    else if (el.imagePreview.hasAttribute('src')) el.imagePreview.removeAttribute('src');
   }
+  if (visibleChanged) el.imagePreview.classList.toggle('visible', visible);
 }
 
 function renderImageHistory() {
@@ -7651,43 +11905,142 @@ function renderImageHistory() {
   el.imageHistoryClear.disabled = state.imageHistory.length === 0;
   el.imageHistory.classList.toggle('hidden', !state.imageHistoryVisible);
   if (!state.imageHistoryVisible) return;
+  const signature = imageHistorySignature();
+  if (imageHistoryRenderSignature === signature) return;
+  imageHistoryRenderSignature = signature;
 
-  el.imageHistory.innerHTML = '';
   if (state.imageHistory.length === 0) {
+    imageHistoryOrderRenderSignature = 'empty';
     const empty = document.createElement('div');
     empty.className = 'image-history-empty';
     empty.textContent = 'No pasted images yet.';
-    el.imageHistory.append(empty);
+    el.imageHistory.replaceChildren(empty);
+    imageHistoryElementCache.clear();
     return;
   }
 
+  const orderSignature = imageHistoryOrderSignature();
+  const sameOrder = imageHistoryOrderRenderSignature === orderSignature
+    && el.imageHistory.childElementCount === state.imageHistory.length;
+
+  if (sameOrder) {
+    for (const item of state.imageHistory) {
+      updateImageHistoryElement(imageHistoryElement(item.id), item);
+    }
+    return;
+  }
+
+  imageHistoryOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const item of state.imageHistory) {
-    const row = document.createElement('div');
-    row.className = 'image-history-row';
-
-    const preview = document.createElement('button');
-    preview.className = 'image-history-preview';
-    preview.title = 'Preview image';
-    preview.innerHTML = `<img alt="" src="${item.dataUrl}" />`;
-    preview.addEventListener('click', () => previewImageHistoryItem(item));
-
-    const meta = document.createElement('button');
-    meta.className = 'image-history-meta';
-    meta.title = 'Preview image';
-    meta.innerHTML = `<span>${escapeHtml(item.path)}</span><small>${escapeHtml(item.createdAt)}</small>`;
-    meta.addEventListener('click', () => previewImageHistoryItem(item));
-
-    const paste = document.createElement('button');
-    paste.className = 'image-history-paste';
-    paste.textContent = 'Paste';
-    paste.title = 'Paste tag to active shell';
-    paste.addEventListener('click', () => void pasteImageTagToActiveTerminal(item.tag));
-
-    row.append(preview, meta, paste);
+    seen.add(item.id);
+    const row = imageHistoryElement(item.id);
+    updateImageHistoryElement(row, item);
     fragment.append(row);
   }
-  el.imageHistory.append(fragment);
+  el.imageHistory.replaceChildren(fragment);
+  pruneImageHistoryElementCache(seen);
+}
+
+function imageHistoryElement(id: string) {
+  const cached = imageHistoryElementCache.get(id);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.className = 'image-history-row';
+  row.dataset.imageHistoryId = id;
+
+  const preview = document.createElement('button');
+  preview.className = 'image-history-preview';
+  preview.title = 'Preview image';
+  const image = document.createElement('img');
+  image.alt = '';
+  preview.append(image);
+  preview.addEventListener('click', () => {
+    const item = imageHistoryItemForRow(row);
+    if (item) previewImageHistoryItem(item);
+  });
+
+  const meta = document.createElement('button');
+  meta.className = 'image-history-meta';
+  meta.title = 'Preview image';
+  const path = document.createElement('span');
+  const createdAt = document.createElement('small');
+  meta.append(path, createdAt);
+  meta.addEventListener('click', () => {
+    const item = imageHistoryItemForRow(row);
+    if (item) previewImageHistoryItem(item);
+  });
+
+  const paste = document.createElement('button');
+  paste.className = 'image-history-paste';
+  paste.textContent = 'Paste';
+  paste.title = 'Paste tag to active shell';
+  paste.addEventListener('click', () => {
+    const item = imageHistoryItemForRow(row);
+    if (item) void pasteImageTagToActiveTerminal(item.tag);
+  });
+
+  row.append(preview, meta, paste);
+  imageHistoryPartCache.set(row, { image, path, createdAt });
+  imageHistoryElementCache.set(id, row);
+  return row;
+}
+
+function imageHistoryParts(row: HTMLElement) {
+  const cached = imageHistoryPartCache.get(row);
+  if (cached) return cached;
+  const meta = row.querySelector<HTMLElement>('.image-history-meta')!;
+  const parts = {
+    image: row.querySelector<HTMLImageElement>('.image-history-preview img')!,
+    path: meta.querySelector<HTMLElement>('span')!,
+    createdAt: meta.querySelector<HTMLElement>('small')!
+  };
+  imageHistoryPartCache.set(row, parts);
+  return parts;
+}
+
+function updateImageHistoryElement(row: HTMLElement, item: PastedImageItem) {
+  const signature = `${item.id}\t${item.path}\t${item.tag}\t${item.createdAt}\t${item.dataUrl.length}`;
+  row.dataset.imageHistoryId = item.id;
+  if (row.dataset.renderSignature === signature) return;
+  row.dataset.renderSignature = signature;
+  row.className = 'image-history-row';
+  const parts = imageHistoryParts(row);
+  const image = parts.image;
+  if (image.src !== item.dataUrl) image.src = item.dataUrl;
+  setTextContentIfChanged(parts.path, item.path);
+  setTextContentIfChanged(parts.createdAt, item.createdAt);
+}
+
+function imageHistoryItemForRow(row: HTMLElement) {
+  const id = row.dataset.imageHistoryId ?? '';
+  return state.imageHistory.find((item) => item.id === id) ?? null;
+}
+
+function pruneImageHistoryElementCache(seen: Set<string>) {
+  for (const id of imageHistoryElementCache.keys()) {
+    if (!seen.has(id)) imageHistoryElementCache.delete(id);
+  }
+}
+
+function imageHistoryOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.imageHistory.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.imageHistory[index].id;
+  }
+  return signature;
+}
+
+function imageHistorySignature() {
+  let signature = '';
+  for (let index = 0; index < state.imageHistory.length; index += 1) {
+    const item = state.imageHistory[index];
+    if (index) signature += '\n';
+    signature += `${item.id}\t${item.path}\t${item.createdAt}\t${item.dataUrl.length}`;
+  }
+  return signature;
 }
 
 function previewImageHistoryItem(item: PastedImageItem) {
@@ -7700,7 +12053,7 @@ function previewImageHistoryItem(item: PastedImageItem) {
 }
 
 async function pasteImageTagToActiveTerminal(tag: string) {
-  const active = state.terminals.find((pane) => pane.paneId === state.activePaneId);
+  const active = terminalPaneById.get(state.activePaneId);
   if (!active?.backendId) {
     setStatus('No active shell for image tag paste', true);
     return false;
@@ -7708,6 +12061,100 @@ async function pasteImageTagToActiveTerminal(tag: string) {
   await api.writeTerminal(active.backendId, tag);
   setStatus(`Pasted ${tag}`);
   return true;
+}
+
+function clearForwardLookup() {
+  forwardById.clear();
+  forwardByRemotePort.clear();
+}
+
+function rememberForward(forward: PortForwardResult) {
+  forwardById.set(forward.id, forward);
+  if (!forwardByRemotePort.has(forward.remotePort)) forwardByRemotePort.set(forward.remotePort, forward);
+}
+
+function forgetForward(forward: PortForwardResult) {
+  forwardById.delete(forward.id);
+  if (forwardByRemotePort.get(forward.remotePort) !== forward) return;
+  forwardByRemotePort.delete(forward.remotePort);
+  for (const candidate of state.forwards) {
+    if (candidate === forward || candidate.remotePort !== forward.remotePort) continue;
+    forwardByRemotePort.set(candidate.remotePort, candidate);
+    return;
+  }
+}
+
+function addForward(forward: PortForwardResult) {
+  state.forwards.push(forward);
+  rememberForward(forward);
+}
+
+function forwardForId(id: string) {
+  if (!id) return null;
+  let forward = forwardById.get(id) ?? null;
+  if (!forward) {
+    forward = state.forwards.find((item) => item.id === id) ?? null;
+    if (forward) rememberForward(forward);
+  }
+  return forward;
+}
+
+function forwardForRemotePort(port: number) {
+  let forward = forwardByRemotePort.get(port) ?? null;
+  if (!forward) {
+    forward = state.forwards.find((item) => item.remotePort === port) ?? null;
+    if (forward) rememberForward(forward);
+  }
+  return forward;
+}
+
+function removeForwardById(id: string) {
+  const forward = forwardForId(id);
+  let index = forward ? state.forwards.indexOf(forward) : -1;
+  if (index < 0) index = state.forwards.findIndex((item) => item.id === id);
+  if (index < 0) return null;
+  const removed = state.forwards[index];
+  forgetForward(removed);
+  state.forwards.splice(index, 1);
+  return removed;
+}
+
+function clearDetectedPortLookup() {
+  detectedPortById.clear();
+}
+
+function rememberDetectedPort(port: DetectedPortItem) {
+  detectedPortById.set(port.id, port);
+}
+
+function forgetDetectedPort(port: DetectedPortItem) {
+  detectedPortById.delete(port.id);
+}
+
+function detectedPortForId(id: string) {
+  if (!id) return null;
+  let port = detectedPortById.get(id) ?? null;
+  if (!port) {
+    port = state.detectedPorts.find((item) => item.id === id) ?? null;
+    if (port) rememberDetectedPort(port);
+  }
+  return port;
+}
+
+function addDetectedPort(port: DetectedPortItem) {
+  state.detectedPorts.push(port);
+  rememberDetectedPort(port);
+}
+
+function removeDetectedPortById(id: string) {
+  const port = detectedPortForId(id);
+  let index = port ? state.detectedPorts.indexOf(port) : -1;
+  if (index < 0) index = state.detectedPorts.findIndex((item) => item.id === id);
+  if (index < 0) return null;
+  const removed = state.detectedPorts[index];
+  forgetDetectedPort(removed);
+  state.detectedPorts.splice(index, 1);
+  return removed;
 }
 
 async function startForward() {
@@ -7720,8 +12167,8 @@ async function startForward() {
   }
   try {
     const forward = await api.startPortForward(state.activeProfile.id, remotePort, localPort);
-    state.forwards.push(forward);
-    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(state.activeProfile!.id, remotePort));
+    addForward(forward);
+    removeDetectedPortById(detectedPortId(state.activeProfile.id, remotePort));
     renderForwards();
     await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
     setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
@@ -7761,15 +12208,15 @@ async function openLocalPreviewUrl(url: URL) {
     return;
   }
 
-  const existing = state.forwards.find((forward) => forward.remotePort === port);
+  const existing = forwardForRemotePort(port);
   if (existing) {
     await openLocalBrowserTab(`${existing.url}${suffix}`, browserTabLabel(url.toString()));
     return;
   }
 
   const forward = await startForwardForPort(port, 'manual');
-  state.forwards.push(forward);
-  state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(state.activeProfile!.id, port));
+  addForward(forward);
+  removeDetectedPortById(detectedPortId(state.activeProfile.id, port));
   renderForwards();
   await openLocalBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
   setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
@@ -7783,25 +12230,232 @@ async function canUseDirectLocalPreview(url: string) {
   }
 }
 
-async function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
-  if (pane.workspaceId !== state.activeWorkspaceId) return;
-  if (!state.activeProfile) return;
-  pane.outputBuffer = trimPortScanBuffer(`${pane.outputBuffer}${stripAnsi(data)}`);
-  const ports = detectLocalServerPorts(pane.outputBuffer).filter((port) => !pane.seenPorts.has(port));
-  for (const port of ports) {
-    pane.seenPorts.add(port);
-    queueDetectedPort(port);
+function handleTerminalData(pane: TerminalPane, data: string) {
+  const visibility = enqueueTerminalWrite(pane, data);
+  if (data.includes('\x1b]7;')) {
+    const oscCwd = extractOsc7Cwd(data);
+    if (oscCwd) updateTerminalCwd(pane, oscCwd);
   }
+
+  const shouldTrackPromptCwd = terminalDataMayContainPromptCwdHint(pane, data, visibility);
+  const shouldScanPorts = visibility !== 'background'
+    && (Boolean(pane.portScanTimer) || terminalDataMayContainPortHint(pane, data, visibility));
+  if (!shouldTrackPromptCwd && !shouldScanPorts) return;
+
+  if (shouldTrackPromptCwd) trackTerminalPromptCwdFromOutput(pane, data);
+  if (shouldScanPorts) scanTerminalOutputForPorts(pane, data);
 }
 
-function trackTerminalCwdFromOutput(pane: TerminalPane, data: string) {
-  const oscCwd = extractOsc7Cwd(data);
-  if (oscCwd) updateTerminalCwd(pane, oscCwd);
+function enqueueTerminalWrite(pane: TerminalPane, data: string) {
+  pane.writeBuffer += data;
 
-  const clean = stripAnsi(data).replace(/\r/g, '\n');
-  pane.cwdOutputBuffer = trimTerminalCwdBuffer(`${pane.cwdOutputBuffer}${clean}`);
-  const promptCwd = extractPromptCwd(pane.cwdOutputBuffer, pane);
-  if (promptCwd) updateTerminalCwd(pane, promptCwd);
+  const visibility = terminalPaneVisibility(pane);
+  if (visibility === 'visible') {
+    if (pane.writeTimer) {
+      window.clearTimeout(pane.writeTimer);
+      pane.writeTimer = undefined;
+    }
+    if (pane.writeBuffer.length >= TERMINAL_WRITE_FORCE_FLUSH_CHARS) {
+      flushTerminalWriteBuffer(pane);
+      return visibility;
+    }
+    if (pane.writeFrame) return visibility;
+    pane.writeFrame = window.requestAnimationFrame(() => {
+      pane.writeFrame = undefined;
+      flushTerminalWriteBuffer(pane);
+    });
+    return visibility;
+  }
+
+  if (pane.writeFrame) {
+    window.cancelAnimationFrame(pane.writeFrame);
+    pane.writeFrame = undefined;
+  }
+  if (visibility === 'background' && pane.writeBuffer.length < TERMINAL_WRITE_FORCE_FLUSH_CHARS) return visibility;
+  if (pane.writeTimer) return visibility;
+  const delay = visibility === 'inactive'
+    ? TERMINAL_INACTIVE_WRITE_BATCH_MS
+    : TERMINAL_BACKGROUND_WRITE_BATCH_MS;
+  pane.writeTimer = window.setTimeout(() => {
+    pane.writeTimer = undefined;
+    flushTerminalWriteBufferWhenReady(pane, delay);
+  }, delay);
+  return visibility;
+}
+
+function flushTerminalWriteBufferWhenReady(pane: TerminalPane, timeout = TERMINAL_BACKGROUND_WRITE_BATCH_MS) {
+  if (terminalPaneVisibility(pane) === 'visible') {
+    flushTerminalWriteBuffer(pane);
+    return;
+  }
+  runWhenUiIdle(() => flushTerminalWriteBuffer(pane), timeout);
+}
+
+function terminalPaneVisibility(pane: TerminalPane): TerminalVisibility {
+  if (document.hidden || pane.workspaceId !== state.activeWorkspaceId) return 'background';
+  if (!pane.element.classList.contains('hidden') && !pane.host.classList.contains('hidden')) return 'visible';
+  return 'inactive';
+}
+
+function isTerminalPaneVisible(pane: TerminalPane) {
+  return terminalPaneVisibility(pane) === 'visible';
+}
+
+function flushTerminalWriteBuffer(pane: TerminalPane) {
+  if (pane.writeFrame) {
+    window.cancelAnimationFrame(pane.writeFrame);
+    pane.writeFrame = undefined;
+  }
+  if (pane.writeTimer) {
+    window.clearTimeout(pane.writeTimer);
+    pane.writeTimer = undefined;
+  }
+  if (!pane.writeBuffer) return;
+  const visibility = terminalPaneVisibility(pane);
+  const chunkSize = terminalWriteChunkSize(visibility);
+  const output = pane.writeBuffer.length > chunkSize
+    ? pane.writeBuffer.slice(0, chunkSize)
+    : pane.writeBuffer;
+  pane.writeBuffer = output.length === pane.writeBuffer.length ? '' : pane.writeBuffer.slice(output.length);
+  pane.term.write(output);
+  scheduleTerminalWriteContinuation(pane, visibility);
+}
+
+function terminalWriteChunkSize(visibility: TerminalVisibility) {
+  return visibility === 'visible'
+    ? TERMINAL_VISIBLE_WRITE_CHUNK_CHARS
+    : TERMINAL_HIDDEN_WRITE_CHUNK_CHARS;
+}
+
+function scheduleTerminalWriteContinuation(pane: TerminalPane, visibility = terminalPaneVisibility(pane)) {
+  if (!pane.writeBuffer) return;
+  if (visibility === 'visible') {
+    if (pane.writeFrame) return;
+    pane.writeFrame = window.requestAnimationFrame(() => {
+      pane.writeFrame = undefined;
+      flushTerminalWriteBuffer(pane);
+    });
+    return;
+  }
+  if (pane.writeTimer) return;
+  const delay = visibility === 'inactive'
+    ? TERMINAL_INACTIVE_WRITE_BATCH_MS
+    : TERMINAL_BACKGROUND_WRITE_BATCH_MS;
+  pane.writeTimer = window.setTimeout(() => {
+    pane.writeTimer = undefined;
+    flushTerminalWriteBufferWhenReady(pane, delay);
+  }, delay);
+}
+
+function cleanupTerminalWriteBuffer(pane: TerminalPane) {
+  if (pane.writeFrame) window.cancelAnimationFrame(pane.writeFrame);
+  if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
+  if (pane.portScanTimer) window.clearTimeout(pane.portScanTimer);
+  if (pane.cwdScanTimer) window.clearTimeout(pane.cwdScanTimer);
+  pane.writeFrame = undefined;
+  pane.writeTimer = undefined;
+  pane.portScanTimer = undefined;
+  pane.cwdScanTimer = undefined;
+  pane.writeBuffer = '';
+}
+
+function terminalDataMayContainPromptCwdHint(pane: TerminalPane, data: string, visibility = terminalPaneVisibility(pane)) {
+  if (pane.command) return false;
+  if (visibility === 'background') return false;
+  if (terminalOutputMayContainPromptCwdHint(data)) return true;
+  if (!pane.cwdOutputBuffer || data.length > TERMINAL_CWD_CONTINUATION_TAIL_LIMIT) return false;
+  const tail = terminalPromptCwdContinuationTail(pane.cwdOutputBuffer);
+  return tail ? terminalOutputMayContainPromptCwdHint(`${tail}${data}`) : false;
+}
+
+function terminalDataMayContainPortHint(pane: TerminalPane, data: string, visibility = terminalPaneVisibility(pane)) {
+  if (visibility === 'background') return false;
+  if (pane.workspaceId !== state.activeWorkspaceId) return false;
+  if (!state.activeProfile) return false;
+  return terminalOutputMayContainPreviewPortHint(data);
+}
+
+function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
+  if (pane.workspaceId !== state.activeWorkspaceId) return;
+  if (!state.activeProfile) return;
+  pane.outputBuffer = appendLimitedTextBuffer(pane.outputBuffer, data, TERMINAL_PORT_SCAN_LIMIT);
+  scheduleTerminalPortScan(pane);
+}
+
+function scheduleTerminalPortScan(pane: TerminalPane) {
+  if (pane.portScanTimer) return;
+  const delay = terminalScanDelay(pane, TERMINAL_PORT_SCAN_DEBOUNCE_MS);
+  pane.portScanTimer = window.setTimeout(() => {
+    pane.portScanTimer = undefined;
+    runTerminalScanWhenReady(pane, () => runTerminalPortScan(pane));
+  }, delay);
+}
+
+function runTerminalScanWhenReady(pane: TerminalPane, scan: () => void) {
+  if (terminalPaneVisibility(pane) === 'visible') {
+    scan();
+    return;
+  }
+  runWhenUiIdle(scan, terminalScanDelay(pane, TERMINAL_BACKGROUND_SCAN_BATCH_MS));
+}
+
+function runTerminalPortScan(pane: TerminalPane) {
+  if (pane.workspaceId !== state.activeWorkspaceId) return;
+  if (!state.activeProfile) return;
+  if (!terminalOutputMayContainPreviewPortHint(pane.outputBuffer)) return;
+  const cleanOutput = cleanTerminalMetadataBuffer(pane.outputBuffer);
+  if (!terminalOutputMayContainPreviewPortHint(cleanOutput)) return;
+  const found = detectNewLocalServerPorts(cleanOutput, pane.seenPorts, queueDetectedPort);
+  if (found) pane.outputBuffer = '';
+}
+
+function terminalOutputMayContainPreviewPortHint(text: string) {
+  if (!text) return false;
+  if (!text.includes(':') && !TERMINAL_PREVIEW_PORT_KEYWORD_PATTERN.test(text)) return false;
+  return TERMINAL_PREVIEW_PORT_HINT_PATTERN.test(text);
+}
+
+const TERMINAL_PREVIEW_PORT_KEYWORD_PATTERN = /localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\b(?:listening|running|available|started|serving|server|port)\b/i;
+
+function terminalOutputMayContainPromptCwdHint(text: string) {
+  if (!text) return false;
+  if (text.length <= 256) return TERMINAL_PROMPT_SHORT_HINT_PATTERN.test(text);
+  return TERMINAL_PROMPT_CWD_HINT_PATTERN.test(text);
+}
+
+function trackTerminalPromptCwdFromOutput(pane: TerminalPane, data: string) {
+  pane.cwdOutputBuffer = appendLimitedTextBuffer(pane.cwdOutputBuffer, data, TERMINAL_CWD_SCAN_LIMIT);
+  scheduleTerminalPromptCwdScan(pane);
+}
+
+function scheduleTerminalPromptCwdScan(pane: TerminalPane) {
+  if (pane.cwdScanTimer) return;
+  pane.cwdScanTimer = window.setTimeout(() => {
+    pane.cwdScanTimer = undefined;
+    runTerminalScanWhenReady(pane, () => runTerminalPromptCwdScan(pane));
+  }, terminalScanDelay(pane, TERMINAL_CWD_SCAN_DEBOUNCE_MS));
+}
+
+function terminalScanDelay(pane: TerminalPane, visibleDelay: number) {
+  const visibility = terminalPaneVisibility(pane);
+  if (visibility === 'visible') return visibleDelay;
+  if (visibility === 'inactive') return Math.max(visibleDelay * 3, TERMINAL_INACTIVE_WRITE_BATCH_MS);
+  return TERMINAL_BACKGROUND_SCAN_BATCH_MS;
+}
+
+function runTerminalPromptCwdScan(pane: TerminalPane) {
+  if (pane.command) return;
+  const promptCwd = extractPromptCwd(cleanTerminalMetadataBuffer(pane.cwdOutputBuffer), pane);
+  if (promptCwd) {
+    pane.cwdOutputBuffer = '';
+    updateTerminalCwd(pane, promptCwd);
+    return;
+  }
+  pane.cwdOutputBuffer = terminalPromptCwdContinuationTail(pane.cwdOutputBuffer);
+}
+
+function cleanTerminalMetadataBuffer(value: string) {
+  return stripAnsi(value).replace(/\r/g, '\n');
 }
 
 function trackTerminalCwdFromInput(pane: TerminalPane, data: string) {
@@ -7846,7 +12500,7 @@ function unquoteShellToken(value: string) {
 }
 
 function resolveTerminalCdTarget(pane: TerminalPane, target: string) {
-  const profile = state.profiles.find((item) => item.id === pane.profileId) ?? state.activeProfile;
+  const profile = profileForId(pane.profileId) ?? state.activeProfile;
   if (isWindowsPath(pane.cwd) || profile?.kind === 'windows') {
     return normalizeWindowsTerminalPath(resolveWindowsCdTarget(pane.cwd, target, profile?.root));
   }
@@ -7871,22 +12525,26 @@ function resolveWindowsCdTarget(cwd: string, target: string, root = '') {
 
 function extractOsc7Cwd(data: string) {
   let found = '';
-  const pattern = /\x1b]7;file:\/\/[^/\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
-  for (const match of data.matchAll(pattern)) {
+  TERMINAL_OSC7_CWD_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = TERMINAL_OSC7_CWD_PATTERN.exec(data))) {
     found = decodeTerminalPath(match[1]);
   }
   return found;
 }
 
 function extractPromptCwd(buffer: string, pane: TerminalPane) {
-  const lines = buffer.split('\n').slice(-40);
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index].trimEnd();
-    const powershell = line.match(/(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*)>\s*$/);
+  let end = buffer.length;
+  for (let scanned = 0; end >= 0 && scanned < 40; scanned += 1) {
+    const lineStart = buffer.lastIndexOf('\n', end - 1);
+    const line = buffer.slice(lineStart + 1, end).trimEnd();
+    const powershell = TERMINAL_POWERSHELL_PROMPT_CWD_PATTERN.exec(line);
     if (powershell) return normalizeWindowsTerminalPath(powershell[1]);
 
-    const bash = line.match(/(?:^|\s)[^@\s:]+@[^:\s]+:([^#$\r\n]+)[#$]\s*$/);
+    const bash = TERMINAL_BASH_PROMPT_CWD_PATTERN.exec(line);
     if (bash) return normalizePosixTerminalPath(expandTildeTerminalPath(bash[1].trim(), pane.cwd));
+    if (lineStart < 0) break;
+    end = lineStart;
   }
   return '';
 }
@@ -7894,20 +12552,45 @@ function extractPromptCwd(buffer: string, pane: TerminalPane) {
 function expandTildeTerminalPath(path: string, currentCwd: string) {
   if (!path.startsWith('~')) return path;
   const tail = path === '~' ? '' : path.slice(2);
-  const candidates = [currentCwd, state.workspaceRoot, state.currentDir, state.activeProfile?.root ?? '']
-    .filter((value) => value.startsWith('/'));
   if (!tail) {
-    const current = candidates[0];
-    const home = current?.match(/^(\/home\/[^/]+|\/Users\/[^/]+)/)?.[1];
-    return home || path;
+    for (let index = 0; index < 4; index += 1) {
+      const candidate = terminalCwdCandidateAt(index, currentCwd);
+      if (!candidate.startsWith('/')) continue;
+      return terminalHomeFromCandidate(candidate) || path;
+    }
+    return path;
   }
-  const first = tail.split('/')[0];
-  for (const candidate of candidates) {
-    const marker = `/${first}`;
-    const index = candidate.indexOf(marker);
-    if (index > 0) return `${candidate.slice(0, index)}/${tail}`;
+  const slashIndex = tail.indexOf('/');
+  const first = slashIndex >= 0 ? tail.slice(0, slashIndex) : tail;
+  const marker = `/${first}`;
+  for (let index = 0; index < 4; index += 1) {
+    const candidate = terminalCwdCandidateAt(index, currentCwd);
+    if (!candidate.startsWith('/')) continue;
+    const markerIndex = candidate.indexOf(marker);
+    if (markerIndex > 0) return `${candidate.slice(0, markerIndex)}/${tail}`;
   }
   return path;
+}
+
+function terminalCwdCandidateAt(index: number, currentCwd: string) {
+  if (index === 0) return currentCwd;
+  if (index === 1) return state.workspaceRoot;
+  if (index === 2) return state.currentDir;
+  return state.activeProfile?.root ?? '';
+}
+
+function terminalHomeFromCandidate(candidate: string) {
+  if (candidate.startsWith('/home/')) {
+    if (candidate.length <= 6) return '';
+    const end = candidate.indexOf('/', 6);
+    return end > 6 ? candidate.slice(0, end) : candidate;
+  }
+  if (candidate.startsWith('/Users/')) {
+    if (candidate.length <= 7) return '';
+    const end = candidate.indexOf('/', 7);
+    return end > 7 ? candidate.slice(0, end) : candidate;
+  }
+  return '';
 }
 
 function updateTerminalCwd(pane: TerminalPane, cwd: string) {
@@ -7917,7 +12600,7 @@ function updateTerminalCwd(pane: TerminalPane, cwd: string) {
   pane.cwd = normalized;
   const widget = terminalWidgetForPane(pane);
   if (widget) updateTerminalWidgetTitle(widget);
-  scheduleTerminalCwdSnapshotSave();
+  scheduleTerminalCwdSnapshotSave(pane);
 }
 
 function normalizePosixTerminalPath(path: string) {
@@ -7957,19 +12640,30 @@ function decodeTerminalPath(path: string) {
   }
 }
 
-function trimTerminalCwdBuffer(value: string) {
-  return value.length > TERMINAL_CWD_SCAN_LIMIT
-    ? value.slice(value.length - TERMINAL_CWD_SCAN_LIMIT)
-    : value;
+function terminalPromptCwdContinuationTail(value: string) {
+  if (!value) return '';
+  const tail = value.slice(-TERMINAL_CWD_CONTINUATION_TAIL_LIMIT);
+  const lineStart = Math.max(tail.lastIndexOf('\n'), tail.lastIndexOf('\r'));
+  const line = lineStart >= 0 ? tail.slice(lineStart + 1) : tail;
+  if (!line || line.length > TERMINAL_CWD_CONTINUATION_TAIL_LIMIT) return '';
+  return TERMINAL_PROMPT_CONTINUATION_HINT_PATTERN.test(line) ? line : '';
 }
 
-function scheduleTerminalCwdSnapshotSave() {
+function trimTerminalCwdBuffer(value: string) {
+  return trimLimitedTextBuffer(value, TERMINAL_CWD_SCAN_LIMIT);
+}
+
+function scheduleTerminalCwdSnapshotSave(pane?: TerminalPane) {
   if (restoringWorkspace || !state.workspaceOpen) return;
+  if (pane && pane.workspaceId !== state.activeWorkspaceId) return;
+  const delay = pane && terminalPaneVisibility(pane) === 'background'
+    ? TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS
+    : 150;
   if (terminalCwdSaveTimer) window.clearTimeout(terminalCwdSaveTimer);
   terminalCwdSaveTimer = window.setTimeout(() => {
     terminalCwdSaveTimer = 0;
     saveActiveWorkspaceSnapshot();
-  }, 150);
+  }, delay);
 }
 
 function flushTerminalCwdSnapshotSave() {
@@ -7977,16 +12671,16 @@ function flushTerminalCwdSnapshotSave() {
     window.clearTimeout(terminalCwdSaveTimer);
     terminalCwdSaveTimer = 0;
   }
-  saveActiveWorkspaceSnapshot();
+  saveActiveWorkspaceSnapshot({ immediate: true });
 }
 
 async function openPort(port: number, source: 'manual' | 'auto') {
   if (!state.activeProfile || !isPreviewPort(port)) return;
   const profile = state.activeProfile;
   const key = `${profile.id}:${port}`;
-  const existing = state.forwards.find((forward) => forward.remotePort === port);
+  const existing = forwardForRemotePort(port);
   if (existing) {
-    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
+    removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
     await openLocalBrowserTab(existing.url, portTabLabel(existing.localPort));
     if (source === 'auto') setStatus(`Detected port ${port}; using ${existing.url}`);
@@ -7995,7 +12689,7 @@ async function openPort(port: number, source: 'manual' | 'auto') {
 
   if (profile.kind === 'windows') {
     const url = `http://127.0.0.1:${port}`;
-    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
+    removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
     await openLocalBrowserTab(url, portTabLabel(port));
     setStatus(source === 'auto' ? `Detected local server on ${url}` : `Previewing ${url}`);
@@ -8006,8 +12700,8 @@ async function openPort(port: number, source: 'manual' | 'auto') {
   autoForwardingPorts.add(key);
   try {
     const forward = await startForwardForPort(port, source);
-    state.forwards.push(forward);
-    state.detectedPorts = state.detectedPorts.filter((item) => item.id !== detectedPortId(profile.id, port));
+    addForward(forward);
+    removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
     await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
     setStatus(source === 'auto'
@@ -8030,14 +12724,15 @@ function queueDetectedPort(port: number) {
   const profile = state.activeProfile;
   const id = detectedPortId(profile.id, port);
   const url = `http://127.0.0.1:${port}`;
-  if (state.detectedPorts.some((item) => item.id === id)) return;
-  if (state.browserTabs.some((tab) => tab.url === url)) return;
+  if (detectedPortForId(id)) return;
+  if (browserTabForUrl(url)) return;
 
-  state.detectedPorts.push({ id, profileId: profile.id, port, url });
+  addDetectedPort({ id, profileId: profile.id, port, url });
   renderForwards();
-  setPanelVisible('browser', true);
   logBrowserConsole('info', `Detected local server on ${url}`);
-  setStatus(`Detected local server on :${port}`);
+  setStatus(isBrowserPanelHidden()
+    ? `Detected local server on :${port}; open Browser to preview`
+    : `Detected local server on :${port}`);
 }
 
 function detectedPortId(profileId: string, port: number) {
@@ -8055,62 +12750,388 @@ async function startForwardForPort(port: number, source: 'manual' | 'auto') {
 }
 
 function renderForwards() {
-  el.forwardList.innerHTML = '';
-  const fragment = document.createDocumentFragment();
+  if (isBrowserPanelHidden()) return;
+  const signature = forwardsSignature();
+  if (forwardsRenderSignature === signature) return;
   const activeProfileId = state.activeProfile?.id;
-  let rows = 0;
-  for (const item of state.detectedPorts.filter((port) => port.profileId === activeProfileId)) {
-    const row = document.createElement('div');
-    row.className = 'forward-row pending';
-    row.innerHTML = `<button class="load">Open</button><span>Detected :${item.port}</span><button class="stop">Ignore</button>`;
-    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => void openPort(item.port, 'manual'));
-    row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', () => {
-      state.detectedPorts = state.detectedPorts.filter((port) => port.id !== item.id);
-      renderForwards();
+  const rowCount = forwardRowRenderCount(activeProfileId);
+  const orderSignature = forwardRowsOrderSignature(activeProfileId);
+  const sameOrder = forwardsOrderRenderSignature === orderSignature
+    && el.forwardList.childElementCount === rowCount;
+  forwardsRenderSignature = signature;
+
+  if (sameOrder) {
+    forEachForwardRenderRow(activeProfileId, (key, kind, className, actionLabel, detail, stopLabel, id, port, url, localPort) => {
+      updateForwardRowElement(forwardRowElement(key), kind, className, actionLabel, detail, stopLabel, id, port, url, localPort);
     });
-    fragment.append(row);
-    rows += 1;
+    return;
   }
 
+  forwardsOrderRenderSignature = orderSignature;
+  const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
+  forEachForwardRenderRow(activeProfileId, (key, kind, className, actionLabel, detail, stopLabel, id, port, url, localPort) => {
+    seen.add(key);
+    const element = forwardRowElement(key);
+    updateForwardRowElement(element, kind, className, actionLabel, detail, stopLabel, id, port, url, localPort);
+    fragment.append(element);
+  });
+  el.forwardList.replaceChildren(fragment);
+  pruneForwardRowElementCache(seen);
+}
+
+function forEachForwardRenderRow(
+  activeProfileId: string | undefined,
+  callback: (
+    key: string,
+    kind: ForwardRenderKind,
+    className: string,
+    actionLabel: string,
+    detail: string,
+    stopLabel: string,
+    id?: string,
+    port?: number,
+    url?: string,
+    localPort?: number
+  ) => void
+) {
+  let emitted = false;
+  for (const item of state.detectedPorts) {
+    if (item.profileId !== activeProfileId) continue;
+    emitted = true;
+    callback(
+      `detected:${item.id}`,
+      'detected',
+      'forward-row pending',
+      'Open',
+      `Detected :${item.port}`,
+      'Ignore',
+      item.id,
+      item.port
+    );
+  }
   for (const forward of state.forwards) {
     if (isPreviewProxyLocalPort(forward.localPort)) continue;
-    const row = document.createElement('div');
-    row.className = 'forward-row';
-    row.innerHTML = `<button class="load">:${forward.localPort}</button><span>Forwarded to ${escapeHtml(forward.targetHost)}:${forward.remotePort}</span><button class="stop">Stop</button>`;
-    row.querySelector<HTMLButtonElement>('.load')!.addEventListener('click', () => void openLocalBrowserTab(forward.url, portTabLabel(forward.localPort)));
-    row.querySelector<HTMLButtonElement>('.stop')!.addEventListener('click', async () => {
-      await api.stopPortForward(forward.id).catch((error) => setStatus(String(error), true));
-      state.forwards = state.forwards.filter((item) => item.id !== forward.id);
-      renderForwards();
+    emitted = true;
+    callback(
+      `forward:${forward.id}`,
+      'forward',
+      'forward-row',
+      `:${forward.localPort}`,
+      `Forwarded to ${forward.targetHost}:${forward.remotePort}`,
+      'Stop',
+      forward.id,
+      undefined,
+      forward.url,
+      forward.localPort
+    );
+  }
+  if (!emitted) callback('empty', 'empty', 'forward-row empty', '', 'No active manual forwards.', '');
+}
+
+function forwardRowRenderCount(activeProfileId: string | undefined) {
+  let count = 0;
+  for (const item of state.detectedPorts) {
+    if (item.profileId === activeProfileId) count += 1;
+  }
+  for (const forward of state.forwards) {
+    if (!isPreviewProxyLocalPort(forward.localPort)) count += 1;
+  }
+  return count || 1;
+}
+
+function forwardRowElement(key: string) {
+  const cached = forwardRowElementCache.get(key);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.dataset.forwardRowKey = key;
+  forwardRowElementCache.set(key, row);
+  return row;
+}
+
+function updateForwardRowElement(
+  row: HTMLElement,
+  kind: ForwardRenderKind,
+  className: string,
+  actionLabel: string,
+  detail: string,
+  stopLabel: string,
+  id = '',
+  port?: number,
+  url = '',
+  localPort?: number
+) {
+  const signature = `${kind}\t${className}\t${actionLabel}\t${detail}\t${stopLabel}\t${id}\t${port ?? ''}\t${url}\t${localPort ?? ''}`;
+  row.dataset.forwardKind = kind;
+  if (row.dataset.renderSignature === signature) return;
+  row.dataset.renderSignature = signature;
+  row.className = className;
+
+  if (kind === 'empty') {
+    delete row.dataset.forwardId;
+    delete row.dataset.port;
+    delete row.dataset.url;
+    delete row.dataset.localPort;
+    forwardRowPartCache.delete(row);
+    row.replaceChildren(detail);
+    return;
+  }
+
+  row.dataset.forwardId = id;
+  row.dataset.port = port === undefined ? '' : String(port);
+  row.dataset.url = url;
+  row.dataset.localPort = localPort === undefined ? '' : String(localPort);
+  let parts = forwardRowPartCache.get(row);
+  if (!parts) {
+    const load = document.createElement('button');
+    load.type = 'button';
+    load.className = 'load';
+    load.addEventListener('click', () => {
+      if (row.dataset.forwardKind === 'detected') {
+        const port = Number(row.dataset.port);
+        if (Number.isFinite(port)) void openPort(port, 'manual');
+        return;
+      }
+      const url = row.dataset.url ?? '';
+      const localPort = Number(row.dataset.localPort);
+      if (url) void openLocalBrowserTab(url, portTabLabel(localPort));
     });
-    fragment.append(row);
-    rows += 1;
+    const detail = document.createElement('span');
+    detail.className = 'forward-detail';
+    const stop = document.createElement('button');
+    stop.type = 'button';
+    stop.className = 'stop';
+    stop.addEventListener('click', () => {
+      const id = row.dataset.forwardId ?? '';
+      if (!id) return;
+      if (row.dataset.forwardKind === 'detected') {
+        removeDetectedPortById(id);
+        renderForwards();
+        return;
+      }
+      void (async () => {
+        await api.stopPortForward(id).catch((error) => setStatus(String(error), true));
+        removeForwardById(id);
+        renderForwards();
+      })();
+    });
+    row.replaceChildren(load, detail, stop);
+    parts = { load, detail, stop };
+    forwardRowPartCache.set(row, parts);
   }
-  if (!rows) {
-    const row = document.createElement('div');
-    row.className = 'forward-row empty';
-    row.textContent = 'No active manual forwards.';
-    fragment.append(row);
+  setTextContentIfChanged(parts.load, actionLabel);
+  setTextContentIfChanged(parts.detail, detail);
+  setTextContentIfChanged(parts.stop, stopLabel);
+}
+
+function pruneForwardRowElementCache(seen: Set<string>) {
+  for (const key of forwardRowElementCache.keys()) {
+    if (!seen.has(key)) forwardRowElementCache.delete(key);
   }
-  el.forwardList.append(fragment);
+}
+
+function forwardRowsOrderSignature(activeProfileId: string | undefined) {
+  let signature = '';
+  let count = 0;
+  for (const item of state.detectedPorts) {
+    if (item.profileId !== activeProfileId) continue;
+    if (count) signature += '\n';
+    signature += `detected:${item.id}`;
+    count += 1;
+  }
+  for (const forward of state.forwards) {
+    if (isPreviewProxyLocalPort(forward.localPort)) continue;
+    if (count) signature += '\n';
+    signature += `forward:${forward.id}`;
+    count += 1;
+  }
+  return count ? signature : 'empty';
+}
+
+function forwardsSignature() {
+  const activeProfileId = state.activeProfile?.id ?? '';
+  let detected = '';
+  let detectedCount = 0;
+  for (const port of state.detectedPorts) {
+    if (port.profileId !== activeProfileId) continue;
+    if (detectedCount) detected += ',';
+    detected += `${port.id}:${port.port}`;
+    detectedCount += 1;
+  }
+  let forwards = '';
+  let forwardCount = 0;
+  for (const forward of state.forwards) {
+    if (isPreviewProxyLocalPort(forward.localPort)) continue;
+    if (forwardCount) forwards += ',';
+    forwards += `${forward.id}:${forward.localPort}:${forward.targetHost}:${forward.remotePort}`;
+    forwardCount += 1;
+  }
+  return `${activeProfileId}\n${detected}\n${forwards}`;
 }
 
 function loadPreview(url: string) {
   openBrowserTab(url);
 }
 
-function previewFrames(workspaceId?: string) {
-  const frames = Array.from(el.browserShell.querySelectorAll<HTMLIFrameElement>('iframe.preview-frame'));
-  if (!workspaceId) return frames;
-  return frames.filter((frame) => frame.dataset.browserWorkspaceId === workspaceId);
+function forEachPreviewFrame(
+  workspaceId: string | undefined,
+  callback: (frame: HTMLIFrameElement) => void
+) {
+  if (workspaceId) {
+    const workspaceFrames = browserFramesByWorkspaceId.get(workspaceId);
+    if (!workspaceFrames?.size) return;
+    for (const frame of workspaceFrames) {
+      if (frame.isConnected) callback(frame);
+      else forgetBrowserFrame(frame);
+    }
+    return;
+  }
+  for (const frame of browserFrameByTabId.values()) {
+    if (frame.isConnected) callback(frame);
+    else forgetBrowserFrame(frame);
+  }
+}
+
+function hasBrowserFramesForWorkspace(workspaceId: string) {
+  const frames = browserFramesByWorkspaceId.get(workspaceId);
+  if (!frames?.size) return false;
+  for (const frame of frames) {
+    if (frame.isConnected) return true;
+    forgetBrowserFrame(frame);
+  }
+  return false;
+}
+
+function indexBrowserFrame(frame: HTMLIFrameElement) {
+  const workspaceId = frame.dataset.browserWorkspaceId;
+  if (!workspaceId) return;
+  let frames = browserFramesByWorkspaceId.get(workspaceId);
+  if (!frames) {
+    frames = new Set();
+    browserFramesByWorkspaceId.set(workspaceId, frames);
+  }
+  frames.add(frame);
+}
+
+function unindexBrowserFrame(frame: HTMLIFrameElement) {
+  const workspaceId = frame.dataset.browserWorkspaceId;
+  if (!workspaceId) return;
+  const frames = browserFramesByWorkspaceId.get(workspaceId);
+  if (!frames) return;
+  frames.delete(frame);
+  if (!frames.size) browserFramesByWorkspaceId.delete(workspaceId);
+}
+
+function forgetBrowserFrame(frame: HTMLIFrameElement) {
+  const tabId = frame.dataset.browserTabId ?? '';
+  if (tabId && browserFrameByTabId.get(tabId) === frame) browserFrameByTabId.delete(tabId);
+  unindexBrowserFrame(frame);
 }
 
 function browserFrameForTab(id: string, workspaceId = state.activeWorkspaceId) {
-  return previewFrames(workspaceId).find((frame) => frame.dataset.browserTabId === id) ?? null;
+  const frame = browserFrameByTabId.get(id) ?? null;
+  if (!frame?.isConnected) {
+    if (frame) forgetBrowserFrame(frame);
+    return null;
+  }
+  return frame.dataset.browserWorkspaceId === workspaceId ? frame : null;
 }
 
 function activeBrowserFrame() {
   return browserFrameForTab(state.activeBrowserTabId);
+}
+
+function browserTabFrameReady(tab: BrowserTab) {
+  const frame = browserFrameForTab(tab.id);
+  if (!frame) return false;
+  const frameUrl = tab.frameUrl ?? tab.url;
+  return Boolean(frameUrl) && frame.dataset.loadedUrl === frameUrl;
+}
+
+function cancelBrowserFrameSuspend() {
+  if (browserInactiveFrameSuspendTimer) window.clearTimeout(browserInactiveFrameSuspendTimer);
+  browserInactiveFrameSuspendTimer = 0;
+  cancelScheduledBrowserWorkspaceFrameSuspend(state.activeWorkspaceId);
+}
+
+function cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId?: string) {
+  if (!workspaceId) return;
+  const timer = browserWorkspaceSuspendTimers.get(workspaceId);
+  if (!timer) return;
+  window.clearTimeout(timer);
+  browserWorkspaceSuspendTimers.delete(workspaceId);
+}
+
+function suspendBrowserFramesForAllWorkspaces() {
+  for (const workspaceId of browserFramesByWorkspaceId.keys()) {
+    cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
+    suspendBrowserFramesForWorkspace(workspaceId, { includeActive: true });
+  }
+}
+
+function scheduleBrowserWorkspaceFrameSuspend(
+  workspaceId: string,
+  options: { includeActive?: boolean; delayMs?: number } = {}
+) {
+  if (!workspaceId) return;
+  cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
+  const delayMs = options.delayMs ?? BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS;
+  const timer = window.setTimeout(() => {
+    browserWorkspaceSuspendTimers.delete(workspaceId);
+    runWhenUiIdle(() => {
+      const activeAndVisible = workspaceId === state.activeWorkspaceId && !document.hidden && !isBrowserPanelHidden();
+      if (activeAndVisible) return;
+      suspendBrowserFramesForWorkspace(workspaceId, { includeActive: options.includeActive });
+    }, BROWSER_FRAME_SUSPEND_IDLE_MS);
+  }, delayMs);
+  browserWorkspaceSuspendTimers.set(workspaceId, timer);
+}
+
+function scheduleInactiveBrowserFrameSuspend(delayMs = BROWSER_INACTIVE_FRAME_SUSPEND_DELAY_MS) {
+  if (browserInactiveFrameSuspendTimer) window.clearTimeout(browserInactiveFrameSuspendTimer);
+  browserInactiveFrameSuspendTimer = window.setTimeout(() => {
+    browserInactiveFrameSuspendTimer = 0;
+    runWhenUiIdle(() => {
+      if (document.hidden || isBrowserPanelHidden()) return;
+      suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: false });
+    }, BROWSER_FRAME_SUSPEND_IDLE_MS);
+  }, delayMs);
+}
+
+function suspendBrowserFrame(frame: HTMLIFrameElement, options: { affectsActiveWorkspace?: boolean } = {}) {
+  const tabId = frame.dataset.browserTabId ?? '';
+  const loadedUrl = frame.dataset.loadedUrl || frame.getAttribute('src') || '';
+  if (!loadedUrl || loadedUrl === 'about:blank') return false;
+  setBrowserFrameConsoleDetailed(frame, false);
+  frame.dataset.suspended = 'true';
+  frame.dataset.suspendedUrl = loadedUrl;
+  delete frame.dataset.loadedUrl;
+  toggleClassIfChanged(frame, 'hidden', true);
+  toggleClassIfChanged(frame, 'active', false);
+  frame.src = 'about:blank';
+  if (options.affectsActiveWorkspace && activeBrowserFrameId === tabId) activeBrowserFrameId = '';
+  return true;
+}
+
+function suspendBrowserFramesForWorkspace(workspaceId = state.activeWorkspaceId, options: { includeActive?: boolean } = {}) {
+  if (!workspaceId) return;
+  let suspendedActive = false;
+  const affectsActiveWorkspace = workspaceId === state.activeWorkspaceId;
+  forEachPreviewFrame(workspaceId, (frame) => {
+    const tabId = frame.dataset.browserTabId ?? '';
+    if (!options.includeActive && tabId === state.activeBrowserTabId) return;
+    const wasActive = tabId === activeBrowserFrameId || frame.classList.contains('active');
+    const suspended = suspendBrowserFrame(frame, { affectsActiveWorkspace });
+    suspendedActive = suspendedActive || (suspended && wasActive);
+  });
+  if (affectsActiveWorkspace && (options.includeActive || suspendedActive)) {
+    activeBrowserFrameId = '';
+    toggleClassIfChanged(el.browserShell, 'has-preview', false);
+  }
+  if (affectsActiveWorkspace && options.includeActive && activeEdgeCdp) {
+    disconnectActiveEdgeCdp();
+    setEdgePreviewVisible(false);
+  }
 }
 
 function ensureBrowserFrame(tab: BrowserTab) {
@@ -8125,6 +13146,8 @@ function ensureBrowserFrame(tab: BrowserTab) {
   frame.dataset.browserTabId = tab.id;
   frame.dataset.browserWorkspaceId = workspaceId;
   frame.dataset.displayUrl = tab.url;
+  browserFrameByTabId.set(tab.id, frame);
+  indexBrowserFrame(frame);
   frame.title = tab.label;
   frame.referrerPolicy = 'no-referrer-when-downgrade';
   frame.allow = [
@@ -8146,29 +13169,80 @@ function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
   frame.dataset.browserFrameBound = 'true';
   frame.addEventListener('pointerdown', activateBrowserPanel);
   frame.addEventListener('focus', activateBrowserPanel);
-  frame.addEventListener('load', () => logBrowserConsole('info', `Loaded ${frame.dataset.displayUrl || state.previewUrl}`));
-  frame.addEventListener('error', () => logBrowserConsole('error', `Failed to load ${frame.dataset.displayUrl || state.previewUrl}`));
+  frame.addEventListener('load', () => {
+    if (frame.dataset.suspended === 'true') return;
+    if (!browserFrameIsActiveVisible(frame)) {
+      setBrowserFrameConsoleDetailed(frame, false);
+      return;
+    }
+    logBrowserConsole('info', `Loaded ${frame.dataset.displayUrl || state.previewUrl}`);
+    syncBrowserConsoleCaptureForFrame(frame);
+  });
+  frame.addEventListener('error', () => {
+    if (browserFrameIsActiveVisible(frame)) {
+      logBrowserConsole('error', `Failed to load ${frame.dataset.displayUrl || state.previewUrl}`);
+    }
+  });
+}
+
+function hideBrowserFrameElement(frame: HTMLIFrameElement) {
+  setBrowserFrameConsoleDetailed(frame, false);
+  toggleClassIfChanged(frame, 'hidden', true);
+  toggleClassIfChanged(frame, 'active', false);
 }
 
 function showBrowserFrame(tab: BrowserTab) {
   const frame = ensureBrowserFrame(tab);
-  for (const item of previewFrames()) {
-    const active = item === frame;
-    item.classList.toggle('hidden', !active);
-    item.classList.toggle('active', active);
+  applyBrowserFrameSizing(frame);
+  const title = browserFrameTitle(tab);
+  if (frame.title !== title) frame.title = title;
+  const workspaceId = frame.dataset.browserWorkspaceId || state.activeWorkspaceId;
+  cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
+  if (activeBrowserFrameId === tab.id && frame.classList.contains('active') && !frame.classList.contains('hidden')) {
+    toggleClassIfChanged(el.browserShell, 'has-preview', true);
+    return frame;
   }
-  el.browserShell.classList.add('has-preview');
+
+  const previousActiveFrame = activeBrowserFrameId && activeBrowserFrameId !== tab.id
+    ? browserFrameForTab(activeBrowserFrameId, workspaceId)
+    : null;
+  if (previousActiveFrame && previousActiveFrame !== frame) {
+    hideBrowserFrameElement(previousActiveFrame);
+  } else if (!activeBrowserFrameId || (activeBrowserFrameId !== tab.id && !previousActiveFrame)) {
+    forEachPreviewFrame(workspaceId, (item) => {
+      if (item !== frame && (!item.classList.contains('hidden') || item.classList.contains('active'))) {
+        hideBrowserFrameElement(item);
+      }
+    });
+  }
+
+  toggleClassIfChanged(frame, 'hidden', false);
+  toggleClassIfChanged(frame, 'active', true);
+  activeBrowserFrameId = tab.id;
+  toggleClassIfChanged(el.browserShell, 'has-preview', true);
+  syncBrowserConsoleCaptureForFrame(frame);
+  scheduleInactiveBrowserFrameSuspend();
   return frame;
 }
 
-function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean } = {}) {
+function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean; reload?: boolean } = {}) {
   if (!USE_PREVIEW_PROXY_BROWSER && !USE_EDGE_CDP_BROWSER) {
     tab.frameUrl = tab.url;
   }
   const frame = showBrowserFrame(tab);
   const frameUrl = tab.frameUrl ?? tab.url;
   frame.dataset.displayUrl = tab.url;
-  if (!options.hard && frame.dataset.loadedUrl === frameUrl) return frame;
+  if (!options.hard && !options.reload && frame.dataset.loadedUrl === frameUrl) return frame;
+  delete frame.dataset.suspended;
+  delete frame.dataset.suspendedUrl;
+  if (options.reload && !options.hard && frame.dataset.loadedUrl === frameUrl) {
+    try {
+      frame.contentWindow?.location.reload();
+      return frame;
+    } catch {
+      // Cross-origin frames cannot always be reloaded through contentWindow.
+    }
+  }
   frame.src = options.hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
   frame.dataset.loadedUrl = frameUrl;
   return frame;
@@ -8177,11 +13251,15 @@ function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean } = {}) {
 function removeBrowserFrame(id: string) {
   const frame = browserFrameForTab(id);
   if (!frame) return;
+  forgetBrowserFrame(frame);
+  if (activeBrowserFrameId === id) activeBrowserFrameId = '';
   if (frame === el.previewFrame) {
     frame.removeAttribute('src');
     delete frame.dataset.browserTabId;
     delete frame.dataset.browserWorkspaceId;
     delete frame.dataset.loadedUrl;
+    delete frame.dataset.suspended;
+    delete frame.dataset.suspendedUrl;
     frame.classList.add('hidden');
     frame.classList.remove('active');
     return;
@@ -8190,32 +13268,70 @@ function removeBrowserFrame(id: string) {
 }
 
 function clearBrowserFrames(workspaceId = state.activeWorkspaceId) {
-  for (const frame of previewFrames(workspaceId)) {
+  cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
+  forEachPreviewFrame(workspaceId, (frame) => {
+    const tabId = frame.dataset.browserTabId ?? '';
+    forgetBrowserFrame(frame);
+    if (activeBrowserFrameId === tabId) activeBrowserFrameId = '';
     if (frame === el.previewFrame) {
       frame.removeAttribute('src');
       delete frame.dataset.browserTabId;
       delete frame.dataset.browserWorkspaceId;
       delete frame.dataset.loadedUrl;
+      delete frame.dataset.suspended;
+      delete frame.dataset.suspendedUrl;
       frame.classList.add('hidden');
       frame.classList.remove('active');
     } else {
       frame.remove();
     }
-  }
+  });
 }
 
 function hideBrowserFramesForWorkspace(workspaceId: string) {
-  for (const frame of previewFrames(workspaceId)) {
-    frame.classList.add('hidden');
-    frame.classList.remove('active');
-  }
+  forEachPreviewFrame(workspaceId, (frame) => {
+    hideBrowserFrameElement(frame);
+    if (activeBrowserFrameId === frame.dataset.browserTabId) activeBrowserFrameId = '';
+  });
 }
 
 function hideAllBrowserFrames() {
-  for (const frame of previewFrames()) {
-    frame.classList.add('hidden');
-    frame.classList.remove('active');
+  forEachPreviewFrame(undefined, (frame) => {
+    hideBrowserFrameElement(frame);
+  });
+  activeBrowserFrameId = '';
+}
+
+function browserConsoleDetailedForFrame(frame: HTMLIFrameElement) {
+  return state.browserConsoleVisible
+    && browserFrameIsActiveVisible(frame);
+}
+
+function browserFrameIsActiveVisible(frame: HTMLIFrameElement) {
+  return !isBrowserPanelHidden()
+    && !frame.classList.contains('hidden')
+    && frame.dataset.browserWorkspaceId === state.activeWorkspaceId
+    && frame.dataset.browserTabId === state.activeBrowserTabId;
+}
+
+function setBrowserFrameConsoleDetailed(frame: HTMLIFrameElement, detailed: boolean) {
+  const next = detailed ? 'true' : 'false';
+  if (frame.dataset.consoleDetailed === next) return;
+  frame.dataset.consoleDetailed = next;
+  try {
+    frame.contentWindow?.postMessage({ __simpleVibeConsoleDetailed: detailed }, '*');
+  } catch {
+    // Frame may be navigating or cross-origin; console capture mode is best-effort.
   }
+}
+
+function syncBrowserConsoleCaptureForFrame(frame: HTMLIFrameElement) {
+  setBrowserFrameConsoleDetailed(frame, browserConsoleDetailedForFrame(frame));
+}
+
+function syncBrowserConsoleCaptureForActiveFrame() {
+  const frame = activeBrowserFrame();
+  if (frame) syncBrowserConsoleCaptureForFrame(frame);
 }
 
 function loadBrowserTabFallback(tab: BrowserTab) {
@@ -8228,16 +13344,51 @@ function loadBrowserTabFallback(tab: BrowserTab) {
   }
 }
 
-function loadBrowserTabThroughPreviewProxy(tab: BrowserTab) {
-  showBrowserFrame(tab);
-  void previewFrameUrl(tab.url).then((frameUrl) => {
+function loadBrowserTabThroughPreviewProxy(tab: BrowserTab, options: { hard?: boolean; reload?: boolean; clearCache?: boolean } = {}) {
+  prepareBrowserProxyPendingFrame(tab);
+  if (options.clearCache) clearPreviewProxyForBrowserTab(tab);
+  void previewFrameUrl(tab.url, { forceProbe: Boolean(options.hard || options.clearCache) }).then((frameUrl) => {
     if (tab.frameUrl !== frameUrl) {
       tab.frameUrl = frameUrl;
       const frame = browserFrameForTab(tab.id);
       if (frame) delete frame.dataset.loadedUrl;
     }
-    if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab);
+    if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab, { hard: options.hard, reload: options.reload });
   }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+}
+
+function clearPreviewProxyForBrowserTab(tab: BrowserTab) {
+  const parsed = localHttpPreviewUrl(tab.url);
+  if (!parsed) return false;
+  const targetOrigin = normalizedLocalPreviewOrigin(parsed);
+  const proxy = previewProxyForTargetOrigin(targetOrigin);
+  if (!proxy) return false;
+  removePreviewProxy(proxy);
+  previewProxyProbeAt.delete(proxy.id);
+  void api.stopPortForward(proxy.id).catch(() => undefined);
+  if (tab.frameUrl === proxy.url || tab.frameUrl?.startsWith(`${proxy.url}/`)) {
+    tab.frameUrl = tab.url;
+  }
+  const frame = browserFrameForTab(tab.id);
+  if (frame) {
+    frame.src = 'about:blank';
+    delete frame.dataset.loadedUrl;
+    delete frame.dataset.suspended;
+    delete frame.dataset.suspendedUrl;
+  }
+  return true;
+}
+
+function prepareBrowserProxyPendingFrame(tab: BrowserTab) {
+  const existing = browserFrameForTab(tab.id);
+  if (existing) {
+    showBrowserFrame(tab);
+    return;
+  }
+  hideBrowserFramesForWorkspace(state.activeWorkspaceId);
+  activeBrowserFrameId = '';
+  toggleClassIfChanged(el.browserShell, 'has-preview', false);
+  setEdgePreviewVisible(false);
 }
 
 async function loadEdgeBrowserTab(tab: BrowserTab) {
@@ -8306,16 +13457,16 @@ function stopAllEdgeDevtoolsSessions() {
 }
 
 function setEdgePreviewVisible(visible: boolean) {
-  el.edgePreviewCanvas.classList.toggle('hidden', !visible);
-  el.browserShell.classList.toggle('edge-preview-active', visible);
+  toggleClassIfChanged(el.edgePreviewCanvas, 'hidden', !visible);
+  toggleClassIfChanged(el.browserShell, 'edge-preview-active', visible);
   if (visible) {
     hideAllBrowserFrames();
-    el.browserShell.classList.add('has-preview');
+    toggleClassIfChanged(el.browserShell, 'has-preview', true);
     applyEdgePreviewSizing();
     return;
   }
-  el.edgePreviewStatus.classList.add('hidden');
-  el.browserShell.classList.remove('edge-preview-active');
+  toggleClassIfChanged(el.edgePreviewStatus, 'hidden', true);
+  toggleClassIfChanged(el.browserShell, 'edge-preview-active', false);
 }
 
 function showEdgePreviewStatus(message: string) {
@@ -8538,13 +13689,13 @@ function updateEdgeTabUrl(tabId: string, params: Record<string, unknown>) {
   const frame = asRecord(params.frame);
   const url = typeof frame?.url === 'string' ? frame.url : '';
   if (!url || url === 'about:blank' || typeof frame?.parentId === 'string') return;
-  const tab = state.browserTabs.find((item) => item.id === tabId);
+  const tab = browserTabForId(tabId);
   if (!tab || tab.url === url) return;
-  tab.url = url;
+  updateBrowserTabUrl(tab, url);
   tab.label = browserTabLabel(url);
   if (state.activeBrowserTabId === tabId) {
     state.previewUrl = url;
-    el.previewUrl.value = url;
+    setInputValueIfChanged(el.previewUrl, url);
   }
   renderBrowserTabs();
   saveActiveWorkspaceSnapshot();
@@ -8635,7 +13786,7 @@ async function configureEdgeViewport(cdp = activeEdgeCdp) {
   if (el.edgePreviewCanvas.height !== size.height) el.edgePreviewCanvas.height = size.height;
 
   if (el.browserShell.classList.contains('device')) {
-    const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+    const preset = browserDevicePreset();
     await edgeCdpSend('Emulation.setDeviceMetricsOverride', {
       width: size.width,
       height: size.height,
@@ -8660,7 +13811,7 @@ async function configureEdgeViewport(cdp = activeEdgeCdp) {
 
 function edgePreviewViewportSize() {
   if (el.browserShell.classList.contains('device')) {
-    const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+    const preset = browserDevicePreset();
     const portrait = state.browserOrientation === 'portrait';
     return {
       width: portrait ? preset.width : preset.height,
@@ -8836,38 +13987,56 @@ async function openLocalBrowserTab(url: string, label = browserTabLabel(url)) {
     openBrowserTab(url, label, url);
     return;
   }
-  try {
-    openBrowserTab(url, label, await previewFrameUrl(url));
-  } catch (error) {
-    setStatus(`Preview proxy failed: ${String(error)}`, true);
-    openBrowserTab(url, label);
-  }
+  const existing = localHttpPreviewUrl(url)
+    ? browserTabForUrl(url)
+    : null;
+  openBrowserTab(url, label, existing?.frameUrl ?? url);
 }
 
-async function previewFrameUrl(url: string) {
+async function previewFrameUrl(url: string, options: { forceProbe?: boolean } = {}) {
   const parsed = localHttpPreviewUrl(url);
   if (!parsed) return url;
   const origin = normalizedLocalPreviewOrigin(parsed);
-  const proxy = await ensurePreviewProxy(origin);
+  const proxy = await ensurePreviewProxy(origin, options);
   return `${proxy.url}${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
 
-async function ensurePreviewProxy(targetOrigin: string) {
-  const existing = state.previewProxies.find((proxy) => proxy.targetHost === targetOrigin);
+async function ensurePreviewProxy(targetOrigin: string, options: { forceProbe?: boolean } = {}) {
+  const existing = previewProxyForTargetOrigin(targetOrigin);
   if (existing) {
+    const lastProbe = previewProxyProbeAt.get(existing.id) ?? 0;
+    const shouldProbe = Boolean(options.forceProbe) || (lastProbe > 0 && Date.now() - lastProbe > PREVIEW_PROXY_PROBE_TTL_MS);
+    if (!shouldProbe) return existing;
     try {
-      if (await api.probeLocalHttpUrl(existing.url)) return existing;
+      if (await api.probeLocalHttpUrl(existing.url)) {
+        previewProxyProbeAt.set(existing.id, Date.now());
+        return existing;
+      }
     } catch {
       // Treat probe failures as stale proxy state and recreate below.
     }
-    state.previewProxies = state.previewProxies.filter((proxy) => proxy.id !== existing.id);
+    removePreviewProxy(existing);
+    previewProxyProbeAt.delete(existing.id);
     void api.stopPortForward(existing.id).catch(() => undefined);
     logBrowserConsole('warn', `Preview proxy ${existing.url} was stale; reopening ${targetOrigin}`);
   }
-  const proxy = await api.startPreviewProxy(targetOrigin);
-  state.previewProxies.push(proxy);
-  logBrowserConsole('info', `Preview proxy ${proxy.url} -> ${targetOrigin}`);
-  return proxy;
+  const pending = previewProxyStarts.get(targetOrigin);
+  if (pending) return pending;
+
+  const started = api.startPreviewProxy(targetOrigin)
+    .then((proxy) => {
+      removePreviewProxiesForTargetOrigin(targetOrigin);
+      state.previewProxies.push(proxy);
+      rememberPreviewProxy(proxy);
+      previewProxyProbeAt.set(proxy.id, Date.now());
+      logBrowserConsole('info', `Preview proxy ${proxy.url} -> ${targetOrigin}`);
+      return proxy;
+    })
+    .finally(() => {
+      if (previewProxyStarts.get(targetOrigin) === started) previewProxyStarts.delete(targetOrigin);
+    });
+  previewProxyStarts.set(targetOrigin, started);
+  return started;
 }
 
 function localHttpPreviewUrl(url: string) {
@@ -8887,42 +14056,149 @@ function normalizedLocalPreviewOrigin(url: URL) {
   return `http://${host}:${url.port}`;
 }
 
+function clearPreviewProxyLookup() {
+  previewProxyByTargetOrigin.clear();
+  previewProxyByLocalPort.clear();
+  previewProxyLocalPortMisses.clear();
+}
+
+function rebuildPreviewProxyLookup() {
+  clearPreviewProxyLookup();
+  for (const proxy of state.previewProxies) rememberPreviewProxy(proxy);
+}
+
+function rememberPreviewProxy(proxy: PortForwardResult) {
+  previewProxyLocalPortMisses.delete(proxy.localPort);
+  if (!previewProxyByTargetOrigin.has(proxy.targetHost)) {
+    previewProxyByTargetOrigin.set(proxy.targetHost, proxy);
+  }
+  if (!previewProxyByLocalPort.has(proxy.localPort)) {
+    previewProxyByLocalPort.set(proxy.localPort, proxy);
+  }
+}
+
+function forgetPreviewProxy(proxy: PortForwardResult) {
+  if (previewProxyByTargetOrigin.get(proxy.targetHost) === proxy) {
+    previewProxyByTargetOrigin.delete(proxy.targetHost);
+    for (const candidate of state.previewProxies) {
+      if (candidate.targetHost !== proxy.targetHost) continue;
+      previewProxyByTargetOrigin.set(candidate.targetHost, candidate);
+      break;
+    }
+  }
+  if (previewProxyByLocalPort.get(proxy.localPort) !== proxy) return;
+  previewProxyByLocalPort.delete(proxy.localPort);
+  previewProxyLocalPortMisses.delete(proxy.localPort);
+  for (const candidate of state.previewProxies) {
+    if (candidate.localPort !== proxy.localPort) continue;
+    previewProxyByLocalPort.set(candidate.localPort, candidate);
+    break;
+  }
+}
+
+function previewProxyForTargetOrigin(targetOrigin: string) {
+  let proxy = previewProxyByTargetOrigin.get(targetOrigin) ?? null;
+  if (!proxy) {
+    proxy = state.previewProxies.find((item) => item.targetHost === targetOrigin) ?? null;
+    if (proxy) rememberPreviewProxy(proxy);
+  }
+  return proxy;
+}
+
+function removePreviewProxy(proxy: PortForwardResult) {
+  const index = state.previewProxies.indexOf(proxy);
+  if (index >= 0) state.previewProxies.splice(index, 1);
+  else {
+    const fallbackIndex = state.previewProxies.findIndex((item) => item.id === proxy.id);
+    if (fallbackIndex >= 0) state.previewProxies.splice(fallbackIndex, 1);
+  }
+  forgetPreviewProxy(proxy);
+}
+
+function removePreviewProxiesForTargetOrigin(targetOrigin: string) {
+  for (let index = state.previewProxies.length - 1; index >= 0; index -= 1) {
+    const proxy = state.previewProxies[index];
+    if (proxy.targetHost !== targetOrigin) continue;
+    state.previewProxies.splice(index, 1);
+    forgetPreviewProxy(proxy);
+  }
+}
+
 function isPreviewProxyLocalPort(port: number) {
-  return state.previewProxies.some((proxy) => proxy.localPort === port);
+  if (previewProxyByLocalPort.has(port)) return true;
+  if (previewProxyLocalPortMisses.has(port)) return false;
+  const proxy = state.previewProxies.find((item) => item.localPort === port) ?? null;
+  if (!proxy) {
+    rememberPreviewProxyLocalPortMiss(port);
+    return false;
+  }
+  rememberPreviewProxy(proxy);
+  return true;
+}
+
+function rememberPreviewProxyLocalPortMiss(port: number) {
+  previewProxyLocalPortMisses.add(port);
+  if (previewProxyLocalPortMisses.size <= 512) return;
+  const oldest = previewProxyLocalPortMisses.values().next().value;
+  if (oldest !== undefined) previewProxyLocalPortMisses.delete(oldest);
 }
 
 function ensureActiveBrowserFrame() {
-  if (getPanel('browser').classList.contains('hidden')) return;
-  const active = state.browserTabs.find((tab) => tab.id === state.activeBrowserTabId) ?? state.browserTabs[0];
-  if (active) activateBrowserTab(active.id);
+  if (isBrowserPanelHidden()) return false;
+  const active = browserTabForId(state.activeBrowserTabId) ?? state.browserTabs[0];
+  if (!active) return false;
+  if (!USE_EDGE_CDP_BROWSER && browserTabFrameReady(active)) {
+    showBrowserFrame(active);
+    renderBrowserTabs();
+    return true;
+  }
+  activateBrowserTab(active.id);
+  return true;
 }
 
 function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = url) {
   if (!url) return;
-  const existing = state.browserTabs.find((tab) => tab.url === url);
+  const existing = browserTabForUrl(url);
+  setPanelVisible('browser', true);
   if (existing) {
+    const changed = existing.frameUrl !== frameUrl || existing.label !== label;
     existing.frameUrl = frameUrl;
     existing.label = label;
-    activateBrowserTab(existing.id);
+    activateBrowserTab(existing.id, { forceSave: changed });
     return;
   }
 
   const tab: BrowserTab = { id: makeBrowserTabId(), url, label, frameUrl };
+  const index = state.browserTabs.length;
   state.browserTabs.push(tab);
+  rememberBrowserTab(tab, index);
   logBrowserConsole('info', `Opened preview tab ${url}`);
-  activateBrowserTab(tab.id);
-  setPanelVisible('browser', true);
+  activateBrowserTab(tab.id, { forceSave: true });
 }
 
-function activateBrowserTab(id: string) {
-  const tab = state.browserTabs.find((item) => item.id === id);
+function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
+  const tab = browserTabForId(id);
   if (!tab) return;
-  const alreadyActive = state.activeBrowserTabId === tab.id;
+  const previousActiveId = state.activeBrowserTabId;
+  const alreadyActive = previousActiveId === tab.id;
+  const shouldSave = options.forceSave || !alreadyActive;
   state.activeBrowserTabId = tab.id;
   state.previewUrl = tab.url;
-  el.previewUrl.value = tab.url;
+  setInputValueIfChanged(el.previewUrl, tab.url);
+  if (isBrowserPanelHidden()) {
+    if (!alreadyActive) logBrowserConsole('info', `Selected tab ${tab.url}; Browser panel is hidden`);
+    if (shouldSave) saveActiveWorkspaceSnapshot();
+    return;
+  }
+  if (!USE_EDGE_CDP_BROWSER && browserTabFrameReady(tab)) {
+    showBrowserFrame(tab);
+    renderBrowserTabActivation(previousActiveId, tab);
+    if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
+    if (shouldSave) saveActiveWorkspaceSnapshot();
+    return;
+  }
   if (USE_EDGE_CDP_BROWSER) {
-    renderBrowserTabs();
+    renderBrowserTabActivation(previousActiveId, tab);
     setEdgePreviewVisible(true);
     void loadEdgeBrowserTab(tab).catch((error) => {
       logBrowserConsole('error', `Edge preview failed: ${String(error)}`);
@@ -8930,7 +14206,7 @@ function activateBrowserTab(id: string) {
       loadBrowserTabFallback(tab);
     });
     if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
-    saveActiveWorkspaceSnapshot();
+    if (shouldSave) saveActiveWorkspaceSnapshot();
     return;
   }
   if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(tab.url)) {
@@ -8938,19 +14214,21 @@ function activateBrowserTab(id: string) {
   } else {
     loadBrowserFrame(tab);
   }
-  renderBrowserTabs();
+  renderBrowserTabActivation(previousActiveId, tab);
   if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
-  saveActiveWorkspaceSnapshot();
+  if (shouldSave) saveActiveWorkspaceSnapshot();
 }
 
 function closeBrowserTab(id: string) {
-  const index = state.browserTabs.findIndex((tab) => tab.id === id);
+  const index = browserTabIndexById(id);
   if (index < 0) return;
   const wasActive = state.activeBrowserTabId === id;
   const closedTab = state.browserTabs[index];
   const closedUrl = closedTab.url;
   closeEdgeBrowserTab(closedTab);
   state.browserTabs.splice(index, 1);
+  forgetBrowserTab(closedTab);
+  refreshBrowserTabIndexLookup(index);
   removeBrowserFrame(id);
   logBrowserConsole('info', `Closed tab ${closedUrl}`);
   if (wasActive) {
@@ -8960,9 +14238,9 @@ function closeBrowserTab(id: string) {
     } else {
       state.activeBrowserTabId = '';
       state.previewUrl = '';
-      el.previewUrl.value = '';
+      setInputValueIfChanged(el.previewUrl, '');
       clearBrowserFrames();
-      el.browserShell.classList.remove('has-preview');
+      toggleClassIfChanged(el.browserShell, 'has-preview', false);
       disconnectActiveEdgeCdp();
       setEdgePreviewVisible(false);
       renderBrowserTabs();
@@ -8974,48 +14252,292 @@ function closeBrowserTab(id: string) {
 }
 
 function renderBrowserTabs() {
-  el.browserTabs.innerHTML = '';
+  if (isBrowserPanelHidden()) return;
+  const signature = browserTabsSignature();
+  if (browserTabsRenderSignature === signature) return;
+  const orderSignature = browserTabsOrderSignature();
+  const sameOrder = browserTabsOrderRenderSignature === orderSignature
+    && el.browserTabs.childElementCount === state.browserTabs.length;
+  browserTabsRenderSignature = signature;
+
+  if (sameOrder) {
+    for (const tab of state.browserTabs) {
+      updateBrowserTabElement(browserTabElement(tab.id), tab);
+    }
+    return;
+  }
+
+  browserTabsOrderRenderSignature = orderSignature;
   const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
   for (const tab of state.browserTabs) {
-    const item = document.createElement('div');
-    item.className = `browser-tab${tab.id === state.activeBrowserTabId ? ' active' : ''}`;
-    item.title = tab.url;
-    item.innerHTML = `<button class="tab-label">${escapeHtml(tab.label)}</button><button class="tab-close" title="Close tab" aria-label="Close tab">x</button>`;
-    item.querySelector<HTMLButtonElement>('.tab-label')!.addEventListener('click', () => activateBrowserTab(tab.id));
-    item.querySelector<HTMLButtonElement>('.tab-close')!.addEventListener('click', (event) => {
-      event.stopPropagation();
-      closeBrowserTab(tab.id);
-    });
+    seen.add(tab.id);
+    const item = browserTabElement(tab.id);
+    updateBrowserTabElement(item, tab);
     fragment.append(item);
   }
-  el.browserTabs.append(fragment);
+  el.browserTabs.replaceChildren(fragment);
+  pruneBrowserTabElementCache(seen);
 }
 
-function setBrowserConsoleVisible(visible: boolean) {
+function renderBrowserTabActivation(previousActiveId: string, activeTab: BrowserTab) {
+  if (isBrowserPanelHidden()) return;
+  const orderSignature = browserTabsOrderSignature();
+  const previousChanged = Boolean(previousActiveId && previousActiveId !== activeTab.id);
+  const previousTab = previousChanged
+    ? browserTabForId(previousActiveId)
+    : null;
+  const previousElement = previousChanged ? connectedBrowserTabElement(previousActiveId) : null;
+  const activeElement = connectedBrowserTabElement(activeTab.id);
+  if (
+    browserTabsOrderRenderSignature !== orderSignature
+    || el.browserTabs.childElementCount !== state.browserTabs.length
+    || !activeElement
+    || (previousChanged && (!previousTab || !previousElement))
+  ) {
+    renderBrowserTabs();
+    return;
+  }
+  if (previousTab && previousElement) updateBrowserTabElement(previousElement, previousTab);
+  updateBrowserTabElement(activeElement, activeTab);
+  browserTabsRenderSignature = browserTabsSignature();
+}
+
+function browserTabElement(id: string) {
+  const cached = browserTabElementCache.get(id);
+  if (cached) return cached;
+  const item = document.createElement('div');
+  item.className = 'browser-tab';
+  const labelButton = document.createElement('button');
+  labelButton.className = 'tab-label';
+  labelButton.type = 'button';
+  labelButton.addEventListener('click', () => {
+    const id = item.dataset.browserTabId ?? '';
+    if (id) activateBrowserTab(id);
+  });
+  const closeButton = document.createElement('button');
+  closeButton.className = 'tab-close';
+  closeButton.type = 'button';
+  closeButton.title = 'Close tab';
+  closeButton.setAttribute('aria-label', 'Close tab');
+  closeButton.textContent = 'x';
+  closeButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const id = item.dataset.browserTabId ?? '';
+    if (id) closeBrowserTab(id);
+  });
+  item.append(labelButton, closeButton);
+  browserTabElementCache.set(id, item);
+  return item;
+}
+
+function connectedBrowserTabElement(id: string) {
+  const item = browserTabElementCache.get(id);
+  return item?.isConnected ? item : null;
+}
+
+function updateBrowserTabElement(item: HTMLElement, tab: BrowserTab) {
+  const active = tab.id === state.activeBrowserTabId;
+  const signature = `${tab.id}\t${active ? '1' : '0'}\t${tab.label}\t${tab.url}`;
+  item.dataset.browserTabId = tab.id;
+  if (item.dataset.renderSignature === signature) return;
+  item.dataset.renderSignature = signature;
+  item.className = `browser-tab${active ? ' active' : ''}`;
+  if (item.title !== tab.url) item.title = tab.url;
+  setTextContentIfChanged(browserTabLabelButton(item), tab.label);
+}
+
+function browserTabLabelButton(item: HTMLElement) {
+  return item.firstElementChild as HTMLButtonElement;
+}
+
+function pruneBrowserTabElementCache(seen: Set<string>) {
+  for (const id of browserTabElementCache.keys()) {
+    if (!seen.has(id)) browserTabElementCache.delete(id);
+  }
+}
+
+function clearBrowserTabLookup() {
+  browserTabById.clear();
+  browserTabByUrl.clear();
+  browserTabIndexByIdLookup.clear();
+}
+
+function rebuildBrowserTabLookup() {
+  clearBrowserTabLookup();
+  for (let index = 0; index < state.browserTabs.length; index += 1) {
+    rememberBrowserTab(state.browserTabs[index], index);
+  }
+}
+
+function rememberBrowserTab(tab: BrowserTab, index?: number) {
+  browserTabById.set(tab.id, tab);
+  if (!browserTabByUrl.has(tab.url)) browserTabByUrl.set(tab.url, tab);
+  if (index !== undefined) browserTabIndexByIdLookup.set(tab.id, index);
+}
+
+function forgetBrowserTab(tab: BrowserTab) {
+  browserTabById.delete(tab.id);
+  browserTabIndexByIdLookup.delete(tab.id);
+  if (browserTabByUrl.get(tab.url) !== tab) return;
+  browserTabByUrl.delete(tab.url);
+  for (let index = 0; index < state.browserTabs.length; index += 1) {
+    const candidate = state.browserTabs[index];
+    if (candidate.url !== tab.url) continue;
+    rememberBrowserTab(candidate, index);
+    return;
+  }
+}
+
+function browserTabForId(id: string) {
+  if (!id) return null;
+  let tab = browserTabById.get(id) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.browserTabs.length; index += 1) {
+      const candidate = state.browserTabs[index];
+      if (candidate.id !== id) continue;
+      tab = candidate;
+      rememberBrowserTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function browserTabForUrl(url: string) {
+  if (!url) return null;
+  let tab = browserTabByUrl.get(url) ?? null;
+  if (!tab) {
+    for (let index = 0; index < state.browserTabs.length; index += 1) {
+      const candidate = state.browserTabs[index];
+      if (candidate.url !== url) continue;
+      tab = candidate;
+      rememberBrowserTab(tab, index);
+      break;
+    }
+  }
+  return tab;
+}
+
+function browserTabIndexById(id: string) {
+  const cachedIndex = browserTabIndexByIdLookup.get(id);
+  if (cachedIndex !== undefined && state.browserTabs[cachedIndex]?.id === id) return cachedIndex;
+  for (let index = 0; index < state.browserTabs.length; index += 1) {
+    const tab = state.browserTabs[index];
+    if (tab.id !== id) continue;
+    rememberBrowserTab(tab, index);
+    return index;
+  }
+  browserTabIndexByIdLookup.delete(id);
+  return -1;
+}
+
+function refreshBrowserTabIndexLookup(startIndex = 0) {
+  const start = clamp(startIndex, 0, state.browserTabs.length);
+  for (let index = start; index < state.browserTabs.length; index += 1) {
+    browserTabIndexByIdLookup.set(state.browserTabs[index].id, index);
+  }
+}
+
+function updateBrowserTabUrl(tab: BrowserTab, url: string) {
+  if (tab.url === url) return;
+  if (browserTabByUrl.get(tab.url) === tab) browserTabByUrl.delete(tab.url);
+  tab.url = url;
+  if (!browserTabByUrl.has(url)) browserTabByUrl.set(url, tab);
+}
+
+function browserTabsSignature() {
+  let signature = '';
+  for (let index = 0; index < state.browserTabs.length; index += 1) {
+    const tab = state.browserTabs[index];
+    if (index) signature += '\n';
+    signature += `${tab.id}\t${tab.id === state.activeBrowserTabId ? '1' : '0'}\t${tab.label}\t${tab.url}`;
+  }
+  return signature;
+}
+
+function browserTabsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.browserTabs.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.browserTabs[index].id;
+  }
+  return signature;
+}
+
+function setBrowserConsoleVisible(
+  visible: boolean,
+  options: { skipFrameSync?: boolean; skipRender?: boolean; skipSave?: boolean; deferHiddenFlush?: boolean } = {}
+) {
+  const changed = state.browserConsoleVisible !== visible
+    || el.browserWorkspace.classList.contains('console-visible') !== visible
+    || el.browserConsole.classList.contains('hidden') === visible
+    || el.browserConsoleToggle.classList.contains('active') !== visible
+    || el.browserConsoleToggle.getAttribute('aria-pressed') !== String(visible);
   state.browserConsoleVisible = visible;
-  el.browserWorkspace.classList.toggle('console-visible', visible);
-  el.browserConsole.classList.toggle('hidden', !visible);
-  el.browserConsoleToggle.classList.toggle('active', visible);
-  el.browserConsoleToggle.setAttribute('aria-pressed', String(visible));
+  if (changed) {
+    toggleClassIfChanged(el.browserWorkspace, 'console-visible', visible);
+    toggleClassIfChanged(el.browserConsole, 'hidden', !visible);
+    toggleClassIfChanged(el.browserConsoleToggle, 'active', visible);
+    setAttributeIfChanged(el.browserConsoleToggle, 'aria-pressed', String(visible));
+  }
   applyBrowserConsoleSize();
-  if (visible) renderBrowserConsole();
-  saveActiveWorkspaceSnapshot();
+  if (changed && !options.skipFrameSync) syncBrowserConsoleCaptureForActiveFrame();
+  if (visible && browserConsoleHiddenPayloadQueue.length) {
+    if (options.deferHiddenFlush) scheduleBrowserConsoleHiddenPayloadFlush();
+    else flushBrowserConsoleHiddenPayloadQueue();
+  }
+  if (visible && !options.skipRender) renderBrowserConsole();
+  if (changed && !options.skipSave) saveActiveWorkspaceSnapshot();
 }
 
-function setBrowserConsolePosition(position: BrowserConsolePosition) {
+function setBrowserConsolePosition(
+  position: BrowserConsolePosition,
+  options: { skipLog?: boolean; skipSave?: boolean } = {}
+) {
   if (!['bottom', 'right', 'top', 'left'].includes(position)) return;
+  const className = `console-${position}`;
+  const changed = state.browserConsolePosition !== position
+    || el.browserConsolePosition.value !== position
+    || !el.browserWorkspace.classList.contains(className);
   state.browserConsolePosition = position;
-  el.browserConsolePosition.value = position;
-  el.browserWorkspace.classList.remove('console-bottom', 'console-right', 'console-top', 'console-left');
-  el.browserWorkspace.classList.add(`console-${position}`);
+  if (changed) {
+    setInputValueIfChanged(el.browserConsolePosition, position);
+    setBrowserConsolePositionClass(className);
+  }
   applyBrowserConsoleSize();
-  if (state.browserConsoleVisible) logBrowserConsole('info', `Console moved to ${position}`);
-  saveActiveWorkspaceSnapshot();
+  if (changed && state.browserConsoleVisible && !options.skipLog) logBrowserConsole('info', `Console moved to ${position}`);
+  if (changed && !options.skipSave) saveActiveWorkspaceSnapshot();
+}
+
+function setBrowserConsolePositionClass(className: string) {
+  if (
+    el.browserWorkspace.dataset.browserConsolePositionClass === className
+    && el.browserWorkspace.classList.contains(className)
+  ) {
+    return;
+  }
+  el.browserWorkspace.classList.remove('console-bottom', 'console-right', 'console-top', 'console-left');
+  el.browserWorkspace.classList.add(className);
+  el.browserWorkspace.dataset.browserConsolePositionClass = className;
 }
 
 function applyBrowserConsoleSize() {
   state.browserConsoleSize = clamp(state.browserConsoleSize || 0.34, 0.18, 0.72);
-  el.browserWorkspace.style.setProperty('--browser-console-size', `${(state.browserConsoleSize * 100).toFixed(2)}%`);
+  const value = `${(state.browserConsoleSize * 100).toFixed(2)}%`;
+  if (el.browserWorkspace.style.getPropertyValue('--browser-console-size') !== value) {
+    el.browserWorkspace.style.setProperty('--browser-console-size', value);
+  }
+}
+
+function applyVisibleBrowserLayout() {
+  setBrowserConsolePosition(state.browserConsolePosition, { skipLog: true, skipSave: true });
+  setBrowserConsoleVisible(state.browserConsoleVisible, { deferHiddenFlush: true, skipRender: true, skipSave: true });
+  if (state.browserDeviceId === 'desktop') {
+    setBrowserMode('desktop', { skipSave: true });
+  } else {
+    setBrowserDevice(state.browserDeviceId || DEFAULT_BROWSER_DEVICE_ID, { skipSave: true });
+  }
 }
 
 function startBrowserConsoleResize(event: PointerEvent) {
@@ -9024,17 +14546,19 @@ function startBrowserConsoleResize(event: PointerEvent) {
   event.stopPropagation();
   activateBrowserPanel();
   el.browserConsoleResizer.setPointerCapture(event.pointerId);
+  const rect = el.browserWorkspace.getBoundingClientRect();
+  const workspaceWidth = Math.max(1, rect.width);
+  const workspaceHeight = Math.max(1, rect.height);
+  const position = state.browserConsolePosition;
   const move = (moveEvent: PointerEvent) => {
     if (moveEvent.pointerId !== event.pointerId) return;
-    const rect = el.browserWorkspace.getBoundingClientRect();
-    const position = state.browserConsolePosition;
     const raw = position === 'bottom'
-      ? (rect.bottom - moveEvent.clientY) / rect.height
+      ? (rect.bottom - moveEvent.clientY) / workspaceHeight
       : position === 'top'
-        ? (moveEvent.clientY - rect.top) / rect.height
+        ? (moveEvent.clientY - rect.top) / workspaceHeight
         : position === 'right'
-          ? (rect.right - moveEvent.clientX) / rect.width
-          : (moveEvent.clientX - rect.left) / rect.width;
+          ? (rect.right - moveEvent.clientX) / workspaceWidth
+          : (moveEvent.clientX - rect.left) / workspaceWidth;
     state.browserConsoleSize = clamp(raw, 0.18, 0.72);
     applyBrowserConsoleSize();
   };
@@ -9058,85 +14582,630 @@ function logBrowserConsole(
   message: string,
   options: { scanForLocalPorts?: boolean } = {}
 ) {
-  const entry = {
-    id: makeBrowserTabId(),
-    time: new Date().toTimeString().slice(0, 8),
+  appendBrowserConsoleLogEntry(makeBrowserConsoleLogEntry(level, message), {
+    scanForLocalPorts: options.scanForLocalPorts
+  });
+}
+
+function makeBrowserConsoleLogEntry(
+  level: BrowserConsoleLog['level'],
+  message: string,
+  time = browserConsoleTimeText()
+): BrowserConsoleLog {
+  return {
+    id: makeBrowserConsoleLogId(),
+    time,
     level,
-    message
+    message: truncateConsoleMessage(message)
   };
+}
+
+function appendBrowserConsoleLogEntry(
+  entry: BrowserConsoleLog,
+  options: { scanForLocalPorts?: boolean } = {}
+) {
+  const visible = browserConsoleActuallyVisible();
+  const limit = browserConsoleRuntimeLogLimit(visible);
   state.browserConsoleLogs.push(entry);
-  if (state.browserConsoleLogs.length > 250) state.browserConsoleLogs.shift();
-  if (state.browserConsoleVisible) renderBrowserConsole();
-  if (options.scanForLocalPorts) maybeAutoForwardBrowserLocalUrl(message);
+  trimBrowserConsoleLogs(limit);
+  markBrowserConsoleLogsChanged();
+  if (visible) scheduleBrowserConsoleRender();
+  if (options.scanForLocalPorts && shouldScanBrowserConsoleForLocalPorts()) {
+    scanBrowserConsoleLogForLocalPorts(entry, { immediate: visible });
+  }
+}
+
+function appendBrowserConsoleLogBatch(
+  entries: BrowserConsoleLog[],
+  options: { scanForLocalPorts?: boolean } = {}
+) {
+  if (!entries.length) return;
+  const visible = browserConsoleActuallyVisible();
+  const limit = browserConsoleRuntimeLogLimit(visible);
+  if (entries.length >= limit) {
+    state.browserConsoleLogs = browserConsoleLogTail(entries, limit);
+    clearBrowserConsoleRowElementCache();
+  } else {
+    appendBrowserConsoleLogEntries(state.browserConsoleLogs, entries);
+    trimBrowserConsoleLogs(limit);
+  }
+  markBrowserConsoleLogsChanged();
+  if (visible) scheduleBrowserConsoleRender();
+  if (options.scanForLocalPorts && shouldScanBrowserConsoleForLocalPorts()) {
+    for (const entry of entries) scanBrowserConsoleLogForLocalPorts(entry, { immediate: visible });
+  }
+}
+
+function browserConsoleActuallyVisible() {
+  return state.browserConsoleVisible && !isBrowserPanelHidden();
+}
+
+function trimBrowserConsoleLogs(limit = browserConsoleRuntimeLogLimit()) {
+  if (state.browserConsoleLogs.length > limit) {
+    const removeCount = state.browserConsoleLogs.length - limit;
+    for (let index = 0; index < removeCount; index += 1) {
+      browserConsoleRowElementCache.delete(state.browserConsoleLogs[index].id);
+    }
+    if (browserConsoleLastRenderedLogIndex >= removeCount) {
+      browserConsoleLastRenderedLogIndex -= removeCount;
+    } else {
+      browserConsoleLastRenderedLogIndex = -1;
+    }
+    state.browserConsoleLogs.splice(0, removeCount);
+  }
+}
+
+function scanBrowserConsoleLogForLocalPorts(
+  entry: BrowserConsoleLog,
+  options: { immediate?: boolean } = {}
+) {
+  if (!browserConsoleMayContainLocalPreviewPort(entry.message)) return;
+  if (options.immediate) {
+    maybeAutoForwardBrowserLocalUrl(entry.message);
+    return;
+  }
+  queueBrowserConsoleLocalPortScan(entry.message);
+}
+
+function queueBrowserConsoleLocalPortScan(message: string) {
+  browserConsolePortScanQueue.push(message);
+  pruneBrowserConsoleLocalPortScanQueue();
+  scheduleBrowserConsoleLocalPortScan();
+}
+
+function pruneBrowserConsoleLocalPortScanQueue() {
+  if (browserConsolePortScanQueue.length > BROWSER_CONSOLE_HIDDEN_LOG_LIMIT + BROWSER_CONSOLE_PORT_SCAN_QUEUE_PRUNE_BATCH) {
+    browserConsolePortScanQueue.splice(0, browserConsolePortScanQueue.length - BROWSER_CONSOLE_HIDDEN_LOG_LIMIT);
+  }
+}
+
+function clearBrowserConsoleLocalPortScanQueue() {
+  browserConsolePortScanQueue = [];
+  if (browserConsolePortScanTimer) window.clearTimeout(browserConsolePortScanTimer);
+  browserConsolePortScanTimer = 0;
+}
+
+function queueBrowserConsoleHiddenPayloads(payloads: unknown[]) {
+  const limit = browserConsoleRuntimeLogLimit(false);
+  let accepted = 0;
+  for (let index = 0; index < payloads.length; index += 1) {
+    if (appendBrowserConsoleHiddenPayload(payloads[index])) accepted += 1;
+  }
+  if (!accepted) return;
+  pruneBrowserConsoleHiddenPayloadQueue(limit, accepted >= limit);
+  scheduleBrowserConsoleHiddenPayloadFlush();
+}
+
+function queueBrowserConsoleHiddenPayload(payload: unknown) {
+  if (!appendBrowserConsoleHiddenPayload(payload)) return;
+  pruneBrowserConsoleHiddenPayloadQueue();
+  scheduleBrowserConsoleHiddenPayloadFlush();
+}
+
+function appendBrowserConsoleHiddenPayload(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return false;
+  browserConsoleHiddenPayloadQueue.push(payload);
+  return true;
+}
+
+function pruneBrowserConsoleHiddenPayloadQueue(limit = browserConsoleRuntimeLogLimit(false), force = false) {
+  const max = force ? limit : limit + BROWSER_CONSOLE_PORT_SCAN_QUEUE_PRUNE_BATCH;
+  if (browserConsoleHiddenPayloadQueue.length <= max) return;
+  browserConsoleHiddenPayloadQueue.splice(0, browserConsoleHiddenPayloadQueue.length - limit);
+}
+
+function scheduleBrowserConsoleHiddenPayloadFlush() {
+  if (browserConsoleHiddenPayloadTimer) return;
+  browserConsoleHiddenPayloadTimer = window.setTimeout(() => {
+    browserConsoleHiddenPayloadTimer = 0;
+    runWhenUiIdle(flushBrowserConsoleHiddenPayloadQueue, BROWSER_CONSOLE_HIDDEN_FLUSH_IDLE_MS);
+  }, BROWSER_CONSOLE_HIDDEN_FLUSH_DEBOUNCE_MS);
+}
+
+function flushBrowserConsoleHiddenPayloadQueue() {
+  if (browserConsoleHiddenPayloadTimer) {
+    window.clearTimeout(browserConsoleHiddenPayloadTimer);
+    browserConsoleHiddenPayloadTimer = 0;
+  }
+  if (!browserConsoleHiddenPayloadQueue.length) return;
+  const payloads = browserConsoleHiddenPayloadQueue;
+  browserConsoleHiddenPayloadQueue = [];
+  const entries: BrowserConsoleLog[] = [];
+  const time = browserConsoleTimeText();
+  const formatter = formatConsoleValueCompact;
+  const limit = browserConsoleRuntimeLogLimit(false);
+  const start = Math.max(0, payloads.length - limit);
+  for (let index = start; index < payloads.length; index += 1) {
+    const entry = browserConsoleLogEntryFromPayload(payloads[index], time, formatter);
+    if (entry) entries.push(entry);
+  }
+  appendBrowserConsoleLogBatch(entries, { scanForLocalPorts: true });
+}
+
+function clearBrowserConsoleHiddenPayloadQueue() {
+  browserConsoleHiddenPayloadQueue = [];
+  if (browserConsoleHiddenPayloadTimer) window.clearTimeout(browserConsoleHiddenPayloadTimer);
+  browserConsoleHiddenPayloadTimer = 0;
+}
+
+function scheduleBrowserConsoleLocalPortScan() {
+  if (browserConsolePortScanTimer) return;
+  browserConsolePortScanTimer = window.setTimeout(() => {
+    browserConsolePortScanTimer = 0;
+    runWhenUiIdle(flushBrowserConsoleLocalPortScan, 900);
+  }, 320);
+}
+
+function flushBrowserConsoleLocalPortScan() {
+  if (!shouldScanBrowserConsoleForLocalPorts()) {
+    browserConsolePortScanQueue = [];
+    return;
+  }
+  const count = Math.min(16, browserConsolePortScanQueue.length);
+  for (let index = 0; index < count; index += 1) {
+    maybeAutoForwardBrowserLocalUrl(browserConsolePortScanQueue[index]);
+  }
+  browserConsolePortScanQueue.splice(0, count);
+  if (browserConsolePortScanQueue.length) scheduleBrowserConsoleLocalPortScan();
+}
+
+function shouldScanBrowserConsoleForLocalPorts() {
+  return Boolean(state.activeProfile && state.activeProfile.kind !== 'windows');
+}
+
+function makeBrowserConsoleLogId() {
+  browserConsoleLogSequence = (browserConsoleLogSequence + 1) % Number.MAX_SAFE_INTEGER;
+  return `log-${browserConsoleLogSequence.toString(36)}`;
+}
+
+function browserConsoleTimeText(now = Date.now()) {
+  const second = Math.floor(now / 1000);
+  if (second === browserConsoleLastTimeSecond) return browserConsoleLastTimeText;
+  browserConsoleLastTimeSecond = second;
+  browserConsoleLastTimeText = new Date(now).toTimeString().slice(0, 8);
+  return browserConsoleLastTimeText;
+}
+
+function markBrowserConsoleLogsChanged() {
+  browserConsoleLogVersion += 1;
+}
+
+function scheduleBrowserConsoleRender() {
+  if (!state.browserConsoleVisible || isBrowserPanelHidden() || browserConsoleRenderFrame) return;
+  browserConsoleRenderFrame = window.requestAnimationFrame(() => {
+    browserConsoleRenderFrame = 0;
+    if (browserConsoleActuallyVisible()) renderBrowserConsole();
+  });
 }
 
 function renderBrowserConsole() {
-  if (!state.browserConsoleLogs.length) {
-    el.browserConsoleLog.innerHTML = '<div class="browser-console-empty">No console events yet</div>';
+  if (!state.browserConsoleVisible || isBrowserPanelHidden()) return;
+  if (browserConsoleRenderFrame) {
+    window.cancelAnimationFrame(browserConsoleRenderFrame);
+    browserConsoleRenderFrame = 0;
+  }
+  const logs = state.browserConsoleLogs;
+  const start = Math.max(0, logs.length - BROWSER_CONSOLE_RENDER_LIMIT);
+  const renderCount = logs.length - start;
+  const signature = browserConsoleSignature(renderCount);
+  if (browserConsoleRenderSignature === signature) return;
+  if (!logs.length) {
+    browserConsoleRenderSignature = signature;
+    browserConsoleLastRenderedLogId = '';
+    browserConsoleLastRenderedLogIndex = -1;
+    clearBrowserConsoleRowElementCache();
+    const empty = document.createElement('div');
+    empty.className = 'browser-console-empty';
+    empty.textContent = 'No console events yet';
+    el.browserConsoleLog.replaceChildren(empty);
     return;
   }
 
-  el.browserConsoleLog.innerHTML = state.browserConsoleLogs
-    .map((entry) => `
-      <div class="browser-console-line ${entry.level}">
-        <span class="browser-console-time">${escapeHtml(entry.time)}</span>
-        <span class="browser-console-level">${entry.level}</span>
-        <span class="browser-console-message">${escapeHtml(entry.message)}</span>
-      </div>
-    `)
-    .join('');
+  let lastRenderedIndex = -1;
+  if (
+    browserConsoleLastRenderedLogIndex >= start
+    && logs[browserConsoleLastRenderedLogIndex]?.id === browserConsoleLastRenderedLogId
+  ) {
+    lastRenderedIndex = browserConsoleLastRenderedLogIndex;
+  } else {
+    for (let index = start; index < logs.length; index += 1) {
+      if (logs[index].id === browserConsoleLastRenderedLogId) {
+        lastRenderedIndex = index;
+        break;
+      }
+    }
+  }
+  const canAppend = lastRenderedIndex >= 0
+    && el.browserConsoleLog.childElementCount > 0
+    && !el.browserConsoleLog.firstElementChild?.classList.contains('browser-console-empty');
+
+  if (canAppend) {
+    const firstNewIndex = lastRenderedIndex + 1;
+    const newCount = logs.length - firstNewIndex;
+    if (newCount === 1) {
+      el.browserConsoleLog.append(browserConsoleRowElement(logs[firstNewIndex]));
+    } else if (newCount > 1) {
+      const fragment = document.createDocumentFragment();
+      for (let index = firstNewIndex; index < logs.length; index += 1) {
+        fragment.append(browserConsoleRowElement(logs[index]));
+      }
+      el.browserConsoleLog.append(fragment);
+    }
+    while (el.browserConsoleLog.childElementCount > renderCount) {
+      el.browserConsoleLog.firstElementChild?.remove();
+    }
+  } else {
+    const fragment = document.createDocumentFragment();
+    for (let index = start; index < logs.length; index += 1) {
+      fragment.append(browserConsoleRowElement(logs[index]));
+    }
+    el.browserConsoleLog.replaceChildren(fragment);
+  }
+
+  browserConsoleRenderSignature = signature;
+  browserConsoleLastRenderedLogId = logs[logs.length - 1]?.id ?? '';
+  browserConsoleLastRenderedLogIndex = logs.length - 1;
   el.browserConsoleLog.scrollTop = el.browserConsoleLog.scrollHeight;
 }
 
+function clearBrowserConsoleRowElementCache() {
+  browserConsoleRowElementCache.clear();
+  browserConsoleLastRenderedLogId = '';
+  browserConsoleLastRenderedLogIndex = -1;
+}
+
+function browserConsoleRowElement(entry: BrowserConsoleLog) {
+  const cached = browserConsoleRowElementCache.get(entry.id);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.dataset.browserConsoleLogId = entry.id;
+  row.className = `browser-console-line ${entry.level}`;
+  const time = document.createElement('span');
+  time.className = 'browser-console-time';
+  time.textContent = entry.time;
+  const level = document.createElement('span');
+  level.className = 'browser-console-level';
+  level.textContent = entry.level;
+  const message = document.createElement('span');
+  message.className = 'browser-console-message';
+  message.textContent = entry.message;
+  row.append(time, level, message);
+  browserConsoleRowElementCache.set(entry.id, row);
+  return row;
+}
+
+function browserConsoleSignature(renderCount = Math.min(state.browserConsoleLogs.length, BROWSER_CONSOLE_RENDER_LIMIT)) {
+  const last = state.browserConsoleLogs[state.browserConsoleLogs.length - 1];
+  return `${browserConsoleLogVersion}\t${renderCount}\t${last?.id ?? ''}`;
+}
+
+function activeBrowserFrameForMessage(event: MessageEvent) {
+  if (isBrowserPanelHidden()) return null;
+  const frame = activeBrowserFrame();
+  if (!frame || frame.contentWindow !== event.source) return null;
+  if (frame.classList.contains('hidden')) return null;
+  if (frame.dataset.browserTabId !== state.activeBrowserTabId) return null;
+  return frame;
+}
+
 function handleBrowserConsoleMessage(event: MessageEvent) {
-  const data = event.data;
-  if (!data || typeof data !== 'object') return;
-  const openUrl = (data as { __simpleVibeOpenUrl?: unknown }).__simpleVibeOpenUrl;
+  if (isBrowserPanelHidden()) return;
+  const frame = activeBrowserFrameForMessage(event);
+  if (!frame) return;
+  const data = browserFrameMessagePayload(event.data);
+  if (!data) return;
+  const openUrl = data.__simpleVibeOpenUrl;
   if (typeof openUrl === 'string' && openUrl.trim()) {
     void openPreviewValue(openUrl.trim());
     return;
   }
-  const refresh = (data as { __simpleVibeRefresh?: unknown }).__simpleVibeRefresh;
+  const refresh = data.__simpleVibeRefresh;
   if (refresh && typeof refresh === 'object') {
     refreshPreview(Boolean((refresh as { hard?: unknown }).hard));
     return;
   }
-  const contextMenu = (data as { __simpleVibeContextMenu?: unknown }).__simpleVibeContextMenu;
+  const contextMenu = data.__simpleVibeContextMenu;
   if (contextMenu && typeof contextMenu === 'object') {
     const payload = contextMenu as { x?: unknown; y?: unknown };
     showBrowserContextMenuFromFrame(Number(payload.x), Number(payload.y));
     return;
   }
-  const payload = (data as { simpleVibeConsole?: unknown; __simpleVibeConsole?: unknown }).simpleVibeConsole
-    ?? (data as { simpleVibeConsole?: unknown; __simpleVibeConsole?: unknown }).__simpleVibeConsole;
-  if (!payload || typeof payload !== 'object') return;
+  const dialog = data.__simpleVibeDialog;
+  if (dialog && typeof dialog === 'object') {
+    showBrowserDialogFromFrame(frame, dialog);
+    return;
+  }
+  const batch = data.__simpleVibeConsoleBatch;
+  if (Array.isArray(batch)) {
+    handleBrowserConsoleBatch(batch);
+    return;
+  }
+  const payload = data.simpleVibeConsole ?? data.__simpleVibeConsole;
+  handleBrowserConsoleRecord(payload);
+}
 
-  const record = payload as { level?: string; message?: unknown; args?: unknown[] };
+function browserFrameMessagePayload(data: unknown) {
+  if (!data || typeof data !== 'object') return null;
+  const record = data as {
+    __simpleVibeOpenUrl?: unknown;
+    __simpleVibeRefresh?: unknown;
+    __simpleVibeContextMenu?: unknown;
+    __simpleVibeDialog?: unknown;
+    __simpleVibeConsoleBatch?: unknown;
+    simpleVibeConsole?: unknown;
+    __simpleVibeConsole?: unknown;
+  };
+  if (
+    !('__simpleVibeOpenUrl' in record)
+    && !('__simpleVibeRefresh' in record)
+    && !('__simpleVibeContextMenu' in record)
+    && !('__simpleVibeDialog' in record)
+    && !('__simpleVibeConsoleBatch' in record)
+    && !('simpleVibeConsole' in record)
+    && !('__simpleVibeConsole' in record)
+  ) {
+    return null;
+  }
+  return record;
+}
+
+function showBrowserDialogFromFrame(frame: HTMLIFrameElement, rawPayload: object) {
+  const payload = parseBrowserDialogPayload(rawPayload);
+  if (!payload) return;
+  activateBrowserPanel();
+  const layer = el.browserDialogLayer;
+  layer.replaceChildren();
+  toggleClassIfChanged(layer, 'hidden', false);
+
+  const card = document.createElement('section');
+  card.className = 'browser-dialog-card';
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-modal', 'true');
+  card.setAttribute('aria-label', browserDialogTitle(payload.kind));
+
+  const title = document.createElement('div');
+  title.className = 'browser-dialog-title';
+  title.textContent = browserDialogTitle(payload.kind);
+
+  const message = document.createElement('div');
+  message.className = 'browser-dialog-message';
+  message.textContent = payload.message || '(empty message)';
+
+  const source = document.createElement('div');
+  source.className = 'browser-dialog-source';
+  source.textContent = payload.url || frame.dataset.displayUrl || state.previewUrl || 'Preview page';
+
+  const actions = document.createElement('div');
+  actions.className = 'browser-dialog-actions';
+
+  let input: HTMLInputElement | null = null;
+  if (payload.kind === 'prompt') {
+    input = document.createElement('input');
+    input.className = 'browser-dialog-input';
+    input.value = payload.defaultValue ?? '';
+  }
+
+  const close = (value: unknown) => {
+    sendBrowserDialogResponse(frame, payload.id, value);
+    layer.replaceChildren();
+    toggleClassIfChanged(layer, 'hidden', true);
+  };
+
+  if (payload.kind === 'alert') {
+    const ok = browserDialogButton('OK', true);
+    ok.addEventListener('click', () => close(undefined));
+    actions.append(ok);
+    card.append(title, message, source, actions);
+    layer.append(card);
+    ok.focus();
+    return;
+  }
+
+  const cancel = browserDialogButton('Cancel', false);
+  cancel.addEventListener('click', () => close(payload.kind === 'prompt' ? null : false));
+  const ok = browserDialogButton('OK', true);
+  ok.addEventListener('click', () => close(payload.kind === 'prompt' ? input?.value ?? '' : true));
+  actions.append(cancel, ok);
+  if (input) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        close(input?.value ?? '');
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(null);
+      }
+    });
+    card.append(title, message, input, source, actions);
+  } else {
+    card.append(title, message, source, actions);
+  }
+  layer.append(card);
+  (input ?? ok).focus();
+}
+
+function parseBrowserDialogPayload(rawPayload: object): BrowserDialogPayload | null {
+  const payload = rawPayload as { id?: unknown; kind?: unknown; message?: unknown; defaultValue?: unknown; url?: unknown };
+  const kind = payload.kind === 'confirm' || payload.kind === 'prompt' ? payload.kind : 'alert';
+  return {
+    id: typeof payload.id === 'string' && payload.id ? payload.id : makeBrowserDialogId(),
+    kind,
+    message: typeof payload.message === 'string' ? payload.message : String(payload.message ?? ''),
+    defaultValue: typeof payload.defaultValue === 'string' ? payload.defaultValue : '',
+    url: typeof payload.url === 'string' ? payload.url : ''
+  };
+}
+
+function makeBrowserDialogId() {
+  return `dialog-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function browserDialogTitle(kind: BrowserDialogKind) {
+  if (kind === 'confirm') return 'Confirm';
+  if (kind === 'prompt') return 'Prompt';
+  return 'Alert';
+}
+
+function browserDialogButton(label: string, primary: boolean) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = primary ? 'browser-dialog-primary' : '';
+  button.textContent = label;
+  return button;
+}
+
+function sendBrowserDialogResponse(frame: HTMLIFrameElement, id: string, value: unknown) {
+  try {
+    frame.contentWindow?.postMessage({ __simpleVibeDialogResponse: { id, value } }, '*');
+  } catch {
+    // The frame may be navigating; dialog responses are best-effort.
+  }
+}
+
+function handleBrowserConsoleRecord(payload: unknown) {
+  if (!browserConsoleActuallyVisible()) {
+    queueBrowserConsoleHiddenPayload(payload);
+    return;
+  }
+  const entry = browserConsoleLogEntryFromPayload(payload);
+  if (entry) appendBrowserConsoleLogEntry(entry, { scanForLocalPorts: true });
+}
+
+function handleBrowserConsoleBatch(batch: unknown[]) {
+  if (!browserConsoleActuallyVisible()) {
+    queueBrowserConsoleHiddenPayloads(batch);
+    return;
+  }
+  const entries: BrowserConsoleLog[] = [];
+  const time = browserConsoleTimeText();
+  const formatter = browserConsoleValueFormatter();
+  const limit = browserConsoleRuntimeLogLimit();
+  const start = Math.max(0, batch.length - limit);
+  for (let index = start; index < batch.length; index += 1) {
+    const entry = browserConsoleLogEntryFromPayload(batch[index], time, formatter);
+    if (entry) entries.push(entry);
+  }
+  appendBrowserConsoleLogBatch(entries, { scanForLocalPorts: true });
+}
+
+function browserConsoleLogEntryFromPayload(
+  payload: unknown,
+  time = browserConsoleTimeText(),
+  formatter = browserConsoleValueFormatter()
+) {
+  if (!payload || typeof payload !== 'object') return;
+  const record = payload as { level?: string; message?: unknown; args?: unknown[]; argCount?: unknown };
   const level = record.level === 'warn' || record.level === 'error' ? record.level : 'info';
-  const message = record.args?.map(formatConsoleValue).join(' ') ?? formatConsoleValue(record.message ?? '');
-  if (message) logBrowserConsole(level, message, { scanForLocalPorts: true });
+  const message = formatConsoleMessage(record, formatter);
+  return message ? makeBrowserConsoleLogEntry(level, message, time) : null;
+}
+
+function browserConsoleValueFormatter() {
+  const detailed = browserConsoleActuallyVisible();
+  return detailed ? formatConsoleValue : formatConsoleValueCompact;
+}
+
+function formatConsoleMessage(record: { message?: unknown; args?: unknown[]; argCount?: unknown }, formatter = browserConsoleValueFormatter()) {
+  if (Array.isArray(record.args)) {
+    const limit = Math.min(record.args.length, BROWSER_CONSOLE_ARG_LIMIT);
+    const totalArgs = Number.isFinite(Number(record.argCount))
+      ? Math.max(record.args.length, Math.trunc(Number(record.argCount)))
+      : record.args.length;
+    let message = '';
+    for (let index = 0; index < limit; index += 1) {
+      if (index) message += ' ';
+      message += formatter(record.args[index]);
+    }
+    if (totalArgs > BROWSER_CONSOLE_ARG_LIMIT) {
+      if (message) message += ' ';
+      message += `... +${totalArgs - BROWSER_CONSOLE_ARG_LIMIT} more`;
+    }
+    return truncateConsoleMessage(message);
+  }
+  return truncateConsoleMessage(formatter(record.message ?? ''));
+}
+
+function truncateConsoleMessage(message: string) {
+  if (message.length <= BROWSER_CONSOLE_MESSAGE_MAX_CHARS) return message;
+  return `${message.slice(0, BROWSER_CONSOLE_MESSAGE_MAX_CHARS)} ...[truncated ${message.length - BROWSER_CONSOLE_MESSAGE_MAX_CHARS} chars]`;
+}
+
+function formatConsoleValueCompact(value: unknown) {
+  if (typeof value === 'string') return truncateConsoleMessage(value);
+  if (value == null) return String(value);
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  if (Array.isArray(value)) return `[Array(${value.length})]`;
+  if (typeof value === 'object') {
+    let text = '{';
+    let count = 0;
+    for (const key in value as Record<string, unknown>) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      if (count) text += ',';
+      text += key;
+      count += 1;
+      if (count >= 6) break;
+    }
+    return count ? `${text}}` : '{}';
+  }
+  return String(value);
 }
 
 function maybeAutoForwardBrowserLocalUrl(message: string) {
-  if (!state.activeProfile || state.activeProfile.kind === 'windows') return;
-  const matches = message.matchAll(/\b(?:https?|wss?):\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d{2,5})\b/gi);
-  for (const match of matches) {
+  const profile = state.activeProfile;
+  if (!profile || profile.kind === 'windows') return;
+  const profileId = profile.id;
+  BROWSER_CONSOLE_LOCAL_URL_PORT_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = BROWSER_CONSOLE_LOCAL_URL_PORT_PATTERN.exec(message))) {
     const port = Number(match[1]);
     if (!isPreviewPort(port)) continue;
     if (isPreviewProxyLocalPort(port)) continue;
-    if (state.forwards.some((forward) => forward.remotePort === port)) continue;
-    const key = `browser-dep:${state.activeProfile.id}:${port}`;
+    if (forwardForRemotePort(port)) continue;
+    const key = `browser-dep:${profileId}:${port}`;
     if (autoForwardingPorts.has(key)) continue;
     autoForwardingPorts.add(key);
     void startForwardForPort(port, 'auto')
       .then((forward) => {
-        state.forwards.push(forward);
+        addForward(forward);
         renderForwards();
         logBrowserConsole('info', `Auto forwarded browser dependency port ${port}`);
       })
       .catch((error) => logBrowserConsole('warn', `Auto forward for browser dependency port ${port} failed: ${String(error)}`))
       .finally(() => autoForwardingPorts.delete(key));
   }
+}
+
+function browserConsoleMayContainLocalPreviewPort(message: string) {
+  return message.includes(':')
+    && (message.includes('localhost:')
+    || message.includes('127.0.0.1:')
+    || message.includes('0.0.0.0:')
+    || message.includes('[::1]:')
+    || message.includes('://localhost')
+    || message.includes('://127.0.0.1')
+    || message.includes('://0.0.0.0')
+    || message.includes('://[::1]'));
 }
 
 function showBrowserContextMenuFromFrame(x: number, y: number) {
@@ -9153,17 +15222,72 @@ function showBrowserContextMenuFromFrame(x: number, y: number) {
 }
 
 function formatConsoleValue(value: unknown) {
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return truncateConsoleMessage(value);
   if (value == null) return String(value);
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  if (typeof value !== 'object') return String(value);
+  return truncateConsoleMessage(formatConsoleStructuredValue(value, 0, new WeakSet<object>()));
+}
+
+function formatConsoleStructuredValue(value: unknown, depth: number, seen: WeakSet<object>): string {
+  if (typeof value === 'string') return JSON.stringify(truncateConsoleMessage(value));
+  if (value == null) return String(value);
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  if (typeof value !== 'object') return String(value);
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
   try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
+    return Array.isArray(value)
+      ? formatConsoleArrayValue(value, depth, seen)
+      : formatConsoleObjectValue(value as Record<string, unknown>, depth, seen);
+  } finally {
+    seen.delete(value);
   }
 }
 
+function formatConsoleArrayValue(value: unknown[], depth: number, seen: WeakSet<object>) {
+  if (depth >= BROWSER_CONSOLE_DETAIL_DEPTH_LIMIT) return `[Array(${value.length})]`;
+  const limit = Math.min(value.length, BROWSER_CONSOLE_ARRAY_DETAIL_LIMIT);
+  let text = '[';
+  for (let index = 0; index < limit; index += 1) {
+    if (index) text += ',';
+    text += formatConsoleStructuredValue(value[index], depth + 1, seen);
+    if (text.length >= BROWSER_CONSOLE_STRUCTURED_VALUE_MAX_CHARS) {
+      if (index + 1 < value.length) text += ',...';
+      return `${text}]`;
+    }
+  }
+  if (value.length > limit) {
+    if (limit) text += ',';
+    text += `... +${value.length - limit} more`;
+  }
+  return `${text}]`;
+}
+
+function formatConsoleObjectValue(value: Record<string, unknown>, depth: number, seen: WeakSet<object>) {
+  if (depth >= BROWSER_CONSOLE_DETAIL_DEPTH_LIMIT) return formatConsoleValueCompact(value);
+  let text = '{';
+  let count = 0;
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    if (count >= BROWSER_CONSOLE_OBJECT_DETAIL_KEY_LIMIT) {
+      if (count) text += ',';
+      text += '...';
+      return `${text}}`;
+    }
+    if (count) text += ',';
+    text += `${JSON.stringify(key)}:${formatConsoleStructuredValue(value[key], depth + 1, seen)}`;
+    count += 1;
+    if (text.length >= BROWSER_CONSOLE_STRUCTURED_VALUE_MAX_CHARS) {
+      text += ',...';
+      return `${text}}`;
+    }
+  }
+  return count ? `${text}}` : '{}';
+}
+
 function currentBrowserTab() {
-  return state.browserTabs.find((tab) => tab.id === state.activeBrowserTabId) ?? null;
+  return browserTabForId(state.activeBrowserTabId);
 }
 
 function navigateBrowserHistory(delta: -1 | 1) {
@@ -9211,7 +15335,7 @@ function refreshPreview(hard: boolean) {
   if (activeEdgeCdp && tab.edge && activeEdgeCdp.tabId === tab.id) {
     void edgeCdpSend('Page.reload', { ignoreCache: hard }).then(() => {
       state.previewUrl = tab.url;
-      el.previewUrl.value = tab.url;
+      setInputValueIfChanged(el.previewUrl, tab.url);
       logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
       setStatus(hard ? `Hard refreshed ${tab.url}` : `Reloaded ${tab.url}`);
     }).catch((error) => setStatus(`Browser reload failed: ${String(error)}`, true));
@@ -9223,11 +15347,51 @@ function refreshPreview(hard: boolean) {
     return;
   }
 
-  loadBrowserFrame(tab, { hard });
+  if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(tab.url)) {
+    loadBrowserTabThroughPreviewProxy(tab, { hard, reload: true });
+  } else {
+    loadBrowserFrame(tab, { hard, reload: true });
+  }
   state.previewUrl = tab.url;
-  el.previewUrl.value = tab.url;
+  setInputValueIfChanged(el.previewUrl, tab.url);
   logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
   setStatus(hard ? `Hard refreshed ${tab.url}` : `Reloaded ${tab.url}`);
+}
+
+async function clearBrowserCacheAndReload() {
+  const tab = currentBrowserTab();
+  if (!tab) {
+    setStatus('No browser tab to clear', true);
+    return;
+  }
+
+  if (activeEdgeCdp && tab.edge && activeEdgeCdp.tabId === tab.id) {
+    await edgeCdpSend('Network.clearBrowserCache', {}).catch(() => undefined);
+    await edgeCdpSend('Page.reload', { ignoreCache: true }).then(() => {
+      state.previewUrl = tab.url;
+      setInputValueIfChanged(el.previewUrl, tab.url);
+      logBrowserConsole('info', `Cleared browser cache and reloaded ${tab.url}`);
+      setStatus(`Cleared cache for ${tab.url}`);
+    }).catch((error) => setStatus(`Browser cache clear failed: ${String(error)}`, true));
+    return;
+  }
+
+  const localUrl = localHttpPreviewUrl(tab.url);
+  if (USE_PREVIEW_PROXY_BROWSER && localUrl) {
+    clearPreviewProxyForBrowserTab(tab);
+    loadBrowserTabThroughPreviewProxy(tab, { hard: true, reload: true, clearCache: true });
+  } else {
+    const frame = browserFrameForTab(tab.id);
+    if (frame) {
+      frame.src = 'about:blank';
+      delete frame.dataset.loadedUrl;
+    }
+    loadBrowserFrame(tab, { hard: true, reload: true });
+  }
+  state.previewUrl = tab.url;
+  setInputValueIfChanged(el.previewUrl, tab.url);
+  logBrowserConsole('info', `Cleared preview cache and reloaded ${tab.url}`);
+  setStatus(`Cleared cache for ${tab.url}`);
 }
 
 function makeBrowserTabId() {
@@ -9298,20 +15462,27 @@ function parsePreviewPort(value: string) {
   return isPreviewPort(port) ? port : null;
 }
 
-function detectLocalServerPorts(text: string) {
-  const ports = new Set<number>();
-  const urlPattern = /\b(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b/gi;
-  for (const match of text.matchAll(urlPattern)) {
+function detectNewLocalServerPorts(text: string, seenPorts: Set<number>, onPort: (port: number) => void) {
+  let found = 0;
+  LOCAL_PREVIEW_URL_PORT_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = LOCAL_PREVIEW_URL_PORT_PATTERN.exec(text))) {
     const port = Number(match[1]);
-    if (isPreviewPort(port)) ports.add(port);
+    if (!isPreviewPort(port) || seenPorts.has(port)) continue;
+    seenPorts.add(port);
+    found += 1;
+    onPort(port);
   }
 
-  const listeningPattern = /\b(?:listening|running|available|started|serving|server)\b[^\r\n]{0,80}\b(?:port\s*)?(\d{4,5})\b/gi;
-  for (const match of text.matchAll(listeningPattern)) {
+  LOCAL_PREVIEW_LISTENING_PORT_PATTERN.lastIndex = 0;
+  while ((match = LOCAL_PREVIEW_LISTENING_PORT_PATTERN.exec(text))) {
     const port = Number(match[1]);
-    if (isPreviewPort(port)) ports.add(port);
+    if (!isPreviewPort(port) || seenPorts.has(port)) continue;
+    seenPorts.add(port);
+    found += 1;
+    onPort(port);
   }
-  return [...ports];
+  return found;
 }
 
 function isPreviewPort(port: number) {
@@ -9323,12 +15494,27 @@ function stripAnsi(value: string) {
 }
 
 function trimPortScanBuffer(value: string) {
-  return value.length > TERMINAL_PORT_SCAN_LIMIT
-    ? value.slice(value.length - TERMINAL_PORT_SCAN_LIMIT)
-    : value;
+  return trimLimitedTextBuffer(value, TERMINAL_PORT_SCAN_LIMIT);
+}
+
+function appendLimitedTextBuffer(buffer: string, data: string, limit: number) {
+  if (!data) return buffer;
+  if (data.length >= limit) return data.slice(data.length - limit);
+  const overflow = buffer.length + data.length - limit;
+  return overflow > 0 ? `${buffer.slice(overflow)}${data}` : `${buffer}${data}`;
+}
+
+function trimLimitedTextBuffer(value: string, limit: number) {
+  return value.length > limit ? value.slice(value.length - limit) : value;
 }
 
 function renderBrowserDeviceOptions() {
+  const signature = browserDeviceOptionsSignature();
+  if (browserDeviceOptionsRenderSignature === signature && el.deviceSelect.childElementCount > 0) {
+    if (el.deviceSelect.value !== 'desktop') el.deviceSelect.value = 'desktop';
+    return;
+  }
+  browserDeviceOptionsRenderSignature = signature;
   el.deviceSelect.innerHTML = '';
   const desktop = document.createElement('option');
   desktop.value = 'desktop';
@@ -9337,7 +15523,8 @@ function renderBrowserDeviceOptions() {
   for (const kind of ['phone', 'tablet'] as const) {
     const group = document.createElement('optgroup');
     group.label = kind === 'phone' ? 'Phones' : 'Tablets';
-    for (const preset of BROWSER_DEVICE_PRESETS.filter((item) => item.kind === kind)) {
+    for (const preset of BROWSER_DEVICE_PRESETS) {
+      if (preset.kind !== kind) continue;
       const option = document.createElement('option');
       option.value = preset.id;
       option.textContent = `${preset.label} (${preset.width} x ${preset.height})`;
@@ -9348,38 +15535,49 @@ function renderBrowserDeviceOptions() {
   el.deviceSelect.value = 'desktop';
 }
 
-function setBrowserMode(mode: 'desktop' | 'device') {
+function browserDeviceOptionsSignature() {
+  let signature = 'desktop\tDesktop';
+  for (const preset of BROWSER_DEVICE_PRESETS) {
+    signature += `\n${preset.kind}\t${preset.id}\t${preset.label}\t${preset.width}\t${preset.height}`;
+  }
+  return signature;
+}
+
+function browserDevicePreset(id = state.browserDeviceId) {
+  return BROWSER_DEVICE_PRESET_BY_ID.get(id) ?? BROWSER_DEVICE_PRESETS[0];
+}
+
+function setBrowserMode(mode: 'desktop' | 'device', options: { skipFrameSizing?: boolean; skipSave?: boolean } = {}) {
   const isDesktop = mode === 'desktop';
-  el.browserShell.classList.toggle('device', !isDesktop);
-  el.browserShell.classList.toggle('desktop', isDesktop);
-  el.desktopSize?.classList.toggle('active', isDesktop);
-  el.deviceSelect.classList.toggle('active', !isDesktop);
-  el.rotateDevice.disabled = isDesktop;
+  if (isDesktop) state.browserDeviceId = 'desktop';
+  toggleClassIfChanged(el.browserShell, 'device', !isDesktop);
+  toggleClassIfChanged(el.browserShell, 'desktop', isDesktop);
+  if (el.desktopSize) toggleClassIfChanged(el.desktopSize, 'active', isDesktop);
+  toggleClassIfChanged(el.deviceSelect, 'active', !isDesktop);
+  setDisabledIfChanged(el.rotateDevice, isDesktop);
 
   if (isDesktop) {
-    el.deviceSelect.value = 'desktop';
-    previewFrames().forEach((frame) => {
-      frame.style.width = '';
-      frame.style.height = '';
-      frame.title = state.browserTabs.find((tab) => tab.id === frame.dataset.browserTabId)?.label ?? 'local preview';
-    });
-    el.browserShell.dataset.device = 'Desktop';
-    el.rotateDevice.textContent = 'Rotate';
-    applyEdgePreviewSizing();
-    scheduleConfigureEdgeViewport();
-    saveActiveWorkspaceSnapshot();
+    if (el.deviceSelect.value !== 'desktop') el.deviceSelect.value = 'desktop';
+    if (!options.skipFrameSizing) applyBrowserFrameSizingForActiveFrame();
+    setDatasetValueIfChanged(el.browserShell, 'device', 'Desktop');
+    setElementTextIfChanged(el.rotateDevice, 'Rotate');
+    if (!options.skipFrameSizing) {
+      applyEdgePreviewSizing();
+      scheduleConfigureEdgeViewport();
+    }
+    if (!options.skipSave) saveActiveWorkspaceSnapshot();
     return;
   }
 
-  applyBrowserDevice();
-  saveActiveWorkspaceSnapshot();
+  applyBrowserDevice({ skipFrameSizing: options.skipFrameSizing });
+  if (!options.skipSave) saveActiveWorkspaceSnapshot();
 }
 
-function setBrowserDevice(id: string) {
-  if (!BROWSER_DEVICE_PRESETS.some((preset) => preset.id === id)) return;
+function setBrowserDevice(id: string, options: { skipFrameSizing?: boolean; skipSave?: boolean } = {}) {
+  if (!BROWSER_DEVICE_PRESET_BY_ID.has(id)) return;
   state.browserDeviceId = id;
-  el.deviceSelect.value = id;
-  setBrowserMode('device');
+  if (el.deviceSelect.value !== id) el.deviceSelect.value = id;
+  setBrowserMode('device', options);
 }
 
 function rotateBrowserDevice() {
@@ -9387,32 +15585,60 @@ function rotateBrowserDevice() {
   setBrowserMode('device');
 }
 
-function applyBrowserDevice() {
-  const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+function applyBrowserDevice(options: { skipFrameSizing?: boolean } = {}) {
+  const preset = browserDevicePreset();
   const portrait = state.browserOrientation === 'portrait';
   const width = portrait ? preset.width : preset.height;
   const height = portrait ? preset.height : preset.width;
-  previewFrames().forEach((frame) => {
-    frame.style.width = `${width}px`;
-    frame.style.height = `${height}px`;
-    frame.title = `${preset.label} ${width} x ${height}`;
-  });
-  el.browserShell.dataset.device = `${preset.label} ${width} x ${height}`;
-  el.rotateDevice.textContent = portrait ? 'Rotate' : 'Portrait';
-  applyEdgePreviewSizing();
-  scheduleConfigureEdgeViewport();
+  if (!options.skipFrameSizing) {
+    applyBrowserFrameSizingForActiveFrame();
+  }
+  setDatasetValueIfChanged(el.browserShell, 'device', `${preset.label} ${width} x ${height}`);
+  setElementTextIfChanged(el.rotateDevice, portrait ? 'Rotate' : 'Portrait');
+  if (!options.skipFrameSizing) {
+    applyEdgePreviewSizing();
+    scheduleConfigureEdgeViewport();
+  }
 }
 
 function applyBrowserFrameSizing(frame: HTMLIFrameElement) {
+  const signature = browserFrameSizingSignature();
+  if (frame.dataset.browserSizingSignature === signature) return;
+  frame.dataset.browserSizingSignature = signature;
   if (el.browserShell.classList.contains('desktop')) {
-    frame.style.width = '';
-    frame.style.height = '';
+    if (frame.style.width) frame.style.width = '';
+    if (frame.style.height) frame.style.height = '';
     return;
   }
-  const preset = BROWSER_DEVICE_PRESETS.find((item) => item.id === state.browserDeviceId) ?? BROWSER_DEVICE_PRESETS[0];
+  const preset = browserDevicePreset();
   const portrait = state.browserOrientation === 'portrait';
-  frame.style.width = `${portrait ? preset.width : preset.height}px`;
-  frame.style.height = `${portrait ? preset.height : preset.width}px`;
+  const width = `${portrait ? preset.width : preset.height}px`;
+  const height = `${portrait ? preset.height : preset.width}px`;
+  if (frame.style.width !== width) frame.style.width = width;
+  if (frame.style.height !== height) frame.style.height = height;
+}
+
+function applyBrowserFrameSizingForActiveFrame() {
+  const frame = activeBrowserFrame();
+  if (!frame) return;
+  applyBrowserFrameSizing(frame);
+  const tab = currentBrowserTab();
+  const title = tab ? browserFrameTitle(tab) : 'local preview';
+  if (frame.title !== title) frame.title = title;
+}
+
+function browserFrameTitle(tab: BrowserTab) {
+  if (el.browserShell.classList.contains('desktop')) return tab.label || browserTabLabel(tab.url);
+  const preset = browserDevicePreset();
+  const portrait = state.browserOrientation === 'portrait';
+  const width = portrait ? preset.width : preset.height;
+  const height = portrait ? preset.height : preset.width;
+  return `${preset.label} ${width} x ${height}`;
+}
+
+function browserFrameSizingSignature() {
+  if (el.browserShell.classList.contains('desktop')) return 'desktop';
+  return `${state.browserDeviceId}:${state.browserOrientation}`;
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {
@@ -9454,11 +15680,45 @@ function sameExplorerPath(a: string, b: string): boolean {
 }
 
 function explorerPathKey(path: string): string {
+  const cached = explorerPathKeyCache.get(path);
+  if (cached) return cached;
   const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
-  if (/^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//')) {
-    return normalized.toLocaleLowerCase();
+  const key = /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//')
+    ? normalized.toLocaleLowerCase()
+    : normalized;
+  explorerPathKeyCache.set(path, key);
+  pruneExplorerPathKeyCache();
+  return key;
+}
+
+function pruneExplorerPathKeyCache() {
+  if (explorerPathKeyCache.size <= EXPLORER_PATH_KEY_CACHE_LIMIT + EXPLORER_PATH_KEY_CACHE_PRUNE_BATCH) return;
+  if (explorerCachePruneBusy()) {
+    scheduleExplorerPathKeyCachePrune();
+    if (explorerPathKeyCache.size <= EXPLORER_PATH_KEY_CACHE_BUSY_LIMIT) return;
+    pruneExplorerPathKeyCacheEntries(EXPLORER_PATH_KEY_CACHE_PRUNE_BATCH);
+    return;
   }
-  return normalized;
+  pruneExplorerPathKeyCacheEntries();
+}
+
+function pruneExplorerPathKeyCacheEntries(maxDeletes = Number.POSITIVE_INFINITY) {
+  let deleted = 0;
+  while (explorerPathKeyCache.size > EXPLORER_PATH_KEY_CACHE_LIMIT && deleted < maxDeletes) {
+    const oldest = explorerPathKeyCache.keys().next().value;
+    if (oldest === undefined) break;
+    explorerPathKeyCache.delete(oldest);
+    deleted += 1;
+  }
+}
+
+function scheduleExplorerPathKeyCachePrune() {
+  if (explorerPathKeyCachePruneTimer) return;
+  const delay = Math.max(120, explorerScrollingUntil - Date.now() + EXPLORER_SCROLL_IDLE_MS);
+  explorerPathKeyCachePruneTimer = window.setTimeout(() => {
+    explorerPathKeyCachePruneTimer = 0;
+    runWhenUiIdle(pruneExplorerPathKeyCache, 620);
+  }, delay);
 }
 
 function formatBytes(bytes: number): string {
@@ -9469,16 +15729,6 @@ function formatBytes(bytes: number): string {
 
 function isImagePath(path: string): boolean {
   return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path);
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>'"]/g, (char) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    "'": '&#39;',
-    '"': '&quot;'
-  })[char] ?? char);
 }
 
 init().catch((error) => setStatus(String(error), true));

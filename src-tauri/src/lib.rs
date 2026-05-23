@@ -2,6 +2,7 @@ use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -39,6 +40,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+const LOCAL_DIRECTORY_BATCH_PARALLELISM: usize = 4;
+const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 
 type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 
@@ -224,7 +228,30 @@ struct ConnectionProfile {
 struct FileEntry {
     name: String,
     path: String,
-    kind: String,
+    kind: &'static str,
+    size: u64,
+    hidden: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryListingResult {
+    path: String,
+    entries: Vec<FileEntry>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectorySignatureResult {
+    path: String,
+    signature: String,
+    error: Option<String>,
+}
+
+struct DirectorySignatureEntry {
+    name: String,
+    kind: &'static str,
     size: u64,
     hidden: bool,
 }
@@ -533,19 +560,72 @@ fn resolve_profile_path(profile_id: String, path: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-fn list_directory(profile_id: String, path: String) -> Result<Vec<FileEntry>, String> {
+fn list_directory(
+    profile_id: String,
+    path: String,
+    include_sizes: Option<bool>,
+) -> Result<Vec<FileEntry>, String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
+    let include_sizes = include_sizes.unwrap_or(true);
     match profile.kind.as_str() {
-        "windows" => list_local_directory(Path::new(&path)),
+        "windows" => list_local_directory(Path::new(&path), include_sizes),
         "wsl" => {
             if let Some(windows_path) = wsl_posix_path_to_windows_path(&profile, &path) {
-                list_wsl_directory(&windows_path, &path)
+                list_wsl_directory(&windows_path, &path, include_sizes)
             } else {
-                list_remote_directory(&profile, &path)
+                list_remote_directory(&profile, &path, include_sizes)
             }
         }
-        "ssh" => list_remote_directory(&profile, &path),
+        "ssh" => list_remote_directory(&profile, &path, include_sizes),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+#[tauri::command]
+fn list_directories(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    let profile = profile_from_id(&profile_id);
+    let include_sizes = include_sizes.unwrap_or(true);
+    let paths: Vec<String> = paths
+        .into_iter()
+        .map(|path| normalize_profile_path(&profile, &path))
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+
+    match profile.kind.as_str() {
+        "windows" => Ok(list_local_directories(paths, include_sizes)),
+        "wsl" => list_wsl_directories(&profile, &paths, include_sizes),
+        "ssh" => list_remote_directories(&profile, &paths, include_sizes),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+#[tauri::command]
+fn directory_signatures(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+) -> Result<Vec<DirectorySignatureResult>, String> {
+    let profile = profile_from_id(&profile_id);
+    let include_sizes = include_sizes.unwrap_or(true);
+    let paths: Vec<String> = paths
+        .into_iter()
+        .map(|path| normalize_profile_path(&profile, &path))
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+
+    match profile.kind.as_str() {
+        "windows" => Ok(list_local_directory_signatures(paths, include_sizes)),
+        "wsl" => list_wsl_directory_signatures(&profile, &paths, include_sizes),
+        "ssh" => Ok(directory_signatures_from_listings(list_remote_directories(
+            &profile,
+            &paths,
+            include_sizes,
+        )?)),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
 }
@@ -1531,7 +1611,14 @@ fn allocate_local_port() -> Result<u16, String> {
 
 fn wait_for_edge_devtools(port: u16) -> Result<(), String> {
     for _ in 0..36 {
-        if devtools_http_request_with_timeout(port, "GET", "/json/version", Duration::from_millis(350)).is_ok() {
+        if devtools_http_request_with_timeout(
+            port,
+            "GET",
+            "/json/version",
+            Duration::from_millis(350),
+        )
+        .is_ok()
+        {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(120));
@@ -1847,10 +1934,17 @@ fn terminal_command(
             let remote_command = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
                 format!(
                     "bash -lic {}",
-                    shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command)))
+                    shell_quote(&bash_bootstrap_script(
+                        Some(cwd),
+                        Some(&profile.root),
+                        Some(&command)
+                    ))
                 )
             } else {
-                format!("bash -lc {}", shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None)))
+                format!(
+                    "bash -lc {}",
+                    shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None))
+                )
             };
             (
                 "ssh.exe".to_string(),
@@ -1879,7 +1973,11 @@ fn terminal_command(
     }
 }
 
-fn bash_bootstrap_script(cwd: Option<&str>, fallback_cwd: Option<&str>, command: Option<&str>) -> String {
+fn bash_bootstrap_script(
+    cwd: Option<&str>,
+    fallback_cwd: Option<&str>,
+    command: Option<&str>,
+) -> String {
     let mut script = String::new();
     script.push_str(&format!(
         "__svide_start_cwd={}\n\
@@ -1901,7 +1999,7 @@ fi\n",
     if let Some(command) = command {
         script.push_str(command);
         script.push_str(
-        "\n_status=$?\n\
+            "\n_status=$?\n\
 if [ $_status -ne 0 ]; then\n\
   printf '\\n[simple-vibe-ide] command exited with status %s\\n' \"$_status\"\n\
 fi\n",
@@ -1920,96 +2018,842 @@ __SVIDE_RC__\n\
     script
 }
 
-fn list_local_directory(path: &Path) -> Result<Vec<FileEntry>, String> {
-    let mut entries = Vec::new();
-    for item in fs::read_dir(path).map_err(|err| err.to_string())? {
+fn list_local_directory(path: &Path, include_sizes: bool) -> Result<Vec<FileEntry>, String> {
+    let read_dir = fs::read_dir(path).map_err(|err| err.to_string())?;
+    let mut entries = Vec::with_capacity(read_dir.size_hint().0);
+    for item in read_dir {
         let item = item.map_err(|err| err.to_string())?;
-        let meta = item.metadata().map_err(|err| err.to_string())?;
+        let file_type = item.file_type().map_err(|err| err.to_string())?;
         let file_name = item.file_name().to_string_lossy().to_string();
-        let kind = if meta.is_dir() {
+        let kind = if file_type.is_dir() {
             "dir"
-        } else if meta.is_file() {
+        } else if file_type.is_file() {
             "file"
         } else {
             "other"
+        };
+        let size = if include_sizes && file_type.is_file() {
+            item.metadata().map(|meta| meta.len()).unwrap_or(0)
+        } else {
+            0
         };
         entries.push(FileEntry {
             hidden: file_name.starts_with('.'),
             name: file_name,
             path: item.path().to_string_lossy().to_string(),
-            kind: kind.to_string(),
-            size: meta.len(),
+            kind,
+            size,
         });
     }
     sort_entries(entries)
 }
 
-fn list_wsl_directory(windows_path: &Path, posix_path: &str) -> Result<Vec<FileEntry>, String> {
-    let mut entries = Vec::new();
-    for item in fs::read_dir(windows_path).map_err(|err| err.to_string())? {
+fn list_local_directories(paths: Vec<String>, include_sizes: bool) -> Vec<DirectoryListingResult> {
+    if paths.len() <= 1 {
+        return paths
+            .into_iter()
+            .map(|path| {
+                directory_listing_from_result(
+                    path.clone(),
+                    list_local_directory(Path::new(&path), include_sizes),
+                )
+            })
+            .collect();
+    }
+
+    let worker_count = paths.len().min(LOCAL_DIRECTORY_BATCH_PARALLELISM);
+    let chunk_size = (paths.len() + worker_count - 1) / worker_count;
+    let mut results: Vec<Option<DirectoryListingResult>> = (0..paths.len()).map(|_| None).collect();
+
+    let mut handles = Vec::new();
+    for (chunk_index, chunk) in paths.chunks(chunk_size).enumerate() {
+        let start_index = chunk_index * chunk_size;
+        let chunk_paths = chunk
+            .iter()
+            .enumerate()
+            .map(|(offset, path)| (start_index + offset, path.clone()))
+            .collect::<Vec<_>>();
+        handles.push(thread::spawn(move || {
+            chunk_paths
+                .into_iter()
+                .map(|(index, path)| {
+                    (
+                        index,
+                        directory_listing_from_result(
+                            path.clone(),
+                            list_local_directory(Path::new(&path), include_sizes),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }));
+    }
+
+    for handle in handles {
+        if let Ok(listings) = handle.join() {
+            for (index, listing) in listings {
+                if let Some(slot) = results.get_mut(index) {
+                    *slot = Some(listing);
+                }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| DirectoryListingResult {
+                path: paths.get(index).cloned().unwrap_or_default(),
+                entries: Vec::new(),
+                error: Some("directory listing worker failed".to_string()),
+            })
+        })
+        .collect()
+}
+
+fn list_local_directory_signatures(
+    paths: Vec<String>,
+    include_sizes: bool,
+) -> Vec<DirectorySignatureResult> {
+    if paths.len() <= 1 {
+        return paths
+            .into_iter()
+            .map(|path| {
+                directory_signature_from_result(
+                    path.clone(),
+                    local_directory_signature(Path::new(&path), include_sizes),
+                )
+            })
+            .collect();
+    }
+
+    let worker_count = paths.len().min(LOCAL_DIRECTORY_BATCH_PARALLELISM);
+    let chunk_size = (paths.len() + worker_count - 1) / worker_count;
+    let mut results: Vec<Option<DirectorySignatureResult>> =
+        (0..paths.len()).map(|_| None).collect();
+
+    let mut handles = Vec::new();
+    for (chunk_index, chunk) in paths.chunks(chunk_size).enumerate() {
+        let start_index = chunk_index * chunk_size;
+        let chunk_paths = chunk
+            .iter()
+            .enumerate()
+            .map(|(offset, path)| (start_index + offset, path.clone()))
+            .collect::<Vec<_>>();
+        handles.push(thread::spawn(move || {
+            chunk_paths
+                .into_iter()
+                .map(|(index, path)| {
+                    (
+                        index,
+                        directory_signature_from_result(
+                            path.clone(),
+                            local_directory_signature(Path::new(&path), include_sizes),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }));
+    }
+
+    for handle in handles {
+        if let Ok(signatures) = handle.join() {
+            for (index, signature) in signatures {
+                if let Some(slot) = results.get_mut(index) {
+                    *slot = Some(signature);
+                }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| DirectorySignatureResult {
+                path: paths.get(index).cloned().unwrap_or_default(),
+                signature: String::new(),
+                error: Some("directory signature worker failed".to_string()),
+            })
+        })
+        .collect()
+}
+
+fn local_directory_signature(path: &Path, include_sizes: bool) -> Result<String, String> {
+    let read_dir = fs::read_dir(path).map_err(|err| err.to_string())?;
+    let mut entries = Vec::with_capacity(read_dir.size_hint().0);
+    for item in read_dir {
         let item = item.map_err(|err| err.to_string())?;
-        let meta = item.metadata().map_err(|err| err.to_string())?;
+        let file_type = item.file_type().map_err(|err| err.to_string())?;
         let name = item.file_name().to_string_lossy().to_string();
-        let kind = if meta.is_dir() {
+        let kind = if file_type.is_dir() {
             "dir"
-        } else if meta.is_file() {
+        } else if file_type.is_file() {
             "file"
         } else {
             "other"
+        };
+        let size = if include_sizes && file_type.is_file() {
+            item.metadata().map(|meta| meta.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        entries.push(DirectorySignatureEntry {
+            hidden: name.starts_with('.'),
+            name,
+            kind,
+            size,
+        });
+    }
+    entries.sort_by(|left, right| {
+        directory_kind_order(left.kind)
+            .cmp(&directory_kind_order(right.kind))
+            .then_with(|| compare_entry_names(&left.name, &right.name))
+    });
+    Ok(directory_signature_from_signature_entries(&entries))
+}
+
+fn list_wsl_directory(
+    windows_path: &Path,
+    posix_path: &str,
+    include_sizes: bool,
+) -> Result<Vec<FileEntry>, String> {
+    let read_dir = fs::read_dir(windows_path).map_err(|err| err.to_string())?;
+    let mut entries = Vec::with_capacity(read_dir.size_hint().0);
+    for item in read_dir {
+        let item = item.map_err(|err| err.to_string())?;
+        let file_type = item.file_type().map_err(|err| err.to_string())?;
+        let name = item.file_name().to_string_lossy().to_string();
+        let kind = if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let size = if include_sizes && file_type.is_file() {
+            item.metadata().map(|meta| meta.len()).unwrap_or(0)
+        } else {
+            0
         };
         entries.push(FileEntry {
             path: join_posix(posix_path, &name),
             hidden: name.starts_with('.'),
             name,
-            kind: kind.to_string(),
-            size: meta.len(),
+            kind,
+            size,
         });
     }
     sort_entries(entries)
 }
 
+fn list_wsl_directories(
+    profile: &ConnectionProfile,
+    paths: &[String],
+    include_sizes: bool,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results: Vec<Option<DirectoryListingResult>> = (0..paths.len()).map(|_| None).collect();
+    let mut local_jobs = Vec::new();
+    let mut remote_indexes = Vec::new();
+    let mut remote_paths = Vec::new();
+
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(windows_path) = wsl_posix_path_to_windows_path(profile, path) {
+            local_jobs.push((index, path.clone(), windows_path));
+        } else {
+            remote_indexes.push(index);
+            remote_paths.push(path.clone());
+        }
+    }
+
+    let local_worker_count = local_jobs.len().min(WSL_DIRECTORY_BATCH_PARALLELISM);
+    if local_worker_count <= 1 {
+        for (index, path, windows_path) in local_jobs {
+            match list_wsl_directory(&windows_path, &path, include_sizes) {
+                Ok(entries) => {
+                    results[index] = Some(DirectoryListingResult {
+                        path,
+                        entries,
+                        error: None,
+                    });
+                }
+                Err(error) if should_skip_wsl_shell_fallback(&error) => {
+                    results[index] = Some(DirectoryListingResult {
+                        path,
+                        entries: Vec::new(),
+                        error: Some(error),
+                    });
+                }
+                Err(_) => {
+                    remote_indexes.push(index);
+                    remote_paths.push(path);
+                }
+            }
+        }
+    } else {
+        let chunk_size = (local_jobs.len() + local_worker_count - 1) / local_worker_count;
+        let mut handles = Vec::new();
+        for chunk in local_jobs.chunks(chunk_size) {
+            let chunk_jobs = chunk.to_vec();
+            handles.push(thread::spawn(move || {
+                chunk_jobs
+                    .into_iter()
+                    .map(|(index, path, windows_path)| {
+                        let result = match list_wsl_directory(&windows_path, &path, include_sizes) {
+                            Ok(entries) => Some(DirectoryListingResult {
+                                path: path.clone(),
+                                entries,
+                                error: None,
+                            }),
+                            Err(error) if should_skip_wsl_shell_fallback(&error) => {
+                                Some(DirectoryListingResult {
+                                    path: path.clone(),
+                                    entries: Vec::new(),
+                                    error: Some(error),
+                                })
+                            }
+                            Err(_) => None,
+                        };
+                        (index, path, result)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        for handle in handles {
+            if let Ok(listings) = handle.join() {
+                for (index, path, listing) in listings {
+                    if let Some(listing) = listing {
+                        results[index] = Some(listing);
+                    } else {
+                        remote_indexes.push(index);
+                        remote_paths.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if !remote_paths.is_empty() {
+        for (index, result) in remote_indexes.into_iter().zip(list_remote_directories(
+            profile,
+            &remote_paths,
+            include_sizes,
+        )?) {
+            results[index] = Some(result);
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| DirectoryListingResult {
+                path: paths[index].clone(),
+                entries: Vec::new(),
+                error: Some("directory listing was unavailable".to_string()),
+            })
+        })
+        .collect())
+}
+
+fn list_wsl_directory_signatures(
+    profile: &ConnectionProfile,
+    paths: &[String],
+    include_sizes: bool,
+) -> Result<Vec<DirectorySignatureResult>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results: Vec<Option<DirectorySignatureResult>> =
+        (0..paths.len()).map(|_| None).collect();
+    let mut local_jobs = Vec::new();
+    let mut remote_indexes = Vec::new();
+    let mut remote_paths = Vec::new();
+
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(windows_path) = wsl_posix_path_to_windows_path(profile, path) {
+            local_jobs.push((index, path.clone(), windows_path));
+        } else {
+            remote_indexes.push(index);
+            remote_paths.push(path.clone());
+        }
+    }
+
+    let local_worker_count = local_jobs.len().min(WSL_DIRECTORY_BATCH_PARALLELISM);
+    if local_worker_count <= 1 {
+        for (index, path, windows_path) in local_jobs {
+            match local_directory_signature(&windows_path, include_sizes) {
+                Ok(signature) => {
+                    results[index] = Some(DirectorySignatureResult {
+                        path,
+                        signature,
+                        error: None,
+                    });
+                }
+                Err(error) if should_skip_wsl_shell_fallback(&error) => {
+                    results[index] = Some(DirectorySignatureResult {
+                        path,
+                        signature: String::new(),
+                        error: Some(error),
+                    });
+                }
+                Err(_) => {
+                    remote_indexes.push(index);
+                    remote_paths.push(path);
+                }
+            }
+        }
+    } else {
+        let chunk_size = (local_jobs.len() + local_worker_count - 1) / local_worker_count;
+        let mut handles = Vec::new();
+        for chunk in local_jobs.chunks(chunk_size) {
+            let chunk_jobs = chunk.to_vec();
+            handles.push(thread::spawn(move || {
+                chunk_jobs
+                    .into_iter()
+                    .map(|(index, path, windows_path)| {
+                        let result = match local_directory_signature(&windows_path, include_sizes) {
+                            Ok(signature) => Some(DirectorySignatureResult {
+                                path: path.clone(),
+                                signature,
+                                error: None,
+                            }),
+                            Err(error) if should_skip_wsl_shell_fallback(&error) => {
+                                Some(DirectorySignatureResult {
+                                    path: path.clone(),
+                                    signature: String::new(),
+                                    error: Some(error),
+                                })
+                            }
+                            Err(_) => None,
+                        };
+                        (index, path, result)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        for handle in handles {
+            if let Ok(signatures) = handle.join() {
+                for (index, path, signature) in signatures {
+                    if let Some(signature) = signature {
+                        results[index] = Some(signature);
+                    } else {
+                        remote_indexes.push(index);
+                        remote_paths.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if !remote_paths.is_empty() {
+        let remote_signatures = directory_signatures_from_listings(list_remote_directories(
+            profile,
+            &remote_paths,
+            include_sizes,
+        )?);
+        for (index, result) in remote_indexes.into_iter().zip(remote_signatures) {
+            results[index] = Some(result);
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| DirectorySignatureResult {
+                path: paths[index].clone(),
+                signature: String::new(),
+                error: Some("directory signature was unavailable".to_string()),
+            })
+        })
+        .collect())
+}
+
+fn should_skip_wsl_shell_fallback(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("cannot find")
+        || lower.contains("no such file")
+        || lower.contains("not a directory")
+        || lower.contains("access is denied")
+        || lower.contains("permission denied")
+        || lower.contains("os error 2")
+        || lower.contains("os error 3")
+        || lower.contains("os error 5")
+        || lower.contains("os error 20")
+}
+
 fn list_remote_directory(
     profile: &ConnectionProfile,
     path: &str,
+    include_sizes: bool,
 ) -> Result<Vec<FileEntry>, String> {
     let quoted_path = shell_quote(path);
+    let size_format = if include_sizes { "%s" } else { "0" };
     let script = format!(
         r#"if [ ! -d {quoted_path} ]; then echo "not a directory" >&2; exit 2; fi
-find {quoted_path} -mindepth 1 -maxdepth 1 -printf '%y\t%s\t%f\n' 2>/dev/null || exit 3
+find {quoted_path} -mindepth 1 -maxdepth 1 -printf '%y\t{size_format}\t%f\n' 2>/dev/null || exit 3
 "#,
     );
     let bytes = run_profile_shell(profile, &script, None)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut entries = Vec::new();
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.len() != 3 {
+        let mut parts = line.splitn(3, '\t');
+        let Some(kind_text) = parts.next() else {
             continue;
-        }
-        let kind = match parts[0] {
+        };
+        let Some(size_text) = parts.next() else {
+            continue;
+        };
+        let Some(name_text) = parts.next() else {
+            continue;
+        };
+        let kind = match kind_text {
             "d" => "dir",
             "f" => "file",
             _ => "other",
         };
-        let name = parts[2].to_string();
+        let name = name_text.to_string();
         entries.push(FileEntry {
             path: join_posix(path, &name),
             hidden: name.starts_with('.'),
             name,
-            kind: kind.to_string(),
-            size: parts[1].parse().unwrap_or(0),
+            kind,
+            size: if include_sizes {
+                size_text.parse().unwrap_or(0)
+            } else {
+                0
+            },
         });
     }
     sort_entries(entries)
 }
 
+fn list_remote_directories(
+    profile: &ConnectionProfile,
+    paths: &[String],
+    include_sizes: bool,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let size_format = if include_sizes { "%s" } else { "0" };
+    let mut script = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        let quoted_path = shell_quote(path);
+        script.push_str(&format!(
+            "printf '__SVIDE_DIR_BEGIN__\\t{index}\\n'\n\
+if [ -d {quoted_path} ]; then\n\
+  find {quoted_path} -mindepth 1 -maxdepth 1 -printf '%y\\t{size_format}\\t%f\\n' 2>/dev/null || printf '__SVIDE_DIR_ERROR__\\t{index}\\tfind failed\\n'\n\
+else\n\
+  printf '__SVIDE_DIR_ERROR__\\t{index}\\tnot a directory\\n'\n\
+fi\n\
+printf '__SVIDE_DIR_END__\\t{index}\\n'\n"
+        ));
+    }
+
+    let bytes = run_profile_shell(profile, &script, None)?;
+    Ok(parse_remote_directory_batch(
+        paths,
+        &String::from_utf8_lossy(&bytes),
+        include_sizes,
+    ))
+}
+
+fn parse_remote_directory_batch(
+    paths: &[String],
+    text: &str,
+    include_sizes: bool,
+) -> Vec<DirectoryListingResult> {
+    let mut results: Vec<DirectoryListingResult> = paths
+        .iter()
+        .map(|path| DirectoryListingResult {
+            path: path.clone(),
+            entries: Vec::new(),
+            error: None,
+        })
+        .collect();
+    let mut current: Option<usize> = None;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("__SVIDE_DIR_BEGIN__\t") {
+            current = rest
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index < results.len());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("__SVIDE_DIR_END__\t") {
+            if current == rest.parse::<usize>().ok() {
+                current = None;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("__SVIDE_DIR_ERROR__\t") {
+            let mut parts = rest.splitn(2, '\t');
+            let Some(index_text) = parts.next() else {
+                continue;
+            };
+            if let Ok(index) = index_text.parse::<usize>() {
+                if let Some(result) = results.get_mut(index) {
+                    result.error = Some(
+                        parts
+                            .next()
+                            .unwrap_or("directory listing failed")
+                            .to_string(),
+                    );
+                }
+            }
+            continue;
+        }
+
+        let Some(index) = current else {
+            continue;
+        };
+        let Some(result) = results.get_mut(index) else {
+            continue;
+        };
+        if result.error.is_some() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let Some(kind_text) = parts.next() else {
+            continue;
+        };
+        let Some(size_text) = parts.next() else {
+            continue;
+        };
+        let Some(name_text) = parts.next() else {
+            continue;
+        };
+        let kind = match kind_text {
+            "d" => "dir",
+            "f" => "file",
+            _ => "other",
+        };
+        let name = name_text.to_string();
+        result.entries.push(FileEntry {
+            path: join_posix(&result.path, &name),
+            hidden: name.starts_with('.'),
+            name,
+            kind,
+            size: if include_sizes {
+                size_text.parse().unwrap_or(0)
+            } else {
+                0
+            },
+        });
+    }
+
+    for result in &mut results {
+        if result.error.is_none() {
+            result.entries = sort_entries(std::mem::take(&mut result.entries)).unwrap_or_default();
+        }
+    }
+    results
+}
+
+fn directory_listing_from_result(
+    path: String,
+    result: Result<Vec<FileEntry>, String>,
+) -> DirectoryListingResult {
+    match result {
+        Ok(entries) => DirectoryListingResult {
+            path,
+            entries,
+            error: None,
+        },
+        Err(error) => DirectoryListingResult {
+            path,
+            entries: Vec::new(),
+            error: Some(error),
+        },
+    }
+}
+
+fn directory_signature_from_result(
+    path: String,
+    result: Result<String, String>,
+) -> DirectorySignatureResult {
+    match result {
+        Ok(signature) => DirectorySignatureResult {
+            path,
+            signature,
+            error: None,
+        },
+        Err(error) => DirectorySignatureResult {
+            path,
+            signature: String::new(),
+            error: Some(error),
+        },
+    }
+}
+
+fn directory_signatures_from_listings(
+    listings: Vec<DirectoryListingResult>,
+) -> Vec<DirectorySignatureResult> {
+    listings
+        .into_iter()
+        .map(|listing| {
+            if let Some(error) = listing.error {
+                DirectorySignatureResult {
+                    path: listing.path,
+                    signature: String::new(),
+                    error: Some(error),
+                }
+            } else {
+                DirectorySignatureResult {
+                    signature: directory_signature_from_entries(&listing.entries),
+                    path: listing.path,
+                    error: None,
+                }
+            }
+        })
+        .collect()
+}
+
+fn directory_signature_from_signature_entries(entries: &[DirectorySignatureEntry]) -> String {
+    let mut hash = 2166136261_u32;
+    let mut total_name_length: usize = 0;
+    let mut total_size: u64 = 0;
+    for entry in entries {
+        total_name_length += utf16_len(&entry.name);
+        total_size = total_size.saturating_add(entry.size);
+        hash = hash_directory_signature_string(hash, &entry.name);
+        hash = hash_directory_signature_string(hash, entry.kind);
+        hash = hash_directory_signature_number(hash, entry.size);
+        hash = hash_directory_signature_number(hash, if entry.hidden { 1 } else { 0 });
+    }
+    format!(
+        "{}:{}:{}:{}",
+        entries.len(),
+        total_name_length,
+        total_size,
+        base36_u32(hash)
+    )
+}
+
+fn directory_signature_from_entries(entries: &[FileEntry]) -> String {
+    let mut hash = 2166136261_u32;
+    let mut total_name_length: usize = 0;
+    let mut total_size: u64 = 0;
+    for entry in entries {
+        total_name_length += utf16_len(&entry.name);
+        total_size = total_size.saturating_add(entry.size);
+        hash = hash_directory_signature_string(hash, &entry.name);
+        hash = hash_directory_signature_string(hash, entry.kind);
+        hash = hash_directory_signature_number(hash, entry.size);
+        hash = hash_directory_signature_number(hash, if entry.hidden { 1 } else { 0 });
+    }
+    format!(
+        "{}:{}:{}:{}",
+        entries.len(),
+        total_name_length,
+        total_size,
+        base36_u32(hash)
+    )
+}
+
+fn hash_directory_signature_string(mut hash: u32, value: &str) -> u32 {
+    if value.is_ascii() {
+        for unit in value.bytes() {
+            hash ^= u32::from(unit);
+            hash = hash.wrapping_mul(16777619);
+        }
+        hash ^= 31;
+        return hash.wrapping_mul(16777619);
+    }
+    for unit in value.encode_utf16() {
+        hash ^= u32::from(unit);
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash ^= 31;
+    hash.wrapping_mul(16777619)
+}
+
+fn utf16_len(value: &str) -> usize {
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.encode_utf16().count()
+    }
+}
+
+fn hash_directory_signature_number(mut hash: u32, value: u64) -> u32 {
+    let normalized = value as u32;
+    hash ^= normalized & 0xffff;
+    hash = hash.wrapping_mul(16777619);
+    hash ^= (normalized >> 16) & 0xffff;
+    hash.wrapping_mul(16777619)
+}
+
+fn base36_u32(mut value: u32) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut encoded = Vec::new();
+    while value > 0 {
+        encoded.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    encoded.reverse();
+    String::from_utf8(encoded).unwrap_or_else(|_| "0".to_string())
+}
+
+fn directory_kind_order(kind: &str) -> u8 {
+    if kind == "dir" {
+        0
+    } else {
+        1
+    }
+}
+
 fn sort_entries(mut entries: Vec<FileEntry>) -> Result<Vec<FileEntry>, String> {
-    entries.sort_by(|a, b| match (a.kind == "dir", b.kind == "dir") {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    entries.sort_by(|left, right| {
+        directory_kind_order(left.kind)
+            .cmp(&directory_kind_order(right.kind))
+            .then_with(|| compare_entry_names(&left.name, &right.name))
     });
     Ok(entries)
+}
+
+fn compare_entry_names(left: &str, right: &str) -> std::cmp::Ordering {
+    if left.is_ascii() && right.is_ascii() {
+        return compare_ascii_names_case_insensitive(left.as_bytes(), right.as_bytes());
+    }
+    entry_sort_name_key(left).cmp(&entry_sort_name_key(right))
+}
+
+fn compare_ascii_names_case_insensitive(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let common = left.len().min(right.len());
+    for index in 0..common {
+        let ordering = left[index]
+            .to_ascii_lowercase()
+            .cmp(&right[index].to_ascii_lowercase());
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn entry_sort_name_key(name: &str) -> String {
+    if name.is_ascii() {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_lowercase()
+    }
 }
 
 fn create_local_directory(path: &Path) -> Result<(), String> {
@@ -3069,7 +3913,7 @@ fn rewrite_preview_request_headers(
     let mut lines = headers.lines();
     let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
     let target_origin = format!("http://{target_host}:{target_port}");
-    let mut rewritten = String::new();
+    let mut rewritten = String::with_capacity(headers.len() + 128);
     rewritten.push_str(&rewrite_preview_request_line(
         request_line,
         &target_origin,
@@ -3086,13 +3930,13 @@ fn rewrite_preview_request_headers(
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let lower = name.trim().to_ascii_lowercase();
-        if lower == "host" {
+        let name = name.trim();
+        if header_name_is(name, "host") {
             saw_host = true;
-            rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
-        } else if lower == "origin" {
-            rewritten.push_str(&format!("Origin: {target_origin}\r\n"));
-        } else if lower == "referer" {
+            push_preview_host_header(&mut rewritten, target_host, target_port);
+        } else if header_name_is(name, "origin") {
+            push_preview_header(&mut rewritten, "Origin", &target_origin);
+        } else if header_name_is(name, "referer") {
             rewritten.push_str("Referer: ");
             rewritten.push_str(&rewrite_preview_header_url(
                 value.trim(),
@@ -3100,12 +3944,11 @@ fn rewrite_preview_request_headers(
                 proxy_origin,
             ));
             rewritten.push_str("\r\n");
-        } else if lower == "x-forwarded-host" {
+        } else if header_name_is(name, "x-forwarded-host") {
             saw_forwarded_host = true;
             rewritten.push_str(line.trim_end());
             rewritten.push_str("\r\n");
-        } else if lower == "connection" || lower == "proxy-connection" || lower == "accept-encoding"
-        {
+        } else if header_name_in(name, &["connection", "proxy-connection", "accept-encoding"]) {
             continue;
         } else {
             rewritten.push_str(line.trim_end());
@@ -3113,10 +3956,10 @@ fn rewrite_preview_request_headers(
         }
     }
     if !saw_host {
-        rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+        push_preview_host_header(&mut rewritten, target_host, target_port);
     }
     if !saw_forwarded_host && !proxy_host.is_empty() {
-        rewritten.push_str(&format!("X-Forwarded-Host: {proxy_host}\r\n"));
+        push_preview_header(&mut rewritten, "X-Forwarded-Host", proxy_host);
         rewritten.push_str("X-Forwarded-Proto: http\r\n");
     }
     rewritten.push_str("Accept-Encoding: identity\r\n");
@@ -3133,7 +3976,7 @@ fn rewrite_preview_upgrade_headers(
     let mut lines = headers.lines();
     let request_line = lines.next().unwrap_or("GET / HTTP/1.1").trim_end();
     let target_origin = format!("http://{target_host}:{target_port}");
-    let mut rewritten = String::new();
+    let mut rewritten = String::with_capacity(headers.len() + 96);
     rewritten.push_str(&rewrite_preview_request_line(
         request_line,
         &target_origin,
@@ -3148,13 +3991,13 @@ fn rewrite_preview_upgrade_headers(
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let lower = name.trim().to_ascii_lowercase();
-        if lower == "host" {
+        let name = name.trim();
+        if header_name_is(name, "host") {
             saw_host = true;
-            rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
-        } else if lower == "origin" {
-            rewritten.push_str(&format!("Origin: {target_origin}\r\n"));
-        } else if lower == "referer" {
+            push_preview_host_header(&mut rewritten, target_host, target_port);
+        } else if header_name_is(name, "origin") {
+            push_preview_header(&mut rewritten, "Origin", &target_origin);
+        } else if header_name_is(name, "referer") {
             rewritten.push_str("Referer: ");
             rewritten.push_str(&rewrite_preview_header_url(
                 value.trim(),
@@ -3162,7 +4005,7 @@ fn rewrite_preview_upgrade_headers(
                 proxy_origin,
             ));
             rewritten.push_str("\r\n");
-        } else if lower == "proxy-connection" {
+        } else if header_name_is(name, "proxy-connection") {
             continue;
         } else {
             rewritten.push_str(line.trim_end());
@@ -3170,7 +4013,7 @@ fn rewrite_preview_upgrade_headers(
         }
     }
     if !saw_host {
-        rewritten.push_str(&format!("Host: {target_host}:{target_port}\r\n"));
+        push_preview_host_header(&mut rewritten, target_host, target_port);
     }
     rewritten.push_str("\r\n");
     rewritten
@@ -3181,33 +4024,56 @@ fn rewrite_preview_request_line(
     target_origin: &str,
     proxy_origin: &str,
 ) -> String {
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() != 3 {
+    let mut parts = request_line.split_whitespace();
+    let Some(method) = parts.next() else {
+        return request_line.to_string();
+    };
+    let Some(uri_text) = parts.next() else {
+        return request_line.to_string();
+    };
+    let Some(version) = parts.next() else {
+        return request_line.to_string();
+    };
+    if parts.next().is_some() {
         return request_line.to_string();
     }
-    let uri = if parts[1].starts_with(proxy_origin) {
-        let path = parts[1].trim_start_matches(proxy_origin);
+    let uri = if uri_text.starts_with(proxy_origin) {
+        let path = uri_text.trim_start_matches(proxy_origin);
         if path.is_empty() {
             "/".to_string()
         } else {
             path.to_string()
         }
-    } else if parts[1].starts_with(target_origin) {
-        let path = parts[1].trim_start_matches(target_origin);
+    } else if uri_text.starts_with(target_origin) {
+        let path = uri_text.trim_start_matches(target_origin);
         if path.is_empty() {
             "/".to_string()
         } else {
             path.to_string()
         }
     } else {
-        parts[1].to_string()
+        uri_text.to_string()
     };
-    format!("{} {} {}", parts[0], uri, parts[2])
+    format!("{method} {uri} {version}")
 }
 
 fn rewrite_preview_header_url(value: &str, target_origin: &str, proxy_origin: &str) -> String {
-    if value.starts_with(proxy_origin) {
-        value.replacen(proxy_origin, target_origin, 1)
+    if let Some(path) = value.strip_prefix(proxy_origin) {
+        let mut rewritten = String::with_capacity(target_origin.len() + path.len());
+        rewritten.push_str(target_origin);
+        rewritten.push_str(path);
+        rewritten
+    } else {
+        value.to_string()
+    }
+}
+
+fn rewrite_preview_location_url(value: &str, target_origin: &str, proxy_origin: &str) -> String {
+    if let Some(path) = value.strip_prefix(target_origin) {
+        let mut rewritten = String::with_capacity(proxy_origin.len() + path.len());
+        rewritten.push_str(proxy_origin);
+        rewritten.push_str(path);
+        rewritten
     } else {
         value.to_string()
     }
@@ -3225,92 +4091,150 @@ fn rewrite_preview_response_headers(
         .next()
         .unwrap_or("HTTP/1.1 502 Bad Gateway")
         .trim_end();
-    let mut rewritten = String::new();
+    let mut rewritten = String::with_capacity(headers.len() + 96);
     rewritten.push_str(status_line);
     rewritten.push_str("\r\n");
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let lower = line
-            .split_once(':')
-            .map(|(name, _)| name.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        if matches!(
-            lower.as_str(),
-            "x-frame-options"
-                | "content-security-policy"
-                | "content-security-policy-report-only"
-                | "cross-origin-embedder-policy"
-                | "cross-origin-opener-policy"
-                | "cross-origin-resource-policy"
-                | "permissions-policy"
+        let Some((name, value)) = line.split_once(':') else {
+            rewritten.push_str(line.trim_end());
+            rewritten.push_str("\r\n");
+            continue;
+        };
+        let name_trimmed = name.trim();
+        if header_name_in(
+            name_trimmed,
+            &[
+                "x-frame-options",
+                "content-security-policy",
+                "content-security-policy-report-only",
+                "cross-origin-embedder-policy",
+                "cross-origin-opener-policy",
+                "cross-origin-resource-policy",
+                "permissions-policy",
+            ],
         ) {
             continue;
         }
         if content_length.is_some()
-            && matches!(
-                lower.as_str(),
-                "content-length" | "transfer-encoding" | "cache-control" | "etag"
+            && header_name_in(
+                name_trimmed,
+                &[
+                    "content-length",
+                    "transfer-encoding",
+                    "cache-control",
+                    "etag",
+                ],
             )
         {
             continue;
         }
-        if lower == "location" {
-            if let Some((name, value)) = line.split_once(':') {
-                rewritten.push_str(name.trim_end());
-                rewritten.push_str(": ");
-                rewritten.push_str(&value.trim().replacen(target_origin, proxy_origin, 1));
-                rewritten.push_str("\r\n");
-                continue;
-            }
+        if header_name_is(name_trimmed, "location") {
+            rewritten.push_str(name.trim_end());
+            rewritten.push_str(": ");
+            rewritten.push_str(&rewrite_preview_location_url(
+                value.trim(),
+                target_origin,
+                proxy_origin,
+            ));
+            rewritten.push_str("\r\n");
+            continue;
         }
-        if lower == "access-control-allow-origin" {
+        if header_name_is(name_trimmed, "access-control-allow-origin") {
             rewritten.push_str("Access-Control-Allow-Origin: ");
             rewritten.push_str(proxy_origin);
             rewritten.push_str("\r\n");
             continue;
         }
-        if lower == "set-cookie" {
-            if let Some((name, value)) = line.split_once(':') {
-                rewritten.push_str(name.trim_end());
-                rewritten.push_str(": ");
-                rewritten.push_str(&strip_preview_cookie_domain(value.trim(), target_host));
-                rewritten.push_str("\r\n");
-                continue;
-            }
+        if header_name_is(name_trimmed, "set-cookie") {
+            rewritten.push_str(name.trim_end());
+            rewritten.push_str(": ");
+            rewritten.push_str(&strip_preview_cookie_domain(value.trim(), target_host));
+            rewritten.push_str("\r\n");
+            continue;
         }
         rewritten.push_str(line.trim_end());
         rewritten.push_str("\r\n");
     }
     if let Some(length) = content_length {
         rewritten.push_str("Cache-Control: no-store\r\n");
-        rewritten.push_str(&format!("Content-Length: {length}\r\n"));
+        push_usize_header(&mut rewritten, "Content-Length", length);
     }
     rewritten.push_str("\r\n");
     rewritten
 }
 
+fn push_preview_host_header(output: &mut String, target_host: &str, target_port: u16) {
+    output.push_str("Host: ");
+    output.push_str(target_host);
+    output.push(':');
+    let _ = write!(output, "{target_port}");
+    output.push_str("\r\n");
+}
+
+fn push_preview_header(output: &mut String, name: &str, value: &str) {
+    output.push_str(name);
+    output.push_str(": ");
+    output.push_str(value);
+    output.push_str("\r\n");
+}
+
+fn push_usize_header(output: &mut String, name: &str, value: usize) {
+    output.push_str(name);
+    output.push_str(": ");
+    let _ = write!(output, "{value}");
+    output.push_str("\r\n");
+}
+
+fn header_name_is(name: &str, expected: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(expected)
+}
+
+fn header_name_in(name: &str, expected: &[&str]) -> bool {
+    expected.iter().any(|item| header_name_is(name, item))
+}
+
 fn strip_preview_cookie_domain(value: &str, target_host: &str) -> String {
-    let target_domain = format!("domain={}", target_host.to_ascii_lowercase());
-    value
-        .split(';')
-        .filter_map(|part| {
-            let trimmed = part.trim();
-            let normalized = trimmed.to_ascii_lowercase();
-            if normalized == target_domain
-                || normalized == "domain=localhost"
-                || normalized == "secure"
-            {
-                return None;
-            }
-            if normalized == "samesite=none" {
-                return Some("SameSite=Lax");
-            }
-            Some(trimmed)
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+    let mut rewritten = String::with_capacity(value.len());
+    for part in value.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty()
+            || header_name_is(trimmed, "secure")
+            || should_strip_preview_cookie_domain(trimmed, target_host)
+        {
+            continue;
+        }
+        if !rewritten.is_empty() {
+            rewritten.push_str("; ");
+        }
+        if cookie_attribute_is(trimmed, "samesite", "none") {
+            rewritten.push_str("SameSite=Lax");
+        } else {
+            rewritten.push_str(trimmed);
+        }
+    }
+    rewritten
+}
+
+fn should_strip_preview_cookie_domain(attribute: &str, target_host: &str) -> bool {
+    let Some((name, value)) = attribute.split_once('=') else {
+        return false;
+    };
+    if !name.trim().eq_ignore_ascii_case("domain") {
+        return false;
+    }
+    let domain = value.trim();
+    domain.eq_ignore_ascii_case(target_host) || domain.eq_ignore_ascii_case("localhost")
+}
+
+fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &str) -> bool {
+    let Some((name, value)) = attribute.split_once('=') else {
+        return false;
+    };
+    name.trim().eq_ignore_ascii_case(expected_name)
+        && value.trim().eq_ignore_ascii_case(expected_value)
 }
 
 #[cfg(test)]
@@ -3404,7 +4328,7 @@ fn should_inject_preview_console_bridge(headers: &str) -> bool {
             continue;
         };
         if name.trim().eq_ignore_ascii_case("content-type")
-            && value.to_ascii_lowercase().contains("text/html")
+            && find_ascii_case_insensitive(value.as_bytes(), b"text/html").is_some()
         {
             html = true;
         }
@@ -3488,23 +4412,43 @@ fn find_crlf(buffer: &[u8]) -> Option<usize> {
 }
 
 fn inject_preview_console_bridge(body: &[u8], target_host: &str, target_port: u16) -> Vec<u8> {
-    let mut html = String::from_utf8_lossy(body).to_string();
     let script = preview_console_bridge_script(target_host, target_port);
-    let lower = html.to_ascii_lowercase();
-    if let Some(index) = lower.find("<head") {
-        if let Some(close) = lower[index..].find('>') {
-            html.insert_str(index + close + 1, &script);
-            return html.into_bytes();
-        }
+    let insert_at = html_injection_index(body).unwrap_or(0);
+    inject_bytes_at(body, insert_at, script.as_bytes())
+}
+
+fn html_injection_index(body: &[u8]) -> Option<usize> {
+    html_tag_close_index(body, b"<head").or_else(|| html_tag_close_index(body, b"<body"))
+}
+
+fn html_tag_close_index(body: &[u8], tag: &[u8]) -> Option<usize> {
+    let start = find_ascii_case_insensitive(body, tag)?;
+    let close = body[start..].iter().position(|byte| *byte == b'>')?;
+    Some(start + close + 1)
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
     }
-    if let Some(index) = lower.find("<body") {
-        if let Some(close) = lower[index..].find('>') {
-            html.insert_str(index + close + 1, &script);
-            return html.into_bytes();
-        }
+    if needle.len() > haystack.len() {
+        return None;
     }
-    html.insert_str(0, &script);
-    html.into_bytes()
+    haystack.windows(needle.len()).position(|window| {
+        window
+            .iter()
+            .zip(needle.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
+}
+
+fn inject_bytes_at(body: &[u8], index: usize, insert: &[u8]) -> Vec<u8> {
+    let insert_at = index.min(body.len());
+    let mut output = Vec::with_capacity(body.len() + insert.len());
+    output.extend_from_slice(&body[..insert_at]);
+    output.extend_from_slice(insert);
+    output.extend_from_slice(&body[insert_at..]);
+    output
 }
 
 fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String {
@@ -3515,18 +4459,114 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
 (function () {
   if (window.__simpleVibeConsoleBridge) return;
   window.__simpleVibeConsoleBridge = true;
-  function format(value) {
+  window.__simpleVibeConsoleDetailed = false;
+  window.addEventListener('message', function (event) {
+    try {
+      var data = event && event.data;
+      if (!data || typeof data !== 'object') return;
+      if (Object.prototype.hasOwnProperty.call(data, '__simpleVibeConsoleDetailed')) {
+        window.__simpleVibeConsoleDetailed = !!data.__simpleVibeConsoleDetailed;
+      }
+    } catch (_) {}
+  });
+  function compact(value) {
+    if (typeof value === 'string') return value;
+    if (value == null) return String(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    if (Array.isArray(value)) return '[Array(' + value.length + ')]';
+    if (typeof value === 'object') {
+      try {
+        var keys = [];
+        for (var key in value) {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+          keys.push(key);
+          if (keys.length >= 6) break;
+        }
+        return keys.length ? '{' + keys.join(',') + '}' : '{}';
+      } catch (_) {
+        return '[Object]';
+      }
+    }
+    return String(value);
+  }
+  function format(value, compactMode) {
     try {
       if (typeof value === 'string') return value;
-      if (value instanceof Error) return value.stack || value.message || String(value);
-      return JSON.stringify(value);
+      if (value instanceof Error) {
+        if (compactMode || !window.__simpleVibeConsoleDetailed) return value.message || String(value);
+        return value.stack || value.message || String(value);
+      }
+      if (compactMode || !window.__simpleVibeConsoleDetailed) return compact(value);
+      return JSON.stringify(value) || String(value);
     } catch (_) {
       return String(value);
     }
   }
+  var consoleQueue = [];
+  var consoleFlushTimer = 0;
+  function consoleFlushDelay() {
+    return window.__simpleVibeConsoleDetailed ? 16 : 220;
+  }
+  function consoleFlushLimit() {
+    return window.__simpleVibeConsoleDetailed ? 64 : 80;
+  }
+  function flushConsoleQueue() {
+    try {
+      if (consoleFlushTimer) {
+        clearTimeout(consoleFlushTimer);
+        consoleFlushTimer = 0;
+      }
+      if (!consoleQueue.length) return;
+      var batch = [];
+      for (var index = 0; index < consoleQueue.length; index++) {
+        var item = consoleQueue[index];
+        if (item && item.rawArgs) {
+          var payload = formatConsoleArgs(item.rawArgs, true, item.argCount);
+          batch.push({ level: item.level, args: payload.args, argCount: payload.argCount });
+        } else {
+          batch.push(item);
+        }
+      }
+      consoleQueue = [];
+      window.parent.postMessage({ __simpleVibeConsoleBatch: batch }, '*');
+    } catch (_) {
+      consoleQueue = [];
+      consoleFlushTimer = 0;
+    }
+  }
+  function scheduleConsoleFlush() {
+    if (consoleFlushTimer) return;
+    consoleFlushTimer = setTimeout(flushConsoleQueue, consoleFlushDelay());
+  }
+  function formatConsoleArgs(args, compactMode, explicitTotal) {
+    var total = explicitTotal === undefined ? args.length || 0 : explicitTotal;
+    var limit = Math.min(total, 8);
+    var formatted = [];
+    for (var index = 0; index < limit; index++) {
+      formatted.push(format(args[index], !!compactMode));
+    }
+    return { args: formatted, argCount: total };
+  }
+  function queueRawConsoleArgs(level, args) {
+    var total = args.length || 0;
+    var limit = Math.min(total, 8);
+    var raw = [];
+    for (var index = 0; index < limit; index++) raw.push(args[index]);
+    consoleQueue.push({ level: level, rawArgs: raw, argCount: total });
+    var keep = consoleFlushLimit();
+    if (consoleQueue.length > keep) consoleQueue.splice(0, consoleQueue.length - keep);
+  }
   function send(level, args) {
     try {
-      window.parent.postMessage({ __simpleVibeConsole: { level: level, args: Array.prototype.slice.call(args).map(format) } }, '*');
+      if (window.__simpleVibeConsoleDetailed) {
+        var payload = formatConsoleArgs(args, false);
+        consoleQueue.push({ level: level, args: payload.args, argCount: payload.argCount });
+        if (consoleQueue.length >= consoleFlushLimit()) flushConsoleQueue();
+        else scheduleConsoleFlush();
+      } else {
+        queueRawConsoleArgs(level, args);
+        scheduleConsoleFlush();
+      }
     } catch (_) {}
   }
   window.addEventListener('contextmenu', function (event) {
@@ -3552,9 +4592,80 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
       return false;
     }
   }
+  function makePopupProxy(initialUrl) {
+    var closed = false;
+    var currentUrl = initialUrl ? String(initialUrl) : 'about:blank';
+    function navigate(url) {
+      if (!url) return;
+      currentUrl = String(url);
+      sendOpenUrl(currentUrl);
+    }
+    var locationProxy = {
+      assign: navigate,
+      replace: navigate,
+      reload: function () { sendOpenUrl(currentUrl); },
+      toString: function () { return currentUrl; }
+    };
+    try {
+      Object.defineProperty(locationProxy, 'href', {
+        get: function () { return currentUrl; },
+        set: function (value) { navigate(value); }
+      });
+    } catch (_) {}
+    var popup = {
+      focus: function () {},
+      blur: function () {},
+      close: function () { closed = true; },
+      postMessage: function () {},
+      addEventListener: function () {},
+      removeEventListener: function () {},
+      document: { write: function () {}, close: function () {} }
+    };
+    try {
+      Object.defineProperty(popup, 'closed', { get: function () { return closed; } });
+      Object.defineProperty(popup, 'location', {
+        get: function () { return locationProxy; },
+        set: function (value) { navigate(value); }
+      });
+    } catch (_) {
+      popup.closed = false;
+      popup.location = locationProxy;
+    }
+    return popup;
+  }
   window.open = function (url, target, features) {
-    if (sendOpenUrl(url)) return null;
-    return nativeOpen && nativeOpen.call(window, url, target, features);
+    if (url) sendOpenUrl(url);
+    return makePopupProxy(url);
+  };
+  var dialogSequence = 0;
+  function sendDialog(kind, message, defaultValue) {
+    try {
+      var id = 'dialog-' + Date.now().toString(36) + '-' + (++dialogSequence);
+      window.parent.postMessage({
+        __simpleVibeDialog: {
+          id: id,
+          kind: kind,
+          message: message == null ? '' : String(message),
+          defaultValue: defaultValue == null ? '' : String(defaultValue),
+          url: String(window.location.href || '')
+        }
+      }, '*');
+      return id;
+    } catch (_) {
+      return '';
+    }
+  }
+  window.alert = function (message) {
+    sendDialog('alert', message, '');
+  };
+  window.confirm = function (message) {
+    sendDialog('confirm', message, '');
+    return false;
+  };
+  window.prompt = function (message, defaultValue) {
+    var fallback = defaultValue == null ? '' : String(defaultValue);
+    sendDialog('prompt', message, fallback);
+    return fallback;
   };
   document.addEventListener('click', function (event) {
     var anchor = event.target && event.target.closest ? event.target.closest('a[target="_blank"], a[rel~="external"]') : null;
@@ -3731,9 +4842,16 @@ fn join_posix(base: &str, child: &str) -> String {
     if child.starts_with('/') || child.starts_with('~') {
         child.to_string()
     } else if base.ends_with('/') {
-        format!("{base}{child}")
+        let mut joined = String::with_capacity(base.len() + child.len());
+        joined.push_str(base);
+        joined.push_str(child);
+        joined
     } else {
-        format!("{base}/{child}")
+        let mut joined = String::with_capacity(base.len() + child.len() + 1);
+        joined.push_str(base);
+        joined.push('/');
+        joined.push_str(child);
+        joined
     }
 }
 
@@ -3832,6 +4950,8 @@ pub fn run() {
             set_capture_protection,
             resolve_profile_path,
             list_directory,
+            list_directories,
+            directory_signatures,
             read_text_file,
             read_file_data_url,
             write_text_file,

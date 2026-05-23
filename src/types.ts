@@ -18,6 +18,18 @@ export interface FileEntry {
   hidden: boolean;
 }
 
+export interface DirectoryListingResult {
+  path: string;
+  entries: FileEntry[];
+  error?: string | null;
+}
+
+export interface DirectorySignatureResult {
+  path: string;
+  signature: string;
+  error?: string | null;
+}
+
 export interface AttachmentResult {
   path: string;
   tag: string;

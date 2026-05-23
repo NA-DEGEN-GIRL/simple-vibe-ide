@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AttachmentResult, ConnectionProfile, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
+import type { AttachmentResult, ConnectionProfile, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -9,8 +9,12 @@ export const api = {
     invoke<void>('set_capture_protection', { enabled }),
   resolveProfilePath: (profileId: string, path: string) =>
     invoke<string>('resolve_profile_path', { profileId, path }),
-  listDirectory: (profileId: string, path: string) =>
-    invoke<FileEntry[]>('list_directory', { profileId, path }),
+  listDirectory: (profileId: string, path: string, includeSizes = true) =>
+    invoke<FileEntry[]>('list_directory', { profileId, path, includeSizes }),
+  listDirectories: (profileId: string, paths: string[], includeSizes = true) =>
+    invoke<DirectoryListingResult[]>('list_directories', { profileId, paths, includeSizes }),
+  directorySignatures: (profileId: string, paths: string[], includeSizes = true) =>
+    invoke<DirectorySignatureResult[]>('directory_signatures', { profileId, paths, includeSizes }),
   readTextFile: (profileId: string, path: string) =>
     invoke<string>('read_text_file', { profileId, path }),
   readFileDataUrl: (profileId: string, path: string) =>
