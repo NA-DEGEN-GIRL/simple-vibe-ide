@@ -4637,36 +4637,6 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
     if (url) sendOpenUrl(url);
     return makePopupProxy(url);
   };
-  var dialogSequence = 0;
-  function sendDialog(kind, message, defaultValue) {
-    try {
-      var id = 'dialog-' + Date.now().toString(36) + '-' + (++dialogSequence);
-      window.parent.postMessage({
-        __simpleVibeDialog: {
-          id: id,
-          kind: kind,
-          message: message == null ? '' : String(message),
-          defaultValue: defaultValue == null ? '' : String(defaultValue),
-          url: String(window.location.href || '')
-        }
-      }, '*');
-      return id;
-    } catch (_) {
-      return '';
-    }
-  }
-  window.alert = function (message) {
-    sendDialog('alert', message, '');
-  };
-  window.confirm = function (message) {
-    sendDialog('confirm', message, '');
-    return false;
-  };
-  window.prompt = function (message, defaultValue) {
-    var fallback = defaultValue == null ? '' : String(defaultValue);
-    sendDialog('prompt', message, fallback);
-    return fallback;
-  };
   document.addEventListener('click', function (event) {
     var anchor = event.target && event.target.closest ? event.target.closest('a[target="_blank"], a[rel~="external"]') : null;
     if (anchor && sendOpenUrl(anchor.href)) {

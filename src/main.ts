@@ -84,16 +84,6 @@ interface BrowserTab {
   edge?: EdgeBrowserTarget;
 }
 
-type BrowserDialogKind = 'alert' | 'confirm' | 'prompt';
-
-interface BrowserDialogPayload {
-  id: string;
-  kind: BrowserDialogKind;
-  message: string;
-  defaultValue?: string;
-  url?: string;
-}
-
 interface EdgeBrowserTarget {
   sessionId: string;
   targetId: string;
@@ -1465,7 +1455,6 @@ app.innerHTML = `
             <iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe>
             <canvas id="edge-preview-canvas" class="edge-preview-canvas hidden" tabindex="0" aria-label="Edge browser preview"></canvas>
             <div id="edge-preview-status" class="edge-preview-status hidden">Edge preview idle</div>
-            <div id="browser-dialog-layer" class="browser-dialog-layer hidden" aria-live="polite"></div>
           </div>
           <div id="browser-console-resizer" class="browser-console-resizer" aria-hidden="true"></div>
           <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
@@ -1613,7 +1602,6 @@ const el = {
   forwardList: document.querySelector<HTMLDivElement>('#forward-list')!,
   browserWorkspace: document.querySelector<HTMLDivElement>('#browser-workspace')!,
   browserShell: document.querySelector<HTMLDivElement>('#browser-shell')!,
-  browserDialogLayer: document.querySelector<HTMLDivElement>('#browser-dialog-layer')!,
   browserConsoleResizer: document.querySelector<HTMLDivElement>('#browser-console-resizer')!,
   browserConsole: document.querySelector<HTMLElement>('#browser-console')!,
   browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
@@ -14930,11 +14918,6 @@ function handleBrowserConsoleMessage(event: MessageEvent) {
     showBrowserContextMenuFromFrame(Number(payload.x), Number(payload.y));
     return;
   }
-  const dialog = data.__simpleVibeDialog;
-  if (dialog && typeof dialog === 'object') {
-    showBrowserDialogFromFrame(frame, dialog);
-    return;
-  }
   const batch = data.__simpleVibeConsoleBatch;
   if (Array.isArray(batch)) {
     handleBrowserConsoleBatch(batch);
@@ -14950,7 +14933,6 @@ function browserFrameMessagePayload(data: unknown) {
     __simpleVibeOpenUrl?: unknown;
     __simpleVibeRefresh?: unknown;
     __simpleVibeContextMenu?: unknown;
-    __simpleVibeDialog?: unknown;
     __simpleVibeConsoleBatch?: unknown;
     simpleVibeConsole?: unknown;
     __simpleVibeConsole?: unknown;
@@ -14959,7 +14941,6 @@ function browserFrameMessagePayload(data: unknown) {
     !('__simpleVibeOpenUrl' in record)
     && !('__simpleVibeRefresh' in record)
     && !('__simpleVibeContextMenu' in record)
-    && !('__simpleVibeDialog' in record)
     && !('__simpleVibeConsoleBatch' in record)
     && !('simpleVibeConsole' in record)
     && !('__simpleVibeConsole' in record)
@@ -14967,120 +14948,6 @@ function browserFrameMessagePayload(data: unknown) {
     return null;
   }
   return record;
-}
-
-function showBrowserDialogFromFrame(frame: HTMLIFrameElement, rawPayload: object) {
-  const payload = parseBrowserDialogPayload(rawPayload);
-  if (!payload) return;
-  activateBrowserPanel();
-  const layer = el.browserDialogLayer;
-  layer.replaceChildren();
-  toggleClassIfChanged(layer, 'hidden', false);
-
-  const card = document.createElement('section');
-  card.className = 'browser-dialog-card';
-  card.setAttribute('role', 'dialog');
-  card.setAttribute('aria-modal', 'true');
-  card.setAttribute('aria-label', browserDialogTitle(payload.kind));
-
-  const title = document.createElement('div');
-  title.className = 'browser-dialog-title';
-  title.textContent = browserDialogTitle(payload.kind);
-
-  const message = document.createElement('div');
-  message.className = 'browser-dialog-message';
-  message.textContent = payload.message || '(empty message)';
-
-  const source = document.createElement('div');
-  source.className = 'browser-dialog-source';
-  source.textContent = payload.url || frame.dataset.displayUrl || state.previewUrl || 'Preview page';
-
-  const actions = document.createElement('div');
-  actions.className = 'browser-dialog-actions';
-
-  let input: HTMLInputElement | null = null;
-  if (payload.kind === 'prompt') {
-    input = document.createElement('input');
-    input.className = 'browser-dialog-input';
-    input.value = payload.defaultValue ?? '';
-  }
-
-  const close = (value: unknown) => {
-    sendBrowserDialogResponse(frame, payload.id, value);
-    layer.replaceChildren();
-    toggleClassIfChanged(layer, 'hidden', true);
-  };
-
-  if (payload.kind === 'alert') {
-    const ok = browserDialogButton('OK', true);
-    ok.addEventListener('click', () => close(undefined));
-    actions.append(ok);
-    card.append(title, message, source, actions);
-    layer.append(card);
-    ok.focus();
-    return;
-  }
-
-  const cancel = browserDialogButton('Cancel', false);
-  cancel.addEventListener('click', () => close(payload.kind === 'prompt' ? null : false));
-  const ok = browserDialogButton('OK', true);
-  ok.addEventListener('click', () => close(payload.kind === 'prompt' ? input?.value ?? '' : true));
-  actions.append(cancel, ok);
-  if (input) {
-    input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        close(input?.value ?? '');
-      }
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        close(null);
-      }
-    });
-    card.append(title, message, input, source, actions);
-  } else {
-    card.append(title, message, source, actions);
-  }
-  layer.append(card);
-  (input ?? ok).focus();
-}
-
-function parseBrowserDialogPayload(rawPayload: object): BrowserDialogPayload | null {
-  const payload = rawPayload as { id?: unknown; kind?: unknown; message?: unknown; defaultValue?: unknown; url?: unknown };
-  const kind = payload.kind === 'confirm' || payload.kind === 'prompt' ? payload.kind : 'alert';
-  return {
-    id: typeof payload.id === 'string' && payload.id ? payload.id : makeBrowserDialogId(),
-    kind,
-    message: typeof payload.message === 'string' ? payload.message : String(payload.message ?? ''),
-    defaultValue: typeof payload.defaultValue === 'string' ? payload.defaultValue : '',
-    url: typeof payload.url === 'string' ? payload.url : ''
-  };
-}
-
-function makeBrowserDialogId() {
-  return `dialog-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
-function browserDialogTitle(kind: BrowserDialogKind) {
-  if (kind === 'confirm') return 'Confirm';
-  if (kind === 'prompt') return 'Prompt';
-  return 'Alert';
-}
-
-function browserDialogButton(label: string, primary: boolean) {
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = primary ? 'browser-dialog-primary' : '';
-  button.textContent = label;
-  return button;
-}
-
-function sendBrowserDialogResponse(frame: HTMLIFrameElement, id: string, value: unknown) {
-  try {
-    frame.contentWindow?.postMessage({ __simpleVibeDialogResponse: { id, value } }, '*');
-  } catch {
-    // The frame may be navigating; dialog responses are best-effort.
-  }
 }
 
 function handleBrowserConsoleRecord(payload: unknown) {

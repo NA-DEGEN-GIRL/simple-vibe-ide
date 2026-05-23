@@ -48,6 +48,35 @@ The `.handoff/` directory is shared by Codex, Claude, and Grok. Any of them can 
 ## Patch Notes
 
 
+### 2026-05-23 - Restore native script dialogs
+
+#### Changed
+
+- Reverted the Browser custom overlay for `alert`, `confirm`, and `prompt`.
+  Those APIs are synchronous, and the overlay could not preserve page behavior
+  that depends on the OK/Cancel return value.
+- Kept the `window.open` routing improvement so popup navigations still flow
+  through the Browser widget where possible.
+- Removed the unused Browser dialog overlay DOM, styles, and message handling.
+
+#### Verified
+
+- `npm run check` passed.
+- `npm run build` passed.
+- `cargo fmt --check` passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+  passed.
+- `git diff --check` passed.
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch` passed and
+  rebuilt the Windows release exe.
+
+#### Known Limits
+
+- Native WebView script dialogs are still positioned by Windows/WebView2 rather
+  than inside the Browser widget. Moving them while preserving synchronous
+  dialog semantics likely requires a lower-level WebView2 script-dialog hook.
+
+
 ### 2026-05-23 - Browser-contained popups and dialogs
 
 #### Changed

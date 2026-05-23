@@ -1062,15 +1062,6 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .browser-shell { min-height: 0; overflow: auto; display: grid; align-items: start; justify-items: center; background: #070a0f; padding: 8px; position: relative; contain: layout paint; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .browser-shell { grid-area: preview; }
 .browser-shell:not(.has-preview) { min-height: 160px; }
-.browser-dialog-layer { position: absolute; inset: 8px; z-index: 6; display: grid; align-items: start; justify-items: center; padding-top: 18px; pointer-events: none; }
-.browser-dialog-layer.hidden { display: none; }
-.browser-dialog-card { width: min(440px, calc(100% - 16px)); max-height: calc(100% - 32px); overflow: auto; pointer-events: auto; border: 1px solid #35507a; border-radius: 8px; background: #0d1522; color: #e6edf6; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(127, 176, 255, 0.16) inset; padding: 14px; }
-.browser-dialog-title { font-weight: 800; margin-bottom: 8px; }
-.browser-dialog-message { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; color: #d8e2f0; }
-.browser-dialog-source { margin-top: 10px; color: #7f91a8; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.browser-dialog-input { width: 100%; margin-top: 10px; }
-.browser-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
-.browser-dialog-primary { border-color: #4d8dff; background: #1d3f74; color: #ffffff; }
 .browser-shell iframe {
   border: 1px solid #273449;
   background: white;
