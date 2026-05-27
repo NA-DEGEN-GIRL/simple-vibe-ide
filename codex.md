@@ -19,6 +19,8 @@ Before clearing/resetting a Codex session or handing work to another agent:
 - Use the `handoff` skill in Save Mode.
 - Update `.handoff/latest.md`.
 - Also create a dated backup in `.handoff/YYYY-MM-DD-HHMMSS-session.md`.
+- Keep `.handoff/` local-only; it is intentionally ignored by git because this
+  repository is public.
 - Summarize only current repo state, next actions, constraints, errors, and test results.
 - Do not paste entire source files.
 
@@ -30,22 +32,160 @@ When starting fresh or picking up after another agent:
 - If snapshot and repo differ, trust the repo.
 - Do not guess. Open files and verify.
 
-The `.handoff/` directory is shared by Codex, Claude, and Grok. Any of them can save; any of them can resume.
+The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of them can save; any of them can resume.
 
 ## Current Handoff Focus
 
 - Latest snapshot: `.handoff/latest.md`.
-- Current priority: verify and further improve Explorer/workspace switching
-  responsiveness in the real Windows app, especially WSL/SSH folders.
-- Most recent relevant commit before this handoff: `0153880 optimize-explorer-scroll`.
-- Latest Explorer performance patch virtualizes visible rows, delegates row
-  events, and pauses hover prefetch while scrolling. Treat it as implemented
-  but still requiring real app smoke testing and profiling.
+- Current priority: verify the direct in-process PTY runtime in the real
+  Windows app, especially WSL/SSH shell startup, fast typing, paste, Ctrl+C,
+  prompt duplication, and multi-workspace switching.
+- Most recent relevant commit before this handoff: `b34fcaf Restore`.
+- Runtime keep-alive and pty-host reattach were removed because they harmed the
+  primary product goal: a very responsive shell-first IDE.
+- Workspace snapshots still restore UI/work context, but shell processes are
+  recreated after app close/rebuild rather than reattached.
 - Keep browser preview fixes general. The active browser path is currently the
   iframe/proxy preview; Edge CDP preview is disabled because earlier attempts
   caused startup freeze/endpoint readiness issues.
 
 ## Patch Notes
+
+### 2026-05-27 - Terminal IME path and public repo hygiene
+
+#### Changed
+
+- Upgraded xterm packages to the current stable line and enabled Unicode11
+  width handling for CJK terminal rendering.
+- Removed the app-side IME output hold layer so Korean/CJK composition is left
+  to xterm's native CompositionHelper instead of competing event handlers.
+- Sent non-ASCII terminal input and short control input directly to the PTY
+  instead of routing it through the small input batcher.
+- Marked `.handoff/` as local-only and removed tracked handoff snapshots from
+  git to avoid publishing session notes in the public repository.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- Windows smoke release build with `scripts/windows-runtime-smoke.ps1 -NoLaunch
+  -SkipNpmInstall`
+
+### 2026-05-24 - LLM launchers use the same bash environment as manual shell
+
+#### Changed
+
+- Codex launcher auto-adds `--enable goals` again. The previous runtime error
+  was not that `goals` is unsupported; manual `codex --enable goals --version`
+  succeeds in the `coding` WSL profile.
+- WSL/SSH launcher commands for Codex, Claude, Grok, and Antigravity no longer
+  run in a separate login-interactive `bash -lic` environment.
+- Startup commands are now handed to the final interactive bash session and run
+  after `~/.bashrc` is sourced, matching what the user gets when typing
+  the same command manually in a shell pane.
+- Multiline launcher commands are inserted directly into the generated bash
+  rcfile after `~/.bashrc` loads. This removes the extra environment-variable
+  plus `eval` hop that made quote/parsing failures hard to reason about.
+
+#### Why
+
+- In a root-default WSL distro, a launcher started from a button could resolve a
+  different environment/version than the same command typed manually in the
+  same folder.
+- The quote issue was in the launcher handoff layer, not in the `goals` feature
+  itself. A mock Codex launcher confirmed argv is now passed as three clean
+  arguments: `--dangerously-bypass-approvals-and-sandbox`, `--enable`, `goals`.
+
+#### Verified
+
+- In the `coding` WSL profile, login-interactive bash and normal interactive
+  bash resolved different Codex versions before the patch.
+- The launcher smoke in `coding` WSL resolved the expected interactive Codex
+  path/version and did not produce the previous EOF quote error.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+  passed.
+
+### 2026-05-24 - WSL root workspace shell cwd fix
+
+#### Changed
+
+- WSL terminal spawn now passes the selected workspace folder through
+  `wsl.exe --cd` before starting bash, then still runs the existing bash-side
+  cwd fallback.
+- WSL home detection now first uses `wsl.exe --cd ~ --exec pwd`, avoiding
+  login-shell/profile noise when the distro default user is root.
+
+#### Verified
+
+- `coding` WSL root home resolved with `wsl.exe --cd ~ --exec pwd`.
+- `coding` WSL selected folder startup resolved with `wsl.exe --cd <folder>`.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+  passed.
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch` passed and
+  rebuilt the Windows release exe in `%TEMP%`.
+- The rebuilt Windows exe was launched and the process reported responsive.
+
+### 2026-05-24 - Remove runtime keep-alive and return to direct PTY
+
+#### Changed
+
+- Removed the user-facing runtime Keep control.
+- Removed frontend live-terminal reattach and terminal snapshot replay paths.
+- Removed the Windows pty-host process mode and hidden environment switch.
+- Terminal, port-forward, and preview-proxy commands now use the direct
+  in-process runtime.
+- Workspace terminal snapshots no longer persist backend ids that could point
+  at stale processes after restart.
+
+#### Why
+
+- The pty-host/re-attach design made interactive shell input and LLM TUI output
+  noticeably slower.
+- Simple Vibe IDE now prioritizes fast direct terminal feel over preserving
+  shell processes across rebuilds or app restarts.
+
+#### Verified
+
+- `npm run check` passed.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+  passed.
+- `npm run build` passed.
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch` passed and
+  rebuilt the Windows release exe in `%TEMP%`.
+- The rebuilt Windows exe was launched and the process reported responsive.
+
+### 2026-05-24 - Superseded terminal pty-host experiment
+
+Superseded by the later direct PTY rollback above. This entry is retained only
+as historical context for why the pty-host path was removed.
+
+#### Changed
+
+- A Windows pty-host runtime path was tested to keep terminal sessions alive
+  across main-window restarts.
+- That path was removed after user testing showed unacceptable typing latency,
+  terminal animation stutter, and UI freezes.
+- Current product direction is direct in-process PTY only. Closing or rebuilding
+  the app intentionally terminates shell processes.
+
+#### Verified
+
+- `npm run check` passed.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+  passed.
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch` passed and
+  rebuilt the Windows release exe.
+- The pty-host smoke result is no longer relevant to current builds.
+
+#### Known Limits
+
+- The user still needs to manually confirm the newest UI build under real
+  typing: multiple shell panes, paste, Ctrl+C, prompt duplication, keep-alive
+  close/reopen, and rebuild/relaunch behavior.
 
 
 ### 2026-05-23 - Restore native script dialogs
@@ -7261,6 +7401,24 @@ The `.handoff/` directory is shared by Codex, Claude, and Grok. Any of them can 
   revealing existing values.
 - Fixed browser behavior around stale local server views by adding a hard refresh
   path.
+- Fixed LLM launcher flag detection so Claude's
+  `--dangerously-skip-permissions` and similar defaults are not skipped just
+  because the underlying CLI executable contains the option name in its own help
+  or parser code.
+- Claude launcher now also passes `--permission-mode bypassPermissions` so the
+  session mode is explicit in current Claude Code builds.
+- Claude launcher now bypasses the alias-wrapper duplicate-detection path and
+  directly launches `claude --dangerously-skip-permissions --permission-mode
+  bypassPermissions`, because duplicate flags are tolerated by Claude and the
+  explicit command better matches the expected button behavior.
+- Terminal panes now guard IME composition by letting composing key events pass
+  through, pausing input flush/fit work during composition, and flushing after
+  composition ends to reduce Korean input loss in Claude/xterm sessions.
+- Explorer now supports Ctrl/Shift multi-select, Delete to move selected items
+  into the workspace temp trash, Ctrl+Z restore, and context-menu Delete/Export
+  for multi-selection.
+- Export rows now include Clear actions, and multi-export completion reports a
+  compact item-count summary instead of a long per-file message stream.
 
 #### Verification
 

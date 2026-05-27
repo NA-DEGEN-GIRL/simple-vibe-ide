@@ -27,7 +27,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - 기본 Windows titlebar 없는 frameless UI와 앱 내부 최소화/최대화/닫기 버튼
 - 처음 실행 시 빈 workspace로 시작해서 사용자가 명시적으로 폴더/profile을 열기 전에는 아무 것도 열지 않음
 - workspace tab 저장/복원: profile, root, panel 위치, 크기, 열린 editor/image/browser/shell context 저장
-- workspace tab 전환 시 shell/LLM terminal process 유지
+- 앱 실행 중 workspace tab 전환 시 shell/LLM terminal process 유지
 - IDE Settings에서 UI font, mono font, 추가 secret-mask file pattern 설정 가능
 - 상단 market ticker: Binance USD-M WebSocket 기반 BTC와 NAS100 proxy 표시, custom Binance symbol 1개 추가 가능
 - Explorer, Editor, Image Preview, Browser, Terminal widget 이동/리사이즈/스냅 지원
@@ -136,7 +136,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 ### Workspace와 layout
 
 - workspace tab은 profile, root, panel 위치/크기, 열린 context를 저장합니다.
-- workspace tab을 바꿔도 해당 workspace의 shell/LLM terminal process는 계속 살아 있고 다시 돌아오면 같은 terminal로 복귀합니다.
+- 앱이 실행 중인 동안 workspace tab을 바꿔도 해당 workspace의 shell/LLM terminal process는 계속 살아 있고 다시 돌아오면 같은 terminal로 복귀합니다.
 - workspace tab은 drag로 순서를 바꿀 수 있습니다.
 - Explorer, Editor, Image Preview, Browser, Terminal widget은 title bar로 이동할 수 있고 grip으로 resize할 수 있습니다.
 - 가까운 edge는 자석처럼 붙도록 snap됩니다.
@@ -304,7 +304,7 @@ Windows OpenSSH config의 literal `Host` alias만 자동 import됩니다. wildca
 - WSL UNC checkout은 reliable Windows dev build를 위해 polling watch, `pushd`/mapped-drive 실행, Windows-local Cargo target directory가 필요할 수 있습니다.
 - SSH file operation은 POSIX remote와 `sh`, `find`, `cat`, `base64`, `tar` 등 기본 도구를 가정합니다.
 - 큰 remote image preview는 Tauri command channel을 거치므로 local/WSL보다 느릴 수 있습니다.
-- workspace restore는 UI/context를 복원하지만 오래 실행 중이던 shell process 자체를 snapshot으로 되살리지는 않습니다.
+- workspace restore는 UI/context를 복원하지만 오래 실행 중이던 shell process 자체를 snapshot으로 되살리지는 않습니다. 앱 종료나 재빌드 후 shell은 새로 생성됩니다.
 - Drag out은 WebView2가 `DownloadURL`/`file://` drag data를 받는 방식에 의존합니다. 동작하지 않는 환경에서는 `Open` 버튼이 fallback입니다.
 - Capture protection은 Windows와 capture backend에 따라 결과가 다릅니다.
 - 아직 signed installer나 stable release channel은 없습니다.
@@ -347,7 +347,7 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Frameless window with in-app minimize, maximize/restore, and close controls
 - Empty first launch until the user explicitly opens a local, WSL, or SSH workspace
 - Workspace tabs that restore profile, root, panel positions, sizes, and open context
-- Workspace tab switching keeps shell/LLM terminal processes alive
+- Workspace tab switching keeps shell/LLM terminal processes alive while the app is running
 - IDE Settings for UI font, mono font, and extra secret-mask file patterns
 - Top market ticker for BTC and a NAS100 proxy via Binance USD-M WebSocket, plus one custom Binance symbol
 - Movable, resizable, snapping Explorer, Editor, Image Preview, Browser, and Terminal widgets
@@ -456,7 +456,7 @@ WSL profiles are loaded in the background after the first screen is interactive.
 ### Workspaces And Layout
 
 - Workspace tabs save and restore profile, root, panel positions, sizes, and open context.
-- Switching workspace tabs keeps that workspace's shell/LLM terminal processes alive and returns to the same terminals.
+- While the app is running, switching workspace tabs keeps that workspace's shell/LLM terminal processes alive and returns to the same terminals.
 - Workspace tabs can be reordered by drag and drop.
 - Explorer, Editor, Image Preview, Browser, and Terminal widgets can be moved by their title bars and resized from their grips.
 - Nearby edges snap to each other.
@@ -625,7 +625,7 @@ Static pages, browser cache, or an existing preview session can remain visible. 
 - WSL UNC checkouts may need polling file watching, `pushd`/mapped-drive command execution, and a Windows-local Cargo target directory for reliable Windows dev builds.
 - SSH file operations assume a POSIX remote with common tools such as `sh`, `find`, `cat`, `base64`, and `tar`.
 - Large remote image previews pass through the Tauri command channel, so they may feel slower than local Windows/WSL previews.
-- Restored workspaces save UI/work context, but long-running shell processes are recreated rather than resumed from process snapshots.
+- Restored workspaces save UI/work context, but long-running shell processes are recreated rather than resumed from process snapshots. Closing or rebuilding the app starts shells fresh.
 - Drag out depends on WebView2 accepting `DownloadURL`/`file://` drag data. Use `Open` as the fallback when needed.
 - Capture protection depends on Windows and the capture backend used by the streaming or screen-sharing tool.
 - There is no signed installer or stable release channel yet.

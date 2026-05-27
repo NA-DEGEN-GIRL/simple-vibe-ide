@@ -43,10 +43,13 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const LOCAL_DIRECTORY_BATCH_PARALLELISM: usize = 4;
 const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
+const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
+const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
+const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
+const TERMINAL_CPR_RESPONSE: &[u8] = b"\x1b[1;1R";
 
 type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 
-#[derive(Default)]
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
     forwards: Mutex<HashMap<String, ForwardSession>>,
@@ -54,10 +57,29 @@ struct IdeState {
     edge_sessions: EdgeSessionStore,
 }
 
+impl IdeState {
+    fn new() -> Self {
+        Self {
+            terminals: Mutex::new(HashMap::new()),
+            forwards: Mutex::new(HashMap::new()),
+            exports: Mutex::new(HashMap::new()),
+            edge_sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Default for IdeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct TerminalSession {
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child + Send>,
     master: Box<dyn MasterPty + Send>,
+    rows: u16,
+    cols: u16,
 }
 
 struct ForwardSession {
@@ -74,6 +96,69 @@ struct EdgeDevtoolsSessionState {
     port: u16,
 }
 
+struct AppOutputBatcher {
+    id: String,
+    app: tauri::AppHandle,
+    buffer: Mutex<String>,
+    scheduled: AtomicBool,
+}
+
+impl AppOutputBatcher {
+    fn new(id: String, app: tauri::AppHandle) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            app,
+            buffer: Mutex::new(String::new()),
+            scheduled: AtomicBool::new(false),
+        })
+    }
+
+    fn push(self: &Arc<Self>, data: &str) {
+        let should_flush_now = {
+            let Ok(mut buffer) = self.buffer.lock() else {
+                return;
+            };
+            buffer.push_str(data);
+            buffer.len() >= TERMINAL_OUTPUT_EVENT_FORCE_CHARS
+        };
+        if should_flush_now {
+            self.flush();
+            return;
+        }
+        if self
+            .scheduled
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let batcher = self.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS));
+                batcher.flush();
+            });
+        }
+    }
+
+    fn flush(&self) {
+        self.scheduled.store(false, Ordering::Relaxed);
+        let data = {
+            let Ok(mut buffer) = self.buffer.lock() else {
+                return;
+            };
+            if buffer.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *buffer)
+        };
+        let _ = self.app.emit(
+            "terminal-data",
+            TerminalDataEvent {
+                id: self.id.clone(),
+                data,
+            },
+        );
+    }
+}
+
 fn default_windows_root() -> String {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -85,6 +170,15 @@ fn default_windows_root() -> String {
 
 fn default_wsl_root(distro: &str) -> String {
     detect_wsl_home(distro).unwrap_or_else(|| "/home".to_string())
+}
+
+fn wsl_start_directory_arg(cwd: &str, fallback_cwd: &str) -> String {
+    for candidate in [cwd.trim(), fallback_cwd.trim(), "~"] {
+        if !candidate.is_empty() {
+            return candidate.to_string();
+        }
+    }
+    "~".to_string()
 }
 
 fn windows_spawn_cwd() -> PathBuf {
@@ -277,7 +371,16 @@ struct AttachmentResult {
     tag: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletedPathItem {
+    original_path: String,
+    trash_path: String,
+    name: String,
+    directory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PortForwardResult {
     id: String,
@@ -815,6 +918,37 @@ fn rename_path(profile_id: String, old_path: String, new_path: String) -> Result
 }
 
 #[tauri::command]
+fn delete_paths(profile_id: String, paths: Vec<String>) -> Result<Vec<DeletedPathItem>, String> {
+    let profile = profile_from_id(&profile_id);
+    let mut deleted = Vec::new();
+    let delete_id = Uuid::new_v4().to_string();
+    for (index, raw_path) in paths.iter().enumerate() {
+        let path = normalize_profile_path(&profile, raw_path);
+        match move_path_to_delete_trash(&profile, &path, &delete_id, index) {
+            Ok(item) => deleted.push(item),
+            Err(error) => {
+                for item in deleted.iter().rev() {
+                    let _ = restore_deleted_path(&profile, &item.trash_path, &item.original_path);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+#[tauri::command]
+fn restore_deleted_paths(profile_id: String, items: Vec<DeletedPathItem>) -> Result<(), String> {
+    let profile = profile_from_id(&profile_id);
+    for item in items {
+        let original_path = normalize_profile_path(&profile, &item.original_path);
+        let trash_path = normalize_profile_path(&profile, &item.trash_path);
+        restore_deleted_path(&profile, &trash_path, &original_path)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn open_path(profile_id: String, path: String) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
@@ -1077,19 +1211,20 @@ fn save_attachment(
     })
 }
 
-#[tauri::command]
-fn spawn_terminal(
+fn spawn_terminal_direct(
     app: tauri::AppHandle,
-    state: State<IdeState>,
+    state: &IdeState,
     profile_id: String,
     cwd: String,
     command: Option<String>,
     rows: u16,
     cols: u16,
+    _workspace_id: Option<String>,
+    _title: Option<String>,
 ) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let cwd = normalize_profile_path(&profile, &cwd);
-    let (program, args) = terminal_command(&profile, &cwd, command);
+    let (program, args) = terminal_command(&profile, &cwd, command.clone());
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -1118,30 +1253,35 @@ fn spawn_terminal(
         .master
         .try_clone_reader()
         .map_err(|err| err.to_string())?;
-    let writer = pair.master.take_writer().map_err(|err| err.to_string())?;
+    let writer = Arc::new(Mutex::new(
+        pair.master.take_writer().map_err(|err| err.to_string())?,
+    ));
     let terminal_id = Uuid::new_v4().to_string();
 
     let read_id = terminal_id.clone();
-    let read_app = app.clone();
+    let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone());
+    let read_writer = writer.clone();
     thread::spawn(move || {
         let mut buf = [0_u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = read_app.emit(
-                        "terminal-data",
-                        TerminalDataEvent {
-                            id: read_id.clone(),
-                            data,
-                        },
-                    );
+                    let mut data = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if data.contains(TERMINAL_DSR_CURSOR_QUERY) {
+                        respond_terminal_cursor_query(&read_writer);
+                        data = data.replace(TERMINAL_DSR_CURSOR_QUERY, "");
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
+                    read_batcher.push(&data);
                 }
                 Err(_) => break,
             }
         }
-        let _ = read_app.emit(
+        read_batcher.flush();
+        let _ = app.emit(
             "terminal-exit",
             TerminalExitEvent {
                 id: read_id,
@@ -1160,30 +1300,49 @@ fn spawn_terminal(
                 writer,
                 child,
                 master: pair.master,
+                rows,
+                cols,
             },
         );
 
     Ok(terminal_id)
 }
 
-#[tauri::command]
-fn write_terminal(state: State<IdeState>, id: String, data: String) -> Result<(), String> {
-    let mut terminals = state
+fn write_terminal_host(state: &IdeState, id: String, data: String) -> Result<(), String> {
+    let writer = terminal_writer(state, &id)?;
+    write_terminal_bytes(&writer, data.as_bytes())
+}
+
+fn terminal_writer(
+    state: &IdeState,
+    id: &str,
+) -> Result<Arc<Mutex<Box<dyn Write + Send>>>, String> {
+    let terminals = state
         .terminals
         .lock()
         .map_err(|_| "terminal state poisoned".to_string())?;
-    let session = terminals
-        .get_mut(&id)
-        .ok_or_else(|| format!("terminal not found: {id}"))?;
-    session
-        .writer
-        .write_all(data.as_bytes())
-        .map_err(|err| err.to_string())?;
-    session.writer.flush().map_err(|err| err.to_string())
+    terminals
+        .get(id)
+        .map(|session| session.writer.clone())
+        .ok_or_else(|| format!("terminal not found: {id}"))
 }
 
-#[tauri::command]
-fn resize_terminal(state: State<IdeState>, id: String, rows: u16, cols: u16) -> Result<(), String> {
+fn write_terminal_bytes(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    data: &[u8],
+) -> Result<(), String> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "terminal writer poisoned".to_string())?;
+    writer.write_all(data).map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())
+}
+
+fn respond_terminal_cursor_query(writer: &Arc<Mutex<Box<dyn Write + Send>>>) {
+    let _ = write_terminal_bytes(writer, TERMINAL_CPR_RESPONSE);
+}
+
+fn resize_terminal_host(state: &IdeState, id: String, rows: u16, cols: u16) -> Result<(), String> {
     let mut terminals = state
         .terminals
         .lock()
@@ -1199,11 +1358,13 @@ fn resize_terminal(state: State<IdeState>, id: String, rows: u16, cols: u16) -> 
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    session.rows = rows;
+    session.cols = cols;
+    Ok(())
 }
 
-#[tauri::command]
-fn kill_terminal(state: State<IdeState>, id: String) -> Result<(), String> {
+fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
     let mut terminals = state
         .terminals
         .lock()
@@ -1214,9 +1375,35 @@ fn kill_terminal(state: State<IdeState>, id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn start_port_forward(
-    state: State<IdeState>,
+fn shutdown_runtime_sessions(state: &IdeState) {
+    if let Ok(mut terminals) = state.terminals.lock() {
+        for (_, mut session) in terminals.drain() {
+            let _ = session.child.kill();
+        }
+    }
+
+    if let Ok(mut forwards) = state.forwards.lock() {
+        for (_, mut forward) in forwards.drain() {
+            if let Some(stop) = forward.stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(mut child) = forward.child.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    if let Ok(mut edge_sessions) = state.edge_sessions.lock() {
+        for (_, mut session) in edge_sessions.drain() {
+            if let Some(mut child) = session.child.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+fn start_port_forward_host(
+    state: &IdeState,
     profile_id: String,
     remote_port: u16,
     local_port: u16,
@@ -1226,19 +1413,17 @@ fn start_port_forward(
     let requested_local = local_port;
 
     if profile.kind == "ssh" {
-        if requested_local == 0 {
-            return Err(
-                "automatic local port allocation is not supported for SSH forwards yet".to_string(),
-            );
-        }
+        let actual_local = if requested_local == 0 {
+            allocate_local_port()?
+        } else {
+            requested_local
+        };
         let alias = profile.ssh_alias.unwrap_or_else(|| "default".to_string());
         let mut command = Command::new("ssh.exe");
         command
             .arg("-N")
             .arg("-L")
-            .arg(format!(
-                "127.0.0.1:{requested_local}:127.0.0.1:{remote_port}"
-            ))
+            .arg(format!("127.0.0.1:{actual_local}:127.0.0.1:{remote_port}"))
             .arg(alias)
             .current_dir(windows_spawn_cwd())
             .stdin(Stdio::null())
@@ -1260,10 +1445,10 @@ fn start_port_forward(
             );
         return Ok(PortForwardResult {
             id,
-            local_port: requested_local,
+            local_port: actual_local,
             target_host: "127.0.0.1".to_string(),
             remote_port,
-            url: format!("http://127.0.0.1:{requested_local}"),
+            url: format!("http://127.0.0.1:{actual_local}"),
         });
     }
 
@@ -1341,9 +1526,8 @@ fn start_port_forward(
     })
 }
 
-#[tauri::command]
-fn start_preview_proxy(
-    state: State<IdeState>,
+fn start_preview_proxy_host(
+    state: &IdeState,
     target_url: String,
 ) -> Result<PortForwardResult, String> {
     let target = parse_http_preview_target(&target_url)?;
@@ -1404,8 +1588,7 @@ fn probe_local_http_url(target_url: String) -> Result<bool, String> {
     Ok(TcpStream::connect_timeout(&addr, Duration::from_millis(450)).is_ok())
 }
 
-#[tauri::command]
-fn stop_port_forward(state: State<IdeState>, id: String) -> Result<(), String> {
+fn stop_port_forward_host(state: &IdeState, id: String) -> Result<(), String> {
     let mut forwards = state
         .forwards
         .lock()
@@ -1418,6 +1601,80 @@ fn stop_port_forward(state: State<IdeState>, id: String) -> Result<(), String> {
             let _ = child.kill();
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn spawn_terminal(
+    app: tauri::AppHandle,
+    state: State<'_, IdeState>,
+    profile_id: String,
+    cwd: String,
+    command: Option<String>,
+    rows: u16,
+    cols: u16,
+    workspace_id: Option<String>,
+    title: Option<String>,
+) -> Result<String, String> {
+    spawn_terminal_direct(
+        app,
+        &state,
+        profile_id,
+        cwd,
+        command,
+        rows,
+        cols,
+        workspace_id,
+        title,
+    )
+}
+
+#[tauri::command]
+fn write_terminal(state: State<'_, IdeState>, id: String, data: String) -> Result<(), String> {
+    write_terminal_host(&state, id, data)
+}
+
+#[tauri::command]
+fn resize_terminal(
+    state: State<'_, IdeState>,
+    id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    resize_terminal_host(&state, id, rows, cols)
+}
+
+#[tauri::command]
+fn kill_terminal(state: State<'_, IdeState>, id: String) -> Result<(), String> {
+    kill_terminal_host(&state, id)
+}
+
+#[tauri::command]
+fn start_port_forward(
+    state: State<'_, IdeState>,
+    profile_id: String,
+    remote_port: u16,
+    local_port: u16,
+) -> Result<PortForwardResult, String> {
+    start_port_forward_host(&state, profile_id, remote_port, local_port)
+}
+
+#[tauri::command]
+fn start_preview_proxy(
+    state: State<'_, IdeState>,
+    target_url: String,
+) -> Result<PortForwardResult, String> {
+    start_preview_proxy_host(&state, target_url)
+}
+
+#[tauri::command]
+fn stop_port_forward(state: State<'_, IdeState>, id: String) -> Result<(), String> {
+    stop_port_forward_host(&state, id)
+}
+
+#[tauri::command]
+fn shutdown_runtime_sessions_command(state: State<'_, IdeState>) -> Result<(), String> {
+    shutdown_runtime_sessions(&state);
     Ok(())
 }
 
@@ -1792,6 +2049,21 @@ fn detect_wsl_distros() -> Vec<String> {
 }
 
 fn detect_wsl_home(distro: &str) -> Option<String> {
+    let mut direct = Command::new("wsl.exe");
+    direct
+        .current_dir(windows_spawn_cwd())
+        .arg("-d")
+        .arg(distro)
+        .arg("--cd")
+        .arg("~")
+        .arg("--exec")
+        .arg("pwd");
+    if let Ok(output) = hide_command_window(&mut direct).output() {
+        if let Some(home) = detect_wsl_home_from_output(output) {
+            return Some(home);
+        }
+    }
+
     let mut command = Command::new("wsl.exe");
     command
         .current_dir(windows_spawn_cwd())
@@ -1802,15 +2074,21 @@ fn detect_wsl_home(distro: &str) -> Option<String> {
         .arg("-lc")
         .arg("printf %s \"$HOME\"");
     let output = hide_command_window(&mut command).output().ok()?;
+    detect_wsl_home_from_output(output)
+}
+
+fn detect_wsl_home_from_output(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if home.starts_with('/') && home.len() > 1 {
-        Some(home)
-    } else {
-        None
+    let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+    for line in text.lines() {
+        let home = line.trim();
+        if home.starts_with('/') && home.len() > 1 {
+            return Some(home.to_string());
+        }
     }
+    None
 }
 
 fn detect_ssh_aliases() -> Vec<String> {
@@ -1910,11 +2188,17 @@ fn terminal_command(
                 .distro
                 .clone()
                 .unwrap_or_else(|| "Ubuntu".to_string());
-            let mut args = vec!["-d".to_string(), distro, "--".to_string()];
+            let mut args = vec![
+                "-d".to_string(),
+                distro,
+                "--cd".to_string(),
+                wsl_start_directory_arg(cwd, &profile.root),
+                "--".to_string(),
+            ];
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
                 args.extend([
                     "bash".to_string(),
-                    "-lic".to_string(),
+                    "-lc".to_string(),
                     bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command)),
                 ]);
             } else {
@@ -1933,7 +2217,7 @@ fn terminal_command(
                 .unwrap_or_else(|| "default".to_string());
             let remote_command = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
                 format!(
-                    "bash -lic {}",
+                    "bash -lc {}",
                     shell_quote(&bash_bootstrap_script(
                         Some(cwd),
                         Some(&profile.root),
@@ -1981,30 +2265,23 @@ fn bash_bootstrap_script(
     let mut script = String::new();
     script.push_str(&format!(
         "__svide_start_cwd={}\n\
-__svide_fallback_cwd={}\n\
-case \"$__svide_start_cwd\" in \"~/\"*) __svide_start_cwd=\"$HOME/${{__svide_start_cwd#~/}}\" ;; esac\n\
-case \"$__svide_fallback_cwd\" in \"~/\"*) __svide_fallback_cwd=\"$HOME/${{__svide_fallback_cwd#~/}}\" ;; esac\n\
-if [ -n \"$__svide_start_cwd\" ] && [ \"$__svide_start_cwd\" != \"~\" ]; then\n\
-  cd \"$__svide_start_cwd\" 2>/dev/null || {{\n\
-    if [ -n \"$__svide_fallback_cwd\" ] && [ \"$__svide_fallback_cwd\" != \"~\" ] && [ \"$__svide_fallback_cwd\" != \"$__svide_start_cwd\" ]; then\n\
-      cd \"$__svide_fallback_cwd\" 2>/dev/null || cd ~ 2>/dev/null || true\n\
-    else\n\
-      cd ~ 2>/dev/null || true\n\
-    fi\n\
-  }}\n\
-fi\n",
+	__svide_fallback_cwd={}\n\
+	case \"$__svide_start_cwd\" in \"~/\"*) __svide_start_cwd=\"$HOME/${{__svide_start_cwd#~/}}\" ;; esac\n\
+	case \"$__svide_fallback_cwd\" in \"~/\"*) __svide_fallback_cwd=\"$HOME/${{__svide_fallback_cwd#~/}}\" ;; esac\n\
+	__svide_cd_failed() {{ printf '\\n[simple-vibe-ide] failed to cd: %s\\n' \"$1\" >&2; }}\n\
+	if [ -n \"$__svide_start_cwd\" ] && [ \"$__svide_start_cwd\" != \"~\" ]; then\n\
+	  if ! cd \"$__svide_start_cwd\" 2>/dev/null; then\n\
+	    __svide_cd_failed \"$__svide_start_cwd\"\n\
+	    if [ -n \"$__svide_fallback_cwd\" ] && [ \"$__svide_fallback_cwd\" != \"~\" ] && [ \"$__svide_fallback_cwd\" != \"$__svide_start_cwd\" ]; then\n\
+	      cd \"$__svide_fallback_cwd\" 2>/dev/null || __svide_cd_failed \"$__svide_fallback_cwd\"\n\
+	    fi\n\
+	  fi\n\
+	elif [ -n \"$__svide_fallback_cwd\" ] && [ \"$__svide_fallback_cwd\" != \"~\" ]; then\n\
+	  cd \"$__svide_fallback_cwd\" 2>/dev/null || __svide_cd_failed \"$__svide_fallback_cwd\"\n\
+	fi\n",
         shell_quote(cwd.unwrap_or("")),
         shell_quote(fallback_cwd.unwrap_or(""))
     ));
-    if let Some(command) = command {
-        script.push_str(command);
-        script.push_str(
-            "\n_status=$?\n\
-if [ $_status -ne 0 ]; then\n\
-  printf '\\n[simple-vibe-ide] command exited with status %s\\n' \"$_status\"\n\
-fi\n",
-        );
-    }
     script.push_str(
         "exec bash --rcfile <(cat <<'__SVIDE_RC__'\n\
 [ -f ~/.bashrc ] && . ~/.bashrc\n\
@@ -2012,6 +2289,23 @@ __simple_vibe_ide_prompt_command() { local __sv_status=$?; printf '\\033]7;file:
 case \";${PROMPT_COMMAND:-};\" in *__simple_vibe_ide_prompt_command*) ;; *) PROMPT_COMMAND=\"__simple_vibe_ide_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}\" ;; esac\n\
 export PROMPT_COMMAND\n\
 __simple_vibe_ide_prompt_command\n\
+",
+    );
+    if let Some(command) = command {
+        script.push_str(command);
+        if !command.ends_with('\n') {
+            script.push('\n');
+        }
+        script.push_str(
+            "__svide_status=$?\n\
+if [ $__svide_status -ne 0 ]; then\n\
+  printf '\\n[simple-vibe-ide] command exited with status %s\\n' \"$__svide_status\"\n\
+fi\n\
+unset __svide_status\n",
+        );
+    }
+    script.push_str(
+        "\
 __SVIDE_RC__\n\
 ) -i",
     );
@@ -2877,6 +3171,181 @@ fn rename_local_path(old_path: &Path, new_path: &Path) -> Result<(), String> {
         return Err("target already exists".to_string());
     }
     fs::rename(old_path, new_path).map_err(|err| err.to_string())
+}
+
+fn move_path_to_delete_trash(
+    profile: &ConnectionProfile,
+    path: &str,
+    delete_id: &str,
+    index: usize,
+) -> Result<DeletedPathItem, String> {
+    let name = deleted_path_display_name(profile, path)?;
+    let directory = deleted_path_is_directory(profile, path)?;
+    let trash_path = deleted_trash_path(profile, path, delete_id, index, &name);
+    match profile.kind.as_str() {
+        "windows" => move_local_path_to_trash(Path::new(path), Path::new(&trash_path))?,
+        "wsl" => {
+            let source_windows = wsl_posix_path_to_windows_path(profile, path);
+            let trash_windows = wsl_posix_path_to_windows_path(profile, &trash_path);
+            if let (Some(source_windows), Some(trash_windows)) = (source_windows, trash_windows) {
+                move_local_path_to_trash(&source_windows, &trash_windows)?;
+            } else {
+                move_remote_path_to_trash(profile, path, &trash_path)?;
+            }
+        }
+        "ssh" => move_remote_path_to_trash(profile, path, &trash_path)?,
+        _ => return Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+    Ok(DeletedPathItem {
+        original_path: path.to_string(),
+        trash_path,
+        name,
+        directory,
+    })
+}
+
+fn restore_deleted_path(
+    profile: &ConnectionProfile,
+    trash_path: &str,
+    original_path: &str,
+) -> Result<(), String> {
+    match profile.kind.as_str() {
+        "windows" => restore_local_deleted_path(Path::new(trash_path), Path::new(original_path)),
+        "wsl" => {
+            let trash_windows = wsl_posix_path_to_windows_path(profile, trash_path);
+            let original_windows = wsl_posix_path_to_windows_path(profile, original_path);
+            if let (Some(trash_windows), Some(original_windows)) = (trash_windows, original_windows)
+            {
+                restore_local_deleted_path(&trash_windows, &original_windows)
+            } else {
+                restore_remote_deleted_path(profile, trash_path, original_path)
+            }
+        }
+        "ssh" => restore_remote_deleted_path(profile, trash_path, original_path),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+fn move_local_path_to_trash(source: &Path, trash: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Err("path does not exist".to_string());
+    }
+    if let Some(parent) = trash.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::rename(source, trash).map_err(|err| err.to_string())
+}
+
+fn restore_local_deleted_path(trash: &Path, original: &Path) -> Result<(), String> {
+    if original.exists() {
+        return Err("restore target already exists".to_string());
+    }
+    if let Some(parent) = original.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::rename(trash, original).map_err(|err| err.to_string())
+}
+
+fn move_remote_path_to_trash(
+    profile: &ConnectionProfile,
+    source: &str,
+    trash: &str,
+) -> Result<(), String> {
+    let trash_parent = parent_posix(trash);
+    let script = format!(
+        "if [ ! -e {source} ]; then echo 'path does not exist' >&2; exit 1; fi\n\
+mkdir -p {trash_parent}\n\
+mv -- {source} {trash}",
+        source = shell_quote(source),
+        trash_parent = shell_quote(&trash_parent),
+        trash = shell_quote(trash)
+    );
+    run_profile_shell(profile, &script, None).map(|_| ())
+}
+
+fn restore_remote_deleted_path(
+    profile: &ConnectionProfile,
+    trash: &str,
+    original: &str,
+) -> Result<(), String> {
+    let original_parent = parent_posix(original);
+    let script = format!(
+        "if [ -e {original} ]; then echo 'restore target already exists' >&2; exit 1; fi\n\
+mkdir -p {original_parent}\n\
+mv -- {trash} {original}",
+        original = shell_quote(original),
+        original_parent = shell_quote(&original_parent),
+        trash = shell_quote(trash)
+    );
+    run_profile_shell(profile, &script, None).map(|_| ())
+}
+
+fn deleted_path_display_name(profile: &ConnectionProfile, path: &str) -> Result<String, String> {
+    match profile.kind.as_str() {
+        "windows" => local_file_name(Path::new(path)),
+        "wsl" => wsl_posix_path_to_windows_path(profile, path)
+            .and_then(|windows_path| local_file_name(&windows_path).ok())
+            .map_or_else(|| Ok(remote_file_name(path)), Ok),
+        "ssh" => Ok(remote_file_name(path)),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+fn deleted_path_is_directory(profile: &ConnectionProfile, path: &str) -> Result<bool, String> {
+    match profile.kind.as_str() {
+        "windows" => Ok(Path::new(path).is_dir()),
+        "wsl" => {
+            if let Some(windows_path) = wsl_posix_path_to_windows_path(profile, path) {
+                Ok(windows_path.is_dir())
+            } else {
+                remote_path_is_directory(profile, path)
+            }
+        }
+        "ssh" => remote_path_is_directory(profile, path),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+fn remote_path_is_directory(profile: &ConnectionProfile, path: &str) -> Result<bool, String> {
+    let script = format!(
+        "if [ -d {path} ]; then printf dir; elif [ -e {path} ]; then printf file; else exit 1; fi",
+        path = shell_quote(path)
+    );
+    let output = run_profile_shell(profile, &script, None)?;
+    Ok(String::from_utf8_lossy(&output).trim() == "dir")
+}
+
+fn deleted_trash_path(
+    profile: &ConnectionProfile,
+    original_path: &str,
+    delete_id: &str,
+    index: usize,
+    name: &str,
+) -> String {
+    match profile.kind.as_str() {
+        "windows" => {
+            let parent = Path::new(original_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            parent
+                .join(".vibe-ide-temp")
+                .join("deleted")
+                .join(delete_id)
+                .join(format!("{index}-{name}"))
+                .to_string_lossy()
+                .to_string()
+        }
+        _ => join_posix(
+            &join_posix(
+                &join_posix(
+                    &join_posix(&parent_posix(original_path), ".vibe-ide-temp"),
+                    "deleted",
+                ),
+                delete_id,
+            ),
+            &format!("{index}-{name}"),
+        ),
+    }
 }
 
 #[derive(Clone)]
@@ -4575,7 +5044,26 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
       window.parent.postMessage({ __simpleVibeContextMenu: { x: event.clientX, y: event.clientY } }, '*');
     } catch (_) {}
   });
+  function previewZoomShortcutAction(event) {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return 0;
+    if (event.code === 'NumpadAdd' || event.key === '+' || event.key === '=') return 1;
+    if (event.code === 'NumpadSubtract' || event.key === '-' || event.key === '_') return -1;
+    if (event.code === 'Digit0' || event.code === 'Numpad0' || event.key === '0') return 'reset';
+    return 0;
+  }
   window.addEventListener('keydown', function (event) {
+    var zoomAction = previewZoomShortcutAction(event);
+    if (zoomAction) {
+      try {
+        event.preventDefault();
+        window.parent.postMessage({
+          __simpleVibeZoom: zoomAction === 'reset'
+            ? { reset: true }
+            : { direction: zoomAction }
+        }, '*');
+      } catch (_) {}
+      return;
+    }
     if (event.key !== 'F5') return;
     try {
       event.preventDefault();
@@ -4650,9 +5138,57 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
       return original && original.apply(console, arguments);
     };
   });
+  var reportedPreviewAssetFailures = {};
+  function reportPreviewAssetFailure(kind, target) {
+    try {
+      if (!target) return false;
+      var tag = String(target.tagName || 'resource').toLowerCase();
+      var url = target.href || target.src || target.currentSrc || '';
+      if (!url) return false;
+      var key = kind + ':' + tag + ':' + url;
+      if (reportedPreviewAssetFailures[key]) return true;
+      reportedPreviewAssetFailures[key] = true;
+      send('warn', ['Resource failed', tag, url]);
+      window.parent.postMessage({
+        __simpleVibePreviewAssetFailure: { kind: kind, tag: tag, url: url }
+      }, '*');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  function targetLooksLikePreviewAsset(target) {
+    if (!target || !target.tagName) return false;
+    var tag = String(target.tagName).toLowerCase();
+    if (tag === 'script' || tag === 'img' || tag === 'source' || tag === 'video' || tag === 'audio') return true;
+    if (tag === 'link') {
+      var rel = String(target.rel || '').toLowerCase();
+      return rel.indexOf('stylesheet') >= 0 || rel.indexOf('preload') >= 0 || rel.indexOf('modulepreload') >= 0;
+    }
+    return false;
+  }
   window.addEventListener('error', function (event) {
+    var target = event && event.target;
+    if (targetLooksLikePreviewAsset(target) && reportPreviewAssetFailure('error', target)) return;
     send('error', [event.message || 'Script error']);
-  });
+  }, true);
+  function checkStylesheetHealth() {
+    try {
+      var links = Array.prototype.slice.call(document.querySelectorAll('link[rel~="stylesheet"]'))
+        .filter(function (link) { return !link.disabled && link.href; });
+      if (!links.length) return;
+      var loaded = 0;
+      for (var index = 0; index < links.length; index++) {
+        if (links[index].sheet) loaded += 1;
+      }
+      if (loaded === 0) reportPreviewAssetFailure('missing-stylesheet', links[0]);
+    } catch (_) {}
+  }
+  if (document.readyState === 'complete') {
+    setTimeout(checkStylesheetHealth, 700);
+  } else {
+    window.addEventListener('load', function () { setTimeout(checkStylesheetHealth, 700); }, { once: true });
+  }
   window.addEventListener('unhandledrejection', function (event) {
     send('error', ['Unhandled promise rejection', event.reason]);
   });
@@ -4928,6 +5464,8 @@ pub fn run() {
             create_directory,
             create_file,
             rename_path,
+            delete_paths,
+            restore_deleted_paths,
             open_path,
             read_clipboard_file_paths,
             save_clipboard_image_file,
@@ -4948,7 +5486,8 @@ pub fn run() {
             edge_devtools_activate_page,
             edge_devtools_close_page,
             stop_edge_devtools_session,
-            stop_port_forward
+            stop_port_forward,
+            shutdown_runtime_sessions_command
         ])
         .setup(|app| {
             let window = app.get_webview_window("main").expect("main window");

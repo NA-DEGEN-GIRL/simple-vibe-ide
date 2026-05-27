@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AttachmentResult, ConnectionProfile, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
+import type { AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -27,6 +27,10 @@ export const api = {
     invoke<void>('create_file', { profileId, path }),
   renamePath: (profileId: string, oldPath: string, newPath: string) =>
     invoke<void>('rename_path', { profileId, oldPath, newPath }),
+  deletePaths: (profileId: string, paths: string[]) =>
+    invoke<DeletedPathItem[]>('delete_paths', { profileId, paths }),
+  restoreDeletedPaths: (profileId: string, items: DeletedPathItem[]) =>
+    invoke<void>('restore_deleted_paths', { profileId, items }),
   openPath: (profileId: string, path: string) =>
     invoke<void>('open_path', { profileId, path }),
   readClipboardFilePaths: () => invoke<string[]>('read_clipboard_file_paths'),
@@ -57,19 +61,24 @@ export const api = {
     cwd: string,
     command: string | null,
     rows: number,
-    cols: number
+    cols: number,
+    workspaceId = '',
+    title = 'shell'
   ) =>
     invoke<string>('spawn_terminal', {
       profileId,
       cwd,
       command,
       rows,
-      cols
+      cols,
+      workspaceId,
+      title
     }),
   writeTerminal: (id: string, data: string) => invoke<void>('write_terminal', { id, data }),
   resizeTerminal: (id: string, rows: number, cols: number) =>
     invoke<void>('resize_terminal', { id, rows, cols }),
   killTerminal: (id: string) => invoke<void>('kill_terminal', { id }),
+  shutdownRuntimeSessions: () => invoke<void>('shutdown_runtime_sessions_command'),
   startPortForward: (profileId: string, remotePort: number, localPort: number) =>
     invoke<PortForwardResult>('start_port_forward', { profileId, remotePort, localPort }),
   probeLocalHttpUrl: (targetUrl: string) =>

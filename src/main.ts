@@ -4,12 +4,12 @@ import { Image as TauriImage } from '@tauri-apps/api/image';
 import type { Extension } from '@codemirror/state';
 import type { EditorView as CodeMirrorView } from '@codemirror/view';
 import { readImage, readText, writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
-import type { Terminal as XTermTerminal } from '@xterm/xterm';
+import type { ILink as XTermLink, Terminal as XTermTerminal } from '@xterm/xterm';
 import type { FitAddon as XTermFitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { ConnectionProfile, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 interface TerminalPane {
@@ -27,8 +27,14 @@ interface TerminalPane {
   host: HTMLElement;
   outputBuffer: string;
   writeBuffer: string;
+  backendOutputChars: number;
   cwdOutputBuffer: string;
   inputBuffer: string;
+  inputWriteBuffer: string;
+  inputFlushTimer?: number;
+  inputWritePromise?: Promise<void>;
+  lastUserInputAt?: number;
+  suppressTerminalQueryResponsesUntil?: number;
   seenPorts: Set<number>;
   fitFrame?: number;
   writeFrame?: number;
@@ -80,8 +86,17 @@ interface BrowserTab {
   id: string;
   url: string;
   label: string;
+  deviceId?: string;
+  orientation?: BrowserOrientation;
+  zoom?: number;
   frameUrl?: string;
   edge?: EdgeBrowserTarget;
+}
+
+interface BrowserPreviewAssetFailurePayload {
+  kind?: unknown;
+  url?: unknown;
+  tag?: unknown;
 }
 
 interface EdgeBrowserTarget {
@@ -185,6 +200,14 @@ interface TauriDragDropPayload {
 
 interface ExportJobState extends ExportProgressEvent {
   createdAt: number;
+  batchId?: string;
+  batchTotal?: number;
+}
+
+interface ExplorerDeleteUndoState {
+  profileId: string;
+  workspaceId: string;
+  items: DeletedPathItem[];
 }
 
 interface TextFileCacheEntry {
@@ -208,12 +231,16 @@ interface ImageTabState {
   label: string;
   history: PastedImageItem[];
   historyVisible: boolean;
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
 }
 
 interface NoteTabState {
   id: string;
   path: string;
   title: string;
+  customTitle?: string;
   theme: NoteThemeId;
   content: string;
   dirty: boolean;
@@ -237,6 +264,7 @@ interface WorkspacePanelSnapshot {
 interface WorkspaceTerminalSnapshot {
   title: string;
   command: string | null;
+  backendId?: string;
   widgetId?: string;
   profileId?: string;
   cwd?: string;
@@ -256,18 +284,23 @@ interface ImageTabSnapshot {
   label: string;
   history: PastedImageItem[];
   historyVisible: boolean;
+  zoom?: number;
+  offsetX?: number;
+  offsetY?: number;
 }
 
 interface NoteTabSnapshot {
   id: string;
   path: string;
   title: string;
+  customTitle?: string;
   theme?: NoteThemeId;
 }
 
 interface WorkspaceSnapshot {
   id: string;
   label: string;
+  customLabel?: string;
   profileId: string;
   root: string;
   currentDir: string;
@@ -290,6 +323,7 @@ interface WorkspaceSnapshot {
   notePinned: boolean;
   noteOpacity?: number;
   browserTabs: BrowserTab[];
+  browserHistory: string[];
   activeBrowserTabId: string;
   browserDeviceId: string;
   browserOrientation: BrowserOrientation;
@@ -319,6 +353,7 @@ interface WorkspaceRuntimeCache {
   activeEditorTabId: string;
   explorer?: ExplorerRuntimeCache;
   browserTabs: BrowserTab[];
+  browserHistory: string[];
   activeBrowserTabId: string;
   previewUrl: string;
   previewProxies: PortForwardResult[];
@@ -332,6 +367,8 @@ interface ExplorerRuntimeCache {
   children: Map<string, FileEntry[]>;
   signatures: Map<string, string>;
   selectedPath: string;
+  selectedPaths: Set<string>;
+  selectionAnchorPath: string;
 }
 
 interface ExplorerVisibleRow {
@@ -373,6 +410,7 @@ interface EditorRuntime {
 interface TerminalRuntime {
   Terminal: typeof import('@xterm/xterm').Terminal;
   FitAddon: typeof import('@xterm/addon-fit').FitAddon;
+  Unicode11Addon: typeof import('@xterm/addon-unicode11').Unicode11Addon;
 }
 
 type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'calculator' | 'settings';
@@ -455,6 +493,11 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
         bashPattern: '*--dangerously-skip-permissions*',
         powershellPattern: '--dangerously-skip-permissions',
         args: ['--dangerously-skip-permissions']
+      },
+      {
+        bashPattern: '*--permission-mode[[:space:]]bypassPermissions*|*--permission-mode=bypassPermissions*',
+        powershellPattern: '--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions',
+        args: ['--permission-mode', 'bypassPermissions']
       }
     ]
   },
@@ -487,6 +530,8 @@ const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
 const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
 const WORKSPACE_STORE_PERSIST_LIMIT = 24;
 const DEFAULT_SHOW_FILE_SIZES = false;
+const BROWSER_ADDRESS_HISTORY_LIMIT = 32;
+const BROWSER_ADDRESS_SUGGESTION_LIMIT = 8;
 const WORKSPACE_IMAGE_STORE_KEY = 'simple-vibe-ide.workspaceImages.v1';
 const WORKSPACE_IMAGE_REF_PREFIX = 'simple-vibe-image:';
 const WORKSPACE_IMAGE_REF_CACHE_LIMIT = 512;
@@ -512,17 +557,23 @@ const TERMINAL_PORT_SCAN_DEBOUNCE_MS = 220;
 const TERMINAL_CWD_SCAN_DEBOUNCE_MS = 140;
 const TERMINAL_INACTIVE_WRITE_BATCH_MS = 240;
 const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
+const TERMINAL_INPUT_BATCH_MS = 4;
+const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
 const TERMINAL_BACKGROUND_SCAN_BATCH_MS = 900;
 const TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS = 1200;
-const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 128 * 1024;
-const TERMINAL_VISIBLE_WRITE_CHUNK_CHARS = 256 * 1024;
-const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 64 * 1024;
+const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 64 * 1024;
+const TERMINAL_VISIBLE_WRITE_CHUNK_CHARS = 16 * 1024;
+const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 8 * 1024;
+const TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS = 2 * 1024;
 const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
+const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
 const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
 const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
 const TERMINAL_PROMPT_CONTINUATION_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|^[#$>]\s*$)/;
+const TERMINAL_FILE_LINK_PATTERN = /(?:^|[\s([{"'`])((?:(?:[A-Za-z]:[\\/]|\\\\|\/|~[\\/]|\.{1,2}[\\/])?[A-Za-z0-9_@.+~ -]+[\\/][A-Za-z0-9_@.+~()[\] -]+|[A-Za-z0-9_@.+~()[\] -]+\.(?:png|jpe?g|gif|webp|bmp|svg|ico|txt|md|json|jsonc|yaml|yml|toml|env|ini|conf|config|log|ts|tsx|js|jsx|mjs|cjs|css|scss|html|htm|py|rs|go|java|c|cpp|h|hpp|cs|sh|bash|ps1|bat|cmd))(?:[:#]\d+(?::\d+)?)?)/gi;
 const TERMINAL_PREVIEW_PORT_HINT_PATTERN = /localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\b(?:listening|running|available|started|serving|server|port)\b|:\d{2,5}/i;
 const TERMINAL_OSC7_CWD_PATTERN = /\x1b]7;file:\/\/[^/\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+const TERMINAL_CPR_RESPONSE_PATTERN = /\x1b\[\d+;\d+R/g;
 const LOCAL_PREVIEW_URL_PORT_PATTERN = /\b(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b/gi;
 const LOCAL_PREVIEW_LISTENING_PORT_PATTERN = /\b(?:listening|running|available|started|serving|server)\b[^\r\n]{0,80}\b(?:port\s*)?(\d{4,5})\b/gi;
 const TERMINAL_POWERSHELL_PROMPT_CWD_PATTERN = /(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*)>\s*$/;
@@ -583,6 +634,10 @@ const BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS = 350;
 const BROWSER_FRAME_SUSPEND_IDLE_MS = 250;
 const WORKSPACE_RESTORE_BACKGROUND_DELAY_MS = 1800;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
+const BROWSER_ZOOM_LEVELS = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const IMAGE_PREVIEW_MIN_ZOOM = 0.1;
+const IMAGE_PREVIEW_MAX_ZOOM = 12;
+const IMAGE_PREVIEW_WHEEL_FACTOR = 1.12;
 const USE_EDGE_CDP_BROWSER = false;
 const USE_PREVIEW_PROXY_BROWSER = true;
 const EDGE_SCREENCAST_QUALITY = 66;
@@ -987,6 +1042,8 @@ const state = {
   entries: [] as FileEntry[],
   explorerOpenMode: 'single' as ExplorerOpenMode,
   explorerSelectedPath: '',
+  explorerSelectedPaths: new Set<string>(),
+  explorerSelectionAnchorPath: '',
   explorerTypeahead: '',
   explorerTypeaheadAt: 0,
   explorerExpanded: new Set<string>(),
@@ -1011,6 +1068,9 @@ const state = {
   imageCounter: 0,
   imagePreviewDataUrl: '',
   imagePreviewLabel: 'No image selected',
+  imagePreviewZoom: 1,
+  imagePreviewOffsetX: 0,
+  imagePreviewOffsetY: 0,
   autoPasteImageTagToShell: true,
   imageHistoryVisible: false,
   imageHistory: [] as PastedImageItem[],
@@ -1025,6 +1085,7 @@ const state = {
   previewProxies: [] as PortForwardResult[],
   detectedPorts: [] as DetectedPortItem[],
   browserTabs: [] as BrowserTab[],
+  browserHistory: [] as string[],
   activeBrowserTabId: '',
   previewUrl: '',
   browserDeviceId: DEFAULT_BROWSER_DEVICE_ID,
@@ -1060,6 +1121,7 @@ let noteFontSize = 14;
 let noteOpacity = 100;
 let calculatorFontSize = 15;
 let restoringWorkspace = false;
+let storedActiveWorkspaceId = '';
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
 const autoForwardingPorts = new Set<string>();
 const textFileCache = new Map<string, TextFileCacheEntry>();
@@ -1084,6 +1146,7 @@ const panelToggleCache = new Map<FloatingPanelId, HTMLButtonElement | null>();
 const workspaceTabElementCache = new Map<string, HTMLElement>();
 const workspaceTabPartCache = new WeakMap<HTMLElement, {
   label: HTMLButtonElement;
+  input: HTMLInputElement;
   security: HTMLButtonElement;
   copy: HTMLButtonElement;
   close: HTMLButtonElement;
@@ -1094,6 +1157,7 @@ const editorTabIndexByIdLookup = new Map<string, number>();
 const editorTabElementCache = new Map<string, HTMLElement>();
 const exportJobById = new Map<string, ExportJobState>();
 const exportJobElementCache = new Map<string, HTMLElement>();
+let explorerDeleteUndo: ExplorerDeleteUndoState | null = null;
 const exportJobPartCache = new WeakMap<HTMLElement, {
   title: HTMLElement;
   detail: HTMLElement;
@@ -1131,6 +1195,9 @@ const previewProxyLocalPortMisses = new Set<number>();
 const browserFrameByTabId = new Map<string, HTMLIFrameElement>();
 const browserFramesByWorkspaceId = new Map<string, Set<HTMLIFrameElement>>();
 const browserWorkspaceSuspendTimers = new Map<string, number>();
+const browserLoadRequestByTabId = new Map<string, number>();
+const browserAssetRecoveryByTabId = new Map<string, { url: string; count: number; at: number }>();
+const browserAssetRecoveryTimers = new Map<string, number>();
 const browserTabById = new Map<string, BrowserTab>();
 const browserTabByUrl = new Map<string, BrowserTab>();
 const browserTabIndexByIdLookup = new Map<string, number>();
@@ -1197,6 +1264,8 @@ let explorerCachedRefreshToken = 0;
 const explorerCachedRefreshTimers = new Set<number>();
 let explorerLastSelectedPath = '';
 let explorerEntryLookupDirty = true;
+let explorerModifierPointerPath = '';
+let explorerModifierPointerUntil = 0;
 let browserConsoleRenderFrame = 0;
 let browserConsoleLastRenderedLogId = '';
 let browserConsoleLastRenderedLogIndex = -1;
@@ -1210,6 +1279,7 @@ let browserConsoleHiddenPayloadTimer = 0;
 let browserConsoleHiddenPayloadQueue: unknown[] = [];
 let activeBrowserFrameId = '';
 let browserInactiveFrameSuspendTimer = 0;
+let browserLoadRequestSeq = 0;
 let windowResizeFrame = 0;
 let workspaceSnapshotTimer = 0;
 let workspacePersistTimer = 0;
@@ -1229,6 +1299,7 @@ let noteTabsRenderSignature = '\0';
 let noteTabsOrderRenderSignature = '\0';
 let browserTabsRenderSignature = '\0';
 let browserTabsOrderRenderSignature = '\0';
+let browserAddressSuggestionSignature = '\0';
 let browserConsoleRenderSignature = '\0';
 let shellTabsRenderSignature = '\0';
 let exportJobsRenderSignature = '\0';
@@ -1241,6 +1312,8 @@ let imageHistoryRenderSignature = '\0';
 let imageHistoryOrderRenderSignature = '\0';
 let imagePreviewRenderedDataUrl = '\0';
 let imagePreviewRenderedLabel = '\0';
+let imagePreviewRenderedTransform = '\0';
+let imagePreviewDrag: { pointerId: number; startX: number; startY: number; offsetX: number; offsetY: number } | null = null;
 let calculatorHistoryRenderSignature = '\0';
 let calculatorHistoryOrderRenderSignature = '\0';
 let calculatorKeysRendered = false;
@@ -1417,11 +1490,14 @@ app.innerHTML = `
         <div id="image-label" class="image-label">No image selected</div>
         <div class="image-tools">
           <label class="image-option" title="External image paste only"><input id="auto-paste-image-tag" type="checkbox" checked /> Auto paste to shell</label>
+          <button id="image-fit" class="panel-mode" title="Fit image to preview">Fit</button>
           <button id="toggle-image-history" class="panel-mode" title="Toggle pasted image history" aria-pressed="false">History</button>
           <button id="clear-image-history" class="panel-mode" title="Clear pasted image history">Clear</button>
         </div>
         <div id="image-history" class="image-history hidden"></div>
-        <img id="image-preview" alt="pasted preview" />
+        <div id="image-preview-stage" class="image-preview-stage">
+          <img id="image-preview" alt="pasted preview" draggable="false" />
+        </div>
         <p class="hint">Pasted images are saved in the current folder under .vibe-ide-temp/attachments. Auto paste applies to images pasted from outside the preview.</p>
       </section>
       <section class="panel browser-panel floating-panel hidden" data-panel="browser">
@@ -1433,7 +1509,10 @@ app.innerHTML = `
         <div class="browser-form">
           <button id="browser-back" class="browser-nav-button" title="Back" aria-label="Back">&larr;</button>
           <button id="browser-forward" class="browser-nav-button" title="Forward" aria-label="Forward">&rarr;</button>
-          <input id="preview-url" placeholder="3000 or http://127.0.0.1:3000" />
+          <div class="browser-address-field">
+            <input id="preview-url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="3000 or http://127.0.0.1:3000" />
+            <div id="browser-address-suggestions" class="browser-address-suggestions hidden" role="listbox" aria-label="Workspace browser history"></div>
+          </div>
           <button id="load-preview" title="Load URL">Go</button>
           <button id="reload-preview" class="browser-nav-button" title="Reload" aria-label="Reload">&#x21bb;</button>
           <button id="clear-browser-cache" class="browser-cache-button" title="Clear preview cache and reload">Clear cache</button>
@@ -1576,9 +1655,11 @@ const el = {
   imageTabs: document.querySelector<HTMLDivElement>('#image-tabs')!,
   imageNewTab: document.querySelector<HTMLButtonElement>('#image-new-tab')!,
   imageOpenNewTab: document.querySelector<HTMLInputElement>('#image-open-new-tab')!,
+  imagePreviewStage: document.querySelector<HTMLDivElement>('#image-preview-stage')!,
   imagePreview: document.querySelector<HTMLImageElement>('#image-preview')!,
   imageLabel: document.querySelector<HTMLDivElement>('#image-label')!,
   autoPasteImageTag: document.querySelector<HTMLInputElement>('#auto-paste-image-tag')!,
+  imageFit: document.querySelector<HTMLButtonElement>('#image-fit')!,
   imageHistoryToggle: document.querySelector<HTMLButtonElement>('#toggle-image-history')!,
   imageHistoryClear: document.querySelector<HTMLButtonElement>('#clear-image-history')!,
   imageHistory: document.querySelector<HTMLDivElement>('#image-history')!,
@@ -1586,6 +1667,7 @@ const el = {
   localPort: document.querySelector<HTMLInputElement>('#local-port')!,
   startForward: document.querySelector<HTMLButtonElement>('#start-forward')!,
   previewUrl: document.querySelector<HTMLInputElement>('#preview-url')!,
+  browserAddressSuggestions: document.querySelector<HTMLDivElement>('#browser-address-suggestions')!,
   loadPreview: document.querySelector<HTMLButtonElement>('#load-preview')!,
   browserBack: document.querySelector<HTMLButtonElement>('#browser-back')!,
   browserForward: document.querySelector<HTMLButtonElement>('#browser-forward')!,
@@ -1869,9 +1951,11 @@ function loadWorkspaceStore() {
   try {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACE_STORE_KEY) ?? '') as Partial<WorkspaceStore>;
     state.workspaceSnapshots = workspaceSnapshotsFromStore(parsed.workspaces);
+    storedActiveWorkspaceId = typeof parsed.activeId === 'string' ? parsed.activeId : '';
     state.activeWorkspaceId = '';
   } catch {
     state.workspaceSnapshots = [];
+    storedActiveWorkspaceId = '';
     state.activeWorkspaceId = '';
   }
   rebuildWorkspaceSnapshotLookup();
@@ -2890,6 +2974,13 @@ function workspaceTabElement(id: string) {
   const label = document.createElement('button');
   label.className = 'workspace-tab-label';
   label.type = 'button';
+  label.title = 'Open workspace. Double-click or press F2 to rename.';
+  const input = document.createElement('input');
+  input.className = 'workspace-tab-name-input';
+  input.type = 'text';
+  input.maxLength = 64;
+  input.spellcheck = false;
+  input.setAttribute('aria-label', 'Workspace name');
   const security = document.createElement('button');
   security.className = 'workspace-tab-security';
   security.type = 'button';
@@ -2912,10 +3003,11 @@ function workspaceTabElement(id: string) {
   close.title = 'Close workspace';
   close.setAttribute('aria-label', 'Close workspace');
   close.textContent = 'x';
-  tab.append(label, security, copy, close);
-  const parts = { label, security, copy, close };
+  tab.append(label, security, copy, close, input);
+  const parts = { label, input, security, copy, close };
   workspaceTabPartCache.set(tab, parts);
   parts.label.draggable = false;
+  parts.input.draggable = false;
   parts.security.draggable = false;
   parts.copy.draggable = false;
   parts.close.draggable = false;
@@ -2927,6 +3019,32 @@ function workspaceTabElement(id: string) {
     const workspaceId = workspaceIdForTabElement(tab);
     if (workspaceId) void activateWorkspaceTab(workspaceId);
   });
+  parts.label.addEventListener('dblclick', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) startWorkspaceTabRename(workspaceId);
+  });
+  parts.label.addEventListener('keydown', (event) => {
+    if (event.key !== 'F2') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) startWorkspaceTabRename(workspaceId);
+  });
+  parts.input.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      finishWorkspaceTabRename(tab, true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      finishWorkspaceTabRename(tab, false);
+    }
+  });
+  parts.input.addEventListener('blur', () => finishWorkspaceTabRename(tab, true));
+  parts.input.addEventListener('pointerdown', (event) => event.stopPropagation());
+  parts.input.addEventListener('click', (event) => event.stopPropagation());
   parts.security.addEventListener('click', (event) => {
     event.stopPropagation();
     const workspaceId = workspaceIdForTabElement(tab);
@@ -2970,6 +3088,7 @@ function workspaceTabParts(tab: HTMLElement) {
   if (cached) return cached;
   const parts = {
     label: tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!,
+    input: tab.querySelector<HTMLInputElement>('.workspace-tab-name-input')!,
     security: tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!,
     copy: tab.querySelector<HTMLButtonElement>('.workspace-tab-copy')!,
     close: tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!
@@ -2981,15 +3100,16 @@ function workspaceTabParts(tab: HTMLElement) {
 function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapshot) {
   const protectedWorkspace = Boolean(workspace.captureProtected);
   const active = workspace.id === state.activeWorkspaceId;
-  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}`;
+  const displayLabel = workspaceDisplayLabel(workspace);
+  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}`;
   tab.dataset.workspaceId = workspace.id;
   if (tab.dataset.renderSignature === signature) return;
   tab.dataset.renderSignature = signature;
   tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
-  tab.title = `${workspace.label} - ${workspace.root}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
+  tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
   const parts = workspaceTabParts(tab);
   const label = parts.label;
-  setTextContentIfChanged(label, workspace.label);
+  setTextContentIfChanged(label, displayLabel);
   const security = parts.security;
   const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
   toggleClassIfChanged(security, 'active', protectedWorkspace);
@@ -3000,6 +3120,19 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
 
 function workspaceIdForTabElement(tab: HTMLElement) {
   return tab.dataset.workspaceId || '';
+}
+
+function workspaceDisplayLabel(workspace: WorkspaceSnapshot) {
+  const custom = normalizeWorkspaceCustomLabel(workspace.customLabel ?? '');
+  return custom || workspace.label || 'Workspace';
+}
+
+function normalizeWorkspaceCustomLabel(value: string) {
+  return value.replace(/\s+/g, ' ').trim().slice(0, 64);
+}
+
+function workspaceSnapshotCanAcceptOpen(snapshot: WorkspaceSnapshot | null | undefined) {
+  return Boolean(snapshot && !snapshot.workspaceOpen && !snapshot.profileId && !snapshot.root);
 }
 
 function pruneWorkspaceTabElementCache(seen: Set<string>) {
@@ -3013,7 +3146,7 @@ function workspaceTabsSignature() {
   for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
     const workspace = state.workspaceSnapshots[index];
     if (index) signature += '\n';
-    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}`;
+    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}`;
   }
   return signature;
 }
@@ -3027,10 +3160,58 @@ function workspaceTabsOrderSignature() {
   return signature;
 }
 
+function startWorkspaceTabRename(id: string) {
+  if (workspaceDragState?.dragging) return;
+  const snapshot = workspaceSnapshotForId(id);
+  const tab = connectedWorkspaceTabElement(id);
+  if (!snapshot || !tab) return;
+  const parts = workspaceTabParts(tab);
+  tab.classList.add('renaming');
+  parts.input.value = workspaceDisplayLabel(snapshot);
+  parts.input.dataset.originalValue = parts.input.value;
+  parts.input.focus();
+  parts.input.select();
+  suppressWorkspaceTabClick = true;
+}
+
+function finishWorkspaceTabRename(tab: HTMLElement, commit: boolean) {
+  if (!tab.classList.contains('renaming')) return;
+  const id = workspaceIdForTabElement(tab);
+  const snapshot = workspaceSnapshotForId(id);
+  const parts = workspaceTabParts(tab);
+  const previous = parts.input.dataset.originalValue ?? '';
+  const next = normalizeWorkspaceCustomLabel(parts.input.value);
+  tab.classList.remove('renaming');
+  delete parts.input.dataset.originalValue;
+  window.setTimeout(() => {
+    suppressWorkspaceTabClick = false;
+  }, 0);
+  if (!snapshot || !commit) {
+    parts.input.value = previous;
+    return;
+  }
+
+  const autoLabel = normalizeWorkspaceCustomLabel(snapshot.label);
+  const customLabel = next && next !== autoLabel ? next : undefined;
+  if ((snapshot.customLabel ?? '') === (customLabel ?? '')) {
+    renderWorkspaceTabs();
+    return;
+  }
+  if (customLabel) snapshot.customLabel = customLabel;
+  else delete snapshot.customLabel;
+  snapshot.updatedAt = new Date().toISOString();
+  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+  tab.dataset.renderSignature = '';
+  renderWorkspaceTabs();
+  persistWorkspaceStore();
+  setStatus(`Workspace name: ${workspaceDisplayLabel(snapshot)}`);
+}
+
 function startWorkspaceTabPointerDrag(event: PointerEvent, id: string, tab: HTMLElement) {
   if (event.button !== 0) return;
   const target = event.target instanceof Element ? event.target : null;
-  if (target?.closest('.workspace-tab-security, .workspace-tab-copy, .workspace-tab-close')) return;
+  if (tab.classList.contains('renaming')) return;
+  if (target?.closest('.workspace-tab-security, .workspace-tab-copy, .workspace-tab-close, .workspace-tab-name-input')) return;
   workspaceDragState = {
     id,
     pointerId: event.pointerId,
@@ -3236,14 +3417,16 @@ async function copyWorkspaceTab(id: string) {
   } else {
     await restoreWorkspaceSnapshot(clone);
   }
-  setStatus(`Workspace copied: ${clone.label}`);
+  setStatus(`Workspace copied: ${workspaceDisplayLabel(clone)}`);
 }
 
 function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnapshot {
+  const copiedLabel = `${workspaceDisplayLabel(source)} copy`;
   return {
     ...source,
     id: crypto.randomUUID(),
     label: `${source.label} copy`,
+    customLabel: copiedLabel,
     updatedAt: new Date().toISOString(),
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
@@ -3252,6 +3435,7 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
     imageTabs: cloneImageTabSnapshots(source.imageTabs),
     noteTabs: cloneNoteTabSnapshots(source.noteTabs),
     browserTabs: cloneBrowserTabSnapshots(source.browserTabs),
+    browserHistory: cloneBrowserHistory(source.browserHistory),
     calculatorHistory: cloneCalculatorHistory(source.calculatorHistory)
   };
 }
@@ -3297,6 +3481,10 @@ function cloneBrowserTabSnapshots(tabs: BrowserTab[]) {
   const cloned: BrowserTab[] = [];
   for (const tab of tabs) cloned.push({ ...tab });
   return cloned;
+}
+
+function cloneBrowserHistory(history: string[] | undefined) {
+  return Array.isArray(history) ? history.slice(0, BROWSER_ADDRESS_HISTORY_LIMIT) : [];
 }
 
 function cloneCalculatorHistory(history: CalculatorHistoryItem[] | undefined) {
@@ -3368,6 +3556,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
   return {
     id,
     label: 'New Workspace',
+    customLabel: undefined,
     profileId: '',
     root: '',
     currentDir: '',
@@ -3390,6 +3579,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     notePinned: false,
     noteOpacity: 100,
     browserTabs: [],
+    browserHistory: [],
     activeBrowserTabId: '',
     browserDeviceId: 'desktop',
     browserOrientation: 'portrait',
@@ -3474,11 +3664,13 @@ function createCurrentWorkspaceSnapshot(
   updatedAt = activeWorkspaceSnapshot()?.updatedAt ?? new Date().toISOString()
 ): WorkspaceSnapshot {
   const profile = state.activeProfile!;
+  const previousSnapshot = workspaceSnapshotForId(id);
   const terminalSnapshotState = currentWorkspaceTerminalSnapshotState();
   const editorTabs = currentEditorTabSnapshots();
   return {
     id,
     label: workspaceLabel(profile, state.workspaceRoot || state.currentDir || profile.root),
+    customLabel: previousSnapshot?.customLabel,
     profileId: profile.id,
     root: state.workspaceRoot,
     currentDir: state.currentDir || state.workspaceRoot,
@@ -3501,6 +3693,7 @@ function createCurrentWorkspaceSnapshot(
     notePinned: state.notePinned,
     noteOpacity,
     browserTabs: currentBrowserTabSnapshots(),
+    browserHistory: currentBrowserHistorySnapshot(),
     activeBrowserTabId: state.activeBrowserTabId,
     browserDeviceId: state.browserDeviceId,
     browserOrientation: state.browserOrientation,
@@ -3544,7 +3737,10 @@ function currentImageTabSnapshots() {
       dataUrl: tab.dataUrl,
       label: tab.label,
       history: currentImageHistorySnapshot(tab.history),
-      historyVisible: tab.historyVisible
+      historyVisible: tab.historyVisible,
+      zoom: normalizedImageZoom(tab.zoom),
+      offsetX: tab.offsetX,
+      offsetY: tab.offsetY
     });
   }
   return tabs;
@@ -3560,7 +3756,7 @@ function currentImageHistorySnapshot(history: PastedImageItem[]) {
 function currentNoteTabSnapshots() {
   const tabs: NoteTabSnapshot[] = [];
   for (const tab of state.noteTabs) {
-    tabs.push({ id: tab.id, path: tab.path, title: tab.title, theme: tab.theme });
+    tabs.push({ id: tab.id, path: tab.path, title: tab.title, customTitle: tab.customTitle, theme: tab.theme });
   }
   return tabs;
 }
@@ -3568,9 +3764,24 @@ function currentNoteTabSnapshots() {
 function currentBrowserTabSnapshots() {
   const tabs: BrowserTab[] = [];
   for (const tab of state.browserTabs) {
-    tabs.push({ id: tab.id, url: tab.url, label: tab.label });
+    tabs.push(browserTabSnapshot(tab));
   }
   return tabs;
+}
+
+function browserTabSnapshot(tab: BrowserTab): BrowserTab {
+  return {
+    id: tab.id,
+    url: tab.url,
+    label: tab.label,
+    deviceId: normalizedBrowserDeviceId(tab.deviceId ?? state.browserDeviceId),
+    orientation: normalizedBrowserOrientation(tab.orientation ?? state.browserOrientation),
+    zoom: normalizedBrowserZoom(tab.zoom ?? state.browserZoom)
+  };
+}
+
+function currentBrowserHistorySnapshot() {
+  return state.browserHistory.slice(0, BROWSER_ADDRESS_HISTORY_LIMIT);
 }
 
 function currentCalculatorHistorySnapshot() {
@@ -3583,6 +3794,7 @@ function currentCalculatorHistorySnapshot() {
 function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   let signature = workspaceSignaturePart(snapshot.id);
   signature += `|${workspaceSignaturePart(snapshot.label)}`;
+  signature += `|${workspaceSignaturePart(snapshot.customLabel)}`;
   signature += `|${workspaceSignaturePart(snapshot.profileId)}`;
   signature += `|${workspaceSignaturePart(snapshot.root)}`;
   signature += `|${workspaceSignaturePart(snapshot.currentDir)}`;
@@ -3604,6 +3816,7 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${snapshot.notePinned ? '1' : '0'}`;
   signature += `|${String(snapshot.noteOpacity)}`;
   signature += `|${browserTabSnapshotsSignature(snapshot.browserTabs)}`;
+  signature += `|${browserHistorySignature(snapshot.browserHistory)}`;
   signature += `|${workspaceSignaturePart(snapshot.activeBrowserTabId)}`;
   signature += `|${workspaceSignaturePart(snapshot.browserDeviceId)}`;
   signature += `|${workspaceSignaturePart(snapshot.browserOrientation)}`;
@@ -3644,7 +3857,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function editorTabSnapshotsSignature(tabs: WorkspaceSnapshot['editorTabs']) {
@@ -3667,7 +3880,7 @@ function imageTabSnapshotsSignature(workspaceId: string, tabs: WorkspaceSnapshot
 }
 
 function imageSnapshotSignature(workspaceId: string, tab: ImageTabSnapshot) {
-  return `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.sourcePath ?? '')},${workspaceImageSignaturePart(workspaceId, `tab:${tab.id}`, tab.dataUrl)},${workspaceSignaturePart(tab.label)},${imageSnapshotHistorySignature(workspaceId, tab)},${tab.historyVisible ? '1' : '0'}`;
+  return `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.sourcePath ?? '')},${workspaceImageSignaturePart(workspaceId, `tab:${tab.id}`, tab.dataUrl)},${workspaceSignaturePart(tab.label)},${imageSnapshotHistorySignature(workspaceId, tab)},${tab.historyVisible ? '1' : '0'},${workspaceSignaturePart(tab.zoom)},${workspaceSignaturePart(tab.offsetX)},${workspaceSignaturePart(tab.offsetY)}`;
 }
 
 function imageSnapshotHistorySignature(workspaceId: string, tab: ImageTabSnapshot) {
@@ -3685,7 +3898,7 @@ function noteTabSnapshotsSignature(tabs: WorkspaceSnapshot['noteTabs']) {
   for (let index = 0; index < tabs.length; index += 1) {
     const tab = tabs[index];
     if (index) signature += ';';
-    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.path)},${workspaceSignaturePart(tab.title)},${workspaceSignaturePart(tab.theme)}`;
+    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.path)},${workspaceSignaturePart(tab.title)},${workspaceSignaturePart(tab.customTitle)},${workspaceSignaturePart(tab.theme)}`;
   }
   return signature;
 }
@@ -3695,7 +3908,17 @@ function browserTabSnapshotsSignature(tabs: WorkspaceSnapshot['browserTabs']) {
   for (let index = 0; index < tabs.length; index += 1) {
     const tab = tabs[index];
     if (index) signature += ';';
-    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.url)},${workspaceSignaturePart(tab.label)}`;
+    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.url)},${workspaceSignaturePart(tab.label)},${workspaceSignaturePart(tab.deviceId)},${workspaceSignaturePart(tab.orientation)},${workspaceSignaturePart(tab.zoom)}`;
+  }
+  return signature;
+}
+
+function browserHistorySignature(history?: string[]) {
+  if (!history?.length) return '';
+  let signature = '';
+  for (let index = 0; index < history.length; index += 1) {
+    if (index) signature += ';';
+    signature += workspaceSignaturePart(history[index]);
   }
   return signature;
 }
@@ -3806,6 +4029,7 @@ function saveActiveWorkspaceRuntimeCache() {
     activeEditorTabId: state.activeEditorTabId,
     explorer: snapshotExplorerRuntimeCache(),
     browserTabs: snapshotBrowserTabsForRuntime(),
+    browserHistory: currentBrowserHistorySnapshot(),
     activeBrowserTabId: state.activeBrowserTabId,
     previewUrl: state.previewUrl,
     previewProxies: snapshotPreviewProxiesForRuntime(),
@@ -3899,7 +4123,9 @@ function snapshotExplorerRuntimeCache(): ExplorerRuntimeCache {
     expanded: state.explorerExpanded,
     children: state.explorerChildren,
     signatures: state.explorerSignatures,
-    selectedPath: state.explorerSelectedPath
+    selectedPath: state.explorerSelectedPath,
+    selectedPaths: state.explorerSelectedPaths,
+    selectionAnchorPath: state.explorerSelectionAnchorPath
   };
 }
 
@@ -3914,6 +4140,8 @@ function restoreExplorerRuntimeCache(workspaceId: string, currentDir: string) {
   state.explorerLoading = new Set();
   state.explorerSignatures = cached.signatures;
   state.explorerSelectedPath = cached.selectedPath;
+  state.explorerSelectedPaths = cached.selectedPaths ?? new Set(cached.selectedPath ? [cached.selectedPath] : []);
+  state.explorerSelectionAnchorPath = cached.selectionAnchorPath || cached.selectedPath;
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   renderExplorer();
@@ -3941,7 +4169,7 @@ function deferExplorerDirectoryRestore(path: string, profileId: string, workspac
   markExplorerEntryLookupDirty();
   state.explorerLoading = new Set();
   state.explorerSignatures = new Map();
-  state.explorerSelectedPath = '';
+  resetExplorerSelection();
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   explorerRenderDirty = true;
@@ -3973,7 +4201,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.notePinned = Boolean(snapshot.notePinned);
     noteOpacity = clamp(snapshot.noteOpacity || 100, 45, 100);
     state.browserConsoleSize = clamp(snapshot.browserConsoleSize || 0.34, 0.18, 0.72);
-    state.browserZoom = clamp(snapshot.browserZoom || 1, 0.5, 2);
+    state.browserZoom = normalizedBrowserZoom(snapshot.browserZoom);
     state.calculatorExpression = snapshot.calculatorExpression || '';
     state.calculatorHistory = Array.isArray(snapshot.calculatorHistory) ? snapshot.calculatorHistory.slice(0, 20) : [];
     state.calculatorResult = '';
@@ -4093,20 +4321,20 @@ async function restoreWorkspaceTerminals(
       const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
       const widgetKey = terminal.widgetId || crypto.randomUUID();
       const existingWidget = widgetsBySnapshotId.get(widgetKey);
+      const terminalOptions: CreateTerminalOptions = {
+        focus: false,
+        profile: terminalProfile,
+        cwd: terminal.cwd || workspaceShellCwd(),
+        skipSnapshotSave: true
+      };
+      const terminalTitle = terminal.title || 'shell';
+      const terminalCommand = terminal.command;
       if (existingWidget) {
-        await createTerminalTab(existingWidget, terminal.command, terminal.title || 'shell', {
-          focus: false,
-          profile: terminalProfile,
-          cwd: terminal.cwd || workspaceShellCwd(),
-          skipSnapshotSave: true
-        });
+        await createTerminalTab(existingWidget, terminalCommand, terminalTitle, terminalOptions);
       } else {
-        const widget = await createTerminal(terminal.command, terminal.title || 'shell', {
-          rect: terminal.rect,
-          focus: false,
-          profile: terminalProfile,
-          cwd: terminal.cwd || workspaceShellCwd(),
-          skipSnapshotSave: true
+        const widget = await createTerminal(terminalCommand, terminalTitle, {
+          ...terminalOptions,
+          rect: terminal.rect
         });
         if (widget) widgetsBySnapshotId.set(widgetKey, widget);
       }
@@ -4294,7 +4522,10 @@ function restoredImageTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
       dataUrl: tab.dataUrl || '',
       label: tab.label || 'No image selected',
       history: Array.isArray(tab.history) ? tab.history : [],
-      historyVisible: Boolean(tab.historyVisible)
+      historyVisible: Boolean(tab.historyVisible),
+      zoom: normalizedImageZoom(tab.zoom),
+      offsetX: finiteNumber(tab.offsetX, 0),
+      offsetY: finiteNumber(tab.offsetY, 0)
     });
   }
   return tabs;
@@ -4325,6 +4556,7 @@ function restoredNoteTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
       id: tab.id || crypto.randomUUID(),
       path: tab.path,
       title: tab.title || noteTitleFromPath(tab.path),
+      customTitle: typeof tab.customTitle === 'string' ? tab.customTitle : undefined,
       theme: normalizeNoteTheme(tab.theme),
       content: '',
       dirty: false,
@@ -4524,6 +4756,28 @@ function closeNoteTab(id: string) {
   saveActiveWorkspaceSnapshot();
 }
 
+function renameNoteTab(id: string) {
+  const tab = noteTabForId(id);
+  if (!tab) return;
+  const current = noteTabCustomTitle(tab) || noteTabAutoLabel(tab);
+  const next = window.prompt('Note tab name. Leave empty to use the automatic title.', current);
+  if (next === null) return;
+  setNoteTabCustomTitle(id, next);
+}
+
+function setNoteTabCustomTitle(id: string, title: string) {
+  const tab = noteTabForId(id);
+  if (!tab) return;
+  const previousLabel = noteTabLabel(tab);
+  const customTitle = title.trim();
+  tab.customTitle = customTitle || undefined;
+  const nextLabel = noteTabLabel(tab);
+  if (previousLabel === nextLabel) noteTabsRenderSignature = '\0';
+  renderNoteTabs();
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  setStatus(customTitle ? `Note tab renamed: ${customTitle}` : 'Note tab uses automatic title');
+}
+
 function renderNoteTabs() {
   if (getPanel('notes').classList.contains('hidden')) return;
   const signature = noteTabsSignature();
@@ -4586,6 +4840,13 @@ function noteTabElement(id: string) {
     const id = row.dataset.noteTabId ?? '';
     if (id) activateNoteTab(id);
   });
+  labelButton.addEventListener('keydown', (event) => {
+    if (event.key !== 'F2') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const id = row.dataset.noteTabId ?? '';
+    if (id) renameNoteTab(id);
+  });
   const closeButton = document.createElement('button');
   closeButton.className = 'widget-tab-close';
   closeButton.type = 'button';
@@ -4611,13 +4872,16 @@ function updateNoteTabElement(row: HTMLElement, tab: NoteTabState) {
   const theme = tab.theme ?? 'default';
   const active = tab.id === state.activeNoteTabId;
   const label = `${noteTabLabel(tab)}${tab.dirty ? ' *' : ''}`;
-  const signature = `${tab.id}\t${active ? '1' : '0'}\t${theme}\t${label}\t${tab.path}`;
+  const signature = `${tab.id}\t${active ? '1' : '0'}\t${theme}\t${label}\t${tab.path}\t${noteTabCustomTitle(tab)}`;
   row.dataset.noteTabId = tab.id;
   if (row.dataset.renderSignature === signature) return;
   row.dataset.renderSignature = signature;
   row.className = `widget-tab note-tab note-tab-${theme}${active ? ' active' : ''}`;
   const labelButton = noteTabLabelButton(row);
-  if (labelButton.title !== tab.path) labelButton.title = tab.path;
+  const title = noteTabCustomTitle(tab)
+    ? `${tab.path}\nCustom tab name: ${noteTabCustomTitle(tab)}`
+    : tab.path;
+  if (labelButton.title !== title) labelButton.title = title;
   setTextContentIfChanged(labelButton, label);
 }
 
@@ -4636,7 +4900,7 @@ function noteTabsSignature() {
   for (let index = 0; index < state.noteTabs.length; index += 1) {
     const tab = state.noteTabs[index];
     if (index) signature += '\n';
-    signature += `${tab.id}\t${tab.id === state.activeNoteTabId ? '1' : '0'}\t${tab.theme}\t${noteTabLabel(tab)}\t${tab.dirty ? '1' : '0'}\t${tab.loading ? '1' : '0'}`;
+    signature += `${tab.id}\t${tab.id === state.activeNoteTabId ? '1' : '0'}\t${tab.theme}\t${noteTabLabel(tab)}\t${noteTabCustomTitle(tab)}\t${tab.dirty ? '1' : '0'}\t${tab.loading ? '1' : '0'}`;
   }
   return signature;
 }
@@ -4717,11 +4981,11 @@ function renderNotePin() {
 function handleNoteInput() {
   const tab = activeNoteTab();
   if (!tab) return;
-  const previousTitle = tab.title;
+  const previousLabel = noteTabLabel(tab);
   tab.content = el.notesBody.value;
   tab.dirty = true;
-  tab.title = noteTabLabel(tab);
-  if (tab.title !== previousTitle) renderNoteTabs();
+  tab.title = noteTabAutoLabel(tab);
+  if (noteTabLabel(tab) !== previousLabel) renderNoteTabs();
   renderNoteStatus();
   scheduleNoteSave(tab, NOTES_AUTOSAVE_DELAY_MS);
 }
@@ -4833,6 +5097,14 @@ function isPathSeparator(code: number) {
 }
 
 function noteTabLabel(tab: NoteTabState) {
+  return noteTabCustomTitle(tab) || noteTabAutoLabel(tab);
+}
+
+function noteTabCustomTitle(tab: NoteTabState) {
+  return tab.customTitle?.trim() ?? '';
+}
+
+function noteTabAutoLabel(tab: NoteTabState) {
   const firstLine = tab.content.match(/[^\s][^\r\n]*/)?.[0].trim();
   if (firstLine) return firstLine.slice(0, 40);
   return tab.title || noteTitleFromPath(tab.path);
@@ -4897,6 +5169,22 @@ function handleCalculatorGlobalKey(event: KeyboardEvent) {
   if (event.target === el.calculatorExpression) return;
   if (!isCalculatorKeyboardTarget(event.target)) return;
   handleCalculatorKey(event);
+}
+
+function handleNoteRenameShortcut(event: KeyboardEvent) {
+  if (event.key !== 'F2' || event.ctrlKey || event.metaKey || event.altKey) return;
+  const notes = getPanel('notes');
+  if (notes.classList.contains('hidden')) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest('input, select, .terminal-card, .cm-editor') && !notes.contains(target)) return;
+  const noteTab = target?.closest<HTMLElement>('.note-tab');
+  const id = noteTab?.dataset.noteTabId
+    || (event.target instanceof Node && notes.contains(event.target) ? state.activeNoteTabId : '');
+  if (!id || !noteTabForId(id)) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  renameNoteTab(id);
 }
 
 function isCalculatorKeyboardTarget(target: EventTarget | null) {
@@ -5269,11 +5557,21 @@ function normalizedBrowserDeviceId(value: unknown) {
     : DEFAULT_BROWSER_DEVICE_ID;
 }
 
+function normalizedBrowserOrientation(value: unknown): BrowserOrientation {
+  return value === 'landscape' ? 'landscape' : 'portrait';
+}
+
+function normalizedBrowserZoom(value: unknown) {
+  const zoom = Number(value);
+  return clamp(Number.isFinite(zoom) ? zoom : 1, BROWSER_ZOOM_LEVELS[0], BROWSER_ZOOM_LEVELS[BROWSER_ZOOM_LEVELS.length - 1]);
+}
+
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
   const browserVisible = !isBrowserPanelHidden();
   const browserConsoleVisible = Boolean(snapshot.browserConsoleVisible);
   state.browserTabs = restoredBrowserTabs(snapshot, runtime);
+  state.browserHistory = restoredBrowserHistory(snapshot, runtime);
   rebuildBrowserTabLookup();
   state.previewProxies = USE_PREVIEW_PROXY_BROWSER && runtime ? restoredPreviewProxies(runtime.previewProxies) : [];
   rebuildPreviewProxyLookup();
@@ -5286,17 +5584,22 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   state.activeBrowserTabId = runtime?.activeBrowserTabId ?? '';
   state.previewUrl = runtime?.previewUrl ?? '';
   state.browserDeviceId = normalizedBrowserDeviceId(snapshot.browserDeviceId);
-  state.browserOrientation = snapshot.browserOrientation === 'landscape' ? 'landscape' : 'portrait';
+  state.browserOrientation = normalizedBrowserOrientation(snapshot.browserOrientation);
   state.browserConsolePosition = normalizedBrowserConsolePosition(snapshot.browserConsolePosition);
   state.browserConsoleVisible = browserConsoleVisible;
-  if (browserVisible) applyVisibleBrowserLayout();
   if (state.browserTabs.length) {
     const active = browserTabForId(runtime?.activeBrowserTabId || snapshot.activeBrowserTabId) ?? state.browserTabs[0];
     state.activeBrowserTabId = active.id;
     state.previewUrl = active.url;
+    applyBrowserViewportFromTab(active);
     setInputValueIfChanged(el.previewUrl, active.url);
+    if (browserVisible) applyVisibleBrowserLayout();
     if (browserVisible) showRestoredBrowserIdle(active);
+  } else {
+    if (browserVisible) applyVisibleBrowserLayout();
+    setInputValueIfChanged(el.previewUrl, state.previewUrl);
   }
+  hideBrowserAddressSuggestions();
   if (browserVisible) {
     renderBrowserTabs();
     if (state.browserConsoleVisible) renderBrowserConsole();
@@ -5305,8 +5608,11 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
 
 function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRuntimeCache | null | undefined) {
   const tabs: BrowserTab[] = [];
+  const fallbackDeviceId = normalizedBrowserDeviceId(snapshot.browserDeviceId);
+  const fallbackOrientation = normalizedBrowserOrientation(snapshot.browserOrientation);
+  const fallbackZoom = normalizedBrowserZoom(snapshot.browserZoom);
   if (runtime?.browserTabs.length) {
-    for (const tab of runtime.browserTabs) tabs.push(normalizeBrowserTabForCurrentMode(tab));
+    for (const tab of runtime.browserTabs) tabs.push(normalizeBrowserTabForCurrentMode(tab, fallbackDeviceId, fallbackOrientation, fallbackZoom));
     return tabs;
   }
   if (!Array.isArray(snapshot.browserTabs)) return tabs;
@@ -5315,10 +5621,32 @@ function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRunt
     tabs.push(normalizeBrowserTabForCurrentMode({
       id: tab.id || makeBrowserTabId(),
       url: tab.url,
-      label: tab.label || browserTabLabel(tab.url)
-    }));
+      label: tab.label || browserTabLabel(tab.url),
+      deviceId: tab.deviceId,
+      orientation: tab.orientation,
+      zoom: tab.zoom
+    }, fallbackDeviceId, fallbackOrientation, fallbackZoom));
   }
   return tabs;
+}
+
+function restoredBrowserHistory(snapshot: WorkspaceSnapshot, runtime: WorkspaceRuntimeCache | null | undefined) {
+  const history = Array.isArray(runtime?.browserHistory) && runtime.browserHistory.length
+    ? runtime.browserHistory
+    : Array.isArray(snapshot.browserHistory) && snapshot.browserHistory.length
+      ? snapshot.browserHistory
+      : (Array.isArray(snapshot.browserTabs) ? snapshot.browserTabs.map((tab) => tab?.url).filter(Boolean) : []);
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const value of history) {
+    if (typeof value !== 'string') continue;
+    const url = normalizeBrowserHistoryUrl(value);
+    if (!url || seen.has(url)) continue;
+    normalized.push(url);
+    seen.add(url);
+    if (normalized.length >= BROWSER_ADDRESS_HISTORY_LIMIT) break;
+  }
+  return normalized;
 }
 
 function restoredPreviewProxies(proxies: PortForwardResult[]) {
@@ -5327,8 +5655,16 @@ function restoredPreviewProxies(proxies: PortForwardResult[]) {
   return restored;
 }
 
-function normalizeBrowserTabForCurrentMode(tab: BrowserTab): BrowserTab {
+function normalizeBrowserTabForCurrentMode(
+  tab: BrowserTab,
+  fallbackDeviceId = state.browserDeviceId,
+  fallbackOrientation = state.browserOrientation,
+  fallbackZoom = state.browserZoom
+): BrowserTab {
   const normalized = { ...tab };
+  normalized.deviceId = normalizedBrowserDeviceId(normalized.deviceId ?? fallbackDeviceId);
+  normalized.orientation = normalizedBrowserOrientation(normalized.orientation ?? fallbackOrientation);
+  normalized.zoom = normalizedBrowserZoom(normalized.zoom ?? fallbackZoom);
   if (!USE_EDGE_CDP_BROWSER) normalized.edge = undefined;
   if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(normalized.url)) {
     normalized.frameUrl = undefined;
@@ -5386,8 +5722,9 @@ function bindEvents() {
   el.newWorkspaceTab.addEventListener('click', () => void createBlankWorkspaceTab());
   el.profileSelect.addEventListener('change', async () => {
     saveActiveWorkspaceSnapshot();
+    const canFillActiveEmptyWorkspace = workspaceSnapshotCanAcceptOpen(activeWorkspaceSnapshot());
     if (state.workspaceOpen) await closeWorkspace();
-    state.activeWorkspaceId = '';
+    if (!canFillActiveEmptyWorkspace) state.activeWorkspaceId = '';
     renderWorkspaceTabs();
     selectProfile(el.profileSelect.value);
   });
@@ -5457,6 +5794,17 @@ function bindEvents() {
     state.imageOpenInNewTab = el.imageOpenNewTab.checked;
     saveActiveWorkspaceSnapshot();
   });
+  el.imageFit.addEventListener('click', fitActiveImagePreview);
+  el.imagePreviewStage.addEventListener('wheel', handleImagePreviewWheel, { passive: false });
+  el.imagePreviewStage.addEventListener('pointerdown', startImagePreviewDrag);
+  el.imagePreviewStage.addEventListener('pointermove', moveImagePreviewDrag);
+  el.imagePreviewStage.addEventListener('pointerup', finishImagePreviewDrag);
+  el.imagePreviewStage.addEventListener('pointercancel', finishImagePreviewDrag);
+  el.imagePreviewStage.addEventListener('dblclick', fitActiveImagePreview);
+  el.imagePreview.addEventListener('load', () => {
+    clampImagePreviewPan();
+    applyImagePreviewTransform();
+  });
   for (const button of el.llmButtons) {
     button.addEventListener('click', () => launchLlm(button.dataset.llm ?? 'llm'));
   }
@@ -5470,6 +5818,26 @@ function bindEvents() {
     if (event.key !== 'Enter') return;
     event.preventDefault();
     void openPreviewValue(el.previewUrl.value.trim());
+  });
+  el.previewUrl.addEventListener('focus', () => renderBrowserAddressSuggestions(true));
+  el.previewUrl.addEventListener('click', () => renderBrowserAddressSuggestions(true));
+  el.previewUrl.addEventListener('input', () => renderBrowserAddressSuggestions(true));
+  el.previewUrl.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (!el.browserAddressSuggestions.matches(':hover')) hideBrowserAddressSuggestions();
+    }, 120);
+  });
+  el.browserAddressSuggestions.addEventListener('pointerdown', (event) => {
+    const item = event.target instanceof Element
+      ? event.target.closest<HTMLButtonElement>('.browser-address-suggestion[data-url]')
+      : null;
+    if (!item) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const url = item.dataset.url ?? '';
+    setInputValueIfChanged(el.previewUrl, url);
+    hideBrowserAddressSuggestions();
+    void openPreviewValue(url);
   });
   el.browserBack.addEventListener('click', () => navigateBrowserHistory(-1));
   el.browserForward.addEventListener('click', () => navigateBrowserHistory(1));
@@ -5539,8 +5907,10 @@ function bindEvents() {
   document.addEventListener('paste', handlePaste);
   document.addEventListener('keydown', handleImageClipboardShortcut, true);
   document.addEventListener('keydown', handleEditorSaveShortcut, true);
+  document.addEventListener('keydown', handleBrowserZoomShortcut, true);
   document.addEventListener('keydown', handleResizeShortcut, true);
   document.addEventListener('keydown', handleWidgetFocusShortcut, true);
+  document.addEventListener('keydown', handleNoteRenameShortcut, true);
   document.addEventListener('keydown', handleExplorerKeyboard, true);
   document.addEventListener('keydown', handleCalculatorGlobalKey, true);
   document.addEventListener('keydown', handleBrowserRefreshShortcut, true);
@@ -5633,6 +6003,9 @@ function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
   const workspaceTab = target.closest<HTMLElement>('.workspace-tab');
   if (workspaceTab?.dataset.workspaceId) return workspaceTabContextMenu(workspaceTab.dataset.workspaceId);
 
+  const noteTab = target.closest<HTMLElement>('.note-tab');
+  if (noteTab?.dataset.noteTabId) return noteTabContextMenuItems(noteTab.dataset.noteTabId);
+
   const codeEditor = target.closest('.cm-editor');
   if (codeEditor) return editorContextMenuItems();
 
@@ -5643,7 +6016,7 @@ function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
   if (terminalCard) return terminalContextMenuItems(target, terminalCard);
 
   const fileRow = target.closest<HTMLElement>('.file-row');
-  if (fileRow?.dataset.path) selectExplorerEntry(fileRow.dataset.path, false);
+  if (fileRow?.dataset.path && !isExplorerPathSelected(fileRow.dataset.path)) selectExplorerEntry(fileRow.dataset.path, false);
   if (target.closest('.explorer')) return explorerContextMenuItems();
 
   if (target.closest('.image')) return imageContextMenuItems();
@@ -5692,6 +6065,7 @@ function workspaceTabContextMenu(id: string): ContextMenuItem[] {
   if (!workspace) return [];
   return [
     { label: 'Open workspace', action: () => activateWorkspaceTab(id), disabled: id === state.activeWorkspaceId && state.workspaceOpen },
+    { label: 'Rename workspace', action: () => startWorkspaceTabRename(id) },
     { label: 'Copy workspace', action: () => copyWorkspaceTab(id) },
     {
       label: workspace.captureProtected ? 'Disable capture block' : 'Block capture while active',
@@ -5703,11 +6077,16 @@ function workspaceTabContextMenu(id: string): ContextMenuItem[] {
 }
 
 function explorerContextMenuItems(): ContextMenuItem[] {
-  const entry = findExplorerEntry(state.explorerSelectedPath);
+  const entries = compactRecursiveExplorerSelection(selectedExplorerEntries());
+  const entry = entries.length === 1 ? entries[0] : findExplorerEntry(state.explorerSelectedPath);
+  const selectedCount = entries.length;
+  const multi = selectedCount > 1;
   return [
-    { label: 'Open', action: () => { if (entry) openExplorerEntry(entry); }, disabled: !entry },
-    { label: 'Rename', action: renameSelectedExplorerEntry, disabled: !entry },
-    { label: 'Export', action: startExportSelectedExplorerEntry, disabled: !entry },
+    { label: 'Open', action: () => { if (entry) openExplorerEntry(entry); }, disabled: !entry || multi },
+    { label: 'Rename', action: renameSelectedExplorerEntry, disabled: !entry || multi },
+    { label: multi ? `Export ${selectedCount} items` : 'Export', action: startExportSelectedExplorerEntry, disabled: !selectedCount },
+    { label: multi ? `Delete ${selectedCount} items` : 'Delete', action: deleteSelectedExplorerEntries, disabled: !selectedCount, danger: true },
+    { label: 'Undo delete', action: undoExplorerDelete, disabled: !explorerDeleteUndo },
     { separator: true },
     { label: 'New file', action: () => createExplorerItem('file') },
     { label: 'New folder', action: () => createExplorerItem('dir') },
@@ -5782,6 +6161,20 @@ function notesContextMenuItems(): ContextMenuItem[] {
     { label: 'New note', action: () => createNoteTab({ focus: true }) },
     { label: 'Save note', action: saveActiveNoteNow, disabled: !activeNoteTab() },
     { label: state.notePinned ? 'Unpin notes' : 'Pin notes', action: toggleNotePin }
+  ];
+}
+
+function noteTabContextMenuItems(id: string): ContextMenuItem[] {
+  const tab = noteTabForId(id);
+  if (!tab) return notesContextMenuItems();
+  return [
+    { label: 'Rename tab', action: () => renameNoteTab(id) },
+    { label: 'Use auto title', action: () => setNoteTabCustomTitle(id, ''), disabled: !noteTabCustomTitle(tab) },
+    { separator: true },
+    { label: 'New note', action: () => createNoteTab({ focus: true }) },
+    { label: 'Save note', action: () => saveNoteTabNow(tab), disabled: !shouldSaveNoteTabNow(tab) },
+    { separator: true },
+    { label: 'Close note tab', action: () => closeNoteTab(id), danger: true }
   ];
 }
 
@@ -5951,7 +6344,10 @@ function isWindowChromeInteractive(target: EventTarget | null) {
 async function runWindowAction(action: string) {
   if (action === 'minimize') await currentWindow.minimize();
   else if (action === 'toggle-maximize') await currentWindow.toggleMaximize();
-  else if (action === 'close') await currentWindow.close();
+  else if (action === 'close') {
+    await api.shutdownRuntimeSessions().catch(() => undefined);
+    await currentWindow.close();
+  }
 }
 async function resolveSelectedRoot() {
   if (!state.activeProfile) return '.';
@@ -5969,20 +6365,23 @@ function launchLlm(id: string) {
 function llmLauncherCommand(id: string) {
   const launcher = LLM_LAUNCHERS[id];
   if (!launcher) return id;
+  if (id === 'claude') return directLlmLauncherCommand(launcher);
   return state.activeProfile?.kind === 'windows'
     ? powershellLlmLauncherCommand(launcher)
     : bashLlmLauncherCommand(launcher);
+}
+
+function directLlmLauncherCommand(launcher: LlmLauncherConfig) {
+  const args = launcher.flags.flatMap((flag) => flag.args);
+  return state.activeProfile?.kind === 'windows'
+    ? `& ${launcher.executable} ${args.map(powershellQuote).join(' ')}`
+    : `${launcher.executable} ${args.map(bashQuote).join(' ')}`;
 }
 
 function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
   return [
     `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
-    `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
-    'if [ -n "$__svi_path" ] && [ -f "$__svi_path" ] && [ -r "$__svi_path" ]; then',
-    '  __svi_source="$__svi_source',
-    "$(head -c 65536 \"$__svi_path\" 2>/dev/null | tr -cd '\\011\\012\\015\\040-\\176')\"",
-    'fi',
     '__svi_args=()',
     ...launcher.flags.map((flag) =>
       `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`
@@ -5994,9 +6393,7 @@ function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
   return [
-    `$sviSource = (Get-Command ${executable} -All -ErrorAction SilentlyContinue | Format-List * | Out-String)`,
-    `$sviPath = (Get-Command ${executable} -ErrorAction SilentlyContinue).Source`,
-    'if ($sviPath -and (Test-Path -LiteralPath $sviPath -PathType Leaf)) { $sviSource += "`n" + ((Get-Content -LiteralPath $sviPath -TotalCount 400 -ErrorAction SilentlyContinue) -join "`n") }',
+    `$sviSource = (Get-Command ${executable} -All -ErrorAction SilentlyContinue | Format-List CommandType,Name,Definition,Source | Out-String)`,
     '$sviArgs = @()',
     ...launcher.flags.map((flag) =>
       `if ($sviSource -notmatch ${powershellQuote(flag.powershellPattern)}) { $sviArgs += @(${flag.args.map(powershellQuote).join(', ')}) }`
@@ -6031,6 +6428,7 @@ function handleEditorSaveShortcut(event: KeyboardEvent) {
 }
 
 function handleResizeShortcut(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
   if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
   const direction = shortcutResizeDirection(event);
   if (!direction) return;
@@ -6063,6 +6461,32 @@ function shortcutResizeDirection(event: KeyboardEvent) {
   return 0;
 }
 
+function handleBrowserZoomShortcut(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  if (!browserZoomShortcutTargetActive(event)) return;
+  const action = browserZoomShortcutAction(event);
+  if (!action) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  if (action === 'reset') resetBrowserZoom();
+  else resizeBrowserZoom(action);
+}
+
+function browserZoomShortcutTargetActive(event: KeyboardEvent) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest('.browser-panel')) return true;
+  return keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'browser';
+}
+
+function browserZoomShortcutAction(event: KeyboardEvent): number | 'reset' | null {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return null;
+  if (event.code === 'NumpadAdd' || event.key === '+' || event.key === '=') return 1;
+  if (event.code === 'NumpadSubtract' || event.key === '-' || event.key === '_') return -1;
+  if (event.code === 'Digit0' || event.code === 'Numpad0' || event.key === '0') return 'reset';
+  return null;
+}
+
 function handleExplorerMouseNavigation(event: MouseEvent) {
   if (event.button !== 3) return;
   const explorer = getPanel('explorer');
@@ -6077,10 +6501,24 @@ function handleExplorerMouseNavigation(event: MouseEvent) {
 function handleExplorerKeyboard(event: KeyboardEvent) {
   if (!shouldHandleExplorerKeyboard(event)) return;
 
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'z') {
+    event.preventDefault();
+    event.stopPropagation();
+    void undoExplorerDelete();
+    return;
+  }
+
   if (event.key === 'F2') {
     event.preventDefault();
     event.stopPropagation();
     void renameSelectedExplorerEntry();
+    return;
+  }
+
+  if (event.key === 'Delete' || event.key === 'Backspace') {
+    event.preventDefault();
+    event.stopPropagation();
+    void deleteSelectedExplorerEntries();
     return;
   }
 
@@ -6093,7 +6531,7 @@ function handleExplorerKeyboard(event: KeyboardEvent) {
   }
 
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-    moveExplorerSelection(event.key === 'ArrowDown' ? 1 : -1);
+    moveExplorerSelection(event.key === 'ArrowDown' ? 1 : -1, event.shiftKey);
     event.preventDefault();
     event.stopPropagation();
     return;
@@ -6244,14 +6682,37 @@ function applyNoteOpacity() {
 }
 
 function resizeBrowserZoom(direction: number) {
-  state.browserZoom = clamp(state.browserZoom + direction * 0.1, 0.5, 2);
+  state.browserZoom = nextBrowserZoom(state.browserZoom, direction);
+  syncActiveBrowserTabViewport();
   applyBrowserZoom();
   setStatus(`Browser zoom ${Math.round(state.browserZoom * 100)}%`);
   saveActiveWorkspaceSnapshot();
 }
 
+function resetBrowserZoom() {
+  state.browserZoom = 1;
+  syncActiveBrowserTabViewport();
+  applyBrowserZoom();
+  setStatus('Browser zoom 100%');
+  saveActiveWorkspaceSnapshot();
+}
+
+function nextBrowserZoom(current: number, direction: number) {
+  const normalized = normalizedBrowserZoom(current);
+  if (direction > 0) {
+    return BROWSER_ZOOM_LEVELS.find((level) => level > normalized + 0.001) ?? BROWSER_ZOOM_LEVELS[BROWSER_ZOOM_LEVELS.length - 1];
+  }
+  for (let index = BROWSER_ZOOM_LEVELS.length - 1; index >= 0; index -= 1) {
+    if (BROWSER_ZOOM_LEVELS[index] < normalized - 0.001) return BROWSER_ZOOM_LEVELS[index];
+  }
+  return BROWSER_ZOOM_LEVELS[0];
+}
+
 function applyBrowserZoom() {
   setRootStyleProperty('--browser-preview-zoom', state.browserZoom.toFixed(2));
+  applyBrowserFrameSizingForActiveFrame();
+  applyEdgePreviewSizing();
+  scheduleConfigureEdgeViewport();
 }
 
 function resizeCalculatorFont(direction: number) {
@@ -6918,7 +7379,7 @@ async function switchWorkspace(path: string) {
   clearWorkspacePanels();
   await openWorkspace(path);
   setWorkspaceOpen(true);
-  await createTerminal(null, 'shell');
+  await createTerminal(null, 'shell', { cwd: path });
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
 }
 
@@ -6966,6 +7427,7 @@ async function closeAllTerminals() {
   terminalPanesByWidgetId.clear();
   terminalWidgetById.clear();
   for (const pane of terminals) {
+    await flushTerminalInput(pane).catch(() => undefined);
     if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
     cleanupTerminalWriteBuffer(pane);
     if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
@@ -7013,9 +7475,78 @@ function hideTerminalWidgetsForWorkspace(workspaceId: string) {
   }
 }
 
+function filterTerminalInputData(pane: TerminalPane, data: string) {
+  const suppressUntil = pane.suppressTerminalQueryResponsesUntil ?? 0;
+  if (!suppressUntil || performance.now() >= suppressUntil) return data;
+  return data.replace(TERMINAL_CPR_RESPONSE_PATTERN, '');
+}
+
+function queueTerminalInput(pane: TerminalPane, data: string) {
+  if (!data) return;
+  pane.inputWriteBuffer += data;
+  if (pane.inputWriteBuffer.length >= TERMINAL_INPUT_FORCE_FLUSH_CHARS) {
+    void flushTerminalInput(pane);
+    return;
+  }
+  if (pane.inputFlushTimer) return;
+  pane.inputFlushTimer = window.setTimeout(() => {
+    pane.inputFlushTimer = undefined;
+    void flushTerminalInput(pane);
+  }, TERMINAL_INPUT_BATCH_MS);
+}
+
+function terminalInputShouldSendImmediately(data: string) {
+  if (!data) return false;
+  if (/[^\x00-\x7F]/.test(data)) return true;
+  if (data.length <= 8 && /[\x00-\x1F\x7F]/.test(data)) return true;
+  return false;
+}
+
+async function sendTerminalInputNow(pane: TerminalPane, data: string) {
+  if (!data) return;
+  if (pane.inputWriteBuffer) await flushTerminalInput(pane);
+  if (pane.inputWritePromise) await pane.inputWritePromise.catch(() => undefined);
+  if (!pane.backendId) return;
+  await api.writeTerminal(pane.backendId, data);
+}
+
+async function flushTerminalInput(pane: TerminalPane): Promise<void> {
+  if (pane.inputFlushTimer) {
+    window.clearTimeout(pane.inputFlushTimer);
+    pane.inputFlushTimer = undefined;
+  }
+  if (!pane.inputWriteBuffer || !pane.backendId) {
+    if (pane.inputWritePromise) await pane.inputWritePromise.catch(() => undefined);
+    return;
+  }
+  const data = pane.inputWriteBuffer;
+  const backendId = pane.backendId;
+  pane.inputWriteBuffer = '';
+  const previousWrite = pane.inputWritePromise ?? Promise.resolve();
+  const currentWrite = previousWrite
+    .catch(() => undefined)
+    .then(() => api.writeTerminal(backendId, data))
+    .catch((error) => {
+      pane.inputWriteBuffer = data + pane.inputWriteBuffer;
+      throw error;
+    });
+  const trackedWrite = currentWrite.finally(() => {
+    if (pane.inputWritePromise === trackedWrite) pane.inputWritePromise = undefined;
+    if (pane.inputWriteBuffer && !pane.inputFlushTimer) {
+      pane.inputFlushTimer = window.setTimeout(() => {
+        pane.inputFlushTimer = undefined;
+        void flushTerminalInput(pane);
+      }, TERMINAL_INPUT_BATCH_MS);
+    }
+  });
+  pane.inputWritePromise = trackedWrite;
+  await trackedWrite;
+}
+
 function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined) {
   if (pane.backendId) terminalPaneByBackendId.delete(pane.backendId);
   pane.backendId = backendId;
+  pane.backendOutputChars = 0;
   if (backendId) terminalPaneByBackendId.set(backendId, pane);
 }
 
@@ -7048,7 +7579,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   markExplorerEntryLookupDirty();
   state.explorerLoading = new Set();
   state.explorerSignatures = new Map();
-  state.explorerSelectedPath = '';
+  resetExplorerSelection();
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   state.explorerDropTargetDir = '';
@@ -7062,6 +7593,9 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   if (renderIntermediate) ensureEditorTab();
   state.imagePreviewDataUrl = '';
   state.imagePreviewLabel = 'No image selected';
+  state.imagePreviewZoom = 1;
+  state.imagePreviewOffsetX = 0;
+  state.imagePreviewOffsetY = 0;
   state.imageHistory = [];
   state.imageHistoryVisible = false;
   state.imageTabs = [];
@@ -7094,6 +7628,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   state.detectedPorts = [];
   clearDetectedPortLookup();
   state.browserTabs = [];
+  state.browserHistory = [];
   clearBrowserTabLookup();
   state.activeBrowserTabId = '';
   state.browserConsoleLogs = [];
@@ -7102,6 +7637,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   clearBrowserConsoleLocalPortScanQueue();
   markBrowserConsoleLogsChanged();
   setInputValueIfChanged(el.previewUrl, '');
+  hideBrowserAddressSuggestions();
   if (state.activeWorkspaceId) hideBrowserFramesForWorkspace(state.activeWorkspaceId);
   else hideAllBrowserFrames();
   disconnectActiveEdgeCdp();
@@ -7444,7 +7980,7 @@ function applyLoadedDirectory(path: string, entries: FileEntry[]) {
   markExplorerEntryLookupDirty();
   state.explorerLoading = new Set();
   state.explorerSignatures = new Map([[path, explorerDirectorySignature(state.entries)]]);
-  state.explorerSelectedPath = '';
+  resetExplorerSelection();
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   renderExplorer();
@@ -7707,7 +8243,7 @@ function renderVirtualExplorerRows(
     return;
   }
 
-  const selectedKey = state.explorerSelectedPath ? explorerPathKey(state.explorerSelectedPath) : '';
+  const selectedKeys = explorerSelectedPathKeys();
   const dropTargetKey = state.explorerDropTargetDir ? explorerPathKey(state.explorerDropTargetDir) : '';
   const renameKey = activeExplorerRename ? explorerPathKey(activeExplorerRename.path) : '';
 
@@ -7716,7 +8252,7 @@ function renderVirtualExplorerRows(
     nextScrollTop,
     nextStart,
     nextEnd,
-    selectedKey,
+    selectedKeys,
     dropTargetKey,
     renameKey
   })) {
@@ -7731,7 +8267,7 @@ function renderVirtualExplorerRows(
   const fragment = document.createDocumentFragment();
   appendExplorerSpacer(fragment, explorerRenderedStart * EXPLORER_ROW_HEIGHT, explorerTopSpacer);
   for (let index = explorerRenderedStart; index < explorerRenderedEnd; index += 1) {
-    fragment.append(explorerRowForWindowIndex(index, selectedKey, dropTargetKey, renameKey));
+    fragment.append(explorerRowForWindowIndex(index, selectedKeys, dropTargetKey, renameKey));
   }
   appendExplorerSpacer(fragment, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT, explorerBottomSpacer);
   el.fileList.replaceChildren(fragment);
@@ -7744,11 +8280,11 @@ function patchVirtualExplorerRows(options: {
   nextScrollTop: number;
   nextStart: number;
   nextEnd: number;
-  selectedKey: string;
+  selectedKeys: Set<string>;
   dropTargetKey: string;
   renameKey: string;
 }) {
-  const { total, nextScrollTop, nextStart, nextEnd, selectedKey, dropTargetKey, renameKey } = options;
+  const { total, nextScrollTop, nextStart, nextEnd, selectedKeys, dropTargetKey, renameKey } = options;
   const oldStart = explorerRenderedStart;
   const oldEnd = explorerRenderedEnd;
   if (
@@ -7773,7 +8309,7 @@ function patchVirtualExplorerRows(options: {
   if (nextStart < oldStart) {
     const fragment = document.createDocumentFragment();
     for (let index = nextStart; index < oldStart; index += 1) {
-      fragment.append(explorerRowForWindowIndex(index, selectedKey, dropTargetKey, renameKey));
+      fragment.append(explorerRowForWindowIndex(index, selectedKeys, dropTargetKey, renameKey));
     }
     el.fileList.insertBefore(fragment, explorerTopSpacer.nextSibling);
   }
@@ -7781,7 +8317,7 @@ function patchVirtualExplorerRows(options: {
   if (nextEnd > oldEnd) {
     const fragment = document.createDocumentFragment();
     for (let index = oldEnd; index < nextEnd; index += 1) {
-      fragment.append(explorerRowForWindowIndex(index, selectedKey, dropTargetKey, renameKey));
+      fragment.append(explorerRowForWindowIndex(index, selectedKeys, dropTargetKey, renameKey));
     }
     el.fileList.insertBefore(fragment, explorerBottomSpacer);
   }
@@ -7798,14 +8334,14 @@ function patchVirtualExplorerRows(options: {
 
 function explorerRowForWindowIndex(
   index: number,
-  selectedKey: string,
+  selectedKeys: Set<string>,
   dropTargetKey: string,
   renameKey: string
 ) {
   const item = explorerVisibleRows[index];
   return item.loading
     ? cachedExplorerLoadingRow(item)
-    : cachedExplorerRow(item, selectedKey, dropTargetKey, renameKey);
+    : cachedExplorerRow(item, selectedKeys, dropTargetKey, renameKey);
 }
 
 function removeExplorerRenderedChild(child: Element | null) {
@@ -7833,13 +8369,13 @@ function updateExplorerSpacerHeight(spacer: HTMLElement, height: number) {
 
 function cachedExplorerRow(
   item: ExplorerVisibleRow,
-  selectedKey: string,
+  selectedKeys: Set<string>,
   dropTargetKey: string,
   renameKey: string
 ) {
   const key = `row:${item.pathKey}`;
   const row = cachedExplorerRowElement(key);
-  updateExplorerRowElement(row, item, selectedKey, dropTargetKey, renameKey);
+  updateExplorerRowElement(row, item, selectedKeys, dropTargetKey, renameKey);
   explorerRenderedRowByPath.set(item.pathKey, row);
   return row;
 }
@@ -7901,12 +8437,12 @@ function explorerRowParts(row: HTMLElement) {
 function updateExplorerRowElement(
   row: HTMLElement,
   item: ExplorerVisibleRow,
-  selectedKey: string,
+  selectedKeys: Set<string>,
   dropTargetKey: string,
   renameKey: string
 ) {
   const entry = item.entry!;
-  const selected = item.pathKey === selectedKey;
+  const selected = selectedKeys.has(item.pathKey);
   const dropTarget = item.pathKey === dropTargetKey;
   const renameActive = item.pathKey === renameKey;
   const stateSignature = `${selected ? '1' : '0'}${dropTarget ? '1' : '0'}${renameActive ? '1' : '0'}`;
@@ -8024,6 +8560,7 @@ function bindExplorerListEvents() {
   el.fileList.addEventListener('scroll', handleExplorerScroll, { passive: true });
   el.fileList.addEventListener('pointerover', handleExplorerPointerOver);
   el.fileList.addEventListener('pointerdown', handleExplorerPointerDown);
+  el.fileList.addEventListener('selectstart', handleExplorerSelectStart);
   el.fileList.addEventListener('focusin', handleExplorerFocusIn);
   el.fileList.addEventListener('click', handleExplorerClick);
   el.fileList.addEventListener('dblclick', handleExplorerDoubleClick);
@@ -8104,18 +8641,45 @@ function handleExplorerPointerOver(event: PointerEvent) {
 
 function handleExplorerPointerDown(event: PointerEvent) {
   if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
-  const entry = explorerEntryFromEvent(event);
+  if (event.button !== 0) return;
+  const row = explorerRowFromEvent(event);
+  if (!row) return;
+  const entry = explorerEntryForRow(row);
   if (!entry) return;
-  selectExplorerEntry(entry.path, false);
+  if (event.shiftKey || event.ctrlKey || event.metaKey) {
+    rememberExplorerModifierPointer(entry.path);
+    clearExplorerTextSelection();
+    scheduleTextFilePrefetch(entry, 0);
+    scheduleExplorerDirectoryPrefetch(entry, 0);
+    return;
+  }
+  clearExplorerModifierPointer();
+  selectExplorerEntryFromPointer(entry, event, false);
   scheduleTextFilePrefetch(entry, 0);
   scheduleExplorerDirectoryPrefetch(entry, 0);
+}
+
+function handleExplorerSelectStart(event: Event) {
+  if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
+  if (explorerRowFromEvent(event)) event.preventDefault();
+}
+
+function clearExplorerTextSelection() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return;
+  selection.removeAllRanges();
 }
 
 function handleExplorerFocusIn(event: FocusEvent) {
   if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
   const entry = explorerEntryFromEvent(event);
   if (!entry) return;
-  selectExplorerEntry(entry.path, false);
+  if (isExplorerModifierPointerActive(entry.path)) {
+    scheduleTextFilePrefetch(entry, 0);
+    scheduleExplorerDirectoryPrefetch(entry, 0);
+    return;
+  }
+  if (!isExplorerPathSelected(entry.path)) selectExplorerEntry(entry.path, false);
   scheduleTextFilePrefetch(entry, 0);
   scheduleExplorerDirectoryPrefetch(entry, 0);
 }
@@ -8124,6 +8688,13 @@ function handleExplorerClick(event: MouseEvent) {
   if (event.target instanceof Element && event.target.closest('.file-rename-input')) return;
   const entry = explorerEntryFromEvent(event);
   if (!entry) return;
+  if (event.shiftKey || event.ctrlKey || event.metaKey) {
+    event.preventDefault();
+    clearExplorerTextSelection();
+    selectExplorerEntryFromPointer(entry, event, false);
+    clearExplorerModifierPointer();
+    return;
+  }
   if (state.explorerOpenMode === 'single') openExplorerEntry(entry);
   else selectExplorerEntry(entry.path, false);
 }
@@ -8149,6 +8720,60 @@ function explorerEntryForRow(row: HTMLElement) {
   const path = row.dataset.path ?? '';
   const pathKey = row.dataset.pathKey || explorerPathKey(path);
   return explorerVisibleEntryForPathKey(pathKey) ?? findExplorerEntry(path);
+}
+
+function selectExplorerEntryFromPointer(entry: FileEntry, event: MouseEvent | PointerEvent, scrollIntoView = true) {
+  if (event.shiftKey) {
+    selectExplorerRange(entry.path, scrollIntoView);
+    return;
+  }
+  if (event.ctrlKey || event.metaKey) {
+    toggleExplorerSelection(entry.path, scrollIntoView);
+    return;
+  }
+  selectExplorerEntry(entry.path, scrollIntoView);
+}
+
+function rememberExplorerModifierPointer(path: string) {
+  explorerModifierPointerPath = path;
+  explorerModifierPointerUntil = performance.now() + 900;
+}
+
+function isExplorerModifierPointerActive(path: string) {
+  if (!explorerModifierPointerPath || performance.now() > explorerModifierPointerUntil) return false;
+  return sameExplorerPath(explorerModifierPointerPath, path);
+}
+
+function clearExplorerModifierPointer() {
+  explorerModifierPointerPath = '';
+  explorerModifierPointerUntil = 0;
+}
+
+function selectExplorerRange(path: string, scrollIntoView = true) {
+  const anchor = state.explorerSelectionAnchorPath || state.explorerSelectedPath || path;
+  const anchorIndex = explorerVisibleIndexByPath.get(explorerPathKey(anchor));
+  const targetIndex = explorerVisibleIndexByPath.get(explorerPathKey(path));
+  if (anchorIndex === undefined || targetIndex === undefined) {
+    selectExplorerEntry(path, scrollIntoView);
+    return;
+  }
+  const start = Math.min(anchorIndex, targetIndex);
+  const end = Math.max(anchorIndex, targetIndex);
+  const paths: string[] = [];
+  for (let index = start; index <= end; index += 1) {
+    const entry = explorerVisibleRows[index]?.entry;
+    if (entry) paths.push(entry.path);
+  }
+  setExplorerSelection(paths, path, anchor, scrollIntoView);
+}
+
+function toggleExplorerSelection(path: string, scrollIntoView = true) {
+  const selected = new Set(state.explorerSelectedPaths);
+  if (!selected.size && state.explorerSelectedPath) selected.add(state.explorerSelectedPath);
+  if (selected.has(path) && selected.size > 1) selected.delete(path);
+  else selected.add(path);
+  const activePath = selected.has(path) ? path : selected.values().next().value || '';
+  setExplorerSelection(selected, activePath, state.explorerSelectionAnchorPath || activePath, scrollIntoView);
 }
 
 function explorerVisibleEntryForPathKey(pathKey: string) {
@@ -8178,28 +8803,101 @@ function cancelExplorerHoverPrefetch() {
 
 async function startExportSelectedExplorerEntry() {
   if (!state.activeProfile || !state.workspaceOpen) return;
-  const entry = findExplorerEntry(state.explorerSelectedPath);
-  if (!entry) {
+  const entries = compactRecursiveExplorerSelection(selectedExplorerEntries());
+  if (!entries.length) {
     setStatus('Select an item to export', true);
     return;
   }
 
+  const batchId = entries.length > 1 ? crypto.randomUUID() : '';
   try {
-    const result = await api.startExportPath(state.activeProfile.id, entry.path);
-    upsertExportJob({
-      id: result.id,
-      name: result.name,
-      status: 'running',
-      progress: 0,
-      outputPath: null,
-      message: 'Export queued',
-      directory: entry.kind === 'dir',
-      createdAt: Date.now()
-    });
-    setStatus(`Exporting ${entry.name} in background`);
+    let queued = 0;
+    for (const entry of entries) {
+      const result = await api.startExportPath(state.activeProfile.id, entry.path);
+      upsertExportJob({
+        id: result.id,
+        name: result.name,
+        status: 'running',
+        progress: 0,
+        outputPath: null,
+        message: 'Export queued',
+        directory: entry.kind === 'dir',
+        createdAt: Date.now(),
+        batchId,
+        batchTotal: entries.length
+      });
+      queued += 1;
+    }
+    setStatus(queued === 1
+      ? `Exporting ${entries[0].name} in background`
+      : `Exporting ${queued} items in background`);
   } catch (error) {
     setStatus(`Export failed to start: ${String(error)}`, true);
   }
+}
+
+async function deleteSelectedExplorerEntries() {
+  if (!state.activeProfile || !state.workspaceOpen) return;
+  const entries = selectedExplorerEntries();
+  if (!entries.length) {
+    setStatus('Select an item to delete', true);
+    return;
+  }
+
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  try {
+    const deleted = await api.deletePaths(profileId, entries.map((entry) => entry.path));
+    explorerDeleteUndo = { profileId, workspaceId, items: deleted };
+    for (const item of deleted) {
+      invalidateExplorerParentDirectoryCache(profileId, item.originalPath);
+      invalidateExplorerParentDirectoryCache(profileId, item.trashPath);
+      invalidateExplorerDirectoryCache(profileId, item.originalPath);
+    }
+    clearDeletedExplorerReferences(deleted);
+    resetExplorerSelection();
+    await refreshExplorerTree({ manual: true, silent: true });
+    setStatus(deleted.length === 1
+      ? `Deleted ${deleted[0].name}. Ctrl+Z to undo`
+      : `Deleted ${deleted.length} items. Ctrl+Z to undo`);
+  } catch (error) {
+    setStatus(`Delete failed: ${String(error)}`, true);
+  }
+}
+
+async function undoExplorerDelete() {
+  if (!explorerDeleteUndo) {
+    setStatus('Nothing to undo');
+    return;
+  }
+  const undo = explorerDeleteUndo;
+  if (!state.activeProfile || state.activeProfile.id !== undo.profileId) {
+    setStatus('Switch back to the original profile to undo delete', true);
+    return;
+  }
+  try {
+    await api.restoreDeletedPaths(undo.profileId, undo.items);
+    for (const item of undo.items) {
+      invalidateExplorerParentDirectoryCache(undo.profileId, item.originalPath);
+      invalidateExplorerParentDirectoryCache(undo.profileId, item.trashPath);
+    }
+    explorerDeleteUndo = null;
+    await refreshExplorerTree({ manual: true, silent: true });
+    setExplorerSelection(undo.items.map((item) => item.originalPath), undo.items[0]?.originalPath ?? '');
+    setStatus(undo.items.length === 1 ? `Restored ${undo.items[0].name}` : `Restored ${undo.items.length} items`);
+  } catch (error) {
+    setStatus(`Undo delete failed: ${String(error)}`, true);
+  }
+}
+
+function clearDeletedExplorerReferences(items: DeletedPathItem[]) {
+  for (const item of items) {
+    invalidateTextFileCache(state.activeProfile?.id ?? '', item.originalPath);
+    state.explorerExpanded.delete(item.originalPath);
+    state.explorerChildren.delete(item.originalPath);
+    state.explorerSignatures.delete(item.originalPath);
+  }
+  markExplorerEntryLookupDirty();
 }
 
 function handleExportProgress(payload: ExportProgressEvent) {
@@ -8212,9 +8910,15 @@ function handleExportProgress(payload: ExportProgressEvent) {
     outputPath: payload.outputPath ?? null,
     message: payload.message ?? null,
     directory: payload.directory,
-    createdAt: existing?.createdAt ?? Date.now()
+    createdAt: existing?.createdAt ?? Date.now(),
+    batchId: existing?.batchId,
+    batchTotal: existing?.batchTotal
   });
-  if (payload.status === 'completed') setStatus(`${payload.name} ready to drag out`);
+  if (payload.status === 'completed') {
+    const batchStatus = existing?.batchId ? exportBatchCompletionStatus(existing.batchId) : null;
+    if (batchStatus?.done) setStatus(`${batchStatus.total} items exported and ready to drag out`);
+    else if (!existing?.batchId) setStatus(`${payload.name} ready to drag out`);
+  }
   else if (payload.status === 'failed') setStatus(`Export failed: ${payload.message ?? payload.name}`, true);
   else if (payload.status === 'cancelled') setStatus(`Export cancelled: ${payload.name}`);
 }
@@ -8226,12 +8930,20 @@ function upsertExportJob(job: ExportJobState) {
   } else {
     state.exportJobs.unshift(job);
     exportJobById.set(job.id, job);
-    while (state.exportJobs.length > 8) {
+    while (state.exportJobs.length > 24) {
       const removed = state.exportJobs.pop();
       if (removed) exportJobById.delete(removed.id);
     }
   }
   renderExportJobs();
+}
+
+function exportBatchCompletionStatus(batchId: string) {
+  const jobs = state.exportJobs.filter((job) => job.batchId === batchId);
+  if (!jobs.length) return null;
+  const total = jobs[0].batchTotal || jobs.length;
+  const doneCount = jobs.filter((job) => job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled').length;
+  return { total, done: doneCount >= total };
 }
 
 function renderExportJobs() {
@@ -8331,8 +9043,8 @@ function updateExportJobElement(row: HTMLElement, job: ExportJobState) {
   const actionSignature = job.status === 'running'
     ? 'cancel'
     : job.status === 'completed' && job.outputPath
-      ? 'drag-open'
-      : '';
+      ? 'drag-open-clear'
+      : 'clear';
   const signature = `${job.id}\t${job.name}\t${job.status}\t${progressPercent}\t${job.progress == null ? '1' : '0'}\t${detailText}\t${job.outputPath ?? ''}\t${actionSignature}`;
   row.dataset.exportJobId = job.id;
   if (row.dataset.renderSignature === signature) return;
@@ -8372,9 +9084,31 @@ function updateExportJobElement(row: HTMLElement, job: ExportJobState) {
         const current = exportJobForRow(row);
         if (current?.outputPath) void api.openExportPath(current.outputPath);
       });
-      parts.actions.append(drag, open);
+      const clear = exportJobClearButton(row);
+      parts.actions.append(drag, open, clear);
+    } else {
+      parts.actions.append(exportJobClearButton(row));
     }
   }
+}
+
+function exportJobClearButton(row: HTMLElement) {
+  const clear = document.createElement('button');
+  clear.textContent = 'Clear';
+  clear.addEventListener('click', () => {
+    const id = row.dataset.exportJobId;
+    if (id) clearExportJob(id);
+  });
+  return clear;
+}
+
+function clearExportJob(id: string) {
+  const index = state.exportJobs.findIndex((job) => job.id === id);
+  if (index >= 0) state.exportJobs.splice(index, 1);
+  exportJobById.delete(id);
+  exportJobsRenderSignature = '\0';
+  renderExportJobs();
+  if (!state.exportJobs.length) setStatus('Export messages cleared');
 }
 
 function exportJobForRow(row: HTMLElement) {
@@ -8805,6 +9539,8 @@ async function refreshExplorerDirectory(
 ) {
   if (!profileId) return;
   const selected = state.explorerSelectedPath;
+  const selectedPaths = new Set(state.explorerSelectedPaths);
+  const selectionAnchor = state.explorerSelectionAnchorPath;
   const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force);
   if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
   const signature = explorerDirectorySignature(entries);
@@ -8815,7 +9551,7 @@ async function refreshExplorerDirectory(
     state.entries = entries;
     markExplorerEntryLookupDirty();
     state.explorerSignatures.set(path, signature);
-    state.explorerSelectedPath = selected;
+    restoreExplorerSelection(selected, selectedPaths, selectionAnchor);
     renderExplorer();
     return;
   }
@@ -8824,7 +9560,7 @@ async function refreshExplorerDirectory(
   markExplorerEntryLookupDirty();
   state.explorerSignatures.set(path, signature);
   state.explorerExpanded.add(path);
-  state.explorerSelectedPath = selected;
+  restoreExplorerSelection(selected, selectedPaths, selectionAnchor);
   renderExplorer();
 }
 
@@ -8836,12 +9572,12 @@ async function refreshExplorerTree(options: { manual?: boolean; silent?: boolean
   if (options.manual) {
     el.refreshExplorer.disabled = true;
     el.refreshExplorer.textContent = '...';
-    setStatus('Refreshing Explorer...');
+    if (!options.silent) setStatus('Refreshing Explorer...');
   }
 
   try {
     const changed = await pollExplorerDirectories({ manual: options.manual });
-    if (options.manual) setStatus(changed ? 'Explorer refreshed' : 'Explorer already up to date');
+    if (options.manual && !options.silent) setStatus(changed ? 'Explorer refreshed' : 'Explorer already up to date');
     else if (changed && !options.silent) setStatus('Explorer updated');
   } catch (error) {
     if (options.manual) setStatus(`Explorer refresh failed: ${String(error)}`, true);
@@ -8919,6 +9655,8 @@ async function pollExplorerDirectories(options: { manual?: boolean } = {}) {
   const startedAt = performance.now();
   let changed = false;
   const previousSelection = state.explorerSelectedPath;
+  const previousSelectedPaths = new Set(state.explorerSelectedPaths);
+  const previousSelectionAnchor = state.explorerSelectionAnchorPath;
   try {
     const paths = explorerWatchPaths(options.manual ? EXPLORER_WATCH_MAX_DIRS : explorerWatchPathLimit());
     const pathsNeedingListings = options.manual
@@ -8961,7 +9699,7 @@ async function pollExplorerDirectories(options: { manual?: boolean } = {}) {
     }
     if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return changed;
     if (changed) {
-      state.explorerSelectedPath = previousSelection;
+      restoreExplorerSelection(previousSelection, previousSelectedPaths, previousSelectionAnchor);
       if (!options.manual && shouldPauseExplorerBackgroundWork()) {
         explorerRenderDirty = true;
         return changed;
@@ -9168,38 +9906,95 @@ function uniqueExplorerName(baseName: string, entries: FileEntry[] = state.entri
 }
 
 function selectExplorerEntry(path: string, scrollIntoView = true) {
-  if (state.explorerSelectedPath === path) {
-    if (!scrollIntoView) return;
-    updateExplorerSelection(scrollIntoView);
-    return;
+  setExplorerSelection([path], path, path, scrollIntoView);
+}
+
+function setExplorerSelection(paths: Iterable<string>, activePath = '', anchorPath = activePath, scrollIntoView = true) {
+  const next = new Set<string>();
+  for (const path of paths) {
+    if (path) next.add(path);
   }
-  state.explorerSelectedPath = path;
-  updateExplorerSelection(scrollIntoView);
+  if (activePath && !next.has(activePath)) next.add(activePath);
+  state.explorerSelectedPaths = next;
+  state.explorerSelectedPath = activePath || next.values().next().value || '';
+  state.explorerSelectionAnchorPath = anchorPath || state.explorerSelectedPath;
+  updateExplorerSelection(scrollIntoView, true);
+}
+
+function resetExplorerSelection() {
+  state.explorerSelectedPath = '';
+  state.explorerSelectedPaths = new Set();
+  state.explorerSelectionAnchorPath = '';
+  explorerLastSelectedPath = '';
+}
+
+function restoreExplorerSelection(selectedPath: string, selectedPaths?: Set<string>, anchorPath = selectedPath) {
+  state.explorerSelectedPath = selectedPath;
+  state.explorerSelectedPaths = selectedPaths ?? new Set(selectedPath ? [selectedPath] : []);
+  if (selectedPath && !state.explorerSelectedPaths.has(selectedPath)) state.explorerSelectedPaths.add(selectedPath);
+  state.explorerSelectionAnchorPath = anchorPath || selectedPath;
+}
+
+function explorerSelectedPathKeys() {
+  const keys = new Set<string>();
+  for (const path of state.explorerSelectedPaths) keys.add(explorerPathKey(path));
+  if (state.explorerSelectedPath) keys.add(explorerPathKey(state.explorerSelectedPath));
+  return keys;
+}
+
+function selectedExplorerEntries() {
+  const entries: FileEntry[] = [];
+  const seen = new Set<string>();
+  const paths = state.explorerSelectedPaths.size
+    ? [...state.explorerSelectedPaths]
+    : state.explorerSelectedPath ? [state.explorerSelectedPath] : [];
+  for (const path of paths) {
+    const entry = findExplorerEntry(path);
+    if (!entry) continue;
+    const key = explorerPathKey(entry.path);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push(entry);
+  }
+  entries.sort((left, right) => {
+    const leftIndex = explorerVisibleIndexByPath.get(explorerPathKey(left.path)) ?? Number.MAX_SAFE_INTEGER;
+    const rightIndex = explorerVisibleIndexByPath.get(explorerPathKey(right.path)) ?? Number.MAX_SAFE_INTEGER;
+    return leftIndex - rightIndex;
+  });
+  return entries;
+}
+
+function compactRecursiveExplorerSelection(entries: FileEntry[]) {
+  return entries.filter((entry) => {
+    const entryKey = explorerPathKey(entry.path);
+    for (const candidate of entries) {
+      if (candidate === entry || candidate.kind !== 'dir') continue;
+      const parentKey = explorerPathKey(candidate.path);
+      if (entryKey.startsWith(`${parentKey}/`)) return false;
+    }
+    return true;
+  });
+}
+
+function isExplorerPathSelected(path: string) {
+  if (!path) return false;
+  const key = explorerPathKey(path);
+  for (const selected of state.explorerSelectedPaths) {
+    if (explorerPathKey(selected) === key) return true;
+  }
+  return explorerPathKey(state.explorerSelectedPath) === key;
 }
 
 function updateExplorerSelection(scrollIntoView = true, forceFull = false) {
   if (scrollIntoView) scrollExplorerPathIntoView(state.explorerSelectedPath);
-  const selectedKey = state.explorerSelectedPath ? explorerPathKey(state.explorerSelectedPath) : '';
-  const syncRow = (path: string, selected: boolean) => {
-    if (!path) return;
-    const row = explorerRowForPath(path);
-    if (!row) return;
+  const selectedKeys = explorerSelectedPathKeys();
+
+  explorerRenderedRowByPath.forEach((row) => {
+    const key = row.dataset.pathKey || explorerPathKey(row.dataset.path ?? '');
+    const selected = selectedKeys.has(key);
     toggleClassIfChanged(row, 'selected', selected);
     setAttributeIfChanged(row, 'aria-selected', String(selected));
-  };
-
-  if (forceFull || !explorerLastSelectedPath) {
-    explorerRenderedRowByPath.forEach((row) => {
-      const selected = (row.dataset.pathKey || explorerPathKey(row.dataset.path ?? '')) === selectedKey;
-      toggleClassIfChanged(row, 'selected', selected);
-      setAttributeIfChanged(row, 'aria-selected', String(selected));
-    });
-  } else if (explorerPathKey(explorerLastSelectedPath) !== selectedKey) {
-    syncRow(explorerLastSelectedPath, false);
-    syncRow(state.explorerSelectedPath, true);
-  } else {
-    syncRow(state.explorerSelectedPath, true);
-  }
+  });
   explorerLastSelectedPath = state.explorerSelectedPath;
 }
 
@@ -9447,7 +10242,7 @@ function ensureExplorerTypeaheadCandidates() {
   rebuildExplorerTypeaheadCandidates();
 }
 
-function moveExplorerSelection(direction: number) {
+function moveExplorerSelection(direction: number, extend = false) {
   if (!explorerVisibleRows.length) return;
   const selectedIndex = explorerVisibleIndexByPath.get(explorerPathKey(state.explorerSelectedPath));
   let next = selectedIndex === undefined
@@ -9457,7 +10252,8 @@ function moveExplorerSelection(direction: number) {
     next = (next + direction + explorerVisibleRows.length) % explorerVisibleRows.length;
     const entry = explorerVisibleRows[next]?.entry;
     if (entry) {
-      selectExplorerEntry(entry.path);
+      if (extend) selectExplorerRange(entry.path);
+      else selectExplorerEntry(entry.path);
       return;
     }
   }
@@ -10086,7 +10882,10 @@ function createImageTab(seed?: Partial<ImageTabState>, activate = true, id: stri
     dataUrl: seed?.dataUrl ?? '',
     label: seed?.label ?? 'No image selected',
     history: seed?.history ?? [],
-    historyVisible: seed?.historyVisible ?? false
+    historyVisible: seed?.historyVisible ?? false,
+    zoom: normalizedImageZoom(seed?.zoom),
+    offsetX: finiteNumber(seed?.offsetX, 0),
+    offsetY: finiteNumber(seed?.offsetY, 0)
   };
   const index = state.imageTabs.length;
   state.imageTabs.push(tab);
@@ -10274,6 +11073,9 @@ function syncImageStateFromActiveTab() {
   state.imagePreviewLabel = tab.label;
   state.imageHistory = tab.history;
   state.imageHistoryVisible = tab.historyVisible;
+  state.imagePreviewZoom = normalizedImageZoom(tab.zoom);
+  state.imagePreviewOffsetX = tab.offsetX;
+  state.imagePreviewOffsetY = tab.offsetY;
 }
 
 function syncActiveImageTabFromState() {
@@ -10283,6 +11085,9 @@ function syncActiveImageTabFromState() {
   tab.label = state.imagePreviewLabel;
   tab.history = state.imageHistory;
   tab.historyVisible = state.imageHistoryVisible;
+  tab.zoom = normalizedImageZoom(state.imagePreviewZoom);
+  tab.offsetX = state.imagePreviewOffsetX;
+  tab.offsetY = state.imagePreviewOffsetY;
 }
 
 async function openImageFile(path: string) {
@@ -10304,6 +11109,7 @@ async function openImageFile(path: string) {
     setImageTabSourcePath(tab, path);
     tab.dataUrl = dataUrl;
     tab.label = `Image selected: ${path}`;
+    resetImageTabView(tab);
     state.activeImageTabId = tab.id;
     syncImageStateFromActiveTab();
     renderImageTabs();
@@ -10689,10 +11495,12 @@ function scheduleEditorRuntimeWarmup() {
 function ensureTerminalRuntime() {
   terminalRuntimePromise ??= Promise.all([
     import('@xterm/xterm'),
-    import('@xterm/addon-fit')
-  ]).then(([terminalModule, fitModule]) => ({
+    import('@xterm/addon-fit'),
+    import('@xterm/addon-unicode11')
+  ]).then(([terminalModule, fitModule, unicodeModule]) => ({
     Terminal: terminalModule.Terminal,
-    FitAddon: fitModule.FitAddon
+    FitAddon: fitModule.FitAddon,
+    Unicode11Addon: unicodeModule.Unicode11Addon
   }));
   return terminalRuntimePromise;
 }
@@ -10983,6 +11791,7 @@ async function createTerminalTab(
   const runtime = await ensureTerminalRuntime();
 
   const term = new runtime.Terminal({
+    allowProposedApi: true,
     cursorBlink: true,
     convertEol: true,
     fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
@@ -10990,6 +11799,9 @@ async function createTerminalTab(
     theme: { background: '#080b10', foreground: '#d8e0ea' }
   });
   const fit = new runtime.FitAddon();
+  const unicode11 = new runtime.Unicode11Addon();
+  term.loadAddon(unicode11);
+  term.unicode.activeVersion = '11';
   term.loadAddon(fit);
   term.open(host);
 
@@ -11007,8 +11819,10 @@ async function createTerminalTab(
     host,
     outputBuffer: '',
     writeBuffer: '',
+    backendOutputChars: 0,
     cwdOutputBuffer: '',
     inputBuffer: '',
+    inputWriteBuffer: '',
     seenPorts: new Set(),
     lastRows: term.rows,
     lastCols: term.cols
@@ -11016,6 +11830,7 @@ async function createTerminalTab(
   state.terminals.push(pane);
   terminalPaneById.set(pane.paneId, pane);
   rememberTerminalPane(pane);
+  registerTerminalFileLinks(pane);
   if (options.focus !== false) {
     setActivePane(paneId);
     bringPanelToFront(widget.element);
@@ -11028,8 +11843,17 @@ async function createTerminalTab(
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
-    trackTerminalCwdFromInput(pane, data);
-    if (pane.backendId) void api.writeTerminal(pane.backendId, data);
+    const inputData = filterTerminalInputData(pane, data);
+    if (!inputData) return;
+    markTerminalUserInput(pane);
+    trackTerminalCwdFromInput(pane, inputData);
+    if (terminalInputShouldSendImmediately(inputData)) {
+      void sendTerminalInputNow(pane, inputData).catch((error) => {
+        setStatus(`Failed to write terminal input: ${String(error)}`, true);
+      });
+    } else {
+      queueTerminalInput(pane, inputData);
+    }
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
 
@@ -11041,12 +11865,15 @@ async function createTerminalTab(
   try {
     const initiallyVisible = isTerminalPaneVisible(pane);
     if (initiallyVisible) await settleTerminalInitialFit(pane);
-    const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd);
-    if (spawnCwd !== pane.cwd) {
-      pane.cwd = spawnCwd;
-      updateTerminalWidgetTitle(widget);
+    if (terminalProfile.kind === 'windows') {
+      const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd);
+      if (spawnCwd !== pane.cwd) {
+        pane.cwd = spawnCwd;
+        updateTerminalWidgetTitle(widget);
+      }
     }
-    setTerminalBackendId(pane, await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols));
+    const backendId = await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols, widget.workspaceId, title);
+    setTerminalBackendId(pane, backendId);
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
       bringPanelToFront(widget.element);
@@ -11065,6 +11892,7 @@ async function closeTerminalPane(paneId: string) {
   const pane = terminalPaneById.get(paneId) ?? state.terminals.find((item) => item.paneId === paneId);
   if (!pane) return;
   const widget = terminalWidgetForPane(pane);
+  await flushTerminalInput(pane).catch(() => undefined);
   if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
   setTerminalBackendId(pane, undefined);
   terminalPaneById.delete(pane.paneId);
@@ -11411,6 +12239,102 @@ function updateTerminalWidgetTitle(widget: TerminalWidget, options: { force?: bo
   setTextContentIfChanged(widget.cwd, pane?.cwd ?? '');
 }
 
+function registerTerminalFileLinks(pane: TerminalPane) {
+  pane.term.registerLinkProvider({
+    provideLinks: (bufferLineNumber: number, callback: (links: XTermLink[] | undefined) => void) => {
+      const line = pane.term.buffer.active.getLine(Math.max(0, bufferLineNumber - 1))
+        ?? pane.term.buffer.active.getLine(bufferLineNumber);
+      const text = line?.translateToString(true) ?? '';
+      const links = terminalFileLinksForLine(pane, text, bufferLineNumber);
+      callback(links.length ? links : undefined);
+    }
+  });
+}
+
+function terminalFileLinksForLine(pane: TerminalPane, line: string, y: number) {
+  const links: XTermLink[] = [];
+  TERMINAL_FILE_LINK_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = TERMINAL_FILE_LINK_PATTERN.exec(line))) {
+    const rawText = trimTerminalFileLinkText(match[1] ?? '');
+    if (!rawText || terminalFileLinkLooksLikeUrl(rawText)) continue;
+    const start = (match.index ?? 0) + match[0].indexOf(match[1] ?? rawText) + 1;
+    links.push({
+      range: {
+        start: { x: start, y },
+        end: { x: start + rawText.length, y }
+      },
+      text: rawText,
+      decorations: { pointerCursor: true, underline: true },
+      activate: (event, text) => {
+        if (!event.ctrlKey && !event.metaKey) {
+          setStatus('Ctrl+click a terminal file link to open it');
+          return;
+        }
+        void openTerminalFileLink(pane, text);
+      },
+      hover: () => {
+        setStatus('Ctrl+click to open file');
+      }
+    });
+  }
+  return links;
+}
+
+function trimTerminalFileLinkText(text: string) {
+  let value = text.trim();
+  value = value.replace(/^[<"'`]+/, '');
+  while (/[),.;\]"'`>]+$/.test(value)) value = value.slice(0, -1);
+  return value;
+}
+
+function terminalFileLinkLooksLikeUrl(text: string) {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text);
+}
+
+async function openTerminalFileLink(pane: TerminalPane, text: string) {
+  const path = resolveTerminalFileLinkPath(pane, text);
+  if (!path) {
+    setStatus('Could not resolve terminal file link', true);
+    return;
+  }
+  try {
+    await openFile(path);
+    setStatus(`Opened ${pathBasename(path, path)}`);
+  } catch (error) {
+    setStatus(`Failed to open terminal file link: ${String(error)}`, true);
+  }
+}
+
+function resolveTerminalFileLinkPath(pane: TerminalPane, text: string) {
+  const withoutLine = text.replace(/(?::|#)\d+(?::\d+)?$/, '');
+  const decoded = decodeTerminalPath(withoutLine);
+  if (!decoded) return '';
+  const profile = profileForIdWithWindowsFallback(pane.profileId) ?? state.activeProfile;
+  const windows = profile?.kind === 'windows' || isWindowsPath(decoded);
+  if (isAbsoluteTerminalFilePath(decoded, windows) || decoded.startsWith('~')) {
+    return windows ? normalizeWindowsTerminalPath(decoded) : normalizePosixTerminalPath(decoded);
+  }
+  const base = pane.cwd || state.currentDir || state.workspaceRoot || profile?.root || '.';
+  return joinTerminalFilePath(base, decoded, windows);
+}
+
+function isAbsoluteTerminalFilePath(path: string, windows: boolean) {
+  if (windows) return isWindowsPath(path) || path.startsWith('\\\\');
+  return path.startsWith('/');
+}
+
+function joinTerminalFilePath(base: string, relative: string, windows: boolean) {
+  const separator = windows ? '\\' : '/';
+  const normalizedRelative = relative.replace(/[\\/]+/g, separator);
+  const joined = `${base.replace(/[\\/]+$/, '')}${separator}${normalizedRelative}`;
+  return windows ? normalizeWindowsTerminalPath(joined) : normalizePosixTerminalPath(joined);
+}
+
+function markTerminalUserInput(pane: TerminalPane) {
+  pane.lastUserInputAt = performance.now();
+}
+
 function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly?: boolean } = {}) {
   if (options.activeOnly) {
     const pane = activePaneForWidget(widget);
@@ -11421,6 +12345,11 @@ function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly
 }
 
 function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
+  if (event.isComposing || event.key === 'Process' || event.keyCode === 229) {
+    return true;
+  }
+  if (event.type === 'keydown') markTerminalUserInput(pane);
+
   if (isWidgetFocusShortcut(event)) {
     if (terminalUsesAlternateBuffer(pane)) return true;
     event.preventDefault();
@@ -11472,8 +12401,9 @@ function handleTerminalPaste(event: ClipboardEvent, pane: TerminalPane) {
 async function pasteTerminalText(pane: TerminalPane, text?: string) {
   try {
     const value = normalizeTerminalPasteText(text ?? await readText());
-    if (!value || !pane.backendId) return;
-    await api.writeTerminal(pane.backendId, terminalPastePayload(value));
+    if (!value) return;
+    markTerminalUserInput(pane);
+    await sendTerminalInputNow(pane, terminalPastePayload(value));
   } catch (error) {
     setStatus(`Failed to paste terminal text: ${String(error)}`, true);
   }
@@ -11860,6 +12790,9 @@ async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteIm
   setImageTabSourcePath(targetTab, result.path);
   const pasted = pasteToShell ? await pasteImageTagToActiveTerminal(result.tag) : false;
   state.imagePreviewLabel = pasted ? `${result.tag} copied into active prompt` : `${result.tag} saved`;
+  state.imagePreviewZoom = 1;
+  state.imagePreviewOffsetX = 0;
+  state.imagePreviewOffsetY = 0;
   syncActiveImageTabFromState();
   renderImageTabs();
   renderImagePreview();
@@ -11872,19 +12805,140 @@ function renderImagePreview() {
   const label = state.imagePreviewLabel;
   const dataUrl = state.imagePreviewDataUrl;
   const visible = Boolean(dataUrl);
+  const transformSignature = imagePreviewTransformSignature();
   const labelChanged = imagePreviewRenderedLabel !== label;
   const dataChanged = imagePreviewRenderedDataUrl !== dataUrl;
+  const transformChanged = imagePreviewRenderedTransform !== transformSignature;
   const visibleChanged = el.imagePreview.classList.contains('visible') !== visible;
-  if (!labelChanged && !dataChanged && !visibleChanged) return;
+  if (!labelChanged && !dataChanged && !transformChanged && !visibleChanged) return;
 
   imagePreviewRenderedLabel = label;
   imagePreviewRenderedDataUrl = dataUrl;
+  imagePreviewRenderedTransform = transformSignature;
   if (labelChanged) setTextContentIfChanged(el.imageLabel, label);
   if (dataChanged) {
     if (dataUrl) el.imagePreview.src = dataUrl;
     else if (el.imagePreview.hasAttribute('src')) el.imagePreview.removeAttribute('src');
   }
   if (visibleChanged) el.imagePreview.classList.toggle('visible', visible);
+  applyImagePreviewTransform();
+}
+
+function normalizedImageZoom(value: unknown) {
+  const zoom = Number(value);
+  return clamp(Number.isFinite(zoom) ? zoom : 1, IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM);
+}
+
+function finiteNumber(value: unknown, fallback: number) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function imagePreviewTransformSignature() {
+  return `${normalizedImageZoom(state.imagePreviewZoom).toFixed(4)}:${Math.round(state.imagePreviewOffsetX)}:${Math.round(state.imagePreviewOffsetY)}`;
+}
+
+function resetImageTabView(tab: ImageTabState) {
+  tab.zoom = 1;
+  tab.offsetX = 0;
+  tab.offsetY = 0;
+}
+
+function fitActiveImagePreview() {
+  state.imagePreviewZoom = 1;
+  state.imagePreviewOffsetX = 0;
+  state.imagePreviewOffsetY = 0;
+  syncActiveImageTabFromState();
+  renderImagePreview();
+  saveActiveWorkspaceSnapshot();
+}
+
+function handleImagePreviewWheel(event: WheelEvent) {
+  if (!event.ctrlKey || !state.imagePreviewDataUrl) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const oldZoom = normalizedImageZoom(state.imagePreviewZoom);
+  const factor = event.deltaY < 0 ? IMAGE_PREVIEW_WHEEL_FACTOR : 1 / IMAGE_PREVIEW_WHEEL_FACTOR;
+  const nextZoom = normalizedImageZoom(oldZoom * factor);
+  if (Math.abs(nextZoom - oldZoom) < 0.0001) return;
+  zoomImagePreviewAt(event.clientX, event.clientY, oldZoom, nextZoom);
+}
+
+function zoomImagePreviewAt(clientX: number, clientY: number, oldZoom: number, nextZoom: number) {
+  const rect = el.imagePreviewStage.getBoundingClientRect();
+  const anchorX = clientX - rect.left - rect.width / 2;
+  const anchorY = clientY - rect.top - rect.height / 2;
+  const ratio = nextZoom / oldZoom;
+  state.imagePreviewZoom = nextZoom;
+  state.imagePreviewOffsetX = (state.imagePreviewOffsetX - anchorX) * ratio + anchorX;
+  state.imagePreviewOffsetY = (state.imagePreviewOffsetY - anchorY) * ratio + anchorY;
+  clampImagePreviewPan();
+  syncActiveImageTabFromState();
+  renderImagePreview();
+  saveActiveWorkspaceSnapshot();
+}
+
+function startImagePreviewDrag(event: PointerEvent) {
+  if (!state.imagePreviewDataUrl || normalizedImageZoom(state.imagePreviewZoom) <= 1) return;
+  if (event.button !== 0) return;
+  event.preventDefault();
+  imagePreviewDrag = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    offsetX: state.imagePreviewOffsetX,
+    offsetY: state.imagePreviewOffsetY
+  };
+  el.imagePreviewStage.classList.add('dragging');
+  el.imagePreviewStage.setPointerCapture(event.pointerId);
+}
+
+function moveImagePreviewDrag(event: PointerEvent) {
+  if (!imagePreviewDrag || imagePreviewDrag.pointerId !== event.pointerId) return;
+  event.preventDefault();
+  state.imagePreviewOffsetX = imagePreviewDrag.offsetX + event.clientX - imagePreviewDrag.startX;
+  state.imagePreviewOffsetY = imagePreviewDrag.offsetY + event.clientY - imagePreviewDrag.startY;
+  clampImagePreviewPan();
+  syncActiveImageTabFromState();
+  renderImagePreview();
+}
+
+function finishImagePreviewDrag(event: PointerEvent) {
+  if (!imagePreviewDrag || imagePreviewDrag.pointerId !== event.pointerId) return;
+  if (el.imagePreviewStage.hasPointerCapture(event.pointerId)) el.imagePreviewStage.releasePointerCapture(event.pointerId);
+  imagePreviewDrag = null;
+  el.imagePreviewStage.classList.remove('dragging');
+  clampImagePreviewPan();
+  syncActiveImageTabFromState();
+  renderImagePreview();
+  saveActiveWorkspaceSnapshot();
+}
+
+function clampImagePreviewPan() {
+  const zoom = normalizedImageZoom(state.imagePreviewZoom);
+  state.imagePreviewZoom = zoom;
+  if (zoom <= 1 || !el.imagePreview.naturalWidth || !el.imagePreview.naturalHeight) {
+    state.imagePreviewOffsetX = 0;
+    state.imagePreviewOffsetY = 0;
+    return;
+  }
+  const rect = el.imagePreviewStage.getBoundingClientRect();
+  const fitScale = Math.min(rect.width / el.imagePreview.naturalWidth, rect.height / el.imagePreview.naturalHeight);
+  const renderedWidth = el.imagePreview.naturalWidth * fitScale * zoom;
+  const renderedHeight = el.imagePreview.naturalHeight * fitScale * zoom;
+  const maxX = Math.max(0, (renderedWidth - rect.width) / 2);
+  const maxY = Math.max(0, (renderedHeight - rect.height) / 2);
+  state.imagePreviewOffsetX = clamp(state.imagePreviewOffsetX, -maxX, maxX);
+  state.imagePreviewOffsetY = clamp(state.imagePreviewOffsetY, -maxY, maxY);
+}
+
+function applyImagePreviewTransform() {
+  clampImagePreviewPan();
+  const zoom = normalizedImageZoom(state.imagePreviewZoom);
+  const transform = `translate3d(${state.imagePreviewOffsetX.toFixed(1)}px, ${state.imagePreviewOffsetY.toFixed(1)}px, 0) scale(${zoom.toFixed(4)})`;
+  if (el.imagePreview.style.transform !== transform) el.imagePreview.style.transform = transform;
+  toggleClassIfChanged(el.imagePreviewStage, 'zoomed', zoom > 1 && Boolean(state.imagePreviewDataUrl));
+  el.imageFit.disabled = !state.imagePreviewDataUrl || (zoom === 1 && state.imagePreviewOffsetX === 0 && state.imagePreviewOffsetY === 0);
 }
 
 function renderImageHistory() {
@@ -12034,6 +13088,9 @@ function imageHistorySignature() {
 function previewImageHistoryItem(item: PastedImageItem) {
   state.imagePreviewDataUrl = item.dataUrl;
   state.imagePreviewLabel = item.tag;
+  state.imagePreviewZoom = 1;
+  state.imagePreviewOffsetX = 0;
+  state.imagePreviewOffsetY = 0;
   syncActiveImageTabFromState();
   renderImagePreview();
   renderImageTabs();
@@ -12166,18 +13223,21 @@ async function startForward() {
 }
 
 async function openPreviewValue(value: string) {
-  if (!value) return;
-  const localUrl = parseLocalPreviewUrl(value);
+  const normalized = normalizeBrowserAddressValue(value);
+  if (!normalized) return;
+  rememberBrowserAddress(normalized);
+  hideBrowserAddressSuggestions();
+  const localUrl = parseLocalPreviewUrl(normalized);
   if (localUrl) {
     await openLocalPreviewUrl(localUrl);
     return;
   }
-  const port = parsePreviewPort(value);
+  const port = parsePreviewPort(normalized);
   if (port) {
     await openPort(port, 'manual');
     return;
   }
-  openBrowserTab(normalizePreviewUrl(value));
+  openBrowserTab(normalized);
 }
 
 async function openLocalPreviewUrl(url: URL) {
@@ -12219,6 +13279,7 @@ async function canUseDirectLocalPreview(url: string) {
 }
 
 function handleTerminalData(pane: TerminalPane, data: string) {
+  pane.backendOutputChars += data.length;
   const visibility = enqueueTerminalWrite(pane, data);
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
@@ -12232,6 +13293,17 @@ function handleTerminalData(pane: TerminalPane, data: string) {
 
   if (shouldTrackPromptCwd) trackTerminalPromptCwdFromOutput(pane, data);
   if (shouldScanPorts) scanTerminalOutputForPorts(pane, data);
+}
+
+function handleTerminalSnapshotData(pane: TerminalPane, output: string) {
+  if (!output) return;
+  const alreadyWritten = pane.backendOutputChars;
+  if (alreadyWritten > 0) {
+    if (output.length <= alreadyWritten) return;
+    handleTerminalData(pane, output.slice(alreadyWritten));
+    return;
+  }
+  handleTerminalData(pane, output);
 }
 
 function enqueueTerminalWrite(pane: TerminalPane, data: string) {
@@ -12300,7 +13372,7 @@ function flushTerminalWriteBuffer(pane: TerminalPane) {
   }
   if (!pane.writeBuffer) return;
   const visibility = terminalPaneVisibility(pane);
-  const chunkSize = terminalWriteChunkSize(visibility);
+  const chunkSize = terminalWriteChunkSize(pane, visibility);
   const output = pane.writeBuffer.length > chunkSize
     ? pane.writeBuffer.slice(0, chunkSize)
     : pane.writeBuffer;
@@ -12309,10 +13381,17 @@ function flushTerminalWriteBuffer(pane: TerminalPane) {
   scheduleTerminalWriteContinuation(pane, visibility);
 }
 
-function terminalWriteChunkSize(visibility: TerminalVisibility) {
+function terminalWriteChunkSize(pane: TerminalPane, visibility: TerminalVisibility) {
+  if (visibility === 'visible' && terminalHasRecentUserInput(pane)) {
+    return TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS;
+  }
   return visibility === 'visible'
     ? TERMINAL_VISIBLE_WRITE_CHUNK_CHARS
     : TERMINAL_HIDDEN_WRITE_CHUNK_CHARS;
+}
+
+function terminalHasRecentUserInput(pane: TerminalPane) {
+  return performance.now() - (pane.lastUserInputAt ?? 0) < TERMINAL_RECENT_INPUT_WINDOW_MS;
 }
 
 function scheduleTerminalWriteContinuation(pane: TerminalPane, visibility = terminalPaneVisibility(pane)) {
@@ -12340,10 +13419,14 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
   if (pane.portScanTimer) window.clearTimeout(pane.portScanTimer);
   if (pane.cwdScanTimer) window.clearTimeout(pane.cwdScanTimer);
+  if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
   pane.writeFrame = undefined;
   pane.writeTimer = undefined;
   pane.portScanTimer = undefined;
   pane.cwdScanTimer = undefined;
+  pane.inputFlushTimer = undefined;
+  pane.inputBuffer = '';
+  pane.inputWritePromise = undefined;
   pane.writeBuffer = '';
 }
 
@@ -13077,13 +14160,8 @@ function scheduleBrowserWorkspaceFrameSuspend(
 
 function scheduleInactiveBrowserFrameSuspend(delayMs = BROWSER_INACTIVE_FRAME_SUSPEND_DELAY_MS) {
   if (browserInactiveFrameSuspendTimer) window.clearTimeout(browserInactiveFrameSuspendTimer);
-  browserInactiveFrameSuspendTimer = window.setTimeout(() => {
-    browserInactiveFrameSuspendTimer = 0;
-    runWhenUiIdle(() => {
-      if (document.hidden || isBrowserPanelHidden()) return;
-      suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: false });
-    }, BROWSER_FRAME_SUSPEND_IDLE_MS);
-  }, delayMs);
+  browserInactiveFrameSuspendTimer = 0;
+  void delayMs;
 }
 
 function suspendBrowserFrame(frame: HTMLIFrameElement, options: { affectsActiveWorkspace?: boolean } = {}) {
@@ -13159,6 +14237,12 @@ function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
   frame.addEventListener('focus', activateBrowserPanel);
   frame.addEventListener('load', () => {
     if (frame.dataset.suspended === 'true') return;
+    const logicalUrl = frame.dataset.loadingUrl;
+    if (logicalUrl) {
+      frame.dataset.loadedUrl = logicalUrl;
+      delete frame.dataset.loadingUrl;
+      delete frame.dataset.loadingSrc;
+    }
     if (!browserFrameIsActiveVisible(frame)) {
       setBrowserFrameConsoleDetailed(frame, false);
       return;
@@ -13231,13 +14315,18 @@ function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean; reload?: b
       // Cross-origin frames cannot always be reloaded through contentWindow.
     }
   }
-  frame.src = options.hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
-  frame.dataset.loadedUrl = frameUrl;
+  const src = options.hard ? withPreviewCacheBuster(frameUrl) : frameUrl;
+  frame.dataset.loadingUrl = frameUrl;
+  frame.dataset.loadingSrc = src;
+  delete frame.dataset.loadedUrl;
+  frame.src = src;
   return frame;
 }
 
 function removeBrowserFrame(id: string) {
   const frame = browserFrameForTab(id);
+  cancelBrowserAssetRecovery(id);
+  browserLoadRequestByTabId.delete(id);
   if (!frame) return;
   forgetBrowserFrame(frame);
   if (activeBrowserFrameId === id) activeBrowserFrameId = '';
@@ -13246,6 +14335,8 @@ function removeBrowserFrame(id: string) {
     delete frame.dataset.browserTabId;
     delete frame.dataset.browserWorkspaceId;
     delete frame.dataset.loadedUrl;
+    delete frame.dataset.loadingUrl;
+    delete frame.dataset.loadingSrc;
     delete frame.dataset.suspended;
     delete frame.dataset.suspendedUrl;
     frame.classList.add('hidden');
@@ -13259,6 +14350,10 @@ function clearBrowserFrames(workspaceId = state.activeWorkspaceId) {
   cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
   forEachPreviewFrame(workspaceId, (frame) => {
     const tabId = frame.dataset.browserTabId ?? '';
+    if (tabId) {
+      cancelBrowserAssetRecovery(tabId);
+      browserLoadRequestByTabId.delete(tabId);
+    }
     forgetBrowserFrame(frame);
     if (activeBrowserFrameId === tabId) activeBrowserFrameId = '';
     if (frame === el.previewFrame) {
@@ -13266,6 +14361,8 @@ function clearBrowserFrames(workspaceId = state.activeWorkspaceId) {
       delete frame.dataset.browserTabId;
       delete frame.dataset.browserWorkspaceId;
       delete frame.dataset.loadedUrl;
+      delete frame.dataset.loadingUrl;
+      delete frame.dataset.loadingSrc;
       delete frame.dataset.suspended;
       delete frame.dataset.suspendedUrl;
       frame.classList.add('hidden');
@@ -13335,7 +14432,10 @@ function loadBrowserTabFallback(tab: BrowserTab) {
 function loadBrowserTabThroughPreviewProxy(tab: BrowserTab, options: { hard?: boolean; reload?: boolean; clearCache?: boolean } = {}) {
   prepareBrowserProxyPendingFrame(tab);
   if (options.clearCache) clearPreviewProxyForBrowserTab(tab);
+  const requestId = ++browserLoadRequestSeq;
+  browserLoadRequestByTabId.set(tab.id, requestId);
   void previewFrameUrl(tab.url, { forceProbe: Boolean(options.hard || options.clearCache) }).then((frameUrl) => {
+    if (browserLoadRequestByTabId.get(tab.id) !== requestId) return;
     if (tab.frameUrl !== frameUrl) {
       tab.frameUrl = frameUrl;
       const frame = browserFrameForTab(tab.id);
@@ -13361,6 +14461,8 @@ function clearPreviewProxyForBrowserTab(tab: BrowserTab) {
   if (frame) {
     frame.src = 'about:blank';
     delete frame.dataset.loadedUrl;
+    delete frame.dataset.loadingUrl;
+    delete frame.dataset.loadingSrc;
     delete frame.dataset.suspended;
     delete frame.dataset.suspendedUrl;
   }
@@ -13819,8 +14921,9 @@ function applyEdgePreviewSizing() {
     return;
   }
   const { width, height } = edgePreviewViewportSize();
-  el.edgePreviewCanvas.style.width = `${width}px`;
-  el.edgePreviewCanvas.style.height = `${height}px`;
+  const zoom = normalizedBrowserZoom(state.browserZoom);
+  el.edgePreviewCanvas.style.width = `${Math.max(1, Math.round(width / zoom))}px`;
+  el.edgePreviewCanvas.style.height = `${Math.max(1, Math.round(height / zoom))}px`;
 }
 
 function bindEdgePreviewInput() {
@@ -14156,12 +15259,75 @@ function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = ur
     return;
   }
 
-  const tab: BrowserTab = { id: makeBrowserTabId(), url, label, frameUrl };
+  const tab: BrowserTab = {
+    id: makeBrowserTabId(),
+    url,
+    label,
+    deviceId: state.browserDeviceId,
+    orientation: state.browserOrientation,
+    zoom: state.browserZoom,
+    frameUrl
+  };
   const index = state.browserTabs.length;
   state.browserTabs.push(tab);
   rememberBrowserTab(tab, index);
   logBrowserConsole('info', `Opened preview tab ${url}`);
   activateBrowserTab(tab.id, { forceSave: true });
+}
+
+function rememberBrowserAddress(url: string) {
+  const normalized = normalizeBrowserHistoryUrl(url);
+  if (!normalized) return;
+  const history = state.browserHistory.filter((item) => item !== normalized);
+  history.unshift(normalized);
+  state.browserHistory = history.slice(0, BROWSER_ADDRESS_HISTORY_LIMIT);
+  browserAddressSuggestionSignature = '\0';
+  if (document.activeElement === el.previewUrl) renderBrowserAddressSuggestions(true);
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderBrowserAddressSuggestions(force = false) {
+  if (!force && document.activeElement !== el.previewUrl) return;
+  const suggestions = browserAddressSuggestionsForInput();
+  const signature = `${state.activeWorkspaceId}\t${el.previewUrl.value}\t${suggestions.join('\t')}`;
+  if (browserAddressSuggestionSignature === signature) return;
+  browserAddressSuggestionSignature = signature;
+  if (!suggestions.length) {
+    el.browserAddressSuggestions.replaceChildren();
+    toggleClassIfChanged(el.browserAddressSuggestions, 'hidden', true);
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const url of suggestions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'browser-address-suggestion';
+    button.dataset.url = url;
+    button.setAttribute('role', 'option');
+    const label = document.createElement('span');
+    label.textContent = url;
+    button.append(label);
+    fragment.append(button);
+  }
+  el.browserAddressSuggestions.replaceChildren(fragment);
+  toggleClassIfChanged(el.browserAddressSuggestions, 'hidden', false);
+}
+
+function browserAddressSuggestionsForInput() {
+  const query = el.previewUrl.value.trim().toLowerCase();
+  const suggestions: string[] = [];
+  for (const url of state.browserHistory) {
+    if (query && !url.toLowerCase().includes(query)) continue;
+    suggestions.push(url);
+    if (suggestions.length >= BROWSER_ADDRESS_SUGGESTION_LIMIT) break;
+  }
+  return suggestions;
+}
+
+function hideBrowserAddressSuggestions() {
+  browserAddressSuggestionSignature = '\0';
+  el.browserAddressSuggestions.replaceChildren();
+  toggleClassIfChanged(el.browserAddressSuggestions, 'hidden', true);
 }
 
 function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
@@ -14172,6 +15338,7 @@ function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
   const shouldSave = options.forceSave || !alreadyActive;
   state.activeBrowserTabId = tab.id;
   state.previewUrl = tab.url;
+  applyBrowserViewportFromTab(tab);
   setInputValueIfChanged(el.previewUrl, tab.url);
   if (isBrowserPanelHidden()) {
     if (!alreadyActive) logBrowserConsole('info', `Selected tab ${tab.url}; Browser panel is hidden`);
@@ -14912,10 +16079,25 @@ function handleBrowserConsoleMessage(event: MessageEvent) {
     refreshPreview(Boolean((refresh as { hard?: unknown }).hard));
     return;
   }
+  const zoom = data.__simpleVibeZoom;
+  if (zoom && typeof zoom === 'object') {
+    const payload = zoom as { direction?: unknown; reset?: unknown };
+    if (payload.reset) resetBrowserZoom();
+    else {
+      const direction = Number(payload.direction);
+      if (direction) resizeBrowserZoom(direction > 0 ? 1 : -1);
+    }
+    return;
+  }
   const contextMenu = data.__simpleVibeContextMenu;
   if (contextMenu && typeof contextMenu === 'object') {
     const payload = contextMenu as { x?: unknown; y?: unknown };
     showBrowserContextMenuFromFrame(Number(payload.x), Number(payload.y));
+    return;
+  }
+  const assetFailure = data.__simpleVibePreviewAssetFailure;
+  if (assetFailure && typeof assetFailure === 'object') {
+    handleBrowserPreviewAssetFailure(frame, assetFailure as BrowserPreviewAssetFailurePayload);
     return;
   }
   const batch = data.__simpleVibeConsoleBatch;
@@ -14932,7 +16114,9 @@ function browserFrameMessagePayload(data: unknown) {
   const record = data as {
     __simpleVibeOpenUrl?: unknown;
     __simpleVibeRefresh?: unknown;
+    __simpleVibeZoom?: unknown;
     __simpleVibeContextMenu?: unknown;
+    __simpleVibePreviewAssetFailure?: unknown;
     __simpleVibeConsoleBatch?: unknown;
     simpleVibeConsole?: unknown;
     __simpleVibeConsole?: unknown;
@@ -14940,7 +16124,9 @@ function browserFrameMessagePayload(data: unknown) {
   if (
     !('__simpleVibeOpenUrl' in record)
     && !('__simpleVibeRefresh' in record)
+    && !('__simpleVibeZoom' in record)
     && !('__simpleVibeContextMenu' in record)
+    && !('__simpleVibePreviewAssetFailure' in record)
     && !('__simpleVibeConsoleBatch' in record)
     && !('simpleVibeConsole' in record)
     && !('__simpleVibeConsole' in record)
@@ -14948,6 +16134,50 @@ function browserFrameMessagePayload(data: unknown) {
     return null;
   }
   return record;
+}
+
+function handleBrowserPreviewAssetFailure(frame: HTMLIFrameElement, payload: BrowserPreviewAssetFailurePayload) {
+  const tabId = frame.dataset.browserTabId ?? '';
+  const tab = tabId ? browserTabForId(tabId) : null;
+  if (!tab || tab.id !== state.activeBrowserTabId) return;
+  const kind = typeof payload.kind === 'string' ? payload.kind : 'asset';
+  const tag = typeof payload.tag === 'string' ? payload.tag : 'resource';
+  const url = typeof payload.url === 'string' ? payload.url : tab.url;
+  logBrowserConsole('warn', `Preview ${tag} load issue (${kind}): ${url}`);
+  scheduleBrowserAssetRecovery(tab);
+}
+
+function scheduleBrowserAssetRecovery(tab: BrowserTab) {
+  const existingTimer = browserAssetRecoveryTimers.get(tab.id);
+  if (existingTimer) return;
+  const now = Date.now();
+  const previous = browserAssetRecoveryByTabId.get(tab.id);
+  const sameUrl = previous?.url === tab.url && now - previous.at < 45_000;
+  const count = sameUrl ? previous.count + 1 : 1;
+  browserAssetRecoveryByTabId.set(tab.id, { url: tab.url, count, at: now });
+  if (count > 2) {
+    logBrowserConsole('warn', `Preview asset recovery stopped after repeated failures for ${tab.url}`);
+    return;
+  }
+  const timer = window.setTimeout(() => {
+    browserAssetRecoveryTimers.delete(tab.id);
+    const current = browserTabForId(tab.id);
+    if (!current || current.id !== state.activeBrowserTabId || current.url !== tab.url) return;
+    logBrowserConsole('info', `Retrying preview load after asset failure (${count}/2)`);
+    if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(current.url)) {
+      loadBrowserTabThroughPreviewProxy(current, { hard: true, reload: true, clearCache: count > 1 });
+    } else {
+      loadBrowserFrame(current, { hard: true, reload: true });
+    }
+  }, count === 1 ? 450 : 900);
+  browserAssetRecoveryTimers.set(tab.id, timer);
+}
+
+function cancelBrowserAssetRecovery(tabId: string) {
+  const timer = browserAssetRecoveryTimers.get(tabId);
+  if (timer) window.clearTimeout(timer);
+  browserAssetRecoveryTimers.delete(tabId);
+  browserAssetRecoveryByTabId.delete(tabId);
 }
 
 function handleBrowserConsoleRecord(payload: unknown) {
@@ -15252,6 +16482,8 @@ async function clearBrowserCacheAndReload() {
     if (frame) {
       frame.src = 'about:blank';
       delete frame.dataset.loadedUrl;
+      delete frame.dataset.loadingUrl;
+      delete frame.dataset.loadingSrc;
     }
     loadBrowserFrame(tab, { hard: true, reload: true });
   }
@@ -15296,9 +16528,39 @@ function withPreviewCacheBuster(url: string) {
   }
 }
 
+function normalizeBrowserAddressValue(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  return normalizeBrowserHistoryUrl(trimmed);
+}
+
 function normalizePreviewUrl(value: string) {
+  const localPortUrl = normalizeLocalPortShorthandUrl(value);
+  if (localPortUrl) return localPortUrl;
   if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return value;
   return `http://${value}`;
+}
+
+function normalizeLocalPortShorthandUrl(value: string) {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^:?(?<port>\d{1,5})(?<suffix>(?:[/?#].*)?)$/);
+  if (!match?.groups) return '';
+  const port = Number(match.groups.port);
+  if (!isPreviewPort(port)) return '';
+  return `http://127.0.0.1:${port}${match.groups.suffix || ''}`;
+}
+
+function normalizeBrowserHistoryUrl(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(normalizePreviewUrl(trimmed));
+    const base = `${parsed.protocol}//${parsed.host}`;
+    if (parsed.pathname === '/' && !parsed.search && !parsed.hash) return base;
+    return `${base}${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return normalizePreviewUrl(trimmed);
+  }
 }
 
 function parseLocalPreviewUrl(value: string) {
@@ -15378,7 +16640,8 @@ function trimLimitedTextBuffer(value: string, limit: number) {
 function renderBrowserDeviceOptions() {
   const signature = browserDeviceOptionsSignature();
   if (browserDeviceOptionsRenderSignature === signature && el.deviceSelect.childElementCount > 0) {
-    if (el.deviceSelect.value !== 'desktop') el.deviceSelect.value = 'desktop';
+    const value = normalizedBrowserDeviceId(state.browserDeviceId);
+    if (el.deviceSelect.value !== value) el.deviceSelect.value = value;
     return;
   }
   browserDeviceOptionsRenderSignature = signature;
@@ -15399,7 +16662,7 @@ function renderBrowserDeviceOptions() {
     }
     el.deviceSelect.append(group);
   }
-  el.deviceSelect.value = 'desktop';
+  el.deviceSelect.value = normalizedBrowserDeviceId(state.browserDeviceId);
 }
 
 function browserDeviceOptionsSignature() {
@@ -15414,9 +16677,35 @@ function browserDevicePreset(id = state.browserDeviceId) {
   return BROWSER_DEVICE_PRESET_BY_ID.get(id) ?? BROWSER_DEVICE_PRESETS[0];
 }
 
+function applyBrowserViewportFromTab(tab: BrowserTab | null | undefined, options: { skipFrameSizing?: boolean } = {}) {
+  state.browserDeviceId = normalizedBrowserDeviceId(tab?.deviceId ?? state.browserDeviceId);
+  state.browserOrientation = normalizedBrowserOrientation(tab?.orientation ?? state.browserOrientation);
+  state.browserZoom = normalizedBrowserZoom(tab?.zoom ?? state.browserZoom);
+  if (tab) {
+    tab.deviceId = state.browserDeviceId;
+    tab.orientation = state.browserOrientation;
+    tab.zoom = state.browserZoom;
+  }
+  applyBrowserZoom();
+  if (state.browserDeviceId === 'desktop') {
+    setBrowserMode('desktop', { skipFrameSizing: options.skipFrameSizing, skipSave: true });
+  } else {
+    setBrowserDevice(state.browserDeviceId, { skipFrameSizing: options.skipFrameSizing, skipSave: true });
+  }
+}
+
+function syncActiveBrowserTabViewport() {
+  const tab = currentBrowserTab();
+  if (!tab) return;
+  tab.deviceId = state.browserDeviceId;
+  tab.orientation = state.browserOrientation;
+  tab.zoom = state.browserZoom;
+}
+
 function setBrowserMode(mode: 'desktop' | 'device', options: { skipFrameSizing?: boolean; skipSave?: boolean } = {}) {
   const isDesktop = mode === 'desktop';
   if (isDesktop) state.browserDeviceId = 'desktop';
+  if (!options.skipSave) syncActiveBrowserTabViewport();
   toggleClassIfChanged(el.browserShell, 'device', !isDesktop);
   toggleClassIfChanged(el.browserShell, 'desktop', isDesktop);
   if (el.desktopSize) toggleClassIfChanged(el.desktopSize, 'active', isDesktop);
@@ -15443,12 +16732,14 @@ function setBrowserMode(mode: 'desktop' | 'device', options: { skipFrameSizing?:
 function setBrowserDevice(id: string, options: { skipFrameSizing?: boolean; skipSave?: boolean } = {}) {
   if (!BROWSER_DEVICE_PRESET_BY_ID.has(id)) return;
   state.browserDeviceId = id;
+  if (!options.skipSave) syncActiveBrowserTabViewport();
   if (el.deviceSelect.value !== id) el.deviceSelect.value = id;
   setBrowserMode('device', options);
 }
 
 function rotateBrowserDevice() {
   state.browserOrientation = state.browserOrientation === 'portrait' ? 'landscape' : 'portrait';
+  syncActiveBrowserTabViewport();
   setBrowserMode('device');
 }
 
@@ -15479,8 +16770,9 @@ function applyBrowserFrameSizing(frame: HTMLIFrameElement) {
   }
   const preset = browserDevicePreset();
   const portrait = state.browserOrientation === 'portrait';
-  const width = `${portrait ? preset.width : preset.height}px`;
-  const height = `${portrait ? preset.height : preset.width}px`;
+  const zoom = normalizedBrowserZoom(state.browserZoom);
+  const width = `${Math.max(1, Math.round((portrait ? preset.width : preset.height) / zoom))}px`;
+  const height = `${Math.max(1, Math.round((portrait ? preset.height : preset.width) / zoom))}px`;
   if (frame.style.width !== width) frame.style.width = width;
   if (frame.style.height !== height) frame.style.height = height;
 }
@@ -15504,8 +16796,8 @@ function browserFrameTitle(tab: BrowserTab) {
 }
 
 function browserFrameSizingSignature() {
-  if (el.browserShell.classList.contains('desktop')) return 'desktop';
-  return `${state.browserDeviceId}:${state.browserOrientation}`;
+  if (el.browserShell.classList.contains('desktop')) return `desktop:${state.browserZoom.toFixed(2)}`;
+  return `${state.browserDeviceId}:${state.browserOrientation}:${state.browserZoom.toFixed(2)}`;
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {

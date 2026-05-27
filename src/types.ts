@@ -18,6 +18,13 @@ export interface FileEntry {
   hidden: boolean;
 }
 
+export interface DeletedPathItem {
+  originalPath: string;
+  trashPath: string;
+  name: string;
+  directory: boolean;
+}
+
 export interface DirectoryListingResult {
   path: string;
   entries: FileEntry[];

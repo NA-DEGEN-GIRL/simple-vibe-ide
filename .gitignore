@@ -2,6 +2,7 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+.handoff/
 .vibe-ide/attachments/
 .vibe-ide/tmp/
 .vibe-ide-temp/

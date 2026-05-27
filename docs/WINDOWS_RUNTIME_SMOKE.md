@@ -94,6 +94,9 @@ The script runs:
   buffered output does not freeze the UI.
 - Switch workspaces while terminals are alive; confirm hidden/restored terminal
   widgets behave correctly.
+- Close/relaunch after saving a workspace; confirm UI/work context restores but
+  shell processes start fresh. Runtime keep-alive/reattach is intentionally not
+  part of the current product.
 
 ### 4. Browser widget used/unused states
 
