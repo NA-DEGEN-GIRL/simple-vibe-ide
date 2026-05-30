@@ -41,6 +41,74 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Process-wide Windows Job Object that owns every child process the IDE
+/// spawns (terminals, ssh/wsl, port forwards, Edge devtools). It is configured
+/// with `KILL_ON_JOB_CLOSE`, so when the IDE process dies for ANY reason -
+/// graceful exit, a Rust panic (the release profile uses `panic = "abort"`),
+/// or an external force-kill - Windows tears down the whole tree. This is the
+/// crash-safety net behind the explicit teardown in `shutdown_runtime_sessions`.
+#[cfg(windows)]
+mod cleanup_job {
+    use std::sync::OnceLock;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+    struct SendHandle(HANDLE);
+    // The job handle lives for the whole process and is only touched behind a
+    // OnceLock; it is safe to share across threads.
+    unsafe impl Send for SendHandle {}
+    unsafe impl Sync for SendHandle {}
+
+    static JOB: OnceLock<Option<SendHandle>> = OnceLock::new();
+
+    fn init_job() -> Option<SendHandle> {
+        unsafe {
+            let handle = CreateJobObjectW(None, PCWSTR::null()).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let result = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if result.is_err() {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            Some(SendHandle(handle))
+        }
+    }
+
+    fn job_handle() -> Option<HANDLE> {
+        JOB.get_or_init(init_job).as_ref().map(|h| h.0)
+    }
+
+    /// Assign a spawned child PID to the cleanup job. Best-effort: any failure
+    /// (e.g. the child already exited, or it lives in an incompatible job) is
+    /// ignored because the explicit `taskkill /T` teardown is the primary path.
+    pub fn assign(pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        let Some(job) = job_handle() else {
+            return;
+        };
+        unsafe {
+            if let Ok(process) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) {
+                let _ = AssignProcessToJobObject(job, process);
+                let _ = CloseHandle(process);
+            }
+        }
+    }
+}
+
 const LOCAL_DIRECTORY_BATCH_PARALLELISM: usize = 4;
 const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
@@ -303,6 +371,44 @@ fn hide_command_window(command: &mut Command) -> &mut Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// Register a freshly spawned child with the process-wide cleanup job so it is
+/// guaranteed to die with the IDE even on a crash. No-op off Windows.
+fn assign_child_to_cleanup_job(pid: u32) {
+    #[cfg(windows)]
+    cleanup_job::assign(pid);
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
+/// Forcefully terminate a process *and its entire child tree* by PID.
+///
+/// On Windows, killing only the directly spawned process (e.g. `wsl.exe` or
+/// `ssh.exe`) leaves grandchildren (wslhost, ssh ControlMaster, PTY helpers)
+/// behind as orphans, because Windows does not propagate termination down the
+/// tree. `taskkill /T` walks the tree and `/F` forces termination.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        if pid == 0 {
+            return;
+        }
+        let mut command = Command::new("taskkill");
+        command
+            .arg("/T")
+            .arg("/F")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = hide_command_window(&mut command).status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1355,6 +1461,9 @@ fn spawn_terminal_direct(
         .slave
         .spawn_command(cmd)
         .map_err(|err| err.to_string())?;
+    if let Some(pid) = child.process_id() {
+        assign_child_to_cleanup_job(pid);
+    }
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -1484,7 +1593,11 @@ fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
         .lock()
         .map_err(|_| "terminal state poisoned".to_string())?;
     if let Some(mut session) = terminals.remove(&id) {
-        session.child.kill().map_err(|err| err.to_string())?;
+        if let Some(pid) = session.child.process_id() {
+            kill_process_tree(pid);
+        }
+        let _ = session.child.kill();
+        let _ = session.child.wait();
     }
     Ok(())
 }
@@ -1492,7 +1605,11 @@ fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
 fn shutdown_runtime_sessions(state: &IdeState) {
     if let Ok(mut terminals) = state.terminals.lock() {
         for (_, mut session) in terminals.drain() {
+            if let Some(pid) = session.child.process_id() {
+                kill_process_tree(pid);
+            }
             let _ = session.child.kill();
+            let _ = session.child.wait();
         }
     }
 
@@ -1502,7 +1619,9 @@ fn shutdown_runtime_sessions(state: &IdeState) {
                 stop.store(true, Ordering::Relaxed);
             }
             if let Some(mut child) = forward.child.take() {
+                kill_process_tree(child.id());
                 let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -1510,7 +1629,9 @@ fn shutdown_runtime_sessions(state: &IdeState) {
     if let Ok(mut edge_sessions) = state.edge_sessions.lock() {
         for (_, mut session) in edge_sessions.drain() {
             if let Some(mut child) = session.child.take() {
+                kill_process_tree(child.id());
                 let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -1546,6 +1667,7 @@ fn start_port_forward_host(
         let child = hide_command_window(&mut command)
             .spawn()
             .map_err(|err| format!("failed to start ssh forward: {err}"))?;
+        assign_child_to_cleanup_job(child.id());
         state
             .forwards
             .lock()
@@ -1712,7 +1834,9 @@ fn stop_port_forward_host(state: &IdeState, id: String) -> Result<(), String> {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(mut child) = forward.child.take() {
+            kill_process_tree(child.id());
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
     Ok(())
@@ -1855,9 +1979,12 @@ fn start_edge_devtools_session_blocking(
     let mut child = hide_command_window(&mut command)
         .spawn()
         .map_err(|err| format!("failed to start Edge: {err}"))?;
+    assign_child_to_cleanup_job(child.id());
 
     if let Err(err) = wait_for_edge_devtools(port) {
+        kill_process_tree(child.id());
         let _ = child.kill();
+        let _ = child.wait();
         return Err(err);
     }
 
@@ -1939,7 +2066,9 @@ fn stop_edge_devtools_session(state: State<IdeState>, session_id: String) -> Res
         .map_err(|_| "edge session state poisoned".to_string())?;
     if let Some(mut session) = sessions.remove(&id) {
         if let Some(mut child) = session.child.take() {
+            kill_process_tree(child.id());
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
     Ok(())
@@ -5667,6 +5796,14 @@ pub fn run() {
                 .expect("set title");
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Simple Vibe IDE");
+        .build(tauri::generate_context!())
+        .expect("error while running Simple Vibe IDE")
+        .run(|app_handle, event| {
+            // Guarantee child processes (terminals, ssh/wsl, port forwards,
+            // Edge devtools) are torn down on every exit path, not only when
+            // the custom window-close button invokes shutdownRuntimeSessions.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                shutdown_runtime_sessions(app_handle.state::<IdeState>().inner());
+            }
+        });
 }

@@ -1543,7 +1543,9 @@ app.innerHTML = `
         <div id="image-label" class="image-label">No image selected</div>
         <div class="image-tools">
           <label class="image-option" title="External image paste only"><input id="auto-paste-image-tag" type="checkbox" checked /> Auto paste to shell</label>
-          <button id="image-fit" class="panel-mode" title="Fit image to preview">Fit</button>
+          <button id="image-fit" class="panel-mode" title="Fit whole image to preview">Fit</button>
+          <button id="image-fit-width" class="panel-mode" title="Fit image to width (pan vertically)">Fit W</button>
+          <button id="image-fit-height" class="panel-mode" title="Fit image to height (pan horizontally)">Fit H</button>
           <button id="toggle-image-history" class="panel-mode" title="Toggle pasted image history" aria-pressed="false">History</button>
           <button id="clear-image-history" class="panel-mode" title="Clear pasted image history">Clear</button>
         </div>
@@ -1717,6 +1719,8 @@ const el = {
   imageLabel: document.querySelector<HTMLDivElement>('#image-label')!,
   autoPasteImageTag: document.querySelector<HTMLInputElement>('#auto-paste-image-tag')!,
   imageFit: document.querySelector<HTMLButtonElement>('#image-fit')!,
+  imageFitWidth: document.querySelector<HTMLButtonElement>('#image-fit-width')!,
+  imageFitHeight: document.querySelector<HTMLButtonElement>('#image-fit-height')!,
   imageHistoryToggle: document.querySelector<HTMLButtonElement>('#toggle-image-history')!,
   imageHistoryClear: document.querySelector<HTMLButtonElement>('#clear-image-history')!,
   imageHistory: document.querySelector<HTMLDivElement>('#image-history')!,
@@ -3624,7 +3628,10 @@ async function toggleWorkspaceCaptureProtection(id: string) {
 
   const enabled = !snapshot.captureProtected;
   snapshot.captureProtected = enabled;
-  if (id === state.activeWorkspaceId) {
+  // Apply the OS block immediately for the window the user is looking at — including before any
+  // workspace is connected (activeWorkspaceId is '' at startup) — so there is no unprotected gap
+  // between toggling and connecting. A non-active background tab only updates its stored flag.
+  if (id === state.activeWorkspaceId || !state.activeWorkspaceId) {
     state.workspaceCaptureProtected = enabled;
     await applyWorkspaceCaptureProtection(enabled);
   }
@@ -6120,6 +6127,8 @@ function bindEvents() {
     saveActiveWorkspaceSnapshot();
   });
   el.imageFit.addEventListener('click', fitActiveImagePreview);
+  el.imageFitWidth.addEventListener('click', () => fitImagePreviewToAxis('width'));
+  el.imageFitHeight.addEventListener('click', () => fitImagePreviewToAxis('height'));
   el.imagePreviewStage.addEventListener('wheel', handleImagePreviewWheel, { passive: false });
   el.imagePreviewStage.addEventListener('pointerdown', startImagePreviewDrag);
   el.imagePreviewStage.addEventListener('pointermove', moveImagePreviewDrag);
@@ -6680,7 +6689,12 @@ async function runWindowAction(action: string) {
   if (action === 'minimize') await currentWindow.minimize();
   else if (action === 'toggle-maximize') await currentWindow.toggleMaximize();
   else if (action === 'close') {
-    await api.shutdownRuntimeSessions().catch(() => undefined);
+    // Close immediately for a snappy exit. Don't await teardown here: the
+    // backend RunEvent::ExitRequested hook runs shutdown_runtime_sessions as
+    // the window tears down, and the Windows Job Object guarantees the child
+    // process tree dies with the app even if that never runs. We still kick off
+    // teardown fire-and-forget so it starts a beat earlier.
+    void api.shutdownRuntimeSessions().catch(() => undefined);
     await currentWindow.close();
   }
 }
@@ -13585,15 +13599,57 @@ function fitActiveImagePreview() {
   saveActiveWorkspaceSnapshot();
 }
 
+// Fit the image so the chosen axis fills the stage. The base render is object-fit:contain
+// (zoom 1 = whole image fits), so a width/height fit is just a zoom relative to that contain
+// scale: when the other axis overflows, the existing pan machinery (enabled at zoom > 1) lets
+// the user drag along it.
+function fitImagePreviewToAxis(axis: 'width' | 'height') {
+  if (!state.imagePreviewDataUrl) return;
+  const rect = el.imagePreviewStage.getBoundingClientRect();
+  const imgW = el.imagePreview.naturalWidth;
+  const imgH = el.imagePreview.naturalHeight;
+  if (!rect.width || !rect.height || !imgW || !imgH) return;
+  const containScale = Math.min(rect.width / imgW, rect.height / imgH);
+  if (!(containScale > 0)) return;
+  const targetScale = axis === 'width' ? rect.width / imgW : rect.height / imgH;
+  state.imagePreviewZoom = normalizedImageZoom(targetScale / containScale);
+  state.imagePreviewOffsetX = 0;
+  state.imagePreviewOffsetY = 0;
+  clampImagePreviewPan();
+  syncActiveImageTabFromState();
+  renderImagePreview();
+  saveActiveWorkspaceSnapshot();
+}
+
 function handleImagePreviewWheel(event: WheelEvent) {
-  if (!event.ctrlKey || !state.imagePreviewDataUrl) return;
+  if (!state.imagePreviewDataUrl) return;
+  if (event.ctrlKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    const oldZoom = normalizedImageZoom(state.imagePreviewZoom);
+    const factor = event.deltaY < 0 ? IMAGE_PREVIEW_WHEEL_FACTOR : 1 / IMAGE_PREVIEW_WHEEL_FACTOR;
+    const nextZoom = normalizedImageZoom(oldZoom * factor);
+    if (Math.abs(nextZoom - oldZoom) < 0.0001) return;
+    zoomImagePreviewAt(event.clientX, event.clientY, oldZoom, nextZoom);
+    return;
+  }
+  // Plain wheel pans the zoomed image. A single drag stroke can't always reach
+  // an edge on a small panel (the WebView may drop pointer capture once the
+  // cursor leaves the stage), so wheel panning is the reliable way to reach the
+  // top/bottom of a tall image. clampImagePreviewPan keeps it within bounds.
+  if (normalizedImageZoom(state.imagePreviewZoom) <= 1) return;
   event.preventDefault();
   event.stopPropagation();
-  const oldZoom = normalizedImageZoom(state.imagePreviewZoom);
-  const factor = event.deltaY < 0 ? IMAGE_PREVIEW_WHEEL_FACTOR : 1 / IMAGE_PREVIEW_WHEEL_FACTOR;
-  const nextZoom = normalizedImageZoom(oldZoom * factor);
-  if (Math.abs(nextZoom - oldZoom) < 0.0001) return;
-  zoomImagePreviewAt(event.clientX, event.clientY, oldZoom, nextZoom);
+  if (event.shiftKey) {
+    state.imagePreviewOffsetX -= event.deltaY || event.deltaX;
+  } else {
+    state.imagePreviewOffsetX -= event.deltaX;
+    state.imagePreviewOffsetY -= event.deltaY;
+  }
+  clampImagePreviewPan();
+  syncActiveImageTabFromState();
+  applyImagePreviewTransform();
+  saveActiveWorkspaceSnapshot();
 }
 
 function zoomImagePreviewAt(clientX: number, clientY: number, oldZoom: number, nextZoom: number) {
@@ -13715,6 +13771,8 @@ function applyImagePreviewTransform() {
   if (el.imagePreview.style.transform !== transform) el.imagePreview.style.transform = transform;
   toggleClassIfChanged(el.imagePreviewStage, 'zoomed', zoom > 1 && Boolean(state.imagePreviewDataUrl));
   el.imageFit.disabled = !state.imagePreviewDataUrl || (zoom === 1 && state.imagePreviewOffsetX === 0 && state.imagePreviewOffsetY === 0);
+  el.imageFitWidth.disabled = !state.imagePreviewDataUrl;
+  el.imageFitHeight.disabled = !state.imagePreviewDataUrl;
 }
 
 function renderImageHistory() {
