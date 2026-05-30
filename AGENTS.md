@@ -21,14 +21,16 @@ Simple Vibe IDE is a Windows-first Tauri v2 desktop app for fast WSL/SSH/Windows
 - Rust format check: `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
 - Rust Windows check: `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
 - Windows smoke build: `.\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch`
+- Windows release from a WSL checkout: load the Visual Studio developer environment, set `CARGO_TARGET_DIR` to a spacious Windows-local folder, then run the smoke script through `cmd pushd`.
 
 When running from a WSL-hosted checkout with Windows tools, prefer `cmd /d /c "pushd ""\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide"" && ..."` so Windows gets a temporary drive mapping instead of a raw UNC working directory.
 
 ## Build And Runtime Notes
 
-- Set `CARGO_TARGET_DIR` to a Windows-local temp folder such as `%TEMP%\simple-vibe-ide-target` for Windows builds from a WSL checkout.
+- Set `CARGO_TARGET_DIR` to a Windows-local folder such as `%TEMP%\simple-vibe-ide-target` for Windows builds from a WSL checkout. If `%TEMP%` quota is tight, use another spacious local path such as `D:\build-cache\simple-vibe-ide-target`; do not put Cargo target output on a WSL/UNC path.
 - Release builds use `.cargo/config.toml` with `target-cpu=native`; produced binaries are intended for the build machine, not portable distribution.
 - `scripts/windows-runtime-smoke.ps1` redacts local usernames in displayed paths. Keep that behavior.
+- If running Windows tools from WSL says `cmd.exe: command not found` or `.exe` returns `Exec format error`, verify WSL interop/binfmt before declaring Windows builds impossible.
 - Runtime keep-alive and pty-host reattach were removed because they made shell input and TUI output too slow. Do not reintroduce a background terminal host without a fresh low-latency design and explicit user approval.
 - Closing or rebuilding the app terminates in-process shell sessions. Optimize for fast direct terminal I/O over restart persistence.
 
@@ -71,7 +73,8 @@ When running from a WSL-hosted checkout with Windows tools, prefer `cmd /d /c "p
 
 ## Subagents
 
-- Use explorer subagents for bounded read-only questions such as terminal freeze causes, direct PTY lifecycle, or browser proxy behavior.
-- Use worker subagents only for independent patches with clear ownership. Avoid multiple workers editing `src/main.ts` at once.
-- Good worker ownership boundaries: `scripts/` + `docs/`, or `src-tauri/src/lib.rs` backend-only, or one specific UI widget area.
-- Main agent should keep final integration, conflict resolution, release builds, and user-facing product decisions.
+- Prefer explorer subagents first for bounded read-only questions: terminal freeze causes, direct PTY lifecycle, browser proxy behavior, workspace snapshot churn, or Windows build diagnostics.
+- Use worker subagents only for independent patches with explicit ownership and a disjoint write set. Avoid broad workers in `src/main.ts` or `src-tauri/src/lib.rs`; if either file is already dirty, keep it main-agent-owned unless the user explicitly assigns it.
+- Good worker ownership boundaries: `scripts/` + `docs/`, `src/privacyPolicy.ts`, one isolated UI widget area, or a backend-only change in `src-tauri/src/lib.rs` when no other agent is editing backend runtime code.
+- Use verification subagents after integration-heavy work. Good verification prompts: inspect terminal input/IME semantics, DSR filtering, chunked xterm writes, WSL/SSH cwd launch behavior, Browser preview proxy regressions, or Windows smoke output.
+- Main agent should keep final integration, conflict resolution, release builds, user-facing product decisions, and commits.

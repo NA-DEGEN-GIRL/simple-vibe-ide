@@ -381,6 +381,8 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .workspace-bar { min-height: 46px; flex-wrap: wrap; align-content: center; padding-block: 6px; }
 .workspace-bar label { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .workspace-bar button { white-space: nowrap; }
+.saved-workspace-control { max-width: 230px; }
+#saved-workspace-select { max-width: 170px; }
 #profile-select { width: min(220px, 22vw); }
 #root-input { width: clamp(180px, 22vw, 420px); }
 .market-ticker {
@@ -1085,6 +1087,7 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
   will-change: transform;
   user-select: none;
   -webkit-user-drag: none;
+  pointer-events: none;
 }
 #image-preview.visible { display: block; }
 .hint, .console-note { color: #7f91a8; font-size: 12px; line-height: 1.35; padding: 8px 10px; margin: 0; border-top: 1px solid #182132; }

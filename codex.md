@@ -51,6 +51,56 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-05-28 - Saved workspaces and faster close
+
+#### Changed
+
+- Added a workspace Save/Load control so the current workspace layout can be
+  saved separately from open workspace tabs and loaded again later.
+- Made workspace-tab close detach terminal UI immediately and kill backend
+  terminal sessions in the background, avoiding sequential close waits.
+- Tightened terminal file-link opening so Ctrl+click opens detected text files
+  in the editor and image paths in Image Preview without overwriting errors
+  with a false success status.
+- Reworked terminal file-link hit ranges to use xterm cell positions instead
+  of raw string offsets, so links stay aligned when Korean/CJK text appears
+  before a path.
+- Restricted unquoted terminal file links to extension-bearing file names and
+  stripped a leading `@` attachment marker when resolving paths, preventing
+  prose after an image path from becoming part of the link.
+- Restored the editor panel after failed terminal-link file opens so a bad path
+  does not leave the editor stuck on `Opening file...`.
+- Kept terminal output visible during IME composition and only deferred terminal
+  fit/resize work, avoiding Korean text appearing only after space/commit.
+- Added explicit xterm helper-textarea refocus after terminal-pane activation,
+  app focus return, and IME composition release. The root issue was that a
+  visible active shell could lack helper-textarea focus; switching shells fixed
+  it by forcing a blur/focus reset.
+- Added an Explorer context-menu action to run local Windows or WSL `.ps1`
+  files through an elevated Windows PowerShell prompt.
+- Added `scripts/run-temp-release.ps1` to copy the built Windows exe into a
+  temp-local app folder, create reusable VBS/CMD launchers, and fall back to a
+  timestamped exe when the stable temp exe is locked by a running app.
+- Fixed the generated VBS launcher so each VBScript statement is written on one
+  line; the previous split line could show a Windows Script Host compile error.
+- Updated `AGENTS.md` with Windows build-cache and subagent ownership guidance.
+
+#### Verified
+
+- `npm run check` passed.
+- `npm run build` passed.
+- Windows smoke release build with `D:\build-cache\simple-vibe-ide-target`
+  passed and produced the release exe.
+- `scripts/run-temp-release.ps1 -NoLaunch` copied the release exe into
+  `%TEMP%\simple-vibe-ide-target` and generated launchers.
+- `cscript //nologo %TEMP%\simple-vibe-ide-target\run-built-temp.vbs` returned
+  success after the VBS line-generation fix.
+
+#### Known Limits
+
+- IME feel and the elevated `.ps1` UAC flow still need a manual check inside
+  the Windows app because they are interactive runtime behaviors.
+
 ### 2026-05-27 - Terminal IME path and public repo hygiene
 
 #### Changed

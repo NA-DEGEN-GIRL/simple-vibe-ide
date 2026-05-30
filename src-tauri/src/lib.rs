@@ -757,6 +757,53 @@ fn read_text_file(profile_id: String, path: String) -> Result<String, String> {
     }
 }
 
+/// Cheap freshness probe (mtime:size) used to validate the frontend text-file cache so
+/// externally modified files (terminal/LLM edits, vim, other processes) are never served
+/// as stale editor content. Much lighter than re-reading the whole file on every open.
+#[tauri::command]
+fn file_signature(profile_id: String, path: String) -> Result<String, String> {
+    let profile = profile_from_id(&profile_id);
+    let path = normalize_profile_path(&profile, &path);
+    match profile.kind.as_str() {
+        "windows" => local_file_signature(Path::new(&path)),
+        "wsl" => {
+            if let Some(windows_path) = wsl_posix_path_to_windows_path(&profile, &path) {
+                local_file_signature(&windows_path)
+            } else {
+                remote_file_signature(&profile, &path)
+            }
+        }
+        "ssh" => remote_file_signature(&profile, &path),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+fn local_file_signature(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|delta| delta.as_millis())
+        .unwrap_or(0);
+    Ok(format!("{mtime}:{size}"))
+}
+
+fn remote_file_signature(profile: &ConnectionProfile, path: &str) -> Result<String, String> {
+    // GNU stat (Linux/WSL) first, then BSD stat (macOS) as a fallback. Both emit mtime:size.
+    let script = format!(
+        "stat -c '%Y:%s' -- {0} 2>/dev/null || stat -f '%m:%z' -- {0}",
+        shell_quote(path)
+    );
+    let bytes = run_profile_shell(profile, &script, None)?;
+    let signature = String::from_utf8_lossy(&bytes).trim().to_string();
+    if signature.is_empty() {
+        return Err("could not stat remote file".to_string());
+    }
+    Ok(signature)
+}
+
 #[tauri::command]
 fn read_file_data_url(profile_id: String, path: String) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
@@ -970,6 +1017,65 @@ fn open_path(profile_id: String, path: String) -> Result<(), String> {
         .arg("start")
         .arg("")
         .arg(target.to_string_lossy().to_string())
+        .current_dir(windows_spawn_cwd())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command)
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn run_powershell_script_as_admin(profile_id: String, path: String) -> Result<(), String> {
+    let profile = profile_from_id(&profile_id);
+    let path = normalize_profile_path(&profile, &path);
+    let target = match profile.kind.as_str() {
+        "windows" => PathBuf::from(&path),
+        "wsl" => wsl_posix_path_to_windows_path(&profile, &path)
+            .ok_or_else(|| "cannot translate WSL path to a Windows path".to_string())?,
+        "ssh" => {
+            return Err(
+                "running remote SSH PowerShell scripts as Windows admin is not supported"
+                    .to_string(),
+            )
+        }
+        _ => return Err(format!("unsupported profile kind: {}", profile.kind)),
+    };
+
+    if !target.exists() {
+        return Err(format!("path does not exist: {}", target.to_string_lossy()));
+    }
+    if target
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("ps1"))
+        .unwrap_or(true)
+    {
+        return Err("admin PowerShell launch only supports .ps1 files".to_string());
+    }
+
+    let target_text = target.to_string_lossy().to_string();
+    let working_dir = target
+        .parent()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| windows_spawn_cwd().to_string_lossy().to_string());
+    let elevated_script = format!("& {}", powershell_single_quote(&target_text));
+    let encoded_script = powershell_encoded_command(&elevated_script);
+    let launcher_script = format!(
+        "$dir = {}; Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{}') -WorkingDirectory $dir -Verb RunAs",
+        powershell_single_quote(&working_dir),
+        encoded_script
+    );
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(launcher_script)
         .current_dir(windows_spawn_cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1263,11 +1369,13 @@ fn spawn_terminal_direct(
     let read_writer = writer.clone();
     thread::spawn(move || {
         let mut buf = [0_u8; 8192];
+        let mut leftover: Vec<u8> = Vec::with_capacity(8);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut data = String::from_utf8_lossy(&buf[..n]).to_string();
+                    leftover.extend_from_slice(&buf[..n]);
+                    let mut data = drain_complete_utf8(&mut leftover);
                     if data.contains(TERMINAL_DSR_CURSOR_QUERY) {
                         respond_terminal_cursor_query(&read_writer);
                         data = data.replace(TERMINAL_DSR_CURSOR_QUERY, "");
@@ -1278,6 +1386,12 @@ fn spawn_terminal_direct(
                     read_batcher.push(&data);
                 }
                 Err(_) => break,
+            }
+        }
+        if !leftover.is_empty() {
+            let trailing = String::from_utf8_lossy(&leftover).to_string();
+            if !trailing.is_empty() {
+                read_batcher.push(&trailing);
             }
         }
         read_batcher.flush();
@@ -5344,6 +5458,35 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn drain_complete_utf8(buffer: &mut Vec<u8>) -> String {
+    if buffer.is_empty() {
+        return String::new();
+    }
+    let split = match std::str::from_utf8(buffer) {
+        Ok(_) => buffer.len(),
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        Err(_) => buffer.len(),
+    };
+    if split == 0 {
+        return String::new();
+    }
+    let decoded = String::from_utf8_lossy(&buffer[..split]).to_string();
+    buffer.drain(..split);
+    decoded
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 fn join_posix(base: &str, child: &str) -> String {
     if child.starts_with('/') || child.starts_with('~') {
         child.to_string()
@@ -5459,6 +5602,7 @@ pub fn run() {
             list_directories,
             directory_signatures,
             read_text_file,
+            file_signature,
             read_file_data_url,
             write_text_file,
             create_directory,
@@ -5467,6 +5611,7 @@ pub fn run() {
             delete_paths,
             restore_deleted_paths,
             open_path,
+            run_powershell_script_as_admin,
             read_clipboard_file_paths,
             save_clipboard_image_file,
             copy_dropped_files,

@@ -17,6 +17,8 @@ export const api = {
     invoke<DirectorySignatureResult[]>('directory_signatures', { profileId, paths, includeSizes }),
   readTextFile: (profileId: string, path: string) =>
     invoke<string>('read_text_file', { profileId, path }),
+  fileSignature: (profileId: string, path: string) =>
+    invoke<string>('file_signature', { profileId, path }),
   readFileDataUrl: (profileId: string, path: string) =>
     invoke<string>('read_file_data_url', { profileId, path }),
   writeTextFile: (profileId: string, path: string, content: string) =>
@@ -33,6 +35,8 @@ export const api = {
     invoke<void>('restore_deleted_paths', { profileId, items }),
   openPath: (profileId: string, path: string) =>
     invoke<void>('open_path', { profileId, path }),
+  runPowerShellScriptAsAdmin: (profileId: string, path: string) =>
+    invoke<void>('run_powershell_script_as_admin', { profileId, path }),
   readClipboardFilePaths: () => invoke<string[]>('read_clipboard_file_paths'),
   saveClipboardImageFile: (profileId: string, targetDir: string, fileName: string, base64Data: string) =>
     invoke<string>('save_clipboard_image_file', { profileId, targetDir, fileName, base64Data }),
