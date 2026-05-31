@@ -70,6 +70,7 @@ interface TerminalWidget {
   typePadInput: HTMLTextAreaElement;
   typePadPaste: HTMLButtonElement;
   activePaneId: string;
+  typingPadOpen: boolean;
 }
 
 interface OpenFileState {
@@ -87,6 +88,7 @@ interface PastedImageItem {
   path: string;
   tag: string;
   dataUrl: string;
+  fingerprint?: string;
   createdAt: string;
 }
 
@@ -286,6 +288,7 @@ interface WorkspaceTerminalSnapshot {
   widgetId?: string;
   profileId?: string;
   cwd?: string;
+  typingPadOpen?: boolean;
   rect?: LayoutRatio;
 }
 
@@ -1563,7 +1566,7 @@ app.innerHTML = `
         <div id="image-label" class="image-label">No image selected</div>
         <div class="image-tools">
           <label class="image-option" title="External image paste only"><input id="auto-paste-image-tag" type="checkbox" checked /> Auto paste to shell</label>
-          <span id="image-paste-target" class="image-paste-target shell" title="Image tag paste target">Tag -> Shell</span>
+          <span id="image-paste-target" class="image-paste-target target-shell" title="Image tag paste target">Tag -> Shell</span>
           <button id="image-fit" class="panel-mode" title="Fit whole image to preview">Fit</button>
           <button id="image-fit-width" class="panel-mode" title="Fit image to width (pan vertically)">Fit W</button>
           <button id="image-fit-height" class="panel-mode" title="Fit image to height (pan horizontally)">Fit H</button>
@@ -4206,7 +4209,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminal.typingPadOpen ? '1' : '0'},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function editorTabSnapshotsSignature(tabs: WorkspaceSnapshot['editorTabs']) {
@@ -4237,7 +4240,7 @@ function imageSnapshotHistorySignature(workspaceId: string, tab: ImageTabSnapsho
   for (let index = 0; index < tab.history.length; index += 1) {
     const item = tab.history[index];
     if (index) signature += ':';
-    signature += `${workspaceSignaturePart(item.id)},${workspaceSignaturePart(item.path)},${workspaceSignaturePart(item.tag)},${workspaceSignaturePart(item.createdAt)},${workspaceImageSignaturePart(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl)}`;
+    signature += `${workspaceSignaturePart(item.id)},${workspaceSignaturePart(item.path)},${workspaceSignaturePart(item.tag)},${workspaceSignaturePart(item.fingerprint)},${workspaceSignaturePart(item.createdAt)},${workspaceImageSignaturePart(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl)}`;
   }
   return signature;
 }
@@ -4341,10 +4344,11 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
   let activeWidget: TerminalWidget | null = null;
   for (const pane of state.terminals) {
     if (pane.workspaceId !== state.activeWorkspaceId) continue;
-    if (!firstWidget) firstWidget = terminalWidgetForPane(pane);
+    const widget = terminalWidgetForPane(pane);
+    if (!firstWidget) firstWidget = widget;
     if (pane.paneId === state.activePaneId) {
       activeTerminalIndex = terminals.length;
-      activeWidget = terminalWidgetForPane(pane);
+      activeWidget = widget;
     }
     terminals.push({
       title: pane.title.replace(/\s+\(exited\)$/i, ''),
@@ -4354,6 +4358,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
       widgetId: pane.widgetId,
       profileId: pane.profileId,
       cwd: pane.cwd,
+      typingPadOpen: Boolean(widget?.typingPadOpen ?? pane.typingPadOpen),
       rect: elementLayoutRatio(pane.element, { preferCache: true })
     });
   }
@@ -4698,12 +4703,19 @@ async function restoreWorkspaceTerminals(
           restoredPane = activePaneForWidget(widget);
         }
       }
+      if (restoredPane) {
+        restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
+        const typingPadOpen = Boolean(terminal.typingPadOpen);
+        restoredPane.typingPadOpen = typingPadOpen;
+        const restoredWidget = terminalWidgetForPane(restoredPane);
+        if (restoredWidget) {
+          restoredWidget.typingPadOpen = restoredWidget.typingPadOpen || typingPadOpen;
+          syncTerminalTypingPadForWidget(restoredWidget);
+        }
+      }
       if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
-        restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
         await sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined);
-      } else if (restoredPane) {
-        restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
         hideTerminalWidgetsForWorkspace(snapshot.id);
@@ -6279,7 +6291,7 @@ function bindEvents() {
   el.calculatorClear.addEventListener('click', clearCalculator);
   el.settingsSave.addEventListener('click', saveSettingsFromForm);
   window.addEventListener('message', handleBrowserConsoleMessage);
-  document.addEventListener('paste', handlePaste);
+  document.addEventListener('paste', handlePaste, true);
   document.addEventListener('keydown', handleImageClipboardShortcut, true);
   document.addEventListener('keydown', handleEditorSaveShortcut, true);
   document.addEventListener('keydown', handleBrowserZoomShortcut, true);
@@ -6322,6 +6334,7 @@ function bindEvents() {
     }
   });
   window.addEventListener('beforeunload', () => {
+    flushActiveWorkspaceSnapshotSave('flush');
     flushTerminalCwdSnapshotSave();
     flushWorkspaceStorePersist();
     pauseMarketTickerForHidden();
@@ -6736,6 +6749,7 @@ async function runWindowAction(action: string) {
     // process teardown to a background worker as the window tears down. The
     // Windows Job Object remains the hard guarantee if the app exits first. We
     // still kick off teardown fire-and-forget so it starts a beat earlier.
+    flushActiveWorkspaceSnapshotSave('flush');
     void api.shutdownRuntimeSessions().catch(() => undefined);
     await currentWindow.close();
   }
@@ -12475,7 +12489,8 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     typePad,
     typePadInput,
     typePadPaste,
-    activePaneId: ''
+    activePaneId: '',
+    typingPadOpen: false
   };
   state.terminalWidgets.push(widget);
   terminalWidgetById.set(widget.widgetId, widget);
@@ -12553,17 +12568,16 @@ function toggleTerminalTypingPad(widget: TerminalWidget, open?: boolean) {
   const pane = activePaneForWidget(widget);
   if (!pane) return;
   updateTerminalTypingPadDraft(widget);
-  pane.typingPadOpen = open ?? !pane.typingPadOpen;
-  syncTerminalTypingPadForWidget(widget);
-  if (pane.typingPadOpen) focusTerminalTypingPad(widget);
+  const nextOpen = open ?? !terminalTypingPadIsOpen(widget);
+  setTerminalTypingPadOpen(widget, nextOpen, { persist: true });
+  if (terminalTypingPadIsOpen(widget)) focusTerminalTypingPad(widget);
   else focusTerminalFromTypingPad(widget);
 }
 
 function focusTerminalTypingPad(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   if (!pane) return;
-  pane.typingPadOpen = true;
-  syncTerminalTypingPadForWidget(widget);
+  setTerminalTypingPadOpen(widget, true, { persist: true });
   setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
   setTerminalTextTarget('typing-pad');
   cancelTerminalFocusRequest(pane);
@@ -12613,7 +12627,8 @@ async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
 
 function syncTerminalTypingPadForWidget(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
-  const open = Boolean(pane?.typingPadOpen);
+  const open = terminalTypingPadIsOpen(widget);
+  syncTerminalTypingPadOpenToPanes(widget, open);
   const draft = pane?.typingPadDraft ?? '';
   const wasHidden = widget.typePad.classList.contains('hidden');
   toggleClassIfChanged(widget.typePad, 'hidden', !open);
@@ -12624,6 +12639,30 @@ function syncTerminalTypingPadForWidget(widget: TerminalWidget) {
   if (wasHidden === open) {
     window.requestAnimationFrame(() => scheduleFitTerminalWidget(widget));
   }
+}
+
+function terminalTypingPadIsOpen(widget: TerminalWidget) {
+  return Boolean(widget.typingPadOpen);
+}
+
+function setTerminalTypingPadOpen(
+  widget: TerminalWidget,
+  open: boolean,
+  options: { persist?: boolean } = {}
+) {
+  const previousOpen = terminalTypingPadIsOpen(widget);
+  widget.typingPadOpen = open;
+  syncTerminalTypingPadOpenToPanes(widget, open);
+  syncTerminalTypingPadForWidget(widget);
+  if (options.persist && previousOpen !== open) saveTerminalTypingPadOpenSnapshot();
+}
+
+function syncTerminalTypingPadOpenToPanes(widget: TerminalWidget, open = terminalTypingPadIsOpen(widget)) {
+  for (const pane of terminalPanesForWidget(widget)) pane.typingPadOpen = open;
+}
+
+function saveTerminalTypingPadOpenSnapshot() {
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'flush' });
 }
 
 function syncTerminalTypingPadControls(widget: TerminalWidget) {
@@ -12641,12 +12680,14 @@ function currentImageTagPasteTarget(): ImageTagPasteTarget {
   const widget = activeTerminalWidget();
   const pane = widget ? activePaneForWidget(widget) : null;
   if (!widget || !pane) return 'none';
-  if (terminalTextTarget === 'typing-pad' && pane.typingPadOpen) return 'typing-pad';
+  if (terminalTextTarget === 'typing-pad' && terminalTypingPadIsOpen(widget)) return 'typing-pad';
   return 'shell';
 }
 
 function imageTagPasteTargetForEvent(target: EventTarget | null): ImageTagPasteTarget {
   if (target instanceof Element && target.closest('.terminal-type-pad')) return 'typing-pad';
+  if (target instanceof Element && target.closest('.terminal-host')) return 'shell';
+  if (target instanceof Element && target.closest('.terminal-card')) return currentImageTagPasteTarget();
   if (isInsideImagePanel(target)) return currentImageTagPasteTarget();
   return state.autoPasteImageTagToShell ? currentImageTagPasteTarget() : 'none';
 }
@@ -12665,7 +12706,7 @@ function renderImageTagTargetIndicator() {
     : target === 'shell'
       ? 'Image tags paste directly into the active shell prompt'
       : 'Open a shell to paste image tags';
-  el.imagePasteTarget.className = `image-paste-target ${target}`;
+  el.imagePasteTarget.className = `image-paste-target target-${target}`;
 }
 
 function cancelTerminalFocusRequest(pane: TerminalPane) {
@@ -12728,6 +12769,7 @@ async function createTerminalTab(
     cwdOutputBuffer: '',
     inputBuffer: '',
     inputWriteBuffer: '',
+    typingPadOpen: widget.typingPadOpen,
     seenPorts: new Set(),
     lastRows: term.rows,
     lastCols: term.cols
@@ -13412,7 +13454,7 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
   if (key === 'v' && !event.shiftKey) {
     event.preventDefault();
     event.stopPropagation();
-    void pasteTerminalText(pane);
+    void pasteTerminalClipboard(pane);
     return false;
   }
   if (key !== 'c') return true;
@@ -13439,12 +13481,19 @@ async function copyTerminalSelection(pane: TerminalPane) {
 }
 
 function handleTerminalPaste(event: ClipboardEvent, pane: TerminalPane) {
+  if (clipboardEventMayContainImage(event)) return;
+
   const text = event.clipboardData?.getData('text/plain') ?? '';
   if (!text) return;
 
   event.preventDefault();
   event.stopPropagation();
   void pasteTerminalText(pane, text);
+}
+
+async function pasteTerminalClipboard(pane: TerminalPane) {
+  if (await pasteNativeClipboardImageToTarget('shell')) return;
+  await pasteTerminalText(pane);
 }
 
 async function pasteTerminalText(pane: TerminalPane, text?: string) {
@@ -13651,6 +13700,7 @@ function syncTerminalWidgetActiveState(widget: TerminalWidget) {
   for (const pane of terminalPanesForWidget(widget)) {
     toggleClassIfChanged(pane.host, 'hidden', pane.paneId !== widget.activePaneId);
   }
+  syncTerminalTypingPadForWidget(widget);
   updateTerminalWidgetTitle(widget);
 }
 
@@ -13663,12 +13713,12 @@ async function handlePaste(event: ClipboardEvent) {
     return;
   }
 
-  const eventDataUrl = await imageDataUrlFromClipboardEvent(event);
-  const shouldTryNativeImage = !eventDataUrl && clipboardEventMayContainImage(event);
-  if (!eventDataUrl && !shouldTryNativeImage) return;
+  if (!clipboardEventMayContainImage(event)) return;
 
   event.preventDefault();
+  event.stopPropagation();
   try {
+    const eventDataUrl = await imageDataUrlFromClipboardEvent(event);
     const dataUrl = eventDataUrl ?? await nativeClipboardImageToDataUrl();
     await savePastedImage(dataUrl, imageTagPasteTargetForEvent(event.target));
   } catch (error) {
@@ -13795,10 +13845,17 @@ function loadImageElement(dataUrl: string): Promise<HTMLImageElement> {
 
 async function pasteImageFromNativeClipboard() {
   if (!state.activeProfile || !state.workspaceOpen) return;
+  const pasted = await pasteNativeClipboardImageToTarget(currentImageTagPasteTarget());
+  if (!pasted) setStatus('Failed to paste image: clipboard has no image', true);
+}
+
+async function pasteNativeClipboardImageToTarget(target: ImageTagPasteTarget) {
+  if (!state.activeProfile || !state.workspaceOpen) return false;
   try {
-    await savePastedImage(await nativeClipboardImageToDataUrl(), currentImageTagPasteTarget());
-  } catch (error) {
-    setStatus(`Failed to paste image: ${String(error)}`, true);
+    await savePastedImage(await nativeClipboardImageToDataUrl(), target);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -13876,6 +13933,12 @@ async function savePastedImage(
   pasteTarget: ImageTagPasteTarget = state.autoPasteImageTagToShell ? currentImageTagPasteTarget() : 'none'
 ) {
   if (!state.activeProfile) return;
+  const fingerprint = await fingerprintImageDataUrl(dataUrl);
+  const existing = await findExistingPastedImage(dataUrl, fingerprint);
+  if (existing) {
+    await reusePastedImage(existing, dataUrl, pasteTarget);
+    return;
+  }
   const targetTab = state.imageOpenInNewTab && activeImageTab().dataUrl
     ? createImageTab(undefined, true)
     : activeImageTab();
@@ -13893,6 +13956,7 @@ async function savePastedImage(
     path: result.path,
     tag: result.tag,
     dataUrl,
+    fingerprint,
     createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   };
   state.imageHistory = [item, ...state.imageHistory].slice(0, 24);
@@ -13910,6 +13974,109 @@ async function savePastedImage(
   renderImagePreview();
   renderImageHistory();
   setStatus(pasted ? `Saved and pasted ${result.path} to ${imageTagPasteTargetLabel(pasteTarget)}` : `Saved ${result.path}`);
+  saveActiveWorkspaceSnapshot();
+}
+
+interface ExistingPastedImageMatch {
+  item: PastedImageItem;
+  tab: ImageTabState;
+}
+
+async function findExistingPastedImage(dataUrl: string, fingerprint: string): Promise<ExistingPastedImageMatch | null> {
+  const activeTab = activeImageTab();
+  const activeItem = await findMatchingPastedImageItem(state.imageHistory, dataUrl, fingerprint);
+  if (activeItem) return { item: activeItem, tab: activeTab };
+  for (const tab of state.imageTabs) {
+    if (tab.id === activeTab.id) continue;
+    const item = await findMatchingPastedImageItem(tab.history, dataUrl, fingerprint);
+    if (item) return { item, tab };
+  }
+  return null;
+}
+
+async function findMatchingPastedImageItem(history: PastedImageItem[], dataUrl: string, fingerprint: string) {
+  for (const item of history) {
+    const itemFingerprint = await fingerprintPastedImageItem(item);
+    if (itemFingerprint && itemFingerprint === fingerprint) return item;
+    if (sameImageDataUrl(item.dataUrl, dataUrl)) return item;
+  }
+  return null;
+}
+
+function sameImageDataUrl(a: string, b: string) {
+  return a.length === b.length && a === b;
+}
+
+async function fingerprintPastedImageItem(item: PastedImageItem) {
+  if (item.fingerprint) return item.fingerprint;
+  if (!item.dataUrl) return '';
+  item.fingerprint = await fingerprintImageDataUrl(item.dataUrl);
+  return item.fingerprint;
+}
+
+async function fingerprintImageDataUrl(dataUrl: string) {
+  try {
+    return await imagePixelFingerprint(dataUrl);
+  } catch {
+    return `data:${dataUrl.length}:${hashText(dataUrl).toString(36)}`;
+  }
+}
+
+async function imagePixelFingerprint(dataUrl: string) {
+  const image = await loadImageElement(dataUrl);
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context || width <= 0 || height <= 0) throw new Error('could not fingerprint image');
+  context.drawImage(image, 0, 0);
+  return imagePixelDataFingerprint(context.getImageData(0, 0, width, height).data, width, height);
+}
+
+function imagePixelDataFingerprint(data: Uint8ClampedArray, width: number, height: number) {
+  let hashA = 2166136261;
+  let hashB = 2246822519;
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    hashA ^= value;
+    hashA = Math.imul(hashA, 16777619);
+    hashB ^= value + index;
+    hashB = Math.imul(hashB, 3266489917);
+  }
+  return `px:${width}x${height}:${data.length}:${(hashA >>> 0).toString(36)}:${(hashB >>> 0).toString(36)}`;
+}
+
+async function reusePastedImage(
+  existing: ExistingPastedImageMatch,
+  dataUrl: string,
+  pasteTarget: ImageTagPasteTarget
+) {
+  state.activeImageTabId = existing.tab.id;
+  syncImageStateFromActiveTab();
+  state.imageHistory = [
+    existing.item,
+    ...state.imageHistory.filter((item) => item !== existing.item && item.path !== existing.item.path)
+  ].slice(0, 24);
+  state.imagePreviewDataUrl = existing.item.dataUrl || dataUrl;
+  state.imagePreviewZoom = 1;
+  state.imagePreviewOffsetX = 0;
+  state.imagePreviewOffsetY = 0;
+  setImageTabSourcePath(existing.tab, existing.item.path);
+  const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(existing.item.tag, pasteTarget) : false;
+  state.imagePreviewLabel = pasted
+    ? `${existing.item.tag} reused into ${imageTagPasteTargetLabel(pasteTarget)}`
+    : `${existing.item.tag} reused`;
+  syncActiveImageTabFromState();
+  renderImageTabs();
+  renderImagePreview();
+  renderImageHistory();
+  setStatus(
+    pasted
+      ? `Reused and pasted ${existing.item.path} to ${imageTagPasteTargetLabel(pasteTarget)}`
+      : `Reused ${existing.item.path}`
+  );
   saveActiveWorkspaceSnapshot();
 }
 
@@ -14324,8 +14491,8 @@ async function pasteImageTagToTypingPad(tag: string) {
     return false;
   }
 
-  pane.typingPadOpen = true;
-  syncTerminalTypingPadForWidget(widget);
+  const previousOpen = terminalTypingPadIsOpen(widget);
+  setTerminalTypingPadOpen(widget, true);
   const input = widget.typePadInput;
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? input.value.length;
@@ -14336,6 +14503,7 @@ async function pasteImageTagToTypingPad(tag: string) {
   setTerminalTextTarget('typing-pad');
   cancelTerminalFocusRequest(pane);
   input.focus({ preventScroll: true });
+  if (!previousOpen) saveTerminalTypingPadOpenSnapshot();
   setStatus(`Inserted ${tag} into Type pad`);
   return true;
 }
