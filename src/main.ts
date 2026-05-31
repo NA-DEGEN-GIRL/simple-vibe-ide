@@ -19,6 +19,9 @@ interface TerminalPane {
   backendId?: string;
   title: string;
   command: string | null;
+  // Set when opened via an LLM launcher button (codex/claude/grok). On workspace restore this is
+  // used to re-launch the CLI (typed at the prompt) instead of restoring a plain shell.
+  llmId?: string;
   profileId: string;
   cwd: string;
   term: XTermTerminal;
@@ -270,6 +273,7 @@ interface WorkspacePanelSnapshot {
 interface WorkspaceTerminalSnapshot {
   title: string;
   command: string | null;
+  llmId?: string;
   backendId?: string;
   widgetId?: string;
   profileId?: string;
@@ -4190,7 +4194,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function editorTabSnapshotsSignature(tabs: WorkspaceSnapshot['editorTabs']) {
@@ -4333,6 +4337,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
     terminals.push({
       title: pane.title.replace(/\s+\(exited\)$/i, ''),
       command: pane.command,
+      llmId: pane.llmId,
       widgetId: pane.widgetId,
       profileId: pane.profileId,
       cwd: pane.cwd,
@@ -4661,15 +4666,28 @@ async function restoreWorkspaceTerminals(
         skipSnapshotSave: true
       };
       const terminalTitle = terminal.title || 'shell';
-      const terminalCommand = terminal.command;
+      // An LLM-launcher terminal (codex/claude/grok button) is restored by spawning a plain shell
+      // and re-TYPING the launcher command, exactly as the button does, so the CLI comes back in
+      // bypass/YOLO instead of a bare shell. Regular terminals keep their saved command.
+      const llmId = terminal.llmId;
+      const terminalCommand = llmId ? null : terminal.command;
+      let restoredPane: TerminalPane | null | undefined;
       if (existingWidget) {
-        await createTerminalTab(existingWidget, terminalCommand, terminalTitle, terminalOptions);
+        restoredPane = await createTerminalTab(existingWidget, terminalCommand, terminalTitle, terminalOptions);
       } else {
         const widget = await createTerminal(terminalCommand, terminalTitle, {
           ...terminalOptions,
           rect: terminal.rect
         });
-        if (widget) widgetsBySnapshotId.set(widgetKey, widget);
+        if (widget) {
+          widgetsBySnapshotId.set(widgetKey, widget);
+          restoredPane = activePaneForWidget(widget);
+        }
+      }
+      if (llmId && restoredPane?.backendId) {
+        restoredPane.llmId = llmId;
+        await sendTerminalInputNow(restoredPane, `${llmLauncherCommand(llmId, terminalProfile.kind)}\r`)
+          .catch(() => undefined);
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
         hideTerminalWidgetsForWorkspace(snapshot.id);
@@ -6727,15 +6745,18 @@ async function startLlmLauncher(id: string) {
   if (!widget) return;
   const pane = activePaneForWidget(widget);
   if (!pane?.backendId) return;
+  // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
+  pane.llmId = id;
   await sendTerminalInputNow(pane, `${command}\r`).catch((error) => {
     setStatus(`Failed to launch ${id}: ${String(error)}`, true);
   });
+  saveActiveWorkspaceSnapshot();
 }
 
-function llmLauncherCommand(id: string) {
+function llmLauncherCommand(id: string, profileKind: string | undefined = state.activeProfile?.kind) {
   const launcher = LLM_LAUNCHERS[id];
   if (!launcher) return id;
-  return state.activeProfile?.kind === 'windows'
+  return profileKind === 'windows'
     ? powershellLlmLauncherCommand(launcher)
     : bashLlmLauncherCommand(launcher);
 }
