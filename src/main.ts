@@ -517,14 +517,11 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
     executable: 'claude',
     flags: [
       {
-        bashPattern: '*--dangerously-skip-permissions*',
-        powershellPattern: '--dangerously-skip-permissions',
+        // The bypass form can be expressed several ways; if the user's command already carries
+        // ANY of them, add nothing. Otherwise add a single canonical flag (never two).
+        bashPattern: '*--dangerously-skip-permissions*|*--permission-mode[[:space:]]bypassPermissions*|*--permission-mode=bypassPermissions*',
+        powershellPattern: '--dangerously-skip-permissions|--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions',
         args: ['--dangerously-skip-permissions']
-      },
-      {
-        bashPattern: '*--permission-mode[[:space:]]bypassPermissions*|*--permission-mode=bypassPermissions*',
-        powershellPattern: '--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions',
-        args: ['--permission-mode', 'bypassPermissions']
       }
     ]
   },
@@ -6714,23 +6711,23 @@ function launchLlm(id: string) {
 function llmLauncherCommand(id: string) {
   const launcher = LLM_LAUNCHERS[id];
   if (!launcher) return id;
-  if (id === 'claude') return directLlmLauncherCommand(launcher);
+  // Every launcher (codex/claude/grok) goes through dedup so a user alias/function/wrapper that
+  // already injects the bypass flag is not double-flagged. claude used to skip this and always
+  // appended, which double-flagged aliased setups.
   return state.activeProfile?.kind === 'windows'
     ? powershellLlmLauncherCommand(launcher)
     : bashLlmLauncherCommand(launcher);
 }
 
-function directLlmLauncherCommand(launcher: LlmLauncherConfig) {
-  const args = launcher.flags.flatMap((flag) => flag.args);
-  return state.activeProfile?.kind === 'windows'
-    ? `& ${launcher.executable} ${args.map(powershellQuote).join(' ')}`
-    : `${launcher.executable} ${args.map(bashQuote).join(' ')}`;
-}
-
 function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
   return [
+    // Detection source: alias/function bodies come from `type`; a wrapper SCRIPT on PATH only
+    // shows its path via `type`, so also fold in the script's own text (shebang files only, so
+    // we never scan a real binary and false-match an embedded help string).
     `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
+    `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
+    `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`,
     '__svi_args=()',
     ...launcher.flags.map((flag) =>
       `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`
