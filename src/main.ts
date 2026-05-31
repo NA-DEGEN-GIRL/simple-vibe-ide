@@ -487,19 +487,15 @@ type CreateTerminalOptions = {
 };
 
 type LlmLauncherFlag = {
-  args: string[];
-  // Bash path: decide whether to add this flag by PROBING the resolved CLI at launch
-  // (`<exec> <args> --version`) and adding it only if that succeeds. This is the one reliable
-  // dedup — it detects a wrapper/alias that already injects the flag (the duplicate makes the
-  // probe a fatal error) and a CLI that refuses the flag (e.g. claude as root), neither of which
-  // static `type`/text inspection can see. Flags without `probe` are always added (e.g. repeatable
-  // `--enable goals`, which never errors on a duplicate).
-  probe?: boolean;
-  // Bash path: also skip when the effective uid is 0 (claude refuses --dangerously-skip-permissions
-  // as root, and the probe alone may not catch it if --version short-circuits before the check).
-  skipWhenRoot?: boolean;
-  // PowerShell path keeps a static dedup pattern.
+  // Two questions decide whether to add the flag: is it already in the command, and is it root?
+  // `bashPattern` answers the first: it matches the resolved command's source (alias/function body
+  // from `type`, plus a wrapper SCRIPT's own text) so an already-injected flag is not doubled.
+  bashPattern: string;
   powershellPattern: string;
+  args: string[];
+  // Answers the second on the bash path: skip when the effective uid is 0 (claude refuses
+  // --dangerously-skip-permissions as root). Windows shells have no such gate.
+  skipWhenRoot?: boolean;
 };
 
 type LlmLauncherConfig = {
@@ -512,14 +508,14 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
     executable: 'codex',
     flags: [
       {
-        args: ['--dangerously-bypass-approvals-and-sandbox'],
-        probe: true,
-        powershellPattern: '--dangerously-bypass-approvals-and-sandbox'
+        bashPattern: '*--dangerously-bypass-approvals-and-sandbox*',
+        powershellPattern: '--dangerously-bypass-approvals-and-sandbox',
+        args: ['--dangerously-bypass-approvals-and-sandbox']
       },
       {
-        // `--enable` is repeatable (clap), so a duplicate never errors — always add it.
-        args: ['--enable', 'goals'],
-        powershellPattern: '--enable\\s+goals|--enable=goals'
+        bashPattern: '*--enable[[:space:]]goals*|*--enable=goals*',
+        powershellPattern: '--enable\\s+goals|--enable=goals',
+        args: ['--enable', 'goals']
       }
     ]
   },
@@ -527,10 +523,11 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
     executable: 'claude',
     flags: [
       {
-        args: ['--dangerously-skip-permissions'],
-        probe: true,
+        // claude rejects --dangerously-skip-permissions as root, so skip it when uid 0.
         skipWhenRoot: true,
-        powershellPattern: '--dangerously-skip-permissions|--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions'
+        bashPattern: '*--dangerously-skip-permissions*|*--permission-mode[[:space:]]bypassPermissions*|*--permission-mode=bypassPermissions*',
+        powershellPattern: '--dangerously-skip-permissions|--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions',
+        args: ['--dangerously-skip-permissions']
       }
     ]
   },
@@ -538,9 +535,9 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
     executable: 'grok',
     flags: [
       {
-        args: ['--permission-mode', 'bypassPermissions'],
-        probe: true,
-        powershellPattern: '--permission-mode|bypassPermissions'
+        bashPattern: '*--permission-mode*|*bypassPermissions*',
+        powershellPattern: '--permission-mode|bypassPermissions',
+        args: ['--permission-mode', 'bypassPermissions']
       }
     ]
   },
@@ -6720,58 +6717,50 @@ function launchLlm(id: string) {
 }
 
 async function startLlmLauncher(id: string) {
-  // Define the dedup/launch logic SILENTLY in the shell's startup rcfile (defining a function
-  // produces no output and does not run the CLI), then run it by sending only the short call as
-  // terminal input — i.e. exactly as if the user typed it at the prompt. This (a) keeps the
-  // launcher boilerplate hidden and (b) starts the CLI as a real interactive foreground job, which
-  // node-launched CLIs (e.g. codex via nvm) require to enter bypass/YOLO mode (executing them
-  // during rc init silently downgrades them even when the flag is present).
-  const { define, call } = llmLauncherParts(id);
-  const widget = await createTerminal(define, id, { initialHeight: 420 });
+  // Launch the CLI by TYPING the command at the prompt (sending it as terminal input), NOT by
+  // embedding it in the startup rcfile. node-launched CLIs (e.g. codex via nvm) only enter
+  // bypass/YOLO mode when started as a real interactive foreground job; running them during rc
+  // init silently downgrades them. (Typed-ahead input is buffered and runs once the prompt is
+  // ready.) The command itself stays visible in the terminal; hiding it is a separate concern.
+  const command = llmLauncherCommand(id);
+  const widget = await createTerminal(null, id, { initialHeight: 420 });
   if (!widget) return;
   const pane = activePaneForWidget(widget);
   if (!pane?.backendId) return;
-  // \r mimics Enter; the PTY converts it to a newline. The shell buffers this typed-ahead input
-  // and runs it once the prompt is ready (after the rcfile has defined the function).
-  await sendTerminalInputNow(pane, `${call}\r`).catch((error) => {
+  await sendTerminalInputNow(pane, `${command}\r`).catch((error) => {
     setStatus(`Failed to launch ${id}: ${String(error)}`, true);
   });
 }
 
-// Splits a launcher into a `define` part (run silently in the shell rcfile) and a short `call` to
-// type at the prompt. For non-bash shells we keep a single typed command (no separate define).
-function llmLauncherParts(id: string): { define: string | null; call: string } {
+function llmLauncherCommand(id: string) {
   const launcher = LLM_LAUNCHERS[id];
-  if (!launcher) return { define: null, call: id };
+  if (!launcher) return id;
   return state.activeProfile?.kind === 'windows'
-    ? { define: null, call: powershellLlmLauncherCommand(launcher) }
-    : bashLlmLauncherParts(launcher);
+    ? powershellLlmLauncherCommand(launcher)
+    : bashLlmLauncherCommand(launcher);
 }
 
-function bashLlmLauncherParts(launcher: LlmLauncherConfig): { define: string; call: string } {
-  const exec = launcher.executable;
-  // Dedup is decided at RUNTIME by probing the resolved CLI, because whether codex/claude will
-  // already inject the flag depends on the user's alias/function/wrapper — which static inspection
-  // cannot determine (a wrapper SCRIPT only shows its path via `type`, and scanning its text
-  // false-matches). `<exec> <flag> --version` succeeds only when the CLI accepts the flag exactly
-  // once: an already-injecting wrapper turns it into a fatal duplicate, and a CLI that refuses it
-  // (claude as root) also fails — both correctly skip adding the flag.
-  const body = ['__svi_args=()'];
+function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
+  const executable = launcher.executable;
+  // Add the bypass flag only when it is NOT already in the resolved command. `type` reveals an
+  // alias/function body; a wrapper SCRIPT on PATH only shows its path via `type`, so also fold in
+  // the script's own text (shebang files only). If the flag is found there, the user's
+  // alias/wrapper already supplies it — don't add a second one (codex errors on a duplicate).
+  // Otherwise add it. claude additionally refuses the flag as root, so gate it on a non-zero uid.
+  const needsRootGate = launcher.flags.some((flag) => flag.skipWhenRoot);
+  const lines = [
+    `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
+    `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
+    `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`,
+    '__svi_args=()'
+  ];
+  if (needsRootGate) lines.push(`__svi_euid="$(id -u 2>/dev/null || echo 1000)"`);
   for (const flag of launcher.flags) {
-    const argsq = flag.args.map(bashQuote).join(' ');
-    const add = `__svi_args+=(${argsq})`;
-    if (flag.probe) {
-      const guard = flag.skipWhenRoot ? '[ "$(id -u 2>/dev/null || echo 1000)" != 0 ] && ' : '';
-      body.push(`if ${guard}${exec} ${argsq} --version >/dev/null 2>&1; then ${add}; fi`);
-    } else if (flag.skipWhenRoot) {
-      body.push(`if [ "$(id -u 2>/dev/null || echo 1000)" != 0 ]; then ${add}; fi`);
-    } else {
-      body.push(add);
-    }
+    const add = `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`;
+    lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
   }
-  body.push(`${exec} "\${__svi_args[@]}"`);
-  const define = `__svi_run() {\n${body.map((line) => `  ${line}`).join('\n')}\n}`;
-  return { define, call: '__svi_run' };
+  lines.push(`${executable} "\${__svi_args[@]}"`);
+  return lines.join('\n');
 }
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
