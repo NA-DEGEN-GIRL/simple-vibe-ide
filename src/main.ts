@@ -598,7 +598,9 @@ const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 8 * 1024;
 const TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS = 2 * 1024;
 const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
 const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
-const TERMINAL_IME_RELEASE_DEFER_MS = 32;
+// Defer post-composition repaint/refocus well past xterm's own setTimeout(0) finalize (which
+// re-reads the helper-textarea), so our DOM/focus churn can't clobber the committed Hangul tail.
+const TERMINAL_IME_RELEASE_DEFER_MS = 120;
 const TERMINAL_IME_COMPOSITION_FALLBACK_MS = 1800;
 const TERMINAL_FOCUS_RETRY_MS = 36;
 const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
@@ -12875,7 +12877,10 @@ function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
   textarea.addEventListener('compositionstart', () => beginTerminalImeCompositionGuard(pane));
   textarea.addEventListener('compositionupdate', () => beginTerminalImeCompositionGuard(pane));
   textarea.addEventListener('compositionend', () => finishTerminalImeCompositionGuard(pane));
-  textarea.addEventListener('blur', () => finishTerminalImeCompositionGuard(pane));
+  // No 'blur' -> finish handler on purpose: a transient blur mid-composition would schedule a
+  // refocus right across xterm's compositionend finalization window (it re-reads the textarea on a
+  // setTimeout(0)) and drop the last Hangul syllable. The fallback timer already releases a stuck
+  // composition, so blur-based release is both redundant and harmful.
 }
 
 function beginTerminalImeCompositionGuard(pane: TerminalPane) {
@@ -12904,7 +12909,9 @@ function finishTerminalImeCompositionGuard(pane: TerminalPane) {
     // full repaint of the viewport on release; the buffer is correct, only the render is stale.
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
-    focusTerminalPaneWhenReady(pane);
+    // Only reclaim focus if composition actually lost it; refocusing while xterm still holds focus
+    // is needless churn that can disturb IME state mid-commit.
+    if (!terminalPaneHasFocus(pane)) focusTerminalPaneWhenReady(pane);
   }, TERMINAL_IME_RELEASE_DEFER_MS);
 }
 
