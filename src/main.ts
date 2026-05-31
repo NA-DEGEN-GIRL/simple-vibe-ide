@@ -6712,7 +6712,26 @@ async function resolveSelectedRoot() {
 }
 
 function launchLlm(id: string) {
-  createTerminal(llmLauncherCommand(id), id, { initialHeight: 420 });
+  void startLlmLauncher(id);
+}
+
+async function startLlmLauncher(id: string) {
+  const command = llmLauncherCommand(id);
+  // Run the launcher by TYPING it at the shell prompt (sending it as terminal input) instead of
+  // embedding it in the startup rcfile. node-launched CLIs (e.g. codex via nvm) only enter
+  // bypass/YOLO when started as a real interactive foreground job; executing them during rc init
+  // silently downgrades them (no YOLO, intermittent trust prompts) even though the flag is present.
+  // A wrapper that exec()s its target (na_stream's codex) survived rc-init, which masked this.
+  const widget = await createTerminal(null, id, { initialHeight: 420 });
+  if (!widget) return;
+  const pane = activePaneForWidget(widget);
+  if (!pane?.backendId) return;
+  // \r mimics Enter; the PTY's line discipline converts it to a newline. The shell buffers this
+  // typed-ahead input and runs it once the interactive prompt is ready (after ~/.bashrc/nvm load),
+  // so codex resolves exactly as it does when the user types the command by hand.
+  await sendTerminalInputNow(pane, `${command}\r`).catch((error) => {
+    setStatus(`Failed to launch ${id}: ${String(error)}`, true);
+  });
 }
 
 function llmLauncherCommand(id: string) {
