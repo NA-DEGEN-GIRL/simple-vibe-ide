@@ -4670,7 +4670,8 @@ async function restoreWorkspaceTerminals(
       // and re-TYPING the launcher command, exactly as the button does, so the CLI comes back in
       // bypass/YOLO instead of a bare shell. Regular terminals keep their saved command.
       const llmId = terminal.llmId;
-      const terminalCommand = llmId ? null : terminal.command;
+      const llmParts = llmId ? llmLauncherParts(llmId, terminalProfile.kind) : null;
+      const terminalCommand = llmParts ? llmParts.define : terminal.command;
       let restoredPane: TerminalPane | null | undefined;
       if (existingWidget) {
         restoredPane = await createTerminalTab(existingWidget, terminalCommand, terminalTitle, terminalOptions);
@@ -4684,10 +4685,9 @@ async function restoreWorkspaceTerminals(
           restoredPane = activePaneForWidget(widget);
         }
       }
-      if (llmId && restoredPane?.backendId) {
+      if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
-        await sendTerminalInputNow(restoredPane, `${llmLauncherCommand(llmId, terminalProfile.kind)}\r`)
-          .catch(() => undefined);
+        await sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined);
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
         hideTerminalWidgetsForWorkspace(snapshot.id);
@@ -6735,33 +6735,36 @@ function launchLlm(id: string) {
 }
 
 async function startLlmLauncher(id: string) {
-  // Launch the CLI by TYPING the command at the prompt (sending it as terminal input), NOT by
-  // embedding it in the startup rcfile. node-launched CLIs (e.g. codex via nvm) only enter
-  // bypass/YOLO mode when started as a real interactive foreground job; running them during rc
-  // init silently downgrades them. (Typed-ahead input is buffered and runs once the prompt is
-  // ready.) The command itself stays visible in the terminal; hiding it is a separate concern.
-  const command = llmLauncherCommand(id);
-  const widget = await createTerminal(null, id, { initialHeight: 420 });
+  // Define the dedup/launch logic SILENTLY in the shell's startup rcfile (defining a function
+  // produces no output and runs nothing), then TYPE only a short call (`__svi_run`) at the prompt.
+  // This hides the boilerplate AND starts the CLI as a real interactive foreground job, so
+  // node-launched CLIs (e.g. codex via nvm) enter bypass/YOLO.
+  const { define, call } = llmLauncherParts(id);
+  const widget = await createTerminal(define, id, { initialHeight: 420 });
   if (!widget) return;
   const pane = activePaneForWidget(widget);
   if (!pane?.backendId) return;
   // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
   pane.llmId = id;
-  await sendTerminalInputNow(pane, `${command}\r`).catch((error) => {
+  await sendTerminalInputNow(pane, `${call}\r`).catch((error) => {
     setStatus(`Failed to launch ${id}: ${String(error)}`, true);
   });
   saveActiveWorkspaceSnapshot();
 }
 
-function llmLauncherCommand(id: string, profileKind: string | undefined = state.activeProfile?.kind) {
+// `define` is sourced silently in the shell rcfile (no echo); `call` is typed at the prompt. On
+// bash the dedup is hidden inside a `__svi_run` function; on Windows we type the command as-is.
+function llmLauncherParts(
+  id: string,
+  profileKind: string | undefined = state.activeProfile?.kind
+): { define: string | null; call: string } {
   const launcher = LLM_LAUNCHERS[id];
-  if (!launcher) return id;
-  return profileKind === 'windows'
-    ? powershellLlmLauncherCommand(launcher)
-    : bashLlmLauncherCommand(launcher);
+  if (!launcher) return { define: null, call: id };
+  if (profileKind === 'windows') return { define: null, call: powershellLlmLauncherCommand(launcher) };
+  return { define: bashLlmLauncherDefine(launcher), call: '__svi_run' };
 }
 
-function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
+function bashLlmLauncherDefine(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
   // Add the bypass flag only when it is NOT already in the resolved command. `type` reveals an
   // alias/function body; a wrapper SCRIPT on PATH only shows its path via `type`, so also fold in
@@ -6781,7 +6784,7 @@ function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
     lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
   }
   lines.push(`${executable} "\${__svi_args[@]}"`);
-  return lines.join('\n');
+  return `__svi_run() {\n${lines.map((line) => `  ${line}`).join('\n')}\n}`;
 }
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {

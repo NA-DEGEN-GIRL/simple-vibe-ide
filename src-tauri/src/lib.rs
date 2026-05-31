@@ -2541,7 +2541,7 @@ __simple_vibe_ide_prompt_command\n\
         }
         script.push_str(
             "__svide_status=$?\n\
-if [ $__svide_status -ne 0 ]; then\n\
+if [ \"${__svide_status:-0}\" -ne 0 ]; then\n\
   printf '\\n[simple-vibe-ide] command exited with status %s\\n' \"$__svide_status\"\n\
 fi\n\
 unset __svide_status\n",
