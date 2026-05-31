@@ -490,6 +490,9 @@ type LlmLauncherFlag = {
   bashPattern: string;
   powershellPattern: string;
   args: string[];
+  // Some CLIs (claude --dangerously-skip-permissions) refuse to start under root/sudo, so the
+  // bash launcher omits the flag when the effective uid is 0. Windows shells have no such gate.
+  skipWhenRoot?: boolean;
 };
 
 type LlmLauncherConfig = {
@@ -519,6 +522,8 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
       {
         // The bypass form can be expressed several ways; if the user's command already carries
         // ANY of them, add nothing. Otherwise add a single canonical flag (never two).
+        // claude rejects this flag as root, so skip it when the effective uid is 0.
+        skipWhenRoot: true,
         bashPattern: '*--dangerously-skip-permissions*|*--permission-mode[[:space:]]bypassPermissions*|*--permission-mode=bypassPermissions*',
         powershellPattern: '--dangerously-skip-permissions|--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions',
         args: ['--dangerously-skip-permissions']
@@ -6721,19 +6726,23 @@ function llmLauncherCommand(id: string) {
 
 function bashLlmLauncherCommand(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
-  return [
-    // Detection source: alias/function bodies come from `type`; a wrapper SCRIPT on PATH only
-    // shows its path via `type`, so also fold in the script's own text (shebang files only, so
-    // we never scan a real binary and false-match an embedded help string).
-    `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
-    `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
-    `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`,
-    '__svi_args=()',
-    ...launcher.flags.map((flag) =>
-      `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`
-    ),
-    `${executable} "\${__svi_args[@]}"`
-  ].join('\n');
+  // Only dedup against what the user's own alias/function injects (`type`). We deliberately do NOT
+  // scan a wrapper SCRIPT's file contents: a flag string appearing in a script's source (help
+  // text, arg parser, comments, a disabled branch) does not mean the script actually passes it,
+  // and that false match was silently dropping the flag (e.g. codex losing its bypass flag). If a
+  // wrapper genuinely injects the flag, well-behaved wrappers ignore a duplicate and a repeated
+  // boolean flag is harmless, so always adding it here is the safe, reliable choice.
+  const needsRootGate = launcher.flags.some((flag) => flag.skipWhenRoot);
+  const lines = [`__svi_source="$(type ${executable} 2>/dev/null || true)"`, '__svi_args=()'];
+  if (needsRootGate) lines.push(`__svi_euid="$(id -u 2>/dev/null || echo 1000)"`);
+  for (const flag of launcher.flags) {
+    const add = `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`;
+    // claude refuses --dangerously-skip-permissions as root; under uid 0 leave it off so it falls
+    // back to its normal permission prompts instead of failing to start.
+    lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
+  }
+  lines.push(`${executable} "\${__svi_args[@]}"`);
+  return lines.join('\n');
 }
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
