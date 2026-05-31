@@ -18,6 +18,7 @@ interface TerminalPane {
   workspaceId: string;
   backendId?: string;
   title: string;
+  customTitle?: string;
   command: string | null;
   // Set when opened via an LLM launcher button (codex/claude/grok). On workspace restore this is
   // used to re-launch the CLI (typed at the prompt) instead of restoring a plain shell.
@@ -36,6 +37,8 @@ interface TerminalPane {
   inputWriteBuffer: string;
   inputFlushTimer?: number;
   inputWritePromise?: Promise<void>;
+  typingPadOpen?: boolean;
+  typingPadDraft?: string;
   imeComposing?: boolean;
   imeFallbackTimer?: number;
   imeReleaseTimer?: number;
@@ -62,6 +65,10 @@ interface TerminalWidget {
   cwd: HTMLElement;
   tabList: HTMLElement;
   hostStack: HTMLElement;
+  typePadToggle: HTMLButtonElement;
+  typePad: HTMLElement;
+  typePadInput: HTMLTextAreaElement;
+  typePadPaste: HTMLButtonElement;
   activePaneId: string;
 }
 
@@ -272,6 +279,7 @@ interface WorkspacePanelSnapshot {
 
 interface WorkspaceTerminalSnapshot {
   title: string;
+  customTitle?: string;
   command: string | null;
   llmId?: string;
   backendId?: string;
@@ -452,6 +460,8 @@ type CloseTerminalOptions = {
   saveSnapshot?: boolean;
   renderShellTabs?: boolean;
 };
+type TerminalTextTarget = 'shell' | 'typing-pad';
+type ImageTagPasteTarget = TerminalTextTarget | 'none';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
 type BrowserDevicePreset = {
@@ -1156,6 +1166,7 @@ let terminalRuntimePromise: Promise<TerminalRuntime> | null = null;
 let panelZ = 20;
 let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
 let keyboardResizeTargetElement: HTMLElement | null = null;
+let terminalTextTarget: TerminalTextTarget = 'shell';
 let ideScale = 1;
 let editorFontSize = 13;
 let terminalFontSize = 13;
@@ -1552,6 +1563,7 @@ app.innerHTML = `
         <div id="image-label" class="image-label">No image selected</div>
         <div class="image-tools">
           <label class="image-option" title="External image paste only"><input id="auto-paste-image-tag" type="checkbox" checked /> Auto paste to shell</label>
+          <span id="image-paste-target" class="image-paste-target shell" title="Image tag paste target">Tag -> Shell</span>
           <button id="image-fit" class="panel-mode" title="Fit whole image to preview">Fit</button>
           <button id="image-fit-width" class="panel-mode" title="Fit image to width (pan vertically)">Fit W</button>
           <button id="image-fit-height" class="panel-mode" title="Fit image to height (pan horizontally)">Fit H</button>
@@ -1562,7 +1574,6 @@ app.innerHTML = `
         <div id="image-preview-stage" class="image-preview-stage">
           <img id="image-preview" alt="pasted preview" draggable="false" />
         </div>
-        <p class="hint">Pasted images are saved in the current folder under .vibe-ide-temp/attachments. Auto paste applies to images pasted from outside the preview.</p>
       </section>
       <section class="panel browser-panel floating-panel hidden" data-panel="browser">
         <div class="panel-title panel-drag-handle">
@@ -1726,6 +1737,7 @@ const el = {
   imagePreviewStage: document.querySelector<HTMLDivElement>('#image-preview-stage')!,
   imagePreview: document.querySelector<HTMLImageElement>('#image-preview')!,
   imageLabel: document.querySelector<HTMLDivElement>('#image-label')!,
+  imagePasteTarget: document.querySelector<HTMLSpanElement>('#image-paste-target')!,
   autoPasteImageTag: document.querySelector<HTMLInputElement>('#auto-paste-image-tag')!,
   imageFit: document.querySelector<HTMLButtonElement>('#image-fit')!,
   imageFitWidth: document.querySelector<HTMLButtonElement>('#image-fit-width')!,
@@ -4336,6 +4348,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
     }
     terminals.push({
       title: pane.title.replace(/\s+\(exited\)$/i, ''),
+      customTitle: pane.customTitle,
       command: pane.command,
       llmId: pane.llmId,
       widgetId: pane.widgetId,
@@ -4687,7 +4700,10 @@ async function restoreWorkspaceTerminals(
       }
       if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
+        restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
         await sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined);
+      } else if (restoredPane) {
+        restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
         hideTerminalWidgetsForWorkspace(snapshot.id);
@@ -6268,6 +6284,7 @@ function bindEvents() {
   document.addEventListener('keydown', handleEditorSaveShortcut, true);
   document.addEventListener('keydown', handleBrowserZoomShortcut, true);
   document.addEventListener('keydown', handleResizeShortcut, true);
+  document.addEventListener('keydown', handleTerminalTypingPadFocusShortcut, true);
   document.addEventListener('keydown', handleWidgetFocusShortcut, true);
   document.addEventListener('keydown', handleNoteRenameShortcut, true);
   document.addEventListener('keydown', handleExplorerKeyboard, true);
@@ -6488,6 +6505,7 @@ function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMe
     { label: 'Paste', action: () => pasteIntoTerminal(pane), disabled: !pane },
     { label: 'Clear', action: () => pane?.term.clear(), disabled: !pane },
     { separator: true },
+    { label: 'Rename shell tab', action: () => { if (pane) renameTerminalTab(pane.paneId); }, disabled: !pane },
     { label: 'New shell tab', action: () => { if (widget) void createShellTabInWidget(widget); }, disabled: !widget },
     { label: 'Close shell tab', action: () => { if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane, danger: true },
     { label: 'Close shell widget', action: () => { if (widget) void closeTerminalWidget(widget.widgetId); }, disabled: !widget, danger: true }
@@ -6513,10 +6531,11 @@ function browserContextMenuItems(): ContextMenuItem[] {
 
 function imageContextMenuItems(): ContextMenuItem[] {
   const latest = state.imageHistory[0];
+  const tagTarget = currentImageTagPasteTarget();
   return [
     { label: 'Copy image', action: copyCurrentPreviewImage, disabled: !state.imagePreviewDataUrl },
     { label: 'Paste image from clipboard', action: pasteImageFromNativeClipboard },
-    { label: 'Paste latest tag to shell', action: async () => { if (latest) await pasteImageTagToActiveTerminal(latest.tag); }, disabled: !latest },
+    { label: `Paste latest tag to ${imageTagPasteTargetLabel(tagTarget)}`, action: async () => { if (latest) await pasteImageTagToTarget(latest.tag, tagTarget); }, disabled: !latest || tagTarget === 'none' },
     { separator: true },
     { label: state.imageHistoryVisible ? 'Hide history' : 'Show history', action: () => { state.imageHistoryVisible = !state.imageHistoryVisible; syncActiveImageTabFromState(); renderImageHistory(); saveActiveWorkspaceSnapshot(); } },
     { label: 'Clear history', action: () => { state.imageHistory = []; syncActiveImageTabFromState(); renderImageHistory(); saveActiveWorkspaceSnapshot(); }, disabled: !state.imageHistory.length, danger: true }
@@ -6713,10 +6732,10 @@ async function runWindowAction(action: string) {
   else if (action === 'toggle-maximize') await currentWindow.toggleMaximize();
   else if (action === 'close') {
     // Close immediately for a snappy exit. Don't await teardown here: the
-    // backend RunEvent::ExitRequested hook runs shutdown_runtime_sessions as
-    // the window tears down, and the Windows Job Object guarantees the child
-    // process tree dies with the app even if that never runs. We still kick off
-    // teardown fire-and-forget so it starts a beat earlier.
+    // backend RunEvent::ExitRequested hook detaches runtime sessions and moves
+    // process teardown to a background worker as the window tears down. The
+    // Windows Job Object remains the hard guarantee if the app exits first. We
+    // still kick off teardown fire-and-forget so it starts a beat earlier.
     void api.shutdownRuntimeSessions().catch(() => undefined);
     await currentWindow.close();
   }
@@ -6845,6 +6864,26 @@ function handleWidgetFocusShortcut(event: KeyboardEvent) {
   event.preventDefault();
   event.stopPropagation();
   cycleWidgetFocus(event.shiftKey ? -1 : 1);
+}
+
+function handleTerminalTypingPadFocusShortcut(event: KeyboardEvent) {
+  if (event.defaultPrevented || !isTerminalTypingPadFocusShortcut(event)) return;
+  const target = event.target instanceof Element ? event.target : null;
+  const card = target?.closest<HTMLElement>('.terminal-card') ?? null;
+  let widget = card ? terminalWidgetForElement(card) : null;
+  if (!widget && keyboardResizeTarget.kind === 'terminal') {
+    const pane = terminalPaneById.get(keyboardResizeTarget.paneId);
+    widget = pane ? terminalWidgetForPane(pane) : null;
+  }
+  if (!widget) return;
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  if (target?.closest('.terminal-host .xterm') && terminalUsesAlternateBuffer(pane)) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  if (target?.closest('.terminal-type-pad')) focusTerminalFromTypingPad(widget);
+  else focusTerminalTypingPad(widget);
 }
 
 function isWidgetFocusShortcut(event: KeyboardEvent) {
@@ -12370,13 +12409,20 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   cwdEl.textContent = cwd;
   const spacer = document.createElement('span');
   spacer.className = 'spacer';
+  const typePadToggle = document.createElement('button');
+  typePadToggle.className = 'terminal-type-toggle';
+  typePadToggle.type = 'button';
+  typePadToggle.title = 'Toggle Korean-safe typing pad (Ctrl+`)';
+  typePadToggle.setAttribute('aria-label', 'Toggle typing pad');
+  typePadToggle.setAttribute('aria-pressed', 'false');
+  typePadToggle.textContent = 'Type';
   const closeButton = document.createElement('button');
   closeButton.className = 'close-pane';
   closeButton.type = 'button';
   closeButton.title = 'Close shell widget';
   closeButton.setAttribute('aria-label', 'Close shell widget');
   closeButton.textContent = 'x';
-  titlebar.append(focusDot, titleEl, cwdEl, spacer, closeButton);
+  titlebar.append(focusDot, titleEl, cwdEl, spacer, typePadToggle, closeButton);
 
   const tabbar = document.createElement('div');
   tabbar.className = 'terminal-widget-tabbar';
@@ -12392,7 +12438,26 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
 
   const hostStack = document.createElement('div');
   hostStack.className = 'terminal-host-stack';
-  card.append(titlebar, tabbar, hostStack);
+  const typePad = document.createElement('div');
+  typePad.className = 'terminal-type-pad hidden';
+  const typePadInput = document.createElement('textarea');
+  typePadInput.className = 'terminal-type-pad-input';
+  typePadInput.spellcheck = false;
+  typePadInput.rows = 3;
+  typePadInput.placeholder = 'Type here with normal IME, then Ctrl+Enter or Paste to send into the shell prompt...';
+  const typePadActions = document.createElement('div');
+  typePadActions.className = 'terminal-type-pad-actions';
+  const typePadHint = document.createElement('span');
+  typePadHint.className = 'terminal-type-pad-hint';
+  typePadHint.textContent = 'Ctrl+Enter paste · Ctrl+` return to shell';
+  const typePadPaste = document.createElement('button');
+  typePadPaste.className = 'terminal-type-pad-paste';
+  typePadPaste.type = 'button';
+  typePadPaste.title = 'Paste draft into the active shell without pressing Enter';
+  typePadPaste.textContent = 'Paste';
+  typePadActions.append(typePadHint, typePadPaste);
+  typePad.append(typePadInput, typePadActions);
+  card.append(titlebar, tabbar, hostStack, typePad);
   el.mainGrid.append(card);
   const grips = ensureResizeGrips(card, 'terminal');
   if (options.rect) applyLayoutRatio(card, options.rect);
@@ -12406,6 +12471,10 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     cwd: cwdEl,
     tabList,
     hostStack,
+    typePadToggle,
+    typePad,
+    typePadInput,
+    typePadPaste,
     activePaneId: ''
   };
   state.terminalWidgets.push(widget);
@@ -12413,9 +12482,10 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   terminalWidgetByElement.set(widget.element, widget);
   if (workspaceId === state.activeWorkspaceId) visibleTerminalWorkspaceId = workspaceId;
 
-  card.addEventListener('pointerdown', () => {
+  card.addEventListener('pointerdown', (event) => {
     const pane = activePaneForWidget(widget);
-    if (pane) setActivePane(pane.paneId);
+    const fromTypePad = event.target instanceof Element && Boolean(event.target.closest('.terminal-type-pad'));
+    if (pane) setActivePane(pane.paneId, { focus: !fromTypePad });
     bringPanelToFront(card);
   });
   titlebar.addEventListener('pointerdown', (event) => startPanelDrag(event, card));
@@ -12426,12 +12496,187 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     });
   });
   closeButton.addEventListener('click', () => void closeTerminalWidget(widget.widgetId));
+  typePadToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleTerminalTypingPad(widget);
+  });
+  typePadInput.addEventListener('input', () => updateTerminalTypingPadDraft(widget));
+  typePadInput.addEventListener('focus', () => setTerminalTextTarget('typing-pad'));
+  typePadInput.addEventListener('keydown', (event) => handleTerminalTypingPadKey(event, widget));
+  typePadPaste.addEventListener('click', () => void pasteTerminalTypingPadDraft(widget));
   newTabButton.addEventListener('click', (event) => {
     event.stopPropagation();
     void createShellTabInWidget(widget);
   });
 
   return widget;
+}
+
+function updateTerminalTypingPadDraft(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  pane.typingPadDraft = widget.typePadInput.value;
+  syncTerminalTypingPadControls(widget);
+}
+
+function handleTerminalTypingPadKey(event: KeyboardEvent, widget: TerminalWidget) {
+  if (isTerminalTypingPadSubmitShortcut(event)) {
+    if (event.isComposing || event.key === 'Process' || event.keyCode === 229) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void pasteTerminalTypingPadDraft(widget);
+    return;
+  }
+  if (isTerminalTypingPadFocusShortcut(event)) {
+    event.preventDefault();
+    event.stopPropagation();
+    focusTerminalFromTypingPad(widget);
+  }
+}
+
+function isTerminalTypingPadSubmitShortcut(event: KeyboardEvent) {
+  return event.type === 'keydown'
+    && event.key === 'Enter'
+    && (event.ctrlKey || event.metaKey)
+    && !event.altKey;
+}
+
+function isTerminalTypingPadFocusShortcut(event: KeyboardEvent) {
+  return event.type === 'keydown'
+    && (event.ctrlKey || event.metaKey)
+    && !event.altKey
+    && !event.shiftKey
+    && (event.code === 'Backquote' || event.key === '`');
+}
+
+function toggleTerminalTypingPad(widget: TerminalWidget, open?: boolean) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  updateTerminalTypingPadDraft(widget);
+  pane.typingPadOpen = open ?? !pane.typingPadOpen;
+  syncTerminalTypingPadForWidget(widget);
+  if (pane.typingPadOpen) focusTerminalTypingPad(widget);
+  else focusTerminalFromTypingPad(widget);
+}
+
+function focusTerminalTypingPad(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  pane.typingPadOpen = true;
+  syncTerminalTypingPadForWidget(widget);
+  setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
+  setTerminalTextTarget('typing-pad');
+  cancelTerminalFocusRequest(pane);
+  widget.typePadInput.focus({ preventScroll: true });
+  const end = widget.typePadInput.value.length;
+  widget.typePadInput.setSelectionRange(end, end);
+}
+
+function focusTerminalFromTypingPad(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  updateTerminalTypingPadDraft(widget);
+  setTerminalTextTarget('shell');
+  setActivePane(pane.paneId);
+  focusTerminalPaneWhenReady(pane);
+}
+
+async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  updateTerminalTypingPadDraft(widget);
+  const value = normalizeTerminalPasteText(pane.typingPadDraft ?? '');
+  if (!value) {
+    focusTerminalFromTypingPad(widget);
+    return;
+  }
+  if (!pane.backendId) {
+    setStatus('Shell is not ready for typing pad paste', true);
+    widget.typePadInput.focus({ preventScroll: true });
+    return;
+  }
+  try {
+    markTerminalUserInput(pane);
+    await sendTerminalInputNow(pane, terminalPastePayload(value));
+    pane.typingPadDraft = '';
+    widget.typePadInput.value = '';
+    syncTerminalTypingPadControls(widget);
+    focusTerminalFromTypingPad(widget);
+    setStatus('Pasted typing pad draft into shell');
+  } catch (error) {
+    pane.typingPadDraft = value;
+    widget.typePadInput.value = value;
+    setStatus(`Failed to paste typing pad draft: ${String(error)}`, true);
+    widget.typePadInput.focus({ preventScroll: true });
+  }
+}
+
+function syncTerminalTypingPadForWidget(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  const open = Boolean(pane?.typingPadOpen);
+  const draft = pane?.typingPadDraft ?? '';
+  const wasHidden = widget.typePad.classList.contains('hidden');
+  toggleClassIfChanged(widget.typePad, 'hidden', !open);
+  toggleClassIfChanged(widget.typePadToggle, 'active', open);
+  widget.typePadToggle.setAttribute('aria-pressed', open ? 'true' : 'false');
+  if (widget.typePadInput.value !== draft) widget.typePadInput.value = draft;
+  syncTerminalTypingPadControls(widget);
+  if (wasHidden === open) {
+    window.requestAnimationFrame(() => scheduleFitTerminalWidget(widget));
+  }
+}
+
+function syncTerminalTypingPadControls(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  const draft = pane?.typingPadDraft ?? widget.typePadInput.value;
+  widget.typePadPaste.disabled = !pane || !draft;
+}
+
+function setTerminalTextTarget(target: TerminalTextTarget) {
+  terminalTextTarget = target;
+  renderImageTagTargetIndicator();
+}
+
+function currentImageTagPasteTarget(): ImageTagPasteTarget {
+  const widget = activeTerminalWidget();
+  const pane = widget ? activePaneForWidget(widget) : null;
+  if (!widget || !pane) return 'none';
+  if (terminalTextTarget === 'typing-pad' && pane.typingPadOpen) return 'typing-pad';
+  return 'shell';
+}
+
+function imageTagPasteTargetForEvent(target: EventTarget | null): ImageTagPasteTarget {
+  if (target instanceof Element && target.closest('.terminal-type-pad')) return 'typing-pad';
+  if (isInsideImagePanel(target)) return currentImageTagPasteTarget();
+  return state.autoPasteImageTagToShell ? currentImageTagPasteTarget() : 'none';
+}
+
+function imageTagPasteTargetLabel(target = currentImageTagPasteTarget()) {
+  if (target === 'typing-pad') return 'Type pad';
+  if (target === 'shell') return 'Shell';
+  return 'No shell';
+}
+
+function renderImageTagTargetIndicator() {
+  const target = currentImageTagPasteTarget();
+  el.imagePasteTarget.textContent = `Tag -> ${imageTagPasteTargetLabel(target)}`;
+  el.imagePasteTarget.title = target === 'typing-pad'
+    ? 'Image tags paste into the active shell Type pad'
+    : target === 'shell'
+      ? 'Image tags paste directly into the active shell prompt'
+      : 'Open a shell to paste image tags';
+  el.imagePasteTarget.className = `image-paste-target ${target}`;
+}
+
+function cancelTerminalFocusRequest(pane: TerminalPane) {
+  if (pane.focusFrame) {
+    cancelAnimationFrame(pane.focusFrame);
+    pane.focusFrame = undefined;
+  }
+  if (pane.focusRetryTimer) {
+    window.clearTimeout(pane.focusRetryTimer);
+    pane.focusRetryTimer = undefined;
+  }
 }
 
 async function createTerminalTab(
@@ -12674,6 +12919,19 @@ function terminalWidgetTabElement(widget: TerminalWidget, paneId: string) {
     bringPanelToFront(pane.element);
     pane.term.focus();
   });
+  labelButton.addEventListener('dblclick', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const paneId = item.dataset.paneId ?? '';
+    if (paneId) renameTerminalTab(paneId);
+  });
+  labelButton.addEventListener('keydown', (event) => {
+    if (event.key !== 'F2') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const paneId = item.dataset.paneId ?? '';
+    if (paneId) renameTerminalTab(paneId);
+  });
   const closeButton = document.createElement('button');
   closeButton.className = 'widget-tab-close';
   closeButton.type = 'button';
@@ -12701,17 +12959,44 @@ function terminalWidgetTabCache(widget: TerminalWidget) {
 
 function updateTerminalWidgetTabElement(item: HTMLElement, widget: TerminalWidget, pane: TerminalPane) {
   const active = pane.paneId === widget.activePaneId;
-  const signature = `${pane.paneId}\t${active ? '1' : '0'}\t${pane.title}\t${pane.command ?? ''}`;
+  const label = terminalPaneLabel(pane);
+  const signature = `${pane.paneId}\t${active ? '1' : '0'}\t${pane.title}\t${pane.customTitle ?? ''}\t${pane.command ?? ''}`;
   item.dataset.paneId = pane.paneId;
   if (item.dataset.renderSignature === signature) return;
   item.dataset.renderSignature = signature;
   item.className = `widget-tab${active ? ' active' : ''}`;
-  item.title = pane.command || pane.title;
-  setTextContentIfChanged(terminalWidgetTabLabelButton(item), pane.title);
+  item.title = pane.customTitle ? `${pane.customTitle} (${pane.title})` : (pane.command || pane.title);
+  setTextContentIfChanged(terminalWidgetTabLabelButton(item), label);
 }
 
 function terminalWidgetTabLabelButton(item: HTMLElement) {
   return item.firstElementChild as HTMLButtonElement;
+}
+
+function terminalPaneLabel(pane: TerminalPane) {
+  return pane.customTitle?.trim() || pane.title;
+}
+
+function renameTerminalTab(paneId: string) {
+  const pane = terminalPaneById.get(paneId);
+  if (!pane) return;
+  const current = pane.customTitle?.trim() || pane.title;
+  const next = window.prompt('Shell tab name. Leave empty to use the automatic title.', current);
+  if (next === null) return;
+  setTerminalTabCustomTitle(pane, next);
+}
+
+function setTerminalTabCustomTitle(pane: TerminalPane, title: string) {
+  const customTitle = title.trim();
+  pane.customTitle = customTitle || undefined;
+  const widget = terminalWidgetForPane(pane);
+  if (widget) {
+    terminalWidgetTabsRenderSignatures.delete(widget);
+    renderTerminalWidgetTabs(widget);
+    updateTerminalWidgetTitle(widget, { force: true });
+  }
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  setStatus(customTitle ? `Shell tab renamed: ${customTitle}` : 'Shell tab uses automatic title');
 }
 
 function pruneTerminalWidgetTabElementCache(widget: TerminalWidget, seen: Set<string>) {
@@ -12731,7 +13016,7 @@ function terminalWidgetTabsRenderState(widget: TerminalWidget, panes = terminalP
       signature += '\n';
       orderSignature += '\n';
     }
-    signature += `${pane.paneId}\t${pane.paneId === widget.activePaneId ? '1' : '0'}\t${pane.title}\t${pane.command ?? ''}`;
+    signature += `${pane.paneId}\t${pane.paneId === widget.activePaneId ? '1' : '0'}\t${pane.title}\t${pane.customTitle ?? ''}\t${pane.command ?? ''}`;
     orderSignature += pane.paneId;
     count += 1;
   }
@@ -12906,8 +13191,9 @@ function updateTerminalWidgetTitle(widget: TerminalWidget, options: { force?: bo
   const pane = activePaneForWidget(widget);
   widget.activePaneId = pane?.paneId ?? '';
   if (!options.force && widget.element.classList.contains('hidden')) return;
-  setTextContentIfChanged(widget.title, pane?.title ?? 'shell');
+  setTextContentIfChanged(widget.title, pane ? terminalPaneLabel(pane) : 'shell');
   setTextContentIfChanged(widget.cwd, pane?.cwd ?? '');
+  syncTerminalTypingPadForWidget(widget);
 }
 
 function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
@@ -13100,6 +13386,7 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
   if (event.isComposing || event.key === 'Process' || event.keyCode === 229) {
     return true;
   }
+  setTerminalTextTarget('shell');
   if (event.type === 'keydown') markTerminalUserInput(pane);
 
   if (isWidgetFocusShortcut(event)) {
@@ -13107,6 +13394,16 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
     event.preventDefault();
     event.stopPropagation();
     cycleWidgetFocus(event.shiftKey ? -1 : 1, pane.paneId);
+    return false;
+  }
+
+  if (isTerminalTypingPadFocusShortcut(event)) {
+    if (terminalUsesAlternateBuffer(pane)) return true;
+    const widget = terminalWidgetForPane(pane);
+    if (!widget) return true;
+    event.preventDefault();
+    event.stopPropagation();
+    focusTerminalTypingPad(widget);
     return false;
   }
 
@@ -13154,6 +13451,7 @@ async function pasteTerminalText(pane: TerminalPane, text?: string) {
   try {
     const value = normalizeTerminalPasteText(text ?? await readText());
     if (!value) return;
+    setTerminalTextTarget('shell');
     markTerminalUserInput(pane);
     await sendTerminalInputNow(pane, terminalPastePayload(value));
   } catch (error) {
@@ -13293,17 +13591,19 @@ function focusActiveTerminalPaneWhenItOwnsKeyboard() {
   focusTerminalPaneWhenReady(pane);
 }
 
-function setActivePane(paneId: string) {
+function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
   const pane = terminalPaneById.get(paneId);
   if (!pane) return;
   if (pane.workspaceId !== state.activeWorkspaceId) return;
   const previousPaneId = state.activePaneId;
   const widget = terminalWidgetForPane(pane);
+  if (options.focus !== false) setTerminalTextTarget('shell');
   if (previousPaneId === paneId) {
     setKeyboardResizeTarget({ kind: 'terminal', paneId });
     flushTerminalWriteBuffer(pane);
     scheduleFitTerminal(pane);
-    focusTerminalPaneWhenReady(pane);
+    if (options.focus === false) cancelTerminalFocusRequest(pane);
+    else focusTerminalPaneWhenReady(pane);
     return;
   }
   const previousPane = previousPaneId ? terminalPaneById.get(previousPaneId) ?? null : null;
@@ -13322,7 +13622,8 @@ function setActivePane(paneId: string) {
   shellTabsRenderSignature = shellTabsSignature();
   flushTerminalWriteBuffer(pane);
   scheduleFitTerminal(pane);
-  focusTerminalPaneWhenReady(pane);
+  if (options.focus === false) cancelTerminalFocusRequest(pane);
+  else focusTerminalPaneWhenReady(pane);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -13369,8 +13670,7 @@ async function handlePaste(event: ClipboardEvent) {
   event.preventDefault();
   try {
     const dataUrl = eventDataUrl ?? await nativeClipboardImageToDataUrl();
-    const pasteToShell = isInsideImagePanel(event.target) || state.autoPasteImageTagToShell;
-    await savePastedImage(dataUrl, pasteToShell);
+    await savePastedImage(dataUrl, imageTagPasteTargetForEvent(event.target));
   } catch (error) {
     setStatus(`Failed to paste image: ${String(error)}`, true);
   }
@@ -13496,7 +13796,7 @@ function loadImageElement(dataUrl: string): Promise<HTMLImageElement> {
 async function pasteImageFromNativeClipboard() {
   if (!state.activeProfile || !state.workspaceOpen) return;
   try {
-    await savePastedImage(await nativeClipboardImageToDataUrl(), true);
+    await savePastedImage(await nativeClipboardImageToDataUrl(), currentImageTagPasteTarget());
   } catch (error) {
     setStatus(`Failed to paste image: ${String(error)}`, true);
   }
@@ -13571,7 +13871,10 @@ async function nativeClipboardImageToDataUrl() {
   }
 }
 
-async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteImageTagToShell) {
+async function savePastedImage(
+  dataUrl: string,
+  pasteTarget: ImageTagPasteTarget = state.autoPasteImageTagToShell ? currentImageTagPasteTarget() : 'none'
+) {
   if (!state.activeProfile) return;
   const targetTab = state.imageOpenInNewTab && activeImageTab().dataUrl
     ? createImageTab(undefined, true)
@@ -13595,8 +13898,10 @@ async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteIm
   state.imageHistory = [item, ...state.imageHistory].slice(0, 24);
   state.imagePreviewDataUrl = dataUrl;
   setImageTabSourcePath(targetTab, result.path);
-  const pasted = pasteToShell ? await pasteImageTagToActiveTerminal(result.tag) : false;
-  state.imagePreviewLabel = pasted ? `${result.tag} copied into active prompt` : `${result.tag} saved`;
+  const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(result.tag, pasteTarget) : false;
+  state.imagePreviewLabel = pasted
+    ? `${result.tag} copied into ${imageTagPasteTargetLabel(pasteTarget)}`
+    : `${result.tag} saved`;
   state.imagePreviewZoom = 1;
   state.imagePreviewOffsetX = 0;
   state.imagePreviewOffsetY = 0;
@@ -13604,11 +13909,12 @@ async function savePastedImage(dataUrl: string, pasteToShell = state.autoPasteIm
   renderImageTabs();
   renderImagePreview();
   renderImageHistory();
-  setStatus(pasted ? `Saved and pasted ${result.path}` : `Saved ${result.path}`);
+  setStatus(pasted ? `Saved and pasted ${result.path} to ${imageTagPasteTargetLabel(pasteTarget)}` : `Saved ${result.path}`);
   saveActiveWorkspaceSnapshot();
 }
 
 function renderImagePreview() {
+  renderImageTagTargetIndicator();
   const label = state.imagePreviewLabel;
   const dataUrl = state.imagePreviewDataUrl;
   const visible = Boolean(dataUrl);
@@ -13911,10 +14217,10 @@ function imageHistoryElement(id: string) {
   const paste = document.createElement('button');
   paste.className = 'image-history-paste';
   paste.textContent = 'Paste';
-  paste.title = 'Paste tag to active shell';
+  paste.title = 'Paste tag to the current image tag target';
   paste.addEventListener('click', () => {
     const item = imageHistoryItemForRow(row);
-    if (item) void pasteImageTagToActiveTerminal(item.tag);
+    if (item) void pasteImageTagToTarget(item.tag);
   });
 
   row.append(preview, meta, paste);
@@ -13997,8 +14303,40 @@ async function pasteImageTagToActiveTerminal(tag: string) {
     setStatus('No active shell for image tag paste', true);
     return false;
   }
+  setTerminalTextTarget('shell');
   await api.writeTerminal(active.backendId, tag);
   setStatus(`Pasted ${tag}`);
+  return true;
+}
+
+async function pasteImageTagToTarget(tag: string, target = currentImageTagPasteTarget()) {
+  if (target === 'typing-pad') return pasteImageTagToTypingPad(tag);
+  if (target === 'shell') return pasteImageTagToActiveTerminal(tag);
+  setStatus('No active shell for image tag paste', true);
+  return false;
+}
+
+async function pasteImageTagToTypingPad(tag: string) {
+  const widget = activeTerminalWidget();
+  const pane = widget ? activePaneForWidget(widget) : null;
+  if (!widget || !pane) {
+    setStatus('No active Type pad for image tag paste', true);
+    return false;
+  }
+
+  pane.typingPadOpen = true;
+  syncTerminalTypingPadForWidget(widget);
+  const input = widget.typePadInput;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.setRangeText(tag, start, end, 'end');
+  pane.typingPadDraft = input.value;
+  syncTerminalTypingPadControls(widget);
+  setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
+  setTerminalTextTarget('typing-pad');
+  cancelTerminalFocusRequest(pane);
+  input.focus({ preventScroll: true });
+  setStatus(`Inserted ${tag} into Type pad`);
   return true;
 }
 

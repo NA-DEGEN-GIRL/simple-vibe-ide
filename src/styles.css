@@ -651,7 +651,7 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
   max-width: calc(100% - 16px);
   max-height: calc(100% - 16px);
   display: grid;
-  grid-template-rows: 32px 31px minmax(0, 1fr);
+  grid-template-rows: 32px 31px minmax(0, 1fr) auto;
   box-shadow: 0 14px 28px rgba(0, 0, 0, 0.28);
   contain: layout style;
 }
@@ -661,6 +661,8 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .terminal-title .muted { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .focus-dot { width: 12px; height: 12px; padding: 0; border-radius: 999px; background: #39475c; }
 .terminal-card.active .focus-dot { background: #51e384; box-shadow: 0 0 10px #51e384; }
+.terminal-type-toggle { padding: 2px 8px; }
+.terminal-type-toggle.active { color: #dceaff; border-color: #4d8dff; background: #18345d; }
 .close-pane { padding: 2px 8px; }
 .terminal-widget-tabbar {
   min-width: 0;
@@ -673,6 +675,37 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
 .terminal-new-tab { margin: 4px 6px 0 0; }
 .terminal-host-stack { min-height: 0; position: relative; overflow: hidden; background: #080b10; contain: layout paint style; }
 .terminal-host { position: absolute; inset: 0; min-height: 0; padding: 4px; overflow: hidden; background: #080b10; contain: layout paint style; }
+.terminal-type-pad {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(52px, auto) 26px;
+  gap: 5px;
+  padding: 6px;
+  border-top: 1px solid #182132;
+  background: #0a1019;
+}
+.terminal-type-pad-input {
+  min-height: 52px;
+  max-height: 128px;
+  resize: vertical;
+  font-family: var(--mono-font);
+  font-size: 13px;
+  line-height: 1.35;
+  background: #070b12;
+  border-color: #26344a;
+}
+.terminal-type-pad-input:focus { box-shadow: inset 0 0 0 1px rgba(77, 141, 255, 0.42); }
+.terminal-type-pad-actions { display: flex; align-items: center; gap: 8px; }
+.terminal-type-pad-hint {
+  flex: 1;
+  min-width: 0;
+  color: #7f91a8;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-type-pad-paste { padding: 3px 9px; }
 .terminal-host .xterm .composition-view {
   z-index: 30;
   min-width: 1ch;
@@ -1050,11 +1083,27 @@ body.capture-protected .titlebar { box-shadow: inset 0 -2px 0 #f6c04f; }
   padding: 8px;
 }
 
-.image-panel { display: grid; grid-template-rows: 34px auto auto auto auto minmax(0, 1fr) auto; contain: layout style; }
+.image-panel { display: grid; grid-template-rows: 34px auto auto auto auto minmax(0, 1fr); contain: layout style; }
 .image-label { padding: 8px 10px; color: #9fb0c3; border-bottom: 1px solid #182132; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .image-tools { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid #182132; }
-.image-option { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; color: #c7d3e2; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.image-option { flex: 1 1 120px; min-width: 0; display: flex; align-items: center; gap: 7px; color: #c7d3e2; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .image-option input { width: 14px; height: 14px; min-width: 14px; }
+.image-paste-target {
+  flex: 0 0 auto;
+  max-width: 120px;
+  padding: 2px 7px;
+  border: 1px solid #26344a;
+  border-radius: 999px;
+  color: #aebdd0;
+  background: #0d1420;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.image-paste-target.shell { border-color: #34517f; color: #cfe0ff; background: #10213d; }
+.image-paste-target.typing-pad { border-color: #6a4d9d; color: #eadcff; background: #251b3a; }
+.image-paste-target.none { border-color: #45313a; color: #d6a4b0; background: #26131a; }
 .image-tools .panel-mode { flex: 0 0 auto; }
 .image-history { max-height: 140px; overflow: auto; padding: 6px; display: grid; gap: 5px; border-bottom: 1px solid #182132; background: #090e16; contain: layout paint style; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .image-history-row { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 6px; align-items: center; }

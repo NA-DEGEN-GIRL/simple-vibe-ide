@@ -53,8 +53,8 @@ mod cleanup_job {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
@@ -162,6 +162,18 @@ struct ExportSession {
 struct EdgeDevtoolsSessionState {
     child: Option<ProcessChild>,
     port: u16,
+}
+
+struct RuntimeShutdownBatch {
+    terminals: Vec<TerminalSession>,
+    forwards: Vec<ForwardSession>,
+    edge_sessions: Vec<EdgeDevtoolsSessionState>,
+}
+
+impl RuntimeShutdownBatch {
+    fn is_empty(&self) -> bool {
+        self.terminals.is_empty() && self.forwards.is_empty() && self.edge_sessions.is_empty()
+    }
 }
 
 struct AppOutputBatcher {
@@ -1602,39 +1614,70 @@ fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn shutdown_runtime_sessions(state: &IdeState) {
-    if let Ok(mut terminals) = state.terminals.lock() {
-        for (_, mut session) in terminals.drain() {
-            if let Some(pid) = session.child.process_id() {
-                kill_process_tree(pid);
-            }
-            let _ = session.child.kill();
-            let _ = session.child.wait();
+fn drain_runtime_sessions(state: &IdeState) -> RuntimeShutdownBatch {
+    let terminals = state
+        .terminals
+        .lock()
+        .map(|mut sessions| sessions.drain().map(|(_, session)| session).collect())
+        .unwrap_or_default();
+    let forwards = state
+        .forwards
+        .lock()
+        .map(|mut sessions| sessions.drain().map(|(_, session)| session).collect())
+        .unwrap_or_default();
+    let edge_sessions = state
+        .edge_sessions
+        .lock()
+        .map(|mut sessions| sessions.drain().map(|(_, session)| session).collect())
+        .unwrap_or_default();
+    RuntimeShutdownBatch {
+        terminals,
+        forwards,
+        edge_sessions,
+    }
+}
+
+fn terminate_runtime_sessions(batch: RuntimeShutdownBatch) {
+    for mut session in batch.terminals {
+        if let Some(pid) = session.child.process_id() {
+            kill_process_tree(pid);
+        }
+        let _ = session.child.kill();
+        let _ = session.child.wait();
+    }
+
+    for mut forward in batch.forwards {
+        if let Some(stop) = forward.stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(mut child) = forward.child.take() {
+            kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
-    if let Ok(mut forwards) = state.forwards.lock() {
-        for (_, mut forward) in forwards.drain() {
-            if let Some(stop) = forward.stop.take() {
-                stop.store(true, Ordering::Relaxed);
-            }
-            if let Some(mut child) = forward.child.take() {
-                kill_process_tree(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+    for mut session in batch.edge_sessions {
+        if let Some(mut child) = session.child.take() {
+            kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
+}
 
-    if let Ok(mut edge_sessions) = state.edge_sessions.lock() {
-        for (_, mut session) in edge_sessions.drain() {
-            if let Some(mut child) = session.child.take() {
-                kill_process_tree(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+fn shutdown_runtime_sessions_background(state: &IdeState) {
+    let batch = drain_runtime_sessions(state);
+    if batch.is_empty() {
+        return;
     }
+    // Drain the session maps synchronously so future frontend/backend calls see
+    // the runtime as closed, but run process-tree termination and waits off the
+    // Tauri close path. On Windows the cleanup Job Object remains the hard
+    // guarantee if the app process exits before this worker finishes.
+    let _ = thread::Builder::new()
+        .name("simple-vibe-runtime-shutdown".to_string())
+        .spawn(move || terminate_runtime_sessions(batch));
 }
 
 fn start_port_forward_host(
@@ -1912,7 +1955,7 @@ fn stop_port_forward(state: State<'_, IdeState>, id: String) -> Result<(), Strin
 
 #[tauri::command]
 fn shutdown_runtime_sessions_command(state: State<'_, IdeState>) -> Result<(), String> {
-    shutdown_runtime_sessions(&state);
+    shutdown_runtime_sessions_background(&state);
     Ok(())
 }
 
@@ -5800,10 +5843,12 @@ pub fn run() {
         .expect("error while running Simple Vibe IDE")
         .run(|app_handle, event| {
             // Guarantee child processes (terminals, ssh/wsl, port forwards,
-            // Edge devtools) are torn down on every exit path, not only when
-            // the custom window-close button invokes shutdownRuntimeSessions.
+            // Edge devtools) are detached from app state on every exit path,
+            // but do not block the window/app close path on taskkill/wait.
+            // The Windows cleanup Job Object is the hard guarantee if the
+            // process exits before the background worker finishes.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                shutdown_runtime_sessions(app_handle.state::<IdeState>().inner());
+                shutdown_runtime_sessions_background(app_handle.state::<IdeState>().inner());
             }
         });
 }
