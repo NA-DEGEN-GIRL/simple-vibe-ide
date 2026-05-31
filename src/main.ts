@@ -6735,10 +6735,10 @@ function launchLlm(id: string) {
 }
 
 async function startLlmLauncher(id: string) {
-  // Define the dedup/launch logic SILENTLY in the shell's startup rcfile (defining a function
-  // produces no output and runs nothing), then TYPE only a short call (`__svi_run`) at the prompt.
-  // This hides the boilerplate AND starts the CLI as a real interactive foreground job, so
-  // node-launched CLIs (e.g. codex via nvm) enter bypass/YOLO.
+  // Compute the launcher args SILENTLY in the shell's startup rcfile (`define` runs no CLI, so it
+  // produces no output), then TYPE only the short bare command (`call`, e.g. codex "${...}") at the
+  // prompt. This hides the dedup boilerplate AND launches the CLI as a directly-typed foreground
+  // command, which node-launched CLIs (e.g. codex via nvm) need to enter bypass/YOLO.
   const { define, call } = llmLauncherParts(id);
   const widget = await createTerminal(define, id, { initialHeight: 420 });
   if (!widget) return;
@@ -6752,8 +6752,11 @@ async function startLlmLauncher(id: string) {
   saveActiveWorkspaceSnapshot();
 }
 
-// `define` is sourced silently in the shell rcfile (no echo); `call` is typed at the prompt. On
-// bash the dedup is hidden inside a `__svi_run` function; on Windows we type the command as-is.
+// `define` is sourced silently in the shell rcfile (no echo) to COMPUTE the args; `call` is typed
+// at the prompt. The launch (`call`) is a BARE command (e.g. `codex "${__svi_args[@]}"`), NOT a
+// function call: node-launched CLIs (coding's nvm codex) only enter bypass/YOLO when started as a
+// directly-typed foreground command — wrapping the launch in a function breaks that. On Windows we
+// type the whole command as-is (no separate define).
 function llmLauncherParts(
   id: string,
   profileKind: string | undefined = state.activeProfile?.kind
@@ -6761,16 +6764,17 @@ function llmLauncherParts(
   const launcher = LLM_LAUNCHERS[id];
   if (!launcher) return { define: null, call: id };
   if (profileKind === 'windows') return { define: null, call: powershellLlmLauncherCommand(launcher) };
-  return { define: bashLlmLauncherDefine(launcher), call: '__svi_run' };
+  return bashLlmLauncherParts(launcher);
 }
 
-function bashLlmLauncherDefine(launcher: LlmLauncherConfig) {
+function bashLlmLauncherParts(launcher: LlmLauncherConfig): { define: string; call: string } {
   const executable = launcher.executable;
   // Add the bypass flag only when it is NOT already in the resolved command. `type` reveals an
   // alias/function body; a wrapper SCRIPT on PATH only shows its path via `type`, so also fold in
   // the script's own text (shebang files only). If the flag is found there, the user's
   // alias/wrapper already supplies it — don't add a second one (codex errors on a duplicate).
   // Otherwise add it. claude additionally refuses the flag as root, so gate it on a non-zero uid.
+  // These lines only COMPUTE __svi_args (no CLI is run), so running them in the rcfile is silent.
   const needsRootGate = launcher.flags.some((flag) => flag.skipWhenRoot);
   const lines = [
     `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
@@ -6783,8 +6787,7 @@ function bashLlmLauncherDefine(launcher: LlmLauncherConfig) {
     const add = `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`;
     lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
   }
-  lines.push(`${executable} "\${__svi_args[@]}"`);
-  return `__svi_run() {\n${lines.map((line) => `  ${line}`).join('\n')}\n}`;
+  return { define: lines.join('\n'), call: `${executable} "\${__svi_args[@]}"` };
 }
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
