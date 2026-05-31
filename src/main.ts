@@ -12890,6 +12890,10 @@ function finishTerminalImeCompositionGuard(pane: TerminalPane) {
   pane.imeReleaseTimer = window.setTimeout(() => {
     pane.imeReleaseTimer = undefined;
     pane.imeComposing = false;
+    // The DOM renderer can leave stale/blank cells after a mixed-width (Hangul + ASCII) input line
+    // is redrawn through IME composition, so previously-visible glyphs appear to vanish. Force a
+    // full repaint of the viewport on release; the buffer is correct, only the render is stale.
+    pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
     focusTerminalPaneWhenReady(pane);
   }, TERMINAL_IME_RELEASE_DEFER_MS);
