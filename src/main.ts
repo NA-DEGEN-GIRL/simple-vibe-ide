@@ -17000,29 +17000,37 @@ function handleBrowserPreviewAssetFailure(frame: HTMLIFrameElement, payload: Bro
   scheduleBrowserAssetRecovery(tab);
 }
 
+// A dev server (Flutter/webpack/vite) may not be serving every asset the instant the proxy comes
+// up, so give the page a few escalating retries before giving up. Persistent failures (e.g. a
+// cross-origin sub-resource on another port) still stop after the cap so we don't reload forever.
+const BROWSER_ASSET_RECOVERY_MAX_ATTEMPTS = 3;
+const BROWSER_ASSET_RECOVERY_WINDOW_MS = 45_000;
+const BROWSER_ASSET_RECOVERY_DELAYS_MS = [600, 1400, 2800];
+
 function scheduleBrowserAssetRecovery(tab: BrowserTab) {
   const existingTimer = browserAssetRecoveryTimers.get(tab.id);
   if (existingTimer) return;
   const now = Date.now();
   const previous = browserAssetRecoveryByTabId.get(tab.id);
-  const sameUrl = previous?.url === tab.url && now - previous.at < 45_000;
+  const sameUrl = previous?.url === tab.url && now - previous.at < BROWSER_ASSET_RECOVERY_WINDOW_MS;
   const count = sameUrl ? previous.count + 1 : 1;
   browserAssetRecoveryByTabId.set(tab.id, { url: tab.url, count, at: now });
-  if (count > 2) {
+  if (count > BROWSER_ASSET_RECOVERY_MAX_ATTEMPTS) {
     logBrowserConsole('warn', `Preview asset recovery stopped after repeated failures for ${tab.url}`);
     return;
   }
+  const delay = BROWSER_ASSET_RECOVERY_DELAYS_MS[Math.min(count, BROWSER_ASSET_RECOVERY_DELAYS_MS.length) - 1];
   const timer = window.setTimeout(() => {
     browserAssetRecoveryTimers.delete(tab.id);
     const current = browserTabForId(tab.id);
     if (!current || current.id !== state.activeBrowserTabId || current.url !== tab.url) return;
-    logBrowserConsole('info', `Retrying preview load after asset failure (${count}/2)`);
+    logBrowserConsole('info', `Retrying preview load after asset failure (${count}/${BROWSER_ASSET_RECOVERY_MAX_ATTEMPTS})`);
     if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(current.url)) {
       loadBrowserTabThroughPreviewProxy(current, { hard: true, reload: true, clearCache: count > 1 });
     } else {
       loadBrowserFrame(current, { hard: true, reload: true });
     }
-  }, count === 1 ? 450 : 900);
+  }, delay);
   browserAssetRecoveryTimers.set(tab.id, timer);
 }
 
