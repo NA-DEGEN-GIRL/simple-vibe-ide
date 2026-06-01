@@ -12,6 +12,8 @@ import { api } from './api';
 import type { ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
+declare const __SVIDE_BUILD_ID__: string;
+
 interface TerminalPane {
   paneId: string;
   widgetId: string;
@@ -46,6 +48,7 @@ interface TerminalPane {
   focusFrame?: number;
   focusRetryTimer?: number;
   lastUserInputAt?: number;
+  llmWaitingDetectionBuffer?: string;
   suppressTerminalQueryResponsesUntil?: number;
   seenPorts: Set<number>;
   fitFrame?: number;
@@ -88,6 +91,7 @@ interface TerminalWidget {
   tabList: HTMLElement;
   hostStack: HTMLElement;
   typePadToggle: HTMLButtonElement;
+  typePadFocusToggle: HTMLButtonElement;
   typePad: HTMLElement;
   typePadInput: HTMLTextAreaElement;
   typePadPaste: HTMLButtonElement;
@@ -95,6 +99,7 @@ interface TerminalWidget {
   activeGroupId: string;
   activePaneId: string;
   typingPadOpen: boolean;
+  defaultFocusTarget: TerminalDefaultFocusTarget;
 }
 
 interface OpenFileState {
@@ -130,6 +135,7 @@ interface BrowserTab {
   deviceId?: string;
   orientation?: BrowserOrientation;
   zoom?: number;
+  zoomMode?: BrowserZoomMode;
   frameUrl?: string;
   edge?: EdgeBrowserTarget;
 }
@@ -223,6 +229,7 @@ interface IdeSettings {
   monoFont: string;
   editorTheme: EditorThemeId;
   extraMaskPatterns: string[];
+  widgetWrap: WidgetWrapSettings;
 }
 
 interface CalculatorHistoryItem {
@@ -278,6 +285,18 @@ interface ImageTabState {
   offsetY: number;
 }
 
+interface ImagePreviewMetrics {
+  stageWidth: number;
+  stageHeight: number;
+  naturalWidth: number;
+  naturalHeight: number;
+  containScale: number;
+  baseWidth: number;
+  baseHeight: number;
+  renderedWidth: number;
+  renderedHeight: number;
+}
+
 interface NoteTabState {
   id: string;
   path: string;
@@ -315,6 +334,7 @@ interface WorkspaceTerminalSnapshot {
   profileId?: string;
   cwd?: string;
   typingPadOpen?: boolean;
+  defaultFocusTarget?: TerminalDefaultFocusTarget;
   rect?: LayoutRatio;
 }
 
@@ -333,6 +353,7 @@ interface WorkspaceTerminalGroupSnapshot {
   groupId: string;
   customTitle?: string;
   typingPadOpen?: boolean;
+  defaultFocusTarget?: TerminalDefaultFocusTarget;
   activeSnapshotPaneId?: string;
   root: WorkspaceTerminalSplitSnapshot;
 }
@@ -398,6 +419,7 @@ interface WorkspaceSnapshot {
   browserConsolePosition: BrowserConsolePosition;
   browserConsoleSize?: number;
   browserZoom?: number;
+  browserZoomMode?: BrowserZoomMode;
   calculatorExpression?: string;
   calculatorHistory?: CalculatorHistoryItem[];
   explorerOpenMode: ExplorerOpenMode;
@@ -501,6 +523,11 @@ type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
 type BrowserConsolePosition = 'bottom' | 'right' | 'top' | 'left';
+type BrowserZoomMode = 'manual' | 'fit';
+type WidgetWrapTargetId = FloatingPanelId | 'terminal';
+type WidgetWrapPart = 'title' | 'controls';
+type WidgetWrapState = Record<WidgetWrapPart, boolean>;
+type WidgetWrapSettings = Partial<Record<WidgetWrapTargetId, Partial<WidgetWrapState>>>;
 type ForwardRenderKind = 'detected' | 'forward' | 'empty';
 type WorkspaceSnapshotPersistMode = 'flush' | 'defer' | 'none';
 type TerminalVisibility = 'visible' | 'inactive' | 'background';
@@ -510,6 +537,7 @@ type CloseTerminalOptions = {
   renderShellTabs?: boolean;
 };
 type TerminalTextTarget = 'shell' | 'typing-pad';
+type TerminalDefaultFocusTarget = 'shell' | 'typing-pad';
 type ImageTagPasteTarget = TerminalTextTarget | 'none';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
@@ -550,6 +578,7 @@ type CreateTerminalOptions = {
   groupId?: string;
   splitTargetPaneId?: string;
   splitDirection?: TerminalSplitDirection;
+  defaultFocusTarget?: TerminalDefaultFocusTarget;
 };
 
 type LlmLauncherFlag = {
@@ -629,8 +658,21 @@ const APP_VARIANT = location.pathname.endsWith('/terminal.html') || new URLSearc
   : 'ide';
 const IS_TERMINAL_APP = APP_VARIANT === 'terminal';
 const APP_PRODUCT_NAME = IS_TERMINAL_APP ? 'Simple Vibe Terminal' : 'Simple Vibe IDE';
+const APP_BUILD_ID = typeof __SVIDE_BUILD_ID__ === 'string' && __SVIDE_BUILD_ID__
+  ? __SVIDE_BUILD_ID__
+  : 'dev';
 const APP_STORAGE_PREFIX = IS_TERMINAL_APP ? 'simple-vibe-terminal' : 'simple-vibe-ide';
 const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'calculator', 'settings'];
+const WIDGET_WRAP_TARGETS: Array<{ id: WidgetWrapTargetId; label: string }> = [
+  { id: 'terminal', label: 'Shell widgets' },
+  { id: 'explorer', label: 'Explorer' },
+  { id: 'editor', label: 'Editor' },
+  { id: 'image', label: 'Image Preview' },
+  { id: 'browser', label: 'Browser' },
+  { id: 'notes', label: 'Notes' },
+  { id: 'calculator', label: 'Calculator' },
+  { id: 'settings', label: 'Settings' }
+];
 const IDE_DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   explorer: true,
   editor: true,
@@ -697,6 +739,8 @@ const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
 const WORKSPACE_LLM_OUTPUT_ACTIVE_MS = 2500;
 const WORKSPACE_LLM_INPUT_ACTIVE_MS = 3500;
 const WORKSPACE_LLM_START_ACTIVE_MS = 4000;
+const WORKSPACE_LLM_WAITING_BUFFER_CHARS = 6000;
+const DEFAULT_TERMINAL_FOCUS_TARGET: TerminalDefaultFocusTarget = 'shell';
 // Defer post-composition repaint/refocus well past xterm's own setTimeout(0) finalize (which
 // re-reads the helper-textarea), so our DOM/focus churn can't clobber the committed Hangul tail.
 const TERMINAL_IME_RELEASE_DEFER_MS = 120;
@@ -769,7 +813,7 @@ const BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS = 350;
 const BROWSER_FRAME_SUSPEND_IDLE_MS = 250;
 const WORKSPACE_RESTORE_BACKGROUND_DELAY_MS = 1800;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
-const BROWSER_ZOOM_LEVELS = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const BROWSER_ZOOM_LEVELS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const IMAGE_PREVIEW_MIN_ZOOM = 0.1;
 const IMAGE_PREVIEW_MAX_ZOOM = 12;
 const IMAGE_PREVIEW_WHEEL_FACTOR = 1.12;
@@ -787,6 +831,9 @@ const BROWSER_DEVICE_PRESETS: BrowserDevicePreset[] = [
   { id: 'iphone-15', label: 'iPhone 15', width: 393, height: 852, kind: 'phone' },
   { id: 'iphone-15-pro-max', label: 'iPhone 15 Pro Max', width: 430, height: 932, kind: 'phone' },
   { id: 'pixel-7', label: 'Pixel 7', width: 412, height: 915, kind: 'phone' },
+  { id: 'galaxy-s26-ultra', label: 'Galaxy S26 Ultra', width: 412, height: 915, kind: 'phone' },
+  { id: 'galaxy-s25-ultra', label: 'Galaxy S25 Ultra', width: 412, height: 915, kind: 'phone' },
+  { id: 'galaxy-s24-ultra', label: 'Galaxy S24 Ultra', width: 384, height: 824, kind: 'phone' },
   { id: 'galaxy-s23', label: 'Galaxy S23', width: 360, height: 780, kind: 'phone' },
   { id: 'galaxy-fold', label: 'Galaxy Fold', width: 280, height: 653, kind: 'phone' },
   { id: 'ipad-mini', label: 'iPad Mini', width: 768, height: 1024, kind: 'tablet' },
@@ -1164,7 +1211,8 @@ const DEFAULT_IDE_SETTINGS: IdeSettings = {
   uiFont: 'system',
   monoFont: 'cascadia',
   editorTheme: 'simple-dark',
-  extraMaskPatterns: ['*.env', '*.env.*', '*.secret', '*.private', '*.credentials']
+  extraMaskPatterns: ['*.env', '*.env.*', '*.secret', '*.private', '*.credentials'],
+  widgetWrap: defaultWidgetWrapSettings()
 };
 const PANEL_RESIZE_DIRECTIONS: WindowResizeDirection[] = ['North', 'East', 'South', 'West', 'NorthEast', 'NorthWest', 'SouthEast', 'SouthWest'];
 
@@ -1231,6 +1279,7 @@ const state = {
   browserConsoleSize: 0.34,
   browserConsoleLogs: [] as BrowserConsoleLog[],
   browserZoom: 1,
+  browserZoomMode: 'manual' as BrowserZoomMode,
   calculatorExpression: '',
   calculatorResult: '',
   calculatorHistory: [] as CalculatorHistoryItem[],
@@ -1443,6 +1492,7 @@ const workspaceImageRefCache = new Map<string, { dataUrl: string; key: string }>
 const workspaceSnapshotSignatures = new Map<string, string>();
 const workspaceLlmActivityExpiresAt = new Map<string, number>();
 const workspaceLlmActivityTimers = new Map<string, number>();
+const workspaceLlmWaitingByPaneId = new Map<string, { workspaceId: string; llmId: string; detectedAt: number }>();
 let noteStatusRenderSignature = '\0';
 let workspaceTabsRenderSignature = '\0';
 let workspaceTabsOrderRenderSignature = '\0';
@@ -1469,6 +1519,7 @@ let imagePreviewRenderedLabel = '\0';
 let imagePreviewRenderedTransform = '\0';
 let imagePreviewDrag: { pointerId: number; startX: number; startY: number; offsetX: number; offsetY: number } | null = null;
 let imagePreviewDragDocumentBound = false;
+let imagePreviewResizeObserver: ResizeObserver | null = null;
 let calculatorHistoryRenderSignature = '\0';
 let calculatorHistoryOrderRenderSignature = '\0';
 let calculatorKeysRendered = false;
@@ -1508,6 +1559,7 @@ let codeMeasureFrame = 0;
 let activeEdgeCdp: EdgeCdpState | null = null;
 let edgePreviewResizeObserver: ResizeObserver | null = null;
 let edgeViewportFrame = 0;
+let browserFitZoomFrame = 0;
 let activeExplorerRename: {
   path: string;
   originalName: string;
@@ -1688,6 +1740,10 @@ app.innerHTML = `
         <div class="device-form">
           <select id="device-select" title="Device viewport"></select>
           <button id="rotate-device" title="Rotate device">Rotate</button>
+          <button id="browser-zoom-fit" title="Fit browser preview to visible panel">Fit</button>
+          <button id="browser-zoom-out" title="Zoom browser preview out (Ctrl+-)">-</button>
+          <button id="browser-zoom-reset" title="Reset browser preview zoom (Ctrl+0)">100%</button>
+          <button id="browser-zoom-in" title="Zoom browser preview in (Ctrl++)">+</button>
           <button id="toggle-browser-console" title="Toggle preview console" aria-pressed="false">Console</button>
           <select id="browser-console-position" title="Console position">
             <option value="bottom">Bottom</option>
@@ -1698,9 +1754,11 @@ app.innerHTML = `
         </div>
         <div id="browser-workspace" class="browser-workspace console-bottom">
           <div id="browser-shell" class="browser-shell desktop">
-            <iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe>
-            <canvas id="edge-preview-canvas" class="edge-preview-canvas hidden" tabindex="0" aria-label="Edge browser preview"></canvas>
-            <div id="edge-preview-status" class="edge-preview-status hidden">Edge preview idle</div>
+            <div id="browser-preview-scale-box" class="browser-preview-scale-box">
+              <iframe id="preview-frame" class="preview-frame hidden" title="local preview"></iframe>
+              <canvas id="edge-preview-canvas" class="edge-preview-canvas hidden" tabindex="0" aria-label="Edge browser preview"></canvas>
+              <div id="edge-preview-status" class="edge-preview-status hidden">Edge preview idle</div>
+            </div>
           </div>
           <div id="browser-console-resizer" class="browser-console-resizer" aria-hidden="true"></div>
           <section id="browser-console" class="browser-console hidden" aria-label="Preview console">
@@ -1752,6 +1810,11 @@ app.innerHTML = `
             Mask file patterns
             <textarea id="settings-mask-patterns" spellcheck="false" placeholder="*.env&#10;*.secret"></textarea>
           </label>
+          <fieldset class="settings-widget-wrap-section">
+            <legend>Widget wrapping</legend>
+            <p class="hint">Default is on. Title wrap affects the widget title bar; controls wrap affects menus/toolbars inside each widget.</p>
+            <div id="settings-widget-wraps" class="settings-widget-wraps"></div>
+          </fieldset>
           <p class="hint">Patterns are app-wide. Example/sample files stay excluded from default masking.</p>
         </div>
       </section>
@@ -1854,11 +1917,16 @@ const el = {
   desktopSize: document.querySelector<HTMLButtonElement>('#desktop-size'),
   deviceSelect: document.querySelector<HTMLSelectElement>('#device-select')!,
   rotateDevice: document.querySelector<HTMLButtonElement>('#rotate-device')!,
+  browserZoomFit: document.querySelector<HTMLButtonElement>('#browser-zoom-fit')!,
+  browserZoomOut: document.querySelector<HTMLButtonElement>('#browser-zoom-out')!,
+  browserZoomReset: document.querySelector<HTMLButtonElement>('#browser-zoom-reset')!,
+  browserZoomIn: document.querySelector<HTMLButtonElement>('#browser-zoom-in')!,
   browserConsoleToggle: document.querySelector<HTMLButtonElement>('#toggle-browser-console')!,
   browserConsolePosition: document.querySelector<HTMLSelectElement>('#browser-console-position')!,
   forwardList: document.querySelector<HTMLDivElement>('#forward-list')!,
   browserWorkspace: document.querySelector<HTMLDivElement>('#browser-workspace')!,
   browserShell: document.querySelector<HTMLDivElement>('#browser-shell')!,
+  browserPreviewScaleBox: document.querySelector<HTMLDivElement>('#browser-preview-scale-box')!,
   browserConsoleResizer: document.querySelector<HTMLDivElement>('#browser-console-resizer')!,
   browserConsole: document.querySelector<HTMLElement>('#browser-console')!,
   browserConsoleClear: document.querySelector<HTMLButtonElement>('#clear-browser-console')!,
@@ -1875,6 +1943,7 @@ const el = {
   settingsMonoFont: document.querySelector<HTMLSelectElement>('#settings-mono-font')!,
   settingsEditorTheme: document.querySelector<HTMLSelectElement>('#settings-editor-theme')!,
   settingsMaskPatterns: document.querySelector<HTMLTextAreaElement>('#settings-mask-patterns')!,
+  settingsWidgetWraps: document.querySelector<HTMLDivElement>('#settings-widget-wraps')!,
   settingsSave: document.querySelector<HTMLButtonElement>('#settings-save')!,
   contextMenu: document.querySelector<HTMLDivElement>('#context-menu')!
 };
@@ -1890,6 +1959,7 @@ function setStatus(message: string, danger = false) {
   if (appStatusRenderSignature === signature) return;
   appStatusRenderSignature = signature;
   setTextContentIfChanged(el.status, message);
+  el.status.title = `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
   el.status.classList.toggle('danger', danger);
 }
 
@@ -1948,7 +2018,8 @@ function refreshTitle() {
   if (appTitleRenderSignature === context) return;
   appTitleRenderSignature = context;
   setTextContentIfChanged(el.titleContext, context);
-  const title = APP_PRODUCT_NAME;
+  el.titleContext.title = `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
+  const title = `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
   if (document.title !== title) document.title = title;
 }
 
@@ -2029,7 +2100,7 @@ async function init() {
   startAppClock();
   selectProfile('');
   setWorkspaceOpen(false);
-  setStatus('Ready');
+  setStatus(`Ready · build ${APP_BUILD_ID}`);
   if (!IS_TERMINAL_APP) scheduleMarketTickerStart(MARKET_TICKER_BOOT_DELAY_MS);
   scheduleWslProfilesBackgroundLoad();
 }
@@ -2466,6 +2537,44 @@ function flushWorkspaceStorePersist() {
   persistWorkspaceStore();
 }
 
+function normalizedDefaultIdeSettings(): IdeSettings {
+  return {
+    ...DEFAULT_IDE_SETTINGS,
+    extraMaskPatterns: [...DEFAULT_IDE_SETTINGS.extraMaskPatterns],
+    widgetWrap: defaultWidgetWrapSettings()
+  };
+}
+
+function defaultWidgetWrapSettings(): WidgetWrapSettings {
+  const settings: WidgetWrapSettings = {};
+  for (const target of WIDGET_WRAP_TARGETS) {
+    settings[target.id] = { title: true, controls: true };
+  }
+  return settings;
+}
+
+function normalizeWidgetWrapSettings(value: unknown): WidgetWrapSettings {
+  const source = value && typeof value === 'object' ? value as WidgetWrapSettings : {};
+  const settings = defaultWidgetWrapSettings();
+  for (const target of WIDGET_WRAP_TARGETS) {
+    const item = source[target.id];
+    settings[target.id] = {
+      title: item?.title !== false,
+      controls: item?.controls !== false
+    };
+  }
+  return settings;
+}
+
+function widgetWrapState(target: WidgetWrapTargetId): WidgetWrapState {
+  const settings = normalizeWidgetWrapSettings(state.ideSettings.widgetWrap);
+  const item = settings[target] ?? { title: true, controls: true };
+  return {
+    title: item.title !== false,
+    controls: item.controls !== false
+  };
+}
+
 function loadIdeSettings() {
   try {
     const parsed = JSON.parse(localStorage.getItem(IDE_SETTINGS_KEY) ?? '') as Partial<IdeSettings>;
@@ -2475,10 +2584,11 @@ function loadIdeSettings() {
       editorTheme: isEditorThemeId(parsed.editorTheme) ? parsed.editorTheme : DEFAULT_IDE_SETTINGS.editorTheme,
       extraMaskPatterns: Array.isArray(parsed.extraMaskPatterns)
         ? parsed.extraMaskPatterns.map(String).filter(Boolean)
-        : DEFAULT_IDE_SETTINGS.extraMaskPatterns
+        : DEFAULT_IDE_SETTINGS.extraMaskPatterns,
+      widgetWrap: normalizeWidgetWrapSettings(parsed.widgetWrap)
     };
   } catch {
-    state.ideSettings = { ...DEFAULT_IDE_SETTINGS };
+    state.ideSettings = normalizedDefaultIdeSettings();
   }
   applyIdeSettings();
 }
@@ -2493,6 +2603,51 @@ function renderSettings() {
   renderChoiceOptions(el.settingsEditorTheme, EDITOR_THEME_CHOICES, state.ideSettings.editorTheme);
   const maskPatterns = state.ideSettings.extraMaskPatterns.join('\n');
   if (el.settingsMaskPatterns.value !== maskPatterns) el.settingsMaskPatterns.value = maskPatterns;
+  renderWidgetWrapSettings();
+}
+
+function renderWidgetWrapSettings() {
+  const current = normalizeWidgetWrapSettings(state.ideSettings.widgetWrap);
+  const fragment = document.createDocumentFragment();
+  for (const target of WIDGET_WRAP_TARGETS) {
+    const row = document.createElement('div');
+    row.className = 'settings-widget-wrap-row';
+
+    const name = document.createElement('span');
+    name.textContent = target.label;
+    row.append(name);
+
+    for (const part of ['title', 'controls'] as const) {
+      const label = document.createElement('label');
+      label.className = 'settings-inline-check';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.dataset.wrapTarget = target.id;
+      input.dataset.wrapPart = part;
+      input.checked = current[target.id]?.[part] !== false;
+      label.append(input, document.createTextNode(part === 'title' ? 'Title' : 'Controls'));
+      row.append(label);
+    }
+
+    fragment.append(row);
+  }
+  el.settingsWidgetWraps.replaceChildren(fragment);
+}
+
+function widgetWrapSettingsFromForm(): WidgetWrapSettings {
+  const settings = normalizeWidgetWrapSettings(state.ideSettings.widgetWrap);
+  for (const input of Array.from(el.settingsWidgetWraps.querySelectorAll<HTMLInputElement>('input[data-wrap-target][data-wrap-part]'))) {
+    const target = input.dataset.wrapTarget as WidgetWrapTargetId;
+    const part = input.dataset.wrapPart as WidgetWrapPart;
+    if (!WIDGET_WRAP_TARGETS.some((item) => item.id === target)) continue;
+    if (part !== 'title' && part !== 'controls') continue;
+    settings[target] = {
+      title: settings[target]?.title !== false,
+      controls: settings[target]?.controls !== false,
+      [part]: input.checked
+    };
+  }
+  return settings;
 }
 
 function renderFontOptions(select: HTMLSelectElement, choices: FontChoice[], activeId: string) {
@@ -2530,7 +2685,8 @@ function saveSettingsFromForm() {
     uiFont: el.settingsUiFont.value,
     monoFont: el.settingsMonoFont.value,
     editorTheme: editorThemeId(el.settingsEditorTheme.value),
-    extraMaskPatterns: el.settingsMaskPatterns.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    extraMaskPatterns: el.settingsMaskPatterns.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+    widgetWrap: widgetWrapSettingsFromForm()
   };
   persistIdeSettings();
   applyIdeSettings();
@@ -2545,12 +2701,29 @@ function applyIdeSettings() {
   setRootStyleProperty('--mono-font', monoFont);
   applyEditorTheme(state.ideSettings.editorTheme);
   configurePrivacyPolicy(state.ideSettings.extraMaskPatterns);
+  applyWidgetWrapSettings();
   for (const pane of state.terminals) {
     pane.term.options.fontFamily = monoFont;
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
   }
   requestCodeEditorMeasure();
+}
+
+function applyWidgetWrapSettings() {
+  state.ideSettings.widgetWrap = normalizeWidgetWrapSettings(state.ideSettings.widgetWrap);
+  for (const panelId of FLOATING_PANELS) {
+    syncWidgetWrapClasses(getPanel(panelId), panelId);
+  }
+  for (const widget of state.terminalWidgets) {
+    syncWidgetWrapClasses(widget.element, 'terminal');
+  }
+}
+
+function syncWidgetWrapClasses(element: HTMLElement, target: WidgetWrapTargetId) {
+  const setting = widgetWrapState(target);
+  toggleClassIfChanged(element, 'widget-title-wrap', setting.title);
+  toggleClassIfChanged(element, 'widget-controls-wrap', setting.controls);
 }
 
 function fontChoice(choices: FontChoice[], id: string) {
@@ -3332,8 +3505,14 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
   tab.dataset.workspaceId = workspace.id;
   if (tab.dataset.renderSignature === signature) return;
   tab.dataset.renderSignature = signature;
-  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${llmState !== 'none' ? ' llm-present' : ''}${llmState === 'working' ? ' llm-working' : ''}`;
-  const llmTitle = llmState === 'working' ? ' - LLM working' : '';
+  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${llmState !== 'none' ? ' llm-present' : ''}${llmState === 'working' ? ' llm-working' : ''}${llmState === 'waiting' ? ' llm-waiting' : ''}`;
+  const llmTitle = llmState === 'waiting'
+    ? ' - LLM waiting for your response'
+    : llmState === 'working'
+      ? ' - LLM working'
+      : llmState === 'idle'
+        ? ' - LLM session present'
+        : '';
   tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${protectedWorkspace ? ' - capture blocked when active' : ''}${llmTitle}`;
   const parts = workspaceTabParts(tab);
   const label = parts.label;
@@ -3610,6 +3789,12 @@ function markWorkspaceLlmActivityForPane(pane: TerminalPane, durationMs = WORKSP
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
 
+function markWorkspaceLlmUserActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_INPUT_ACTIVE_MS) {
+  if (!pane.llmId || !pane.workspaceId) return;
+  clearWorkspaceLlmWaitingForPane(pane);
+  markWorkspaceLlmActivity(pane.workspaceId, durationMs);
+}
+
 function markWorkspaceLlmOutputActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS) {
   // Resize/focus on workspace activation can make some PTYs repaint a prompt. Treat output as
   // "working" only if the launcher/input path already put the pane into an active window.
@@ -3662,18 +3847,25 @@ function clearWorkspaceLlmActivity(workspaceId: string) {
 }
 
 function refreshWorkspaceLlmActivityAfterPaneChange(workspaceId: string) {
-  if (!workspaceId || workspaceHasRunningLlmPane(workspaceId)) return;
-  clearWorkspaceLlmActivity(workspaceId);
+  if (!workspaceId) return;
+  const hadWaiting = clearStaleWorkspaceLlmWaiting(workspaceId);
+  if (!workspaceHasRunningLlmPane(workspaceId)) {
+    clearWorkspaceLlmActivity(workspaceId);
+    clearWorkspaceLlmWaitingForWorkspace(workspaceId);
+    return;
+  }
+  if (hadWaiting) renderWorkspaceLlmActivityTab(workspaceId);
 }
 
 function workspaceLlmActivityIsActive(workspaceId: string) {
   return workspaceLlmIndicatorState(workspaceId) === 'working';
 }
 
-type WorkspaceLlmIndicatorState = 'none' | 'idle' | 'working';
+type WorkspaceLlmIndicatorState = 'none' | 'idle' | 'working' | 'waiting';
 
 function workspaceLlmIndicatorState(workspaceId: string): WorkspaceLlmIndicatorState {
   if (!workspaceHasLlmPane(workspaceId)) return 'none';
+  if (workspaceHasWaitingLlmPane(workspaceId)) return 'waiting';
   return workspaceHasRunningLlmPane(workspaceId) && (workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0) > Date.now()
     ? 'working'
     : 'idle';
@@ -3687,6 +3879,146 @@ function workspaceHasLlmPane(workspaceId: string) {
 
 function workspaceHasRunningLlmPane(workspaceId: string) {
   return state.terminals.some((pane) => pane.workspaceId === workspaceId && Boolean(pane.llmId && pane.backendId));
+}
+
+function workspaceHasWaitingLlmPane(workspaceId: string) {
+  for (const [paneId, waiting] of workspaceLlmWaitingByPaneId) {
+    if (waiting.workspaceId !== workspaceId) continue;
+    const pane = terminalPaneById.get(paneId);
+    if (pane?.workspaceId === workspaceId && pane.llmId && pane.backendId) return true;
+  }
+  return false;
+}
+
+function clearWorkspaceLlmWaitingForPane(pane: TerminalPane) {
+  const hadWaiting = workspaceLlmWaitingByPaneId.delete(pane.paneId);
+  if (hadWaiting) renderWorkspaceLlmActivityTab(pane.workspaceId);
+}
+
+function clearWorkspaceLlmWaitingForWorkspace(workspaceId: string) {
+  let changed = false;
+  for (const [paneId, waiting] of workspaceLlmWaitingByPaneId) {
+    if (waiting.workspaceId !== workspaceId) continue;
+    workspaceLlmWaitingByPaneId.delete(paneId);
+    changed = true;
+  }
+  if (changed) renderWorkspaceLlmActivityTab(workspaceId);
+}
+
+function clearStaleWorkspaceLlmWaiting(workspaceId: string) {
+  let changed = false;
+  for (const [paneId, waiting] of workspaceLlmWaitingByPaneId) {
+    if (waiting.workspaceId !== workspaceId) continue;
+    const pane = terminalPaneById.get(paneId);
+    if (pane?.workspaceId === workspaceId && pane.llmId && pane.backendId) continue;
+    workspaceLlmWaitingByPaneId.delete(paneId);
+    changed = true;
+  }
+  return changed;
+}
+
+function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
+  if (!pane.llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(pane.llmId)) return false;
+  const normalized = normalizeTerminalOutputForLlmWaitingDetection(data);
+  const meaningful = normalized.trim();
+  if (!meaningful) return workspaceLlmWaitingByPaneId.has(pane.paneId);
+  pane.llmWaitingDetectionBuffer = trimLlmWaitingDetectionBuffer(`${pane.llmWaitingDetectionBuffer ?? ''}\n${meaningful}`);
+  const wasWaiting = workspaceLlmWaitingByPaneId.has(pane.paneId);
+  const looksWaiting = llmOutputLooksLikeUserPrompt(pane.llmId, wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer);
+  if (looksWaiting) {
+    markWorkspaceLlmWaitingForPane(pane);
+    return true;
+  }
+  if (wasWaiting) clearWorkspaceLlmWaitingForPane(pane);
+  return false;
+}
+
+function markWorkspaceLlmWaitingForPane(pane: TerminalPane) {
+  if (!pane.llmId || !pane.workspaceId) return;
+  const previousState = workspaceLlmIndicatorState(pane.workspaceId);
+  workspaceLlmWaitingByPaneId.set(pane.paneId, {
+    workspaceId: pane.workspaceId,
+    llmId: pane.llmId,
+    detectedAt: Date.now()
+  });
+  if (workspaceLlmIndicatorState(pane.workspaceId) !== previousState) renderWorkspaceLlmActivityTab(pane.workspaceId);
+}
+
+function workspaceLlmSupportsWaitingDetection(llmId: string) {
+  return llmId === 'codex' || llmId === 'claude' || llmId === 'grok' || llmId === 'antigravity';
+}
+
+function trimLlmWaitingDetectionBuffer(value: string) {
+  return value.length > WORKSPACE_LLM_WAITING_BUFFER_CHARS
+    ? value.slice(value.length - WORKSPACE_LLM_WAITING_BUFFER_CHARS)
+    : value;
+}
+
+function normalizeTerminalOutputForLlmWaitingDetection(data: string) {
+  return data
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, ' ')
+    .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, ' ')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ' ')
+    .replace(/\x1b[()][A-Za-z0-9]/g, ' ')
+    .replace(/\x1b[@-Z\\-_]/g, ' ')
+    .replace(/\r/g, '\n')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
+  if (!text.trim()) return false;
+  const lower = text.toLowerCase();
+  if (!/(amend|answer|approval|approve|choice|choose|confirm|continue|input|option|permission|pick|plan mode|proceed|project|question|reply|requesting permission|request_user_input|respond|select|trust|waiting|yolo|고르|골라|답변|선택|승인|응답|입력|질문|확인)/.test(lower)) {
+    return false;
+  }
+  const genericPromptPatterns = [
+    /\bwaiting for (?:your|user) (?:input|response|reply|answer|confirmation|approval)\b/i,
+    /\bfor your input\b/i,
+    /\b(?:your|user) (?:input|response|reply|answer|confirmation|approval) (?:is )?(?:required|needed|requested)\b/i,
+    /\brequest(?:ed|ing)? user input\b/i,
+    /\b(?:please )?(?:select|choose|pick) (?:one|an option|a choice|an answer)\b/i,
+    /\b(?:answer|respond to|reply to) (?:the )?(?:question|prompt)\b/i,
+    /\bquestion\b[\s\S]{0,420}\b(?:options?|choices?|select|choose|pick|recommended|1[.)])/i,
+    /\bdo you trust the contents of this (?:directory|project)\b/i,
+    /\b(?:trusting the directory|yes,\s*continue|yes,\s*i trust this folder)\b/i,
+    /\bpress enter to (?:continue|confirm)\b/i,
+    /›\s*1\.\s*yes,\s*(?:continue|proceed)/i,
+    />\s*1\.\s*yes\b/i,
+    /\b\d+\s*\([●○]\)\s*yes,\s*(?:proceed|and don't ask again)/i,
+    /\bno,\s*reject\b/i,
+    /\b(?:confirmation|approval|permission) required\b/i,
+    /\brequesting permission for:/i,
+    /\bwould you like to run the following command\b/i,
+    /\b(?:do you want|would you like|should i) .*\b(?:continue|proceed|apply|approve|allow|run)\b/i,
+    /\bdo you want to proceed\?/i,
+    /\b(?:ctrl\+o:yolo|tab amend|esc to cancel)\b/i,
+    /\b(?:continue|proceed|apply|approve|allow|run)\?\b/i,
+    /(?:사용자|유저).{0,24}(?:응답|입력|답변).{0,24}(?:대기|필요|요청)/,
+    /(?:질문|답변).{0,80}(?:선택|고르|골라|응답)/,
+    /(?:선택|고르|골라).{0,30}(?:주세요|십시오|하세요|필요|옵션)/
+  ];
+  if (genericPromptPatterns.some((pattern) => pattern.test(text))) return true;
+  if (llmId === 'codex') {
+    return /\bplan mode\b[\s\S]{0,360}\b(?:question|select|choose|answer|respond|reply|user input|option)\b/i.test(text)
+      || /\brequest_user_input\b/i.test(text)
+      || /\bwhich (?:option|approach|plan)\b/i.test(text);
+  }
+  if (llmId === 'claude') {
+    return /\b(?:allow|approve|confirm) .*\?/i.test(text)
+      || /\b(?:do you want|would you like) .*\b(?:edit|run|proceed|continue|allow|approve)\b/i.test(text);
+  }
+  if (llmId === 'grok') {
+    return /\b(?:ctrl\+o:yolo|yes,\s*proceed|no,\s*reject|select)\b/i.test(text)
+      || /\bexecute .*\b(?:command|tool)\b[\s\S]{0,420}\b\d+\s*\([●○]\)\s*yes\b/i.test(text);
+  }
+  if (llmId === 'antigravity') {
+    return /\bantigravity cli requires permission\b/i.test(text)
+      || /\brequesting permission for:/i.test(text)
+      || /\bdo you want to proceed\?/i.test(text)
+      || /\byes,\s*i trust this folder\b/i.test(text);
+  }
+  return false;
 }
 
 function renderWorkspaceLlmActivityTab(workspaceId: string) {
@@ -4309,6 +4641,7 @@ function createCurrentWorkspaceSnapshot(
     browserConsolePosition: state.browserConsolePosition,
     browserConsoleSize: state.browserConsoleSize,
     browserZoom: state.browserZoom,
+    browserZoomMode: state.browserZoomMode,
     calculatorExpression: state.calculatorExpression,
     calculatorHistory: currentCalculatorHistorySnapshot(),
     explorerOpenMode: state.explorerOpenMode,
@@ -4384,7 +4717,8 @@ function browserTabSnapshot(tab: BrowserTab): BrowserTab {
     label: tab.label,
     deviceId: normalizedBrowserDeviceId(tab.deviceId ?? state.browserDeviceId),
     orientation: normalizedBrowserOrientation(tab.orientation ?? state.browserOrientation),
-    zoom: normalizedBrowserZoom(tab.zoom ?? state.browserZoom)
+    zoom: normalizedBrowserZoom(tab.zoom ?? state.browserZoom),
+    zoomMode: normalizedBrowserZoomMode(tab.zoomMode ?? state.browserZoomMode)
   };
 }
 
@@ -4433,6 +4767,7 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${workspaceSignaturePart(snapshot.browserConsolePosition)}`;
   signature += `|${String(snapshot.browserConsoleSize ?? '')}`;
   signature += `|${String(snapshot.browserZoom ?? '')}`;
+  signature += `|${workspaceSignaturePart(snapshot.browserZoomMode)}`;
   signature += `|${workspaceSignaturePart(snapshot.calculatorExpression)}`;
   signature += `|${calculatorSnapshotHistorySignature(snapshot.calculatorHistory)}`;
   signature += `|${workspaceSignaturePart(snapshot.explorerOpenMode)}`;
@@ -4466,7 +4801,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminal.typingPadOpen ? '1' : '0'},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function terminalGroupsSignature(groups?: WorkspaceTerminalGroupSnapshot[]) {
@@ -4475,7 +4810,7 @@ function terminalGroupsSignature(groups?: WorkspaceTerminalGroupSnapshot[]) {
   for (let index = 0; index < groups.length; index += 1) {
     if (index) signature += ';';
     const group = groups[index];
-    signature += `${workspaceSignaturePart(group.widgetId)},${workspaceSignaturePart(group.groupId)},${workspaceSignaturePart(group.customTitle ?? '')},${group.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(group.activeSnapshotPaneId ?? '')},${terminalGroupSplitSignature(group.root)}`;
+    signature += `${workspaceSignaturePart(group.widgetId)},${workspaceSignaturePart(group.groupId)},${workspaceSignaturePart(group.customTitle ?? '')},${group.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(group.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${workspaceSignaturePart(group.activeSnapshotPaneId ?? '')},${terminalGroupSplitSignature(group.root)}`;
   }
   return signature;
 }
@@ -4533,7 +4868,7 @@ function browserTabSnapshotsSignature(tabs: WorkspaceSnapshot['browserTabs']) {
   for (let index = 0; index < tabs.length; index += 1) {
     const tab = tabs[index];
     if (index) signature += ';';
-    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.url)},${workspaceSignaturePart(tab.label)},${workspaceSignaturePart(tab.deviceId)},${workspaceSignaturePart(tab.orientation)},${workspaceSignaturePart(tab.zoom)}`;
+    signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.url)},${workspaceSignaturePart(tab.label)},${workspaceSignaturePart(tab.deviceId)},${workspaceSignaturePart(tab.orientation)},${workspaceSignaturePart(tab.zoom)},${workspaceSignaturePart(tab.zoomMode)}`;
   }
   return signature;
 }
@@ -4633,6 +4968,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
             groupId: group.groupId,
             customTitle: group.customTitle,
             typingPadOpen: Boolean(widget.typingPadOpen),
+            defaultFocusTarget: widget.defaultFocusTarget,
             activeSnapshotPaneId: group.activePaneId,
             root: groupSnapshotRoot
           });
@@ -4656,6 +4992,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
           profileId: pane.profileId,
           cwd: pane.cwd,
           typingPadOpen: Boolean(widget.typingPadOpen),
+          defaultFocusTarget: widget.defaultFocusTarget,
           rect: elementLayoutRatio(pane.element, { preferCache: true })
         });
       }
@@ -4879,6 +5216,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     noteOpacity = clamp(snapshot.noteOpacity || 100, 45, 100);
     state.browserConsoleSize = clamp(snapshot.browserConsoleSize || 0.34, 0.18, 0.72);
     state.browserZoom = normalizedBrowserZoom(snapshot.browserZoom);
+    state.browserZoomMode = normalizedBrowserZoomMode(snapshot.browserZoomMode);
     state.calculatorExpression = snapshot.calculatorExpression || '';
     state.calculatorHistory = Array.isArray(snapshot.calculatorHistory) ? snapshot.calculatorHistory.slice(0, 20) : [];
     state.calculatorResult = '';
@@ -4999,12 +5337,14 @@ async function restoreWorkspaceTerminals(
       const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
       const widgetKey = terminal.widgetId || crypto.randomUUID();
       const existingWidget = widgetsBySnapshotId.get(widgetKey);
+      const defaultFocusTarget = terminalDefaultFocusTargetFromSnapshot(terminal, snapshot.terminalGroups);
       const terminalOptions: CreateTerminalOptions = {
         focus: false,
         profile: terminalProfile,
         cwd: terminal.cwd || workspaceShellCwd(),
         skipSnapshotSave: true,
-        groupId: terminal.groupId
+        groupId: terminal.groupId,
+        defaultFocusTarget
       };
       const terminalTitle = terminal.title || 'shell';
       // An LLM-launcher terminal (codex/claude/grok button) is restored by spawning a plain shell
@@ -5034,6 +5374,7 @@ async function restoreWorkspaceTerminals(
         restoredPane.typingPadOpen = typingPadOpen;
         const restoredWidget = terminalWidgetForPane(restoredPane);
         if (restoredWidget) {
+          setTerminalWidgetDefaultFocusTarget(restoredWidget, defaultFocusTarget);
           restoredWidget.typingPadOpen = restoredWidget.typingPadOpen || typingPadOpen;
           syncTerminalTypingPadForWidget(restoredWidget);
         }
@@ -5054,7 +5395,13 @@ async function restoreWorkspaceTerminals(
 
   const active = activeWorkspaceTerminalPaneAtClamped(snapshot.activeTerminalIndex || 0);
   if (active) {
-    setActivePane(active.paneId);
+    const widget = terminalWidgetForPane(active);
+    if (widget) {
+      setActivePane(active.paneId, { focus: false });
+      focusTerminalWidgetDefaultTarget(widget, active);
+    } else {
+      setActivePane(active.paneId);
+    }
     bringPanelToFront(active.element);
   } else {
     state.activePaneId = '';
@@ -5076,6 +5423,7 @@ function restoreTerminalGroupLayouts(
   }
   const typingPadOpenByWidgetId = new Map<string, boolean>();
   const typingPadStateKnownWidgetIds = new Set<string>();
+  const defaultFocusTargetByWidgetId = new Map<string, TerminalDefaultFocusTarget>();
   for (const groupSnapshot of snapshot.terminalGroups) {
     const widget = widgetsBySnapshotId.get(groupSnapshot.widgetId);
     if (!widget) continue;
@@ -5084,6 +5432,12 @@ function restoreTerminalGroupLayouts(
       typingPadOpenByWidgetId.set(
         widget.widgetId,
         Boolean(typingPadOpenByWidgetId.get(widget.widgetId) || groupSnapshot.typingPadOpen)
+      );
+    }
+    if (groupSnapshot.defaultFocusTarget) {
+      defaultFocusTargetByWidgetId.set(
+        widget.widgetId,
+        normalizeTerminalDefaultFocusTarget(groupSnapshot.defaultFocusTarget)
       );
     }
     const group = terminalGroupById(widget, groupSnapshot.groupId);
@@ -5108,6 +5462,8 @@ function restoreTerminalGroupLayouts(
       widget.typingPadOpen = Boolean(typingPadOpenByWidgetId.get(widget.widgetId));
       syncTerminalTypingPadOpenToPanes(widget, widget.typingPadOpen);
     }
+    const defaultFocusTarget = defaultFocusTargetByWidgetId.get(widget.widgetId);
+    if (defaultFocusTarget) setTerminalWidgetDefaultFocusTarget(widget, defaultFocusTarget);
     const activeGroup = activeTerminalGroupForWidget(widget);
     if (activeGroup) {
       widget.activeGroupId = activeGroup.groupId;
@@ -6486,6 +6842,10 @@ function normalizedBrowserZoom(value: unknown) {
   return clamp(Number.isFinite(zoom) ? zoom : 1, BROWSER_ZOOM_LEVELS[0], BROWSER_ZOOM_LEVELS[BROWSER_ZOOM_LEVELS.length - 1]);
 }
 
+function normalizedBrowserZoomMode(value: unknown): BrowserZoomMode {
+  return value === 'fit' ? 'fit' : 'manual';
+}
+
 function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
   const browserVisible = !isBrowserPanelHidden();
@@ -6531,8 +6891,9 @@ function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRunt
   const fallbackDeviceId = normalizedBrowserDeviceId(snapshot.browserDeviceId);
   const fallbackOrientation = normalizedBrowserOrientation(snapshot.browserOrientation);
   const fallbackZoom = normalizedBrowserZoom(snapshot.browserZoom);
+  const fallbackZoomMode = normalizedBrowserZoomMode(snapshot.browserZoomMode);
   if (runtime?.browserTabs.length) {
-    for (const tab of runtime.browserTabs) tabs.push(normalizeBrowserTabForCurrentMode(tab, fallbackDeviceId, fallbackOrientation, fallbackZoom));
+    for (const tab of runtime.browserTabs) tabs.push(normalizeBrowserTabForCurrentMode(tab, fallbackDeviceId, fallbackOrientation, fallbackZoom, fallbackZoomMode));
     return tabs;
   }
   if (!Array.isArray(snapshot.browserTabs)) return tabs;
@@ -6544,8 +6905,9 @@ function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRunt
       label: tab.label || browserTabLabel(tab.url),
       deviceId: tab.deviceId,
       orientation: tab.orientation,
-      zoom: tab.zoom
-    }, fallbackDeviceId, fallbackOrientation, fallbackZoom));
+      zoom: tab.zoom,
+      zoomMode: tab.zoomMode
+    }, fallbackDeviceId, fallbackOrientation, fallbackZoom, fallbackZoomMode));
   }
   return tabs;
 }
@@ -6579,12 +6941,14 @@ function normalizeBrowserTabForCurrentMode(
   tab: BrowserTab,
   fallbackDeviceId = state.browserDeviceId,
   fallbackOrientation = state.browserOrientation,
-  fallbackZoom = state.browserZoom
+  fallbackZoom = state.browserZoom,
+  fallbackZoomMode = state.browserZoomMode
 ): BrowserTab {
   const normalized = { ...tab };
   normalized.deviceId = normalizedBrowserDeviceId(normalized.deviceId ?? fallbackDeviceId);
   normalized.orientation = normalizedBrowserOrientation(normalized.orientation ?? fallbackOrientation);
   normalized.zoom = normalizedBrowserZoom(normalized.zoom ?? fallbackZoom);
+  normalized.zoomMode = normalizedBrowserZoomMode(normalized.zoomMode ?? fallbackZoomMode);
   if (!USE_EDGE_CDP_BROWSER) normalized.edge = undefined;
   if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(normalized.url)) {
     normalized.frameUrl = undefined;
@@ -6738,9 +7102,11 @@ function bindEvents() {
   el.imagePreviewStage.addEventListener('dblclick', fitActiveImagePreview);
   el.imagePreview.addEventListener('dragstart', (event) => event.preventDefault());
   el.imagePreview.addEventListener('load', () => {
-    clampImagePreviewPan();
-    applyImagePreviewTransform();
+    invalidateImagePreviewLayout();
   });
+  imagePreviewResizeObserver?.disconnect();
+  imagePreviewResizeObserver = new ResizeObserver(invalidateImagePreviewLayout);
+  imagePreviewResizeObserver.observe(el.imagePreviewStage);
   for (const button of el.llmButtons) {
     button.addEventListener('click', () => launchLlm(button.dataset.llm ?? 'llm'));
   }
@@ -6818,6 +7184,10 @@ function bindEvents() {
     else setBrowserDevice(el.deviceSelect.value);
   });
   el.rotateDevice.addEventListener('click', rotateBrowserDevice);
+  el.browserZoomFit.addEventListener('click', () => fitBrowserZoom());
+  el.browserZoomOut.addEventListener('click', () => resizeBrowserZoom(-1));
+  el.browserZoomReset.addEventListener('click', resetBrowserZoom);
+  el.browserZoomIn.addEventListener('click', () => resizeBrowserZoom(1));
   el.browserConsoleToggle.addEventListener('click', () => setBrowserConsoleVisible(!state.browserConsoleVisible));
   el.browserConsolePosition.addEventListener('change', () => setBrowserConsolePosition(el.browserConsolePosition.value as BrowserConsolePosition));
   el.browserConsoleResizer.addEventListener('pointerdown', startBrowserConsoleResize);
@@ -7691,6 +8061,7 @@ function applyNoteOpacity() {
 }
 
 function resizeBrowserZoom(direction: number) {
+  state.browserZoomMode = 'manual';
   state.browserZoom = nextBrowserZoom(state.browserZoom, direction);
   syncActiveBrowserTabViewport();
   applyBrowserZoom();
@@ -7699,11 +8070,56 @@ function resizeBrowserZoom(direction: number) {
 }
 
 function resetBrowserZoom() {
+  state.browserZoomMode = 'manual';
   state.browserZoom = 1;
   syncActiveBrowserTabViewport();
   applyBrowserZoom();
   setStatus('Browser zoom 100%');
   saveActiveWorkspaceSnapshot();
+}
+
+function fitBrowserZoom(options: { silent?: boolean; skipSave?: boolean } = {}) {
+  state.browserZoomMode = 'fit';
+  refreshBrowserFitZoom(options);
+}
+
+function refreshBrowserFitZoom(options: { silent?: boolean; skipSave?: boolean } = {}) {
+  const nextZoom = browserFitZoom();
+  state.browserZoom = nextZoom;
+  syncActiveBrowserTabViewport();
+  applyBrowserZoom();
+  if (!options.silent) setStatus(`Browser fit ${Math.round(nextZoom * 100)}%`);
+  if (!options.skipSave) saveActiveWorkspaceSnapshot();
+}
+
+function scheduleBrowserFitZoomRefresh(options: { skipSave?: boolean } = {}) {
+  if (state.browserZoomMode !== 'fit' || browserFitZoomFrame) return;
+  browserFitZoomFrame = requestAnimationFrame(() => {
+    browserFitZoomFrame = 0;
+    if (state.browserZoomMode !== 'fit') return;
+    refreshBrowserFitZoom({ silent: true, skipSave: options.skipSave });
+  });
+}
+
+function browserFitZoom() {
+  if (el.browserShell.classList.contains('desktop')) return 1;
+  if (isBrowserPanelHidden() || !el.browserShell.clientWidth || !el.browserShell.clientHeight) {
+    return normalizedBrowserZoom(state.browserZoom);
+  }
+  const viewport = browserPreviewViewportSize();
+  const available = browserShellContentSize();
+  const fit = Math.min(available.width / viewport.width, available.height / viewport.height);
+  return normalizedBrowserZoom(fit);
+}
+
+function browserShellContentSize() {
+  const style = getComputedStyle(el.browserShell);
+  const horizontalPadding = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+  const verticalPadding = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+  return {
+    width: Math.max(1, el.browserShell.clientWidth - (Number.isFinite(horizontalPadding) ? horizontalPadding : 0)),
+    height: Math.max(1, el.browserShell.clientHeight - (Number.isFinite(verticalPadding) ? verticalPadding : 0))
+  };
 }
 
 function nextBrowserZoom(current: number, direction: number) {
@@ -7719,9 +8135,33 @@ function nextBrowserZoom(current: number, direction: number) {
 
 function applyBrowserZoom() {
   setRootStyleProperty('--browser-preview-zoom', state.browserZoom.toFixed(2));
+  syncBrowserZoomControls();
+  syncBrowserPreviewScaleBox();
   applyBrowserFrameSizingForActiveFrame();
   applyEdgePreviewSizing();
   scheduleConfigureEdgeViewport();
+}
+
+function syncBrowserZoomControls() {
+  const zoomLabel = `${Math.round(normalizedBrowserZoom(state.browserZoom) * 100)}%`;
+  setElementTextIfChanged(el.browserZoomReset, zoomLabel);
+  setAttributeIfChanged(el.browserZoomReset, 'title', `Reset browser preview zoom (currently ${zoomLabel})`);
+  toggleClassIfChanged(el.browserZoomFit, 'active', state.browserZoomMode === 'fit');
+  setAttributeIfChanged(el.browserZoomFit, 'aria-pressed', state.browserZoomMode === 'fit' ? 'true' : 'false');
+}
+
+function syncBrowserPreviewScaleBox() {
+  if (el.browserShell.classList.contains('desktop')) {
+    if (el.browserPreviewScaleBox.style.width) el.browserPreviewScaleBox.style.width = '';
+    if (el.browserPreviewScaleBox.style.height) el.browserPreviewScaleBox.style.height = '';
+    return;
+  }
+  const viewport = browserPreviewViewportSize();
+  const zoom = normalizedBrowserZoom(state.browserZoom);
+  const width = `${Math.max(1, Math.round(viewport.width * zoom))}px`;
+  const height = `${Math.max(1, Math.round(viewport.height * zoom))}px`;
+  if (el.browserPreviewScaleBox.style.width !== width) el.browserPreviewScaleBox.style.width = width;
+  if (el.browserPreviewScaleBox.style.height !== height) el.browserPreviewScaleBox.style.height = height;
 }
 
 function resizeCalculatorFont(direction: number) {
@@ -7833,8 +8273,9 @@ function currentWidgetFocusIndex(items: WidgetFocusItem[], fromPaneId: string) {
 function focusWidget(item: WidgetFocusItem) {
   bringPanelToFront(item.element);
   if (item.kind === 'terminal') {
-    setActivePane(item.pane.paneId);
-    item.pane.term.focus();
+    const widget = terminalWidgetForPane(item.pane);
+    if (widget) focusTerminalWidgetDefaultTarget(widget, item.pane);
+    else setActivePane(item.pane.paneId);
     setStatus(`Focused ${item.pane.title}`);
     return;
   }
@@ -7963,6 +8404,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     if (id === 'image' && wasHidden && !restoringWorkspace) {
       renderImageTabs();
       renderImagePreview();
+      invalidateImagePreviewLayout();
       renderImageHistory();
     }
     if (id === 'calculator' && wasHidden && !restoringWorkspace) renderCalculator();
@@ -8462,6 +8904,9 @@ async function closeAllTerminals() {
     widget.element.remove();
   }
   for (const workspaceId of [...workspaceLlmActivityExpiresAt.keys()]) clearWorkspaceLlmActivity(workspaceId);
+  const waitingWorkspaceIds = new Set([...workspaceLlmWaitingByPaneId.values()].map((waiting) => waiting.workspaceId));
+  workspaceLlmWaitingByPaneId.clear();
+  for (const workspaceId of waitingWorkspaceIds) renderWorkspaceLlmActivityTab(workspaceId);
   syncActivePaneClass();
   renderShellTabs();
 }
@@ -8568,8 +9013,10 @@ async function flushTerminalInput(pane: TerminalPane): Promise<void> {
 
 function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined) {
   if (pane.backendId) terminalPaneByBackendId.delete(pane.backendId);
+  if (!backendId) clearWorkspaceLlmWaitingForPane(pane);
   pane.backendId = backendId;
   pane.backendOutputChars = 0;
+  if (backendId) pane.llmWaitingDetectionBuffer = '';
   if (backendId) terminalPaneByBackendId.set(backendId, pane);
 }
 
@@ -12994,13 +13441,18 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   typePadToggle.setAttribute('aria-label', 'Toggle typing pad');
   typePadToggle.setAttribute('aria-pressed', 'false');
   typePadToggle.textContent = 'Type';
+  const typePadFocusToggle = document.createElement('button');
+  typePadFocusToggle.className = 'terminal-type-focus-toggle';
+  typePadFocusToggle.type = 'button';
+  typePadFocusToggle.title = 'Default focus target when this shell widget is selected';
+  typePadFocusToggle.setAttribute('aria-label', 'Toggle default terminal focus target');
   const closeButton = document.createElement('button');
   closeButton.className = 'close-pane';
   closeButton.type = 'button';
   closeButton.title = 'Close shell widget';
   closeButton.setAttribute('aria-label', 'Close shell widget');
   closeButton.textContent = 'x';
-  titlebar.append(focusDot, titleEl, cwdEl, spacer, typePadToggle, closeButton);
+  titlebar.append(focusDot, titleEl, cwdEl, spacer, typePadToggle, typePadFocusToggle, closeButton);
 
   const tabbar = document.createElement('div');
   tabbar.className = 'terminal-widget-tabbar';
@@ -13050,13 +13502,15 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     tabList,
     hostStack,
     typePadToggle,
+    typePadFocusToggle,
     typePad,
     typePadInput,
     typePadPaste,
     tabGroups: [],
     activeGroupId: '',
     activePaneId: '',
-    typingPadOpen: false
+    typingPadOpen: false,
+    defaultFocusTarget: normalizeTerminalDefaultFocusTarget(options.defaultFocusTarget)
   };
   state.terminalWidgets.push(widget);
   terminalWidgetById.set(widget.widgetId, widget);
@@ -13066,7 +13520,17 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   card.addEventListener('pointerdown', (event) => {
     const pane = terminalPaneForWidgetPointerTarget(widget, event.target) ?? activePaneForWidget(widget);
     const fromTypePad = event.target instanceof Element && Boolean(event.target.closest('.terminal-type-pad'));
-    if (pane) setActivePane(pane.paneId, { focus: !fromTypePad });
+    const fromShell = event.target instanceof Element && Boolean(event.target.closest('.terminal-host'));
+    if (pane) {
+      if (fromTypePad) {
+        setActivePane(pane.paneId, { focus: false });
+      } else if (fromShell) {
+        setActivePane(pane.paneId);
+      } else {
+        setActivePane(pane.paneId, { focus: false });
+        focusTerminalWidgetDefaultTarget(widget, pane);
+      }
+    }
     bringPanelToFront(card);
   });
   titlebar.addEventListener('pointerdown', (event) => startPanelDrag(event, card));
@@ -13081,6 +13545,11 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     event.stopPropagation();
     toggleTerminalTypingPad(widget);
   });
+  typePadFocusToggle.addEventListener('pointerdown', (event) => event.stopPropagation());
+  typePadFocusToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleTerminalWidgetDefaultFocusTarget(widget);
+  });
   typePadInput.addEventListener('input', () => updateTerminalTypingPadDraft(widget));
   typePadInput.addEventListener('focus', () => setTerminalTextTarget('typing-pad'));
   typePadInput.addEventListener('keydown', (event) => handleTerminalTypingPadKey(event, widget));
@@ -13090,7 +13559,81 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     void createShellTabInWidget(widget);
   });
 
+  syncTerminalDefaultFocusControls(widget);
+  syncWidgetWrapClasses(widget.element, 'terminal');
   return widget;
+}
+
+function normalizeTerminalDefaultFocusTarget(value: unknown): TerminalDefaultFocusTarget {
+  return value === 'typing-pad' ? 'typing-pad' : DEFAULT_TERMINAL_FOCUS_TARGET;
+}
+
+function terminalDefaultFocusTargetFromSnapshot(
+  terminal: WorkspaceTerminalSnapshot,
+  groups?: WorkspaceTerminalGroupSnapshot[]
+) {
+  if (terminal.defaultFocusTarget) return normalizeTerminalDefaultFocusTarget(terminal.defaultFocusTarget);
+  if (terminal.widgetId && groups?.length) {
+    const exactGroup = groups.find((group) =>
+      group.widgetId === terminal.widgetId
+      && group.defaultFocusTarget
+      && (!terminal.groupId || group.groupId === terminal.groupId)
+    );
+    if (exactGroup?.defaultFocusTarget) return normalizeTerminalDefaultFocusTarget(exactGroup.defaultFocusTarget);
+    const widgetGroup = groups.find((group) => group.widgetId === terminal.widgetId && group.defaultFocusTarget);
+    if (widgetGroup?.defaultFocusTarget) return normalizeTerminalDefaultFocusTarget(widgetGroup.defaultFocusTarget);
+  }
+  return DEFAULT_TERMINAL_FOCUS_TARGET;
+}
+
+function terminalDefaultFocusTargetLabel(target: TerminalDefaultFocusTarget) {
+  return target === 'typing-pad' ? 'Type' : 'Shell';
+}
+
+function syncTerminalDefaultFocusControls(widget: TerminalWidget) {
+  const target = normalizeTerminalDefaultFocusTarget(widget.defaultFocusTarget);
+  widget.defaultFocusTarget = target;
+  widget.typePadFocusToggle.textContent = `Focus: ${terminalDefaultFocusTargetLabel(target)}`;
+  widget.typePadFocusToggle.title = target === 'typing-pad'
+    ? 'Default focus: Type pad when this widget is selected (falls back to shell while Type pad is closed)'
+    : 'Default focus: shell when this widget is selected';
+  widget.typePadFocusToggle.setAttribute('aria-pressed', target === 'typing-pad' ? 'true' : 'false');
+  widget.typePadFocusToggle.dataset.focusTarget = target;
+  toggleClassIfChanged(widget.typePadFocusToggle, 'typing-pad', target === 'typing-pad');
+}
+
+function setTerminalWidgetDefaultFocusTarget(
+  widget: TerminalWidget,
+  target: TerminalDefaultFocusTarget,
+  options: { persist?: boolean } = {}
+) {
+  const nextTarget = normalizeTerminalDefaultFocusTarget(target);
+  const previousTarget = normalizeTerminalDefaultFocusTarget(widget.defaultFocusTarget);
+  widget.defaultFocusTarget = nextTarget;
+  syncTerminalDefaultFocusControls(widget);
+  if (options.persist && previousTarget !== nextTarget) saveTerminalDefaultFocusSnapshot();
+}
+
+function toggleTerminalWidgetDefaultFocusTarget(widget: TerminalWidget) {
+  const nextTarget = widget.defaultFocusTarget === 'typing-pad' ? 'shell' : 'typing-pad';
+  bringPanelToFront(widget.element);
+  setTerminalWidgetDefaultFocusTarget(widget, nextTarget, { persist: true });
+  focusTerminalWidgetDefaultTarget(widget);
+  setStatus(`Default focus: ${terminalDefaultFocusTargetLabel(nextTarget)}`);
+}
+
+function focusTerminalWidgetDefaultTarget(widget: TerminalWidget, pane = activePaneForWidget(widget)) {
+  if (!pane) return;
+  if (widget.defaultFocusTarget === 'typing-pad' && terminalTypingPadIsOpen(widget)) {
+    setActivePane(pane.paneId, { focus: false });
+    focusTerminalTypingPadWhenReady(widget);
+    return;
+  }
+  setActivePane(pane.paneId);
+}
+
+function saveTerminalDefaultFocusSnapshot() {
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'flush' });
 }
 
 function updateTerminalTypingPadDraft(widget: TerminalWidget) {
@@ -13205,7 +13748,7 @@ async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
   }
   try {
     markTerminalUserInput(pane);
-    markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
+    markWorkspaceLlmUserActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
     await sendTerminalInputNow(pane, terminalPastePayload(value));
     pane.typingPadDraft = '';
     widget.typePadInput.value = '';
@@ -13896,13 +14439,13 @@ function terminalWidgetTabElement(widget: TerminalWidget, groupId: string) {
   const labelButton = document.createElement('button');
   labelButton.className = 'widget-tab-label';
   labelButton.type = 'button';
+  labelButton.addEventListener('pointerdown', (event) => event.stopPropagation());
   labelButton.addEventListener('click', () => {
     const group = terminalGroupById(widget, item.dataset.groupId ?? '');
     const pane = activePaneForTerminalGroup(group);
     if (!pane) return;
-    setActivePane(pane.paneId);
     bringPanelToFront(pane.element);
-    pane.term.focus();
+    focusTerminalWidgetDefaultTarget(widget, pane);
   });
   labelButton.addEventListener('dblclick', (event) => {
     event.preventDefault();
@@ -13923,6 +14466,7 @@ function terminalWidgetTabElement(widget: TerminalWidget, groupId: string) {
   closeButton.title = 'Close shell';
   closeButton.setAttribute('aria-label', 'Close shell');
   closeButton.textContent = 'x';
+  closeButton.addEventListener('pointerdown', (event) => event.stopPropagation());
   closeButton.addEventListener('click', (event) => {
     event.stopPropagation();
     const groupId = item.dataset.groupId ?? '';
@@ -14471,7 +15015,7 @@ function markTerminalUserInput(pane: TerminalPane) {
 
 function markWorkspaceLlmInputActivityForPane(pane: TerminalPane, data: string) {
   if (!terminalInputCountsAsWorkspaceLlmActivity(data)) return;
-  markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
+  markWorkspaceLlmUserActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
 }
 
 function terminalInputCountsAsWorkspaceLlmActivity(data: string) {
@@ -14655,7 +15199,7 @@ async function pasteTerminalText(pane: TerminalPane, text?: string) {
     if (!value) return;
     setTerminalTextTarget('shell');
     markTerminalUserInput(pane);
-    markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
+    markWorkspaceLlmUserActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
     await sendTerminalInputNow(pane, terminalPastePayload(value));
   } catch (error) {
     setStatus(`Failed to paste terminal text: ${String(error)}`, true);
@@ -14795,7 +15339,11 @@ function focusActiveTerminalPaneWhenItOwnsKeyboard() {
   if (!pane) return;
   if (keyboardResizeTarget.kind !== 'terminal' || keyboardResizeTarget.paneId !== pane.paneId) return;
   const widget = terminalWidgetForPane(pane);
-  if (widget && terminalTextTarget === 'typing-pad' && terminalTypingPadIsOpen(widget)) {
+  if (
+    widget
+    && terminalTypingPadIsOpen(widget)
+    && (terminalTextTarget === 'typing-pad' || widget.defaultFocusTarget === 'typing-pad')
+  ) {
     focusTerminalTypingPadWhenReady(widget);
     return;
   }
@@ -15267,6 +15815,8 @@ function renderImagePreview() {
   imagePreviewRenderedDataUrl = dataUrl;
   if (labelChanged) setTextContentIfChanged(el.imageLabel, label);
   if (dataChanged) {
+    imagePreviewRenderedTransform = '\0';
+    syncImagePreviewBaseSize(null);
     if (dataUrl) el.imagePreview.src = dataUrl;
     else if (el.imagePreview.hasAttribute('src')) el.imagePreview.removeAttribute('src');
   }
@@ -15288,6 +15838,51 @@ function imagePreviewTransformSignature() {
   return `${normalizedImageZoom(state.imagePreviewZoom).toFixed(4)}:${Math.round(state.imagePreviewOffsetX)}:${Math.round(state.imagePreviewOffsetY)}`;
 }
 
+function imagePreviewMetrics(zoom = normalizedImageZoom(state.imagePreviewZoom)): ImagePreviewMetrics | null {
+  const stageRect = el.imagePreviewStage.getBoundingClientRect();
+  const stageWidth = stageRect.width;
+  const stageHeight = stageRect.height;
+  const naturalWidth = el.imagePreview.naturalWidth;
+  const naturalHeight = el.imagePreview.naturalHeight;
+  if (!(stageWidth > 0) || !(stageHeight > 0) || !(naturalWidth > 0) || !(naturalHeight > 0)) return null;
+
+  const containScale = Math.min(stageWidth / naturalWidth, stageHeight / naturalHeight);
+  if (!(containScale > 0)) return null;
+
+  const baseWidth = naturalWidth * containScale;
+  const baseHeight = naturalHeight * containScale;
+  return {
+    stageWidth,
+    stageHeight,
+    naturalWidth,
+    naturalHeight,
+    containScale,
+    baseWidth,
+    baseHeight,
+    renderedWidth: baseWidth * zoom,
+    renderedHeight: baseHeight * zoom
+  };
+}
+
+function imagePreviewPanBounds(metrics: ImagePreviewMetrics) {
+  return {
+    maxX: Math.max(0, (metrics.renderedWidth - metrics.stageWidth) / 2),
+    maxY: Math.max(0, (metrics.renderedHeight - metrics.stageHeight) / 2)
+  };
+}
+
+function syncImagePreviewBaseSize(metrics: ImagePreviewMetrics | null) {
+  const width = metrics ? `${metrics.baseWidth.toFixed(2)}px` : '';
+  const height = metrics ? `${metrics.baseHeight.toFixed(2)}px` : '';
+  if (el.imagePreview.style.width !== width) el.imagePreview.style.width = width;
+  if (el.imagePreview.style.height !== height) el.imagePreview.style.height = height;
+}
+
+function invalidateImagePreviewLayout() {
+  imagePreviewRenderedTransform = '\0';
+  applyImagePreviewTransform();
+}
+
 function resetImageTabView(tab: ImageTabState) {
   tab.zoom = 1;
   tab.offsetX = 0;
@@ -15300,6 +15895,7 @@ function fitActiveImagePreview() {
   state.imagePreviewOffsetY = 0;
   syncActiveImageTabFromState();
   renderImagePreview();
+  invalidateImagePreviewLayout();
   saveActiveWorkspaceSnapshot();
 }
 
@@ -15309,19 +15905,18 @@ function fitActiveImagePreview() {
 // the user drag along it.
 function fitImagePreviewToAxis(axis: 'width' | 'height') {
   if (!state.imagePreviewDataUrl) return;
-  const rect = el.imagePreviewStage.getBoundingClientRect();
-  const imgW = el.imagePreview.naturalWidth;
-  const imgH = el.imagePreview.naturalHeight;
-  if (!rect.width || !rect.height || !imgW || !imgH) return;
-  const containScale = Math.min(rect.width / imgW, rect.height / imgH);
-  if (!(containScale > 0)) return;
-  const targetScale = axis === 'width' ? rect.width / imgW : rect.height / imgH;
-  state.imagePreviewZoom = normalizedImageZoom(targetScale / containScale);
+  const metrics = imagePreviewMetrics(1);
+  if (!metrics) return;
+  const targetScale = axis === 'width'
+    ? metrics.stageWidth / metrics.naturalWidth
+    : metrics.stageHeight / metrics.naturalHeight;
+  state.imagePreviewZoom = normalizedImageZoom(targetScale / metrics.containScale);
   state.imagePreviewOffsetX = 0;
   state.imagePreviewOffsetY = 0;
   clampImagePreviewPan();
   syncActiveImageTabFromState();
   renderImagePreview();
+  invalidateImagePreviewLayout();
   saveActiveWorkspaceSnapshot();
 }
 
@@ -15452,17 +16047,14 @@ function endImagePreviewDrag(pointerId: number, options: { save: boolean }) {
 function clampImagePreviewPan() {
   const zoom = normalizedImageZoom(state.imagePreviewZoom);
   state.imagePreviewZoom = zoom;
-  if (zoom <= 1 || !el.imagePreview.naturalWidth || !el.imagePreview.naturalHeight) {
+  if (zoom <= 1) {
     state.imagePreviewOffsetX = 0;
     state.imagePreviewOffsetY = 0;
     return;
   }
-  const rect = el.imagePreviewStage.getBoundingClientRect();
-  const fitScale = Math.min(rect.width / el.imagePreview.naturalWidth, rect.height / el.imagePreview.naturalHeight);
-  const renderedWidth = el.imagePreview.naturalWidth * fitScale * zoom;
-  const renderedHeight = el.imagePreview.naturalHeight * fitScale * zoom;
-  const maxX = Math.max(0, (renderedWidth - rect.width) / 2);
-  const maxY = Math.max(0, (renderedHeight - rect.height) / 2);
+  const metrics = imagePreviewMetrics(zoom);
+  if (!metrics) return;
+  const { maxX, maxY } = imagePreviewPanBounds(metrics);
   state.imagePreviewOffsetX = clamp(state.imagePreviewOffsetX, -maxX, maxX);
   state.imagePreviewOffsetY = clamp(state.imagePreviewOffsetY, -maxY, maxY);
 }
@@ -15470,10 +16062,13 @@ function clampImagePreviewPan() {
 function applyImagePreviewTransform() {
   clampImagePreviewPan();
   const zoom = normalizedImageZoom(state.imagePreviewZoom);
+  const metrics = state.imagePreviewDataUrl ? imagePreviewMetrics(zoom) : null;
+  syncImagePreviewBaseSize(metrics);
   imagePreviewRenderedTransform = imagePreviewTransformSignature();
   const transform = `translate3d(${state.imagePreviewOffsetX.toFixed(1)}px, ${state.imagePreviewOffsetY.toFixed(1)}px, 0) scale(${zoom.toFixed(4)})`;
   if (el.imagePreview.style.transform !== transform) el.imagePreview.style.transform = transform;
-  toggleClassIfChanged(el.imagePreviewStage, 'zoomed', zoom > 1 && Boolean(state.imagePreviewDataUrl));
+  const panBounds = metrics ? imagePreviewPanBounds(metrics) : null;
+  toggleClassIfChanged(el.imagePreviewStage, 'zoomed', panBounds !== null && (panBounds.maxX > 0.5 || panBounds.maxY > 0.5));
   el.imageFit.disabled = !state.imagePreviewDataUrl || (zoom === 1 && state.imagePreviewOffsetX === 0 && state.imagePreviewOffsetY === 0);
   el.imageFitWidth.disabled = !state.imagePreviewDataUrl;
   el.imageFitHeight.disabled = !state.imagePreviewDataUrl;
@@ -15851,7 +16446,8 @@ async function canUseDirectLocalPreview(url: string) {
 
 function handleTerminalData(pane: TerminalPane, data: string) {
   pane.backendOutputChars += data.length;
-  markWorkspaceLlmOutputActivityForPane(pane, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, data);
+  if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
   const visibility = enqueueTerminalWrite(pane, data);
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
@@ -16819,7 +17415,7 @@ function ensureBrowserFrame(tab: BrowserTab) {
     'display-capture'
   ].join('; ');
   bindBrowserFrameEvents(frame);
-  if (!frame.parentElement) el.browserShell.append(frame);
+  if (!frame.parentElement) el.browserPreviewScaleBox.append(frame);
   applyBrowserFrameSizing(frame);
   return frame;
 }
@@ -17493,7 +18089,7 @@ async function configureEdgeViewport(cdp = activeEdgeCdp) {
   }, cdp);
 }
 
-function edgePreviewViewportSize() {
+function browserPreviewViewportSize() {
   if (el.browserShell.classList.contains('device')) {
     const preset = browserDevicePreset();
     const portrait = state.browserOrientation === 'portrait';
@@ -17508,6 +18104,10 @@ function edgePreviewViewportSize() {
   };
 }
 
+function edgePreviewViewportSize() {
+  return browserPreviewViewportSize();
+}
+
 function applyEdgePreviewSizing() {
   if (el.browserShell.classList.contains('desktop')) {
     el.edgePreviewCanvas.style.width = '';
@@ -17515,9 +18115,8 @@ function applyEdgePreviewSizing() {
     return;
   }
   const { width, height } = edgePreviewViewportSize();
-  const zoom = normalizedBrowserZoom(state.browserZoom);
-  el.edgePreviewCanvas.style.width = `${Math.max(1, Math.round(width / zoom))}px`;
-  el.edgePreviewCanvas.style.height = `${Math.max(1, Math.round(height / zoom))}px`;
+  el.edgePreviewCanvas.style.width = `${Math.max(1, Math.round(width))}px`;
+  el.edgePreviewCanvas.style.height = `${Math.max(1, Math.round(height))}px`;
 }
 
 function bindEdgePreviewInput() {
@@ -17564,7 +18163,11 @@ function bindEdgePreviewInput() {
     event.stopPropagation();
     showContextMenu(event.clientX, event.clientY, browserContextMenuItems());
   });
-  edgePreviewResizeObserver = new ResizeObserver(scheduleConfigureEdgeViewport);
+  edgePreviewResizeObserver = new ResizeObserver(() => {
+    if (state.browserZoomMode === 'fit') refreshBrowserFitZoom({ silent: true, skipSave: true });
+    else syncBrowserPreviewScaleBox();
+    scheduleConfigureEdgeViewport();
+  });
   edgePreviewResizeObserver.observe(el.browserShell);
 }
 
@@ -17860,6 +18463,7 @@ function openBrowserTab(url: string, label = browserTabLabel(url), frameUrl = ur
     deviceId: state.browserDeviceId,
     orientation: state.browserOrientation,
     zoom: state.browserZoom,
+    zoomMode: state.browserZoomMode,
     frameUrl
   };
   const index = state.browserTabs.length;
@@ -18231,6 +18835,7 @@ function setBrowserConsoleVisible(
     setAttributeIfChanged(el.browserConsoleToggle, 'aria-pressed', String(visible));
   }
   applyBrowserConsoleSize();
+  scheduleBrowserFitZoomRefresh({ skipSave: options.skipSave });
   if (changed && !options.skipFrameSync) syncBrowserConsoleCaptureForActiveFrame();
   if (visible && browserConsoleHiddenPayloadQueue.length) {
     if (options.deferHiddenFlush) scheduleBrowserConsoleHiddenPayloadFlush();
@@ -18255,6 +18860,7 @@ function setBrowserConsolePosition(
     setBrowserConsolePositionClass(className);
   }
   applyBrowserConsoleSize();
+  scheduleBrowserFitZoomRefresh({ skipSave: options.skipSave });
   if (changed && state.browserConsoleVisible && !options.skipLog) logBrowserConsole('info', `Console moved to ${position}`);
   if (changed && !options.skipSave) saveActiveWorkspaceSnapshot();
 }
@@ -18310,6 +18916,7 @@ function startBrowserConsoleResize(event: PointerEvent) {
           : (moveEvent.clientX - rect.left) / workspaceWidth;
     state.browserConsoleSize = clamp(raw, 0.18, 0.72);
     applyBrowserConsoleSize();
+    scheduleBrowserFitZoomRefresh({ skipSave: true });
   };
   const up = (upEvent: PointerEvent) => {
     if (upEvent.pointerId !== event.pointerId) return;
@@ -19283,12 +19890,15 @@ function applyBrowserViewportFromTab(tab: BrowserTab | null | undefined, options
   state.browserDeviceId = normalizedBrowserDeviceId(tab?.deviceId ?? state.browserDeviceId);
   state.browserOrientation = normalizedBrowserOrientation(tab?.orientation ?? state.browserOrientation);
   state.browserZoom = normalizedBrowserZoom(tab?.zoom ?? state.browserZoom);
+  state.browserZoomMode = normalizedBrowserZoomMode(tab?.zoomMode ?? state.browserZoomMode);
   if (tab) {
     tab.deviceId = state.browserDeviceId;
     tab.orientation = state.browserOrientation;
     tab.zoom = state.browserZoom;
+    tab.zoomMode = state.browserZoomMode;
   }
-  applyBrowserZoom();
+  if (state.browserZoomMode === 'fit') refreshBrowserFitZoom({ silent: true, skipSave: true });
+  else applyBrowserZoom();
   if (state.browserDeviceId === 'desktop') {
     setBrowserMode('desktop', { skipFrameSizing: options.skipFrameSizing, skipSave: true });
   } else {
@@ -19302,6 +19912,7 @@ function syncActiveBrowserTabViewport() {
   tab.deviceId = state.browserDeviceId;
   tab.orientation = state.browserOrientation;
   tab.zoom = state.browserZoom;
+  tab.zoomMode = state.browserZoomMode;
 }
 
 function setBrowserMode(mode: 'desktop' | 'device', options: { skipFrameSizing?: boolean; skipSave?: boolean } = {}) {
@@ -19316,6 +19927,11 @@ function setBrowserMode(mode: 'desktop' | 'device', options: { skipFrameSizing?:
 
   if (isDesktop) {
     if (el.deviceSelect.value !== 'desktop') el.deviceSelect.value = 'desktop';
+    if (state.browserZoomMode === 'fit') {
+      state.browserZoom = 1;
+      syncActiveBrowserTabViewport();
+      applyBrowserZoom();
+    }
     if (!options.skipFrameSizing) applyBrowserFrameSizingForActiveFrame();
     setDatasetValueIfChanged(el.browserShell, 'device', 'Desktop');
     setElementTextIfChanged(el.rotateDevice, 'Rotate');
@@ -19350,12 +19966,15 @@ function applyBrowserDevice(options: { skipFrameSizing?: boolean } = {}) {
   const portrait = state.browserOrientation === 'portrait';
   const width = portrait ? preset.width : preset.height;
   const height = portrait ? preset.height : preset.width;
-  if (!options.skipFrameSizing) {
+  if (!options.skipFrameSizing && state.browserZoomMode === 'fit') {
+    refreshBrowserFitZoom({ silent: true, skipSave: true });
+  } else if (!options.skipFrameSizing) {
     applyBrowserFrameSizingForActiveFrame();
   }
   setDatasetValueIfChanged(el.browserShell, 'device', `${preset.label} ${width} x ${height}`);
   setElementTextIfChanged(el.rotateDevice, portrait ? 'Rotate' : 'Portrait');
-  if (!options.skipFrameSizing) {
+  if (!options.skipFrameSizing && state.browserZoomMode !== 'fit') {
+    syncBrowserPreviewScaleBox();
     applyEdgePreviewSizing();
     scheduleConfigureEdgeViewport();
   }
@@ -19372,9 +19991,8 @@ function applyBrowserFrameSizing(frame: HTMLIFrameElement) {
   }
   const preset = browserDevicePreset();
   const portrait = state.browserOrientation === 'portrait';
-  const zoom = normalizedBrowserZoom(state.browserZoom);
-  const width = `${Math.max(1, Math.round((portrait ? preset.width : preset.height) / zoom))}px`;
-  const height = `${Math.max(1, Math.round((portrait ? preset.height : preset.width) / zoom))}px`;
+  const width = `${Math.max(1, Math.round(portrait ? preset.width : preset.height))}px`;
+  const height = `${Math.max(1, Math.round(portrait ? preset.height : preset.width))}px`;
   if (frame.style.width !== width) frame.style.width = width;
   if (frame.style.height !== height) frame.style.height = height;
 }

@@ -4,6 +4,7 @@ dist-terminal/
 src-tauri/target/
 src-tauri/gen/
 .handoff/
+.antigravitycli/
 .vibe-ide/attachments/
 .vibe-ide/tmp/
 .vibe-ide-temp/

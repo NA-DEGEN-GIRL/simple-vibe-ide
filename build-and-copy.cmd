@@ -27,13 +27,13 @@ echo.
 echo ==^> Build Simple Vibe IDE
 call npm.cmd run tauri -- build --no-bundle || goto :fail
 
+if not exist "%APP_RELEASE%" mkdir "%APP_RELEASE%" || goto :fail
+call :copy_built_exe "simple-vibe-ide" IDE_EXE || goto :fail
+
 echo.
 echo ==^> Build Simple Vibe Terminal
 call npm.cmd run tauri:terminal:build || goto :fail
 
-if not exist "%APP_RELEASE%" mkdir "%APP_RELEASE%" || goto :fail
-
-call :copy_built_exe "simple-vibe-ide" IDE_EXE || goto :fail
 call :copy_built_exe "simple-vibe-terminal" TERMINAL_EXE || goto :fail
 call :write_launcher "run-simple-vibe-ide.cmd" "Simple Vibe IDE" "%IDE_EXE%" || goto :fail
 call :write_launcher "run-simple-vibe-terminal.cmd" "Simple Vibe Terminal" "%TERMINAL_EXE%" || goto :fail
@@ -54,8 +54,7 @@ set "OUTVAR=%~2"
 set "SRC="
 set "DEST=%APP_RELEASE%\%BINARY%.exe"
 
-if defined CARGO_TARGET_DIR if exist "%CARGO_TARGET_DIR%\release\%BINARY%.exe" set "SRC=%CARGO_TARGET_DIR%\release\%BINARY%.exe"
-if not defined SRC if exist "%~dp0src-tauri\target\release\%BINARY%.exe" set "SRC=%~dp0src-tauri\target\release\%BINARY%.exe"
+for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\resolve-built-exe.ps1" -BinaryName "%BINARY%" -RepoRoot "%~dp0" -ExcludeReleaseDir "%APP_RELEASE%"`) do set "SRC=%%I"
 
 if not defined SRC (
   echo Built app not found: %BINARY%.exe
@@ -74,10 +73,19 @@ if errorlevel 1 (
   set "DEST=%APP_RELEASE%\%BINARY%-!STAMP!.exe"
   echo Stable %BINARY%.exe was locked; copying timestamped exe instead.
   copy /Y "%SRC%" "!DEST!" >nul || exit /b 1
+  call :touch_exe "!DEST!"
+) else (
+  call :touch_exe "%DEST%"
 )
 
 set "%OUTVAR%=%DEST%"
 echo Copied %BINARY%.exe
+exit /b 0
+
+:touch_exe
+set "SVI_TOUCH_EXE=%~1"
+powershell.exe -NoProfile -Command "$p=$env:SVI_TOUCH_EXE; if ($p) { (Get-Item -LiteralPath $p).LastWriteTime = Get-Date }" >nul 2>nul
+set "SVI_TOUCH_EXE="
 exit /b 0
 
 :write_launcher
@@ -87,7 +95,11 @@ set "EXE=%~3"
 (
   echo @echo off
   echo setlocal
+  echo echo Launching %TITLE%
+  echo echo Exe: "%EXE%"
+  echo ^> "%APP_ROOT%\last-launched-%~n1.txt" echo "%EXE%"
   echo start "%TITLE%" /D "%%TEMP%%" "%EXE%"
+  echo timeout /t 2 ^>nul
 ) > "%LAUNCHER%"
 exit /b 0
 

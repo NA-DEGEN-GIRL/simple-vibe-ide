@@ -37,15 +37,27 @@ function Invoke-Step {
 function Find-BuiltExe {
   param([string]$BinaryName = "simple-vibe-ide")
 
-  $candidates = @()
   if ($env:CARGO_TARGET_DIR) {
-    $candidates += Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"
-  }
-  $candidates += Join-Path $PSScriptRoot "..\src-tauri\target\release\$BinaryName.exe"
-
-  foreach ($candidate in $candidates) {
+    $candidate = Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"
     $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
     if ($resolved) { return $resolved.Path }
+    return $null
+  }
+
+  $candidates = @()
+  $candidates += "D:\build-cache\simple-vibe-ide-target\release\$BinaryName.exe"
+  $candidates += Join-Path $PSScriptRoot "..\src-tauri\target\release\$BinaryName.exe"
+
+  $seen = @{}
+  foreach ($candidate in $candidates) {
+    $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
+    if (-not $resolved) { continue }
+    $item = Get-Item $resolved.Path -ErrorAction SilentlyContinue
+    if (-not $item) { continue }
+    $key = $item.FullName.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    return $item.FullName
   }
 
   $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -55,6 +67,39 @@ function Find-BuiltExe {
     Select-Object -First 1
   if ($found) { return $found.FullName }
   return $null
+}
+
+function Remove-StaleBuiltExe {
+  param([string]$BinaryName = "simple-vibe-ide")
+
+  if (-not $env:CARGO_TARGET_DIR) { return }
+  $paths = @(
+    (Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"),
+    (Join-Path $env:CARGO_TARGET_DIR "simple-vibe-build-sources\$BinaryName.exe")
+  )
+  foreach ($path in $paths) {
+    if (-not (Test-Path $path)) { continue }
+    try {
+      Remove-Item -LiteralPath $path -Force
+    } catch {
+      throw "Could not remove stale $BinaryName build artifact before rebuild: $(Format-DisplayPath $path). Close running apps that use it. $($_.Exception.Message)"
+    }
+  }
+}
+
+function Save-BuiltExeSnapshot {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceExe,
+    [Parameter(Mandatory = $true)][string]$BinaryName
+  )
+
+  if (-not $env:CARGO_TARGET_DIR) { return $SourceExe }
+  $snapshotDir = Join-Path $env:CARGO_TARGET_DIR "simple-vibe-build-sources"
+  New-Item -ItemType Directory -Force $snapshotDir | Out-Null
+  $snapshotExe = Join-Path $snapshotDir "$BinaryName.exe"
+  Copy-Item -LiteralPath $SourceExe -Destination $snapshotExe -Force
+  (Get-Item -LiteralPath $snapshotExe).LastWriteTime = Get-Date
+  return $snapshotExe
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -103,17 +148,21 @@ Invoke-Step "TypeScript check" { npm.cmd run check }
 Invoke-Step "Frontend build" { npm.cmd run build }
 Invoke-Step "Terminal frontend build" { npm.cmd run build:terminal }
 Invoke-Step "Rust check" { cargo check --manifest-path src-tauri/Cargo.toml }
+Remove-StaleBuiltExe "simple-vibe-ide"
 Invoke-Step "Tauri IDE release no-bundle build" { npm.cmd run tauri -- build --no-bundle }
-Invoke-Step "Tauri Terminal release no-bundle build" { npm.cmd run tauri:terminal:build }
-
 $ideExe = Find-BuiltExe "simple-vibe-ide"
-$terminalExe = Find-BuiltExe "simple-vibe-terminal"
 if (-not $ideExe) {
   throw "Could not find built simple-vibe-ide.exe after Tauri build."
 }
+$ideExe = Save-BuiltExeSnapshot -SourceExe $ideExe -BinaryName "simple-vibe-ide"
+
+Remove-StaleBuiltExe "simple-vibe-terminal"
+Invoke-Step "Tauri Terminal release no-bundle build" { npm.cmd run tauri:terminal:build }
+$terminalExe = Find-BuiltExe "simple-vibe-terminal"
 if (-not $terminalExe) {
   throw "Could not find built simple-vibe-terminal.exe after Tauri terminal build."
 }
+$terminalExe = Save-BuiltExeSnapshot -SourceExe $terminalExe -BinaryName "simple-vibe-terminal"
 
 Write-Host ""
 Write-Host "Built IDE exe: $(Format-DisplayPath $ideExe)" -ForegroundColor Green
