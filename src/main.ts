@@ -15,12 +15,13 @@ import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldM
 interface TerminalPane {
   paneId: string;
   widgetId: string;
+  groupId: string;
   workspaceId: string;
   backendId?: string;
   title: string;
   customTitle?: string;
   command: string | null;
-  // Set when opened via an LLM launcher button (codex/claude/grok). On workspace restore this is
+  // Set when opened via an LLM launcher button (codex/claude/grok/antigravity). On workspace restore this is
   // used to re-launch the CLI (typed at the prompt) instead of restoring a plain shell.
   llmId?: string;
   profileId: string;
@@ -57,6 +58,27 @@ interface TerminalPane {
   resizeObserver?: ResizeObserver;
 }
 
+type TerminalSplitDirection = 'row' | 'column';
+
+type TerminalSplitNode =
+  | { kind: 'pane'; paneId: string }
+  | {
+      kind: 'split';
+      splitId: string;
+      direction: TerminalSplitDirection;
+      ratio: number;
+      first: TerminalSplitNode;
+      second: TerminalSplitNode;
+    };
+
+interface TerminalTabGroup {
+  groupId: string;
+  widgetId: string;
+  activePaneId: string;
+  customTitle?: string;
+  root: TerminalSplitNode;
+}
+
 interface TerminalWidget {
   widgetId: string;
   workspaceId: string;
@@ -69,6 +91,8 @@ interface TerminalWidget {
   typePad: HTMLElement;
   typePadInput: HTMLTextAreaElement;
   typePadPaste: HTMLButtonElement;
+  tabGroups: TerminalTabGroup[];
+  activeGroupId: string;
   activePaneId: string;
   typingPadOpen: boolean;
 }
@@ -280,16 +304,37 @@ interface WorkspacePanelSnapshot {
 }
 
 interface WorkspaceTerminalSnapshot {
+  snapshotPaneId?: string;
   title: string;
   customTitle?: string;
   command: string | null;
   llmId?: string;
   backendId?: string;
   widgetId?: string;
+  groupId?: string;
   profileId?: string;
   cwd?: string;
   typingPadOpen?: boolean;
   rect?: LayoutRatio;
+}
+
+type WorkspaceTerminalSplitSnapshot =
+  | { kind: 'pane'; snapshotPaneId: string }
+  | {
+      kind: 'split';
+      direction: TerminalSplitDirection;
+      ratio: number;
+      first: WorkspaceTerminalSplitSnapshot;
+      second: WorkspaceTerminalSplitSnapshot;
+    };
+
+interface WorkspaceTerminalGroupSnapshot {
+  widgetId: string;
+  groupId: string;
+  customTitle?: string;
+  typingPadOpen?: boolean;
+  activeSnapshotPaneId?: string;
+  root: WorkspaceTerminalSplitSnapshot;
 }
 
 interface EditorTabSnapshot {
@@ -331,6 +376,7 @@ interface WorkspaceSnapshot {
   panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>>;
   terminalSpawnRect?: LayoutRatio;
   terminals: WorkspaceTerminalSnapshot[];
+  terminalGroups?: WorkspaceTerminalGroupSnapshot[];
   activeTerminalIndex: number;
   editorTabs: EditorTabSnapshot[];
   activeEditorTabId: string;
@@ -501,6 +547,9 @@ type CreateTerminalOptions = {
   cwd?: string;
   initialHeight?: number;
   skipSnapshotSave?: boolean;
+  groupId?: string;
+  splitTargetPaneId?: string;
+  splitDirection?: TerminalSplitDirection;
 };
 
 type LlmLauncherFlag = {
@@ -552,6 +601,11 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
     executable: 'grok',
     flags: [
       {
+        bashPattern: '*--always-approve*',
+        powershellPattern: '--always-approve',
+        args: ['--always-approve']
+      },
+      {
         bashPattern: '*--permission-mode*|*bypassPermissions*',
         powershellPattern: '--permission-mode|bypassPermissions',
         args: ['--permission-mode', 'bypassPermissions']
@@ -559,13 +613,25 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
     ]
   },
   antigravity: {
-    executable: 'antigravity',
-    flags: []
+    executable: 'agy',
+    flags: [
+      {
+        bashPattern: '*--dangerously-skip-permissions*',
+        powershellPattern: '--dangerously-skip-permissions',
+        args: ['--dangerously-skip-permissions']
+      }
+    ]
   }
 };
 
+const APP_VARIANT = location.pathname.endsWith('/terminal.html') || new URLSearchParams(location.search).get('app') === 'terminal'
+  ? 'terminal'
+  : 'ide';
+const IS_TERMINAL_APP = APP_VARIANT === 'terminal';
+const APP_PRODUCT_NAME = IS_TERMINAL_APP ? 'Simple Vibe Terminal' : 'Simple Vibe IDE';
+const APP_STORAGE_PREFIX = IS_TERMINAL_APP ? 'simple-vibe-terminal' : 'simple-vibe-ide';
 const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'calculator', 'settings'];
-const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
+const IDE_DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   explorer: true,
   editor: true,
   image: true,
@@ -574,18 +640,30 @@ const DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   calculator: false,
   settings: false
 };
-const WORKSPACE_STORE_KEY = 'simple-vibe-ide.workspaces.v1';
+const TERMINAL_DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
+  explorer: false,
+  editor: false,
+  image: false,
+  browser: false,
+  notes: false,
+  calculator: false,
+  settings: false
+};
+const DEFAULT_PANEL_VISIBILITY = IS_TERMINAL_APP ? TERMINAL_DEFAULT_PANEL_VISIBILITY : IDE_DEFAULT_PANEL_VISIBILITY;
+const WORKSPACE_STORE_KEY = `${APP_STORAGE_PREFIX}.workspaces.v1`;
 const WORKSPACE_STORE_PERSIST_LIMIT = 24;
-const SAVED_WORKSPACE_STORE_KEY = 'simple-vibe-ide.savedWorkspaces.v1';
+const SAVED_WORKSPACE_STORE_KEY = IS_TERMINAL_APP
+  ? 'simple-vibe-terminal.savedLayouts.v1'
+  : 'simple-vibe-ide.savedWorkspaces.v1';
 const SAVED_WORKSPACE_LIMIT = 32;
 const DEFAULT_SHOW_FILE_SIZES = false;
 const BROWSER_ADDRESS_HISTORY_LIMIT = 32;
 const BROWSER_ADDRESS_SUGGESTION_LIMIT = 8;
-const WORKSPACE_IMAGE_STORE_KEY = 'simple-vibe-ide.workspaceImages.v1';
+const WORKSPACE_IMAGE_STORE_KEY = `${APP_STORAGE_PREFIX}.workspaceImages.v1`;
 const WORKSPACE_IMAGE_REF_PREFIX = 'simple-vibe-image:';
 const WORKSPACE_IMAGE_REF_CACHE_LIMIT = 512;
-const MARKET_TICKER_STORE_KEY = 'simple-vibe-ide.marketTicker.v1';
-const IDE_SETTINGS_KEY = 'simple-vibe-ide.settings.v1';
+const MARKET_TICKER_STORE_KEY = `${APP_STORAGE_PREFIX}.marketTicker.v1`;
+const IDE_SETTINGS_KEY = `${APP_STORAGE_PREFIX}.settings.v1`;
 const NOTES_DIR = '.vibe-ide-temp/notes';
 const WORKSPACE_SNAPSHOT_DEBOUNCE_MS = 260;
 const WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS = 900;
@@ -616,6 +694,9 @@ const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 8 * 1024;
 const TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS = 2 * 1024;
 const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
 const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
+const WORKSPACE_LLM_OUTPUT_ACTIVE_MS = 2500;
+const WORKSPACE_LLM_INPUT_ACTIVE_MS = 3500;
+const WORKSPACE_LLM_START_ACTIVE_MS = 4000;
 // Defer post-composition repaint/refocus well past xterm's own setTimeout(0) finalize (which
 // re-reads the helper-textarea), so our DOM/focus churn can't clobber the committed Hangul tail.
 const TERMINAL_IME_RELEASE_DEFER_MS = 120;
@@ -1360,6 +1441,8 @@ let workspaceImageStore: Record<string, string> = {};
 let workspaceImageStoreDirty = false;
 const workspaceImageRefCache = new Map<string, { dataUrl: string; key: string }>();
 const workspaceSnapshotSignatures = new Map<string, string>();
+const workspaceLlmActivityExpiresAt = new Map<string, number>();
+const workspaceLlmActivityTimers = new Map<string, number>();
 let noteStatusRenderSignature = '\0';
 let workspaceTabsRenderSignature = '\0';
 let workspaceTabsOrderRenderSignature = '\0';
@@ -1434,9 +1517,12 @@ let activeExplorerRename: {
 
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('missing app root');
+document.documentElement.dataset.appVariant = APP_VARIANT;
+document.body.classList.toggle('terminal-app', IS_TERMINAL_APP);
+document.body.classList.toggle('ide-app', !IS_TERMINAL_APP);
 
 app.innerHTML = `
-  <div class="shell">
+  <div class="shell ${IS_TERMINAL_APP ? 'terminal-shell' : 'ide-shell'}">
     <div class="window-resize-zones" aria-hidden="true">
       <div class="window-resize-zone window-resize-n" data-window-resize-direction="North"></div>
       <div class="window-resize-zone window-resize-e" data-window-resize-direction="East"></div>
@@ -1461,10 +1547,9 @@ app.innerHTML = `
     </div>
     <header class="titlebar" data-window-drag-region>
       <div class="titlebar-brand" data-window-drag-region>
-        <strong>Simple Vibe IDE</strong>
+        <strong>${APP_PRODUCT_NAME}</strong>
         <span id="title-context" class="muted">starting...</span>
       </div>
-      <div id="status" class="status" data-window-drag-region>Ready</div>
       <div id="app-clock" class="app-clock" data-window-drag-region></div>
     </header>
     <section class="workspace-tabs-bar">
@@ -1472,13 +1557,16 @@ app.innerHTML = `
       <button id="new-workspace-tab" class="tab-add" title="New workspace">+</button>
     </section>
     <section class="workspace-bar">
-      <label>Profile <select id="profile-select"></select></label>
+      <div class="profile-control-stack">
+        <label>Profile <select id="profile-select"></select></label>
+        <div id="status" class="status">Ready</div>
+      </div>
       <label>Root <input id="root-input" spellcheck="false" placeholder="select a profile first" /></label>
       <button id="open-root">Open / Connect</button>
-      <button id="save-workspace" title="Save the current workspace layout for later" disabled>Save WS</button>
-      <label class="saved-workspace-control"><select id="saved-workspace-select" title="Saved workspaces" aria-label="Saved workspaces"></select></label>
-      <button id="load-saved-workspace" title="Load the selected saved workspace" disabled>Load</button>
-      <button id="delete-saved-workspace" title="Delete the selected saved workspace" disabled>Del</button>
+      <button id="save-workspace" title="${IS_TERMINAL_APP ? 'Save the current terminal layout for later' : 'Save the current workspace layout for later'}" disabled>${IS_TERMINAL_APP ? 'Save Layout' : 'Save WS'}</button>
+      <label class="saved-workspace-control"><select id="saved-workspace-select" title="${IS_TERMINAL_APP ? 'Saved terminal layouts' : 'Saved workspaces'}" aria-label="${IS_TERMINAL_APP ? 'Saved terminal layouts' : 'Saved workspaces'}"></select></label>
+      <button id="load-saved-workspace" title="${IS_TERMINAL_APP ? 'Load the selected terminal layout' : 'Load the selected saved workspace'}" disabled>Load</button>
+      <button id="delete-saved-workspace" title="${IS_TERMINAL_APP ? 'Delete the selected terminal layout' : 'Delete the selected saved workspace'}" disabled>Del</button>
       <button id="copy-current-cd" title="Copy a cd command for the current folder" disabled>Copy cd</button>
       <button id="new-shell" disabled>+ Shell</button>
       <button id="new-windows-shell" title="Open local Windows PowerShell at a non-user path">Win Shell</button>
@@ -1547,6 +1635,7 @@ app.innerHTML = `
           </label>
           <select id="notes-theme" class="notes-theme-select" title="Note theme"></select>
           <button id="notes-pin" class="panel-mode" title="Keep Notes above other widgets" aria-pressed="false">Pin</button>
+          <button id="notes-checklist" class="panel-mode" title="Checklist line (Ctrl+Shift+L)">☑</button>
           <button id="notes-new-tab" class="panel-mode" title="New note">+</button>
           <button class="panel-close" data-close-panel="notes" title="Close Notes" aria-label="Close Notes">x</button>
         </div>
@@ -1728,6 +1817,7 @@ const el = {
   notesTabs: document.querySelector<HTMLDivElement>('#notes-tabs')!,
   notesNewTab: document.querySelector<HTMLButtonElement>('#notes-new-tab')!,
   notesPin: document.querySelector<HTMLButtonElement>('#notes-pin')!,
+  notesChecklist: document.querySelector<HTMLButtonElement>('#notes-checklist')!,
   notesTheme: document.querySelector<HTMLSelectElement>('#notes-theme')!,
   notesOpacity: document.querySelector<HTMLInputElement>('#notes-opacity')!,
   notesOpacityValue: document.querySelector<HTMLSpanElement>('#notes-opacity-value')!,
@@ -1854,12 +1944,11 @@ function renderAppClock() {
 }
 
 function refreshTitle() {
-  const profile = state.activeProfile;
-  const location = profile ? `${profile.label} ${state.currentDir || state.workspaceRoot}` : 'no profile';
-  if (appTitleRenderSignature === location) return;
-  appTitleRenderSignature = location;
-  setTextContentIfChanged(el.titleContext, location);
-  const title = `Simple Vibe IDE — ${location}`;
+  const context = state.workspaceOpen ? 'workspace connected' : state.activeProfile ? 'profile selected' : 'no profile';
+  if (appTitleRenderSignature === context) return;
+  appTitleRenderSignature = context;
+  setTextContentIfChanged(el.titleContext, context);
+  const title = APP_PRODUCT_NAME;
   if (document.title !== title) document.title = title;
 }
 
@@ -1872,11 +1961,13 @@ async function init() {
   await listen<TerminalExitEvent>('terminal-exit', (event) => {
     const pane = terminalPaneByBackendId.get(event.payload.id);
     if (pane) {
+      const workspaceId = pane.workspaceId;
       flushTerminalWriteBuffer(pane);
       setTerminalBackendId(pane, undefined);
       pane.title = `${pane.title} (exited)`;
       const widget = terminalWidgetForPane(pane);
       if (widget) renderTerminalWidgetTabs(widget);
+      refreshWorkspaceLlmActivityAfterPaneChange(workspaceId);
     }
   });
 
@@ -1907,7 +1998,7 @@ async function init() {
   setProfiles(await api.listProfiles());
   loadIdeSettings();
   loadWorkspaceStore();
-  loadMarketTickerConfig();
+  if (!IS_TERMINAL_APP) loadMarketTickerConfig();
   ensureEditorTab();
   ensureImageTab();
   renderProfiles();
@@ -1932,14 +2023,14 @@ async function init() {
   applyNoteOpacity();
   applyCalculatorFontSize();
   applyBrowserZoom();
-  scheduleEditorRuntimeWarmup();
+  if (!IS_TERMINAL_APP) scheduleEditorRuntimeWarmup();
   scheduleTerminalRuntimeWarmup();
   bindEvents();
   startAppClock();
   selectProfile('');
   setWorkspaceOpen(false);
   setStatus('Ready');
-  scheduleMarketTickerStart(MARKET_TICKER_BOOT_DELAY_MS);
+  if (!IS_TERMINAL_APP) scheduleMarketTickerStart(MARKET_TICKER_BOOT_DELAY_MS);
   scheduleWslProfilesBackgroundLoad();
 }
 
@@ -3235,13 +3326,15 @@ function workspaceTabParts(tab: HTMLElement) {
 function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapshot) {
   const protectedWorkspace = Boolean(workspace.captureProtected);
   const active = workspace.id === state.activeWorkspaceId;
+  const llmState = workspaceLlmIndicatorState(workspace.id);
   const displayLabel = workspaceDisplayLabel(workspace);
-  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}`;
+  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}\t${llmState}`;
   tab.dataset.workspaceId = workspace.id;
   if (tab.dataset.renderSignature === signature) return;
   tab.dataset.renderSignature = signature;
-  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}`;
-  tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${protectedWorkspace ? ' - capture blocked when active' : ''}`;
+  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${llmState !== 'none' ? ' llm-present' : ''}${llmState === 'working' ? ' llm-working' : ''}`;
+  const llmTitle = llmState === 'working' ? ' - LLM working' : '';
+  tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${protectedWorkspace ? ' - capture blocked when active' : ''}${llmTitle}`;
   const parts = workspaceTabParts(tab);
   const label = parts.label;
   setTextContentIfChanged(label, displayLabel);
@@ -3279,7 +3372,9 @@ function renderSavedWorkspaceSelect() {
     el.savedWorkspaceSelect.innerHTML = '';
     const placeholder = document.createElement('option');
     placeholder.value = '';
-    placeholder.textContent = state.savedWorkspaces.length ? 'select...' : 'none saved';
+    placeholder.textContent = state.savedWorkspaces.length
+      ? (IS_TERMINAL_APP ? 'select layout...' : 'select...')
+      : (IS_TERMINAL_APP ? 'no layouts saved' : 'none saved');
     el.savedWorkspaceSelect.append(placeholder);
     for (const entry of state.savedWorkspaces) {
       const option = document.createElement('option');
@@ -3331,6 +3426,22 @@ function savedWorkspaceOptionTooltip(entry: SavedWorkspaceEntry) {
   return parts.join(' - ');
 }
 
+function savedWorkspaceMatchesTabNameAndTarget(
+  entry: SavedWorkspaceEntry,
+  tabName: string,
+  snapshot: WorkspaceSnapshot
+) {
+  return normalizeSavedWorkspaceName(entry.name, entry.snapshot) === tabName
+    && entry.snapshot.profileId === snapshot.profileId
+    && normalizedSavedWorkspaceRootForCompare(entry.snapshot.root, savedWorkspaceProfileKind(entry))
+      === normalizedSavedWorkspaceRootForCompare(snapshot.root, profileForId(snapshot.profileId)?.kind);
+}
+
+function normalizedSavedWorkspaceRootForCompare(root: string | undefined, kind?: ConnectionProfile['kind']) {
+  const normalized = (root ?? '').trim().replace(/[\\/]+$/, '');
+  return kind === 'windows' ? normalized.toLowerCase() : normalized;
+}
+
 function selectedSavedWorkspaceEntry() {
   const id = el.savedWorkspaceSelect.value;
   if (!id) return null;
@@ -3339,21 +3450,24 @@ function selectedSavedWorkspaceEntry() {
 
 async function saveCurrentWorkspaceForLater() {
   if (!state.workspaceOpen || !state.activeProfile || !state.activeWorkspaceId) {
-    setStatus('Open a workspace before saving it', true);
+    setStatus(IS_TERMINAL_APP ? 'Open a terminal root before saving the layout' : 'Open a workspace before saving it', true);
     return;
   }
   await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   const snapshot = activeWorkspaceSnapshot();
   if (!snapshot?.profileId || !snapshot.root) {
-    setStatus('Nothing to save for this workspace', true);
+    setStatus(IS_TERMINAL_APP ? 'Nothing to save for this terminal layout' : 'Nothing to save for this workspace', true);
     return;
   }
 
   const savedProfile = profileForId(snapshot.profileId);
+  const savedName = normalizeSavedWorkspaceName(workspaceDisplayLabel(snapshot), snapshot);
+  const existingIndex = state.savedWorkspaces.findIndex((entry) => savedWorkspaceMatchesTabNameAndTarget(entry, savedName, snapshot));
+  const existing = existingIndex >= 0 ? state.savedWorkspaces[existingIndex] : null;
   const saved: SavedWorkspaceEntry = {
-    id: crypto.randomUUID(),
-    name: normalizeSavedWorkspaceName(workspaceDisplayLabel(snapshot), snapshot),
+    id: existing?.id ?? crypto.randomUUID(),
+    name: savedName,
     savedAt: new Date().toISOString(),
     profileKind: savedProfile?.kind,
     profileLabel: savedProfile?.label,
@@ -3361,19 +3475,20 @@ async function saveCurrentWorkspaceForLater() {
   };
   state.savedWorkspaces = [
     saved,
-    ...state.savedWorkspaces.filter((entry) => entry.id !== saved.id)
+    ...state.savedWorkspaces.filter((entry, index) => index !== existingIndex && entry.id !== saved.id)
   ].slice(0, SAVED_WORKSPACE_LIMIT);
   persistSavedWorkspaceStore();
   el.savedWorkspaceSelect.value = saved.id;
   renderSavedWorkspaceSelect();
-  setStatus(`Workspace saved: ${saved.name}`);
+  const noun = IS_TERMINAL_APP ? 'Layout' : 'Workspace';
+  setStatus(existing ? `${noun} saved: ${saved.name} (updated)` : `${noun} saved: ${saved.name}`);
 }
 
 async function loadSelectedSavedWorkspace() {
   const saved = selectedSavedWorkspaceEntry();
   if (!saved) return;
   if (!profileForId(saved.snapshot.profileId)) {
-    setStatus(`Saved workspace profile is unavailable: ${saved.name}`, true);
+    setStatus(`${IS_TERMINAL_APP ? 'Saved layout' : 'Saved workspace'} profile is unavailable: ${saved.name}`, true);
     return;
   }
 
@@ -3381,6 +3496,27 @@ async function loadSelectedSavedWorkspace() {
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
   const snapshot = cloneWorkspaceSnapshotForSavedLoad(saved);
+  if (IS_TERMINAL_APP) {
+    const previousActiveId = state.activeWorkspaceId;
+    if (previousActiveId) {
+      await closeTerminalsForWorkspace(previousActiveId, {
+        backgroundKill: true,
+        saveSnapshot: false,
+        renderShellTabs: false
+      });
+      discardWorkspacePreviewRuntime(previousActiveId);
+    }
+    const activeIndex = previousActiveId ? workspaceSnapshotIndexById(previousActiveId) : -1;
+    workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+    if (activeIndex >= 0) replaceWorkspaceSnapshot(activeIndex, snapshot);
+    else insertWorkspaceSnapshot(state.workspaceSnapshots.length, snapshot);
+    state.activeWorkspaceId = snapshot.id;
+    renderWorkspaceTabs();
+    persistWorkspaceStore();
+    await restoreWorkspaceSnapshot(snapshot);
+    setStatus(`Layout loaded: ${saved.name}`);
+    return;
+  }
   workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
   const activeIndex = workspaceSnapshotIndexById(state.activeWorkspaceId);
   insertWorkspaceSnapshot(activeIndex >= 0 ? activeIndex + 1 : state.workspaceSnapshots.length, snapshot);
@@ -3394,12 +3530,12 @@ async function loadSelectedSavedWorkspace() {
 function deleteSelectedSavedWorkspace() {
   const saved = selectedSavedWorkspaceEntry();
   if (!saved) return;
-  if (!window.confirm(`Delete saved workspace "${saved.name}"?`)) return;
+  if (!window.confirm(`Delete saved ${IS_TERMINAL_APP ? 'layout' : 'workspace'} "${saved.name}"?`)) return;
   state.savedWorkspaces = state.savedWorkspaces.filter((entry) => entry.id !== saved.id);
   el.savedWorkspaceSelect.value = '';
   savedWorkspaceSelectRenderSignature = '\0';
   persistSavedWorkspaceStore();
-  setStatus(`Deleted saved workspace: ${saved.name}`);
+  setStatus(`Deleted saved ${IS_TERMINAL_APP ? 'layout' : 'workspace'}: ${saved.name}`);
 }
 
 function cloneWorkspaceSnapshotForSavedStore(source: WorkspaceSnapshot): WorkspaceSnapshot {
@@ -3409,6 +3545,7 @@ function cloneWorkspaceSnapshotForSavedStore(source: WorkspaceSnapshot): Workspa
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
     terminals: cloneTerminalSnapshotsForSavedWorkspace(source.terminals),
+    terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
     imageTabs: cloneImageTabSnapshotsForSavedWorkspace(source.imageTabs),
     noteTabs: cloneNoteTabSnapshots(source.noteTabs),
@@ -3468,12 +3605,107 @@ function pruneWorkspaceTabElementCache(seen: Set<string>) {
   }
 }
 
+function markWorkspaceLlmActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS) {
+  if (!pane.llmId || !pane.workspaceId) return;
+  markWorkspaceLlmActivity(pane.workspaceId, durationMs);
+}
+
+function markWorkspaceLlmOutputActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS) {
+  // Resize/focus on workspace activation can make some PTYs repaint a prompt. Treat output as
+  // "working" only if the launcher/input path already put the pane into an active window.
+  if (!pane.llmId || !workspaceLlmActivityIsActive(pane.workspaceId)) return;
+  markWorkspaceLlmActivity(pane.workspaceId, durationMs);
+}
+
+function markWorkspaceLlmActivity(workspaceId: string, durationMs: number) {
+  if (!workspaceId) return;
+  const previousState = workspaceLlmIndicatorState(workspaceId);
+  const expiresAt = Math.max(workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0, Date.now() + durationMs);
+  workspaceLlmActivityExpiresAt.set(workspaceId, expiresAt);
+  scheduleWorkspaceLlmActivityExpiry(workspaceId);
+  if (workspaceLlmIndicatorState(workspaceId) !== previousState) renderWorkspaceLlmActivityTab(workspaceId);
+}
+
+function scheduleWorkspaceLlmActivityExpiry(workspaceId: string) {
+  if (workspaceLlmActivityTimers.has(workspaceId)) return;
+  const expiresAt = workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0;
+  const delay = Math.max(80, expiresAt - Date.now() + 40);
+  const timer = window.setTimeout(() => {
+    workspaceLlmActivityTimers.delete(workspaceId);
+    expireWorkspaceLlmActivity(workspaceId);
+  }, delay);
+  workspaceLlmActivityTimers.set(workspaceId, timer);
+}
+
+function expireWorkspaceLlmActivity(workspaceId: string) {
+  const hadActivity = workspaceLlmActivityExpiresAt.has(workspaceId);
+  const expiresAt = workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0;
+  if (expiresAt > Date.now() && workspaceHasRunningLlmPane(workspaceId)) {
+    scheduleWorkspaceLlmActivityExpiry(workspaceId);
+    return;
+  }
+  workspaceLlmActivityExpiresAt.delete(workspaceId);
+  const timer = workspaceLlmActivityTimers.get(workspaceId);
+  if (timer) window.clearTimeout(timer);
+  workspaceLlmActivityTimers.delete(workspaceId);
+  if (hadActivity) renderWorkspaceLlmActivityTab(workspaceId);
+}
+
+function clearWorkspaceLlmActivity(workspaceId: string) {
+  if (!workspaceId) return;
+  const hadActivity = workspaceLlmActivityExpiresAt.has(workspaceId);
+  workspaceLlmActivityExpiresAt.delete(workspaceId);
+  const timer = workspaceLlmActivityTimers.get(workspaceId);
+  if (timer) window.clearTimeout(timer);
+  workspaceLlmActivityTimers.delete(workspaceId);
+  if (hadActivity) renderWorkspaceLlmActivityTab(workspaceId);
+}
+
+function refreshWorkspaceLlmActivityAfterPaneChange(workspaceId: string) {
+  if (!workspaceId || workspaceHasRunningLlmPane(workspaceId)) return;
+  clearWorkspaceLlmActivity(workspaceId);
+}
+
+function workspaceLlmActivityIsActive(workspaceId: string) {
+  return workspaceLlmIndicatorState(workspaceId) === 'working';
+}
+
+type WorkspaceLlmIndicatorState = 'none' | 'idle' | 'working';
+
+function workspaceLlmIndicatorState(workspaceId: string): WorkspaceLlmIndicatorState {
+  if (!workspaceHasLlmPane(workspaceId)) return 'none';
+  return workspaceHasRunningLlmPane(workspaceId) && (workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0) > Date.now()
+    ? 'working'
+    : 'idle';
+}
+
+function workspaceHasLlmPane(workspaceId: string) {
+  if (workspaceHasRunningLlmPane(workspaceId)) return true;
+  const snapshot = workspaceSnapshotForId(workspaceId);
+  return Boolean(snapshot?.terminals.some((terminal) => terminal.llmId));
+}
+
+function workspaceHasRunningLlmPane(workspaceId: string) {
+  return state.terminals.some((pane) => pane.workspaceId === workspaceId && Boolean(pane.llmId && pane.backendId));
+}
+
+function renderWorkspaceLlmActivityTab(workspaceId: string) {
+  const workspace = workspaceSnapshotForId(workspaceId);
+  const tab = connectedWorkspaceTabElement(workspaceId);
+  if (!workspace || !tab) {
+    workspaceTabsRenderSignature = '\0';
+    return;
+  }
+  updateWorkspaceTabElement(tab, workspace);
+  workspaceTabsRenderSignature = workspaceTabsSignature();
+}
+
 function workspaceTabsSignature() {
   let signature = '';
   for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
     const workspace = state.workspaceSnapshots[index];
     if (index) signature += '\n';
-    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}`;
+    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}`;
   }
   return signature;
 }
@@ -3779,6 +4011,7 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
     terminals: cloneTerminalSnapshots(source.terminals),
+    terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
     imageTabs: cloneImageTabSnapshots(source.imageTabs),
     noteTabs: cloneNoteTabSnapshots(source.noteTabs),
@@ -3794,6 +4027,27 @@ function cloneTerminalSnapshots(terminals: WorkspaceTerminalSnapshot[]) {
     cloned.push({ ...terminal, rect: terminal.rect ? { ...terminal.rect } : undefined });
   }
   return cloned;
+}
+
+function cloneTerminalGroupSnapshots(groups?: WorkspaceTerminalGroupSnapshot[]) {
+  if (!groups?.length) return undefined;
+  const cloned: WorkspaceTerminalGroupSnapshot[] = [];
+  for (const group of groups) {
+    cloned.push({
+      ...group,
+      root: cloneTerminalSplitSnapshot(group.root)
+    });
+  }
+  return cloned;
+}
+
+function cloneTerminalSplitSnapshot(node: WorkspaceTerminalSplitSnapshot): WorkspaceTerminalSplitSnapshot {
+  if (node.kind === 'pane') return { ...node };
+  return {
+    ...node,
+    first: cloneTerminalSplitSnapshot(node.first),
+    second: cloneTerminalSplitSnapshot(node.second)
+  };
 }
 
 function cloneEditorTabSnapshots(tabs: EditorTabSnapshot[]) {
@@ -3918,6 +4172,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     panels: {},
     terminalSpawnRect: undefined,
     terminals: [],
+    terminalGroups: [],
     activeTerminalIndex: 0,
     editorTabs: [],
     activeEditorTabId: '',
@@ -4032,6 +4287,7 @@ function createCurrentWorkspaceSnapshot(
     panels: snapshotPanels(),
     terminalSpawnRect: terminalSnapshotState.terminalSpawnRect,
     terminals: terminalSnapshotState.terminals,
+    terminalGroups: terminalSnapshotState.terminalGroups,
     activeTerminalIndex: terminalSnapshotState.activeTerminalIndex,
     editorTabs,
     activeEditorTabId: state.activeEditorTabId,
@@ -4155,6 +4411,7 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${workspacePanelsSignature(snapshot.panels)}`;
   signature += `|${layoutRatioSignature(snapshot.terminalSpawnRect)}`;
   signature += `|${terminalSnapshotsSignature(snapshot.terminals)}`;
+  signature += `|${terminalGroupsSignature(snapshot.terminalGroups)}`;
   signature += `|${String(snapshot.activeTerminalIndex)}`;
   signature += `|${editorTabSnapshotsSignature(snapshot.editorTabs)}`;
   signature += `|${workspaceSignaturePart(snapshot.activeEditorTabId)}`;
@@ -4209,7 +4466,23 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminal.typingPadOpen ? '1' : '0'},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminal.typingPadOpen ? '1' : '0'},${layoutRatioSignature(terminal.rect)}`;
+}
+
+function terminalGroupsSignature(groups?: WorkspaceTerminalGroupSnapshot[]) {
+  if (!groups?.length) return '';
+  let signature = '';
+  for (let index = 0; index < groups.length; index += 1) {
+    if (index) signature += ';';
+    const group = groups[index];
+    signature += `${workspaceSignaturePart(group.widgetId)},${workspaceSignaturePart(group.groupId)},${workspaceSignaturePart(group.customTitle ?? '')},${group.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(group.activeSnapshotPaneId ?? '')},${terminalGroupSplitSignature(group.root)}`;
+  }
+  return signature;
+}
+
+function terminalGroupSplitSignature(node: WorkspaceTerminalSplitSnapshot): string {
+  if (node.kind === 'pane') return `p:${workspaceSignaturePart(node.snapshotPaneId)}`;
+  return `s:${node.direction}:${clampTerminalSplitRatio(node.ratio).toFixed(4)}(${terminalGroupSplitSignature(node.first)}|${terminalGroupSplitSignature(node.second)})`;
 }
 
 function editorTabSnapshotsSignature(tabs: WorkspaceSnapshot['editorTabs']) {
@@ -4336,39 +4609,87 @@ function snapshotPanels() {
 
 function currentWorkspaceTerminalSnapshotState(): Pick<
   WorkspaceSnapshot,
-  'terminals' | 'activeTerminalIndex' | 'terminalSpawnRect'
+  'terminals' | 'terminalGroups' | 'activeTerminalIndex' | 'terminalSpawnRect'
 > {
   const terminals: WorkspaceSnapshot['terminals'] = [];
+  const terminalGroups: WorkspaceTerminalGroupSnapshot[] = [];
   let activeTerminalIndex = -1;
   let firstWidget: TerminalWidget | null = null;
   let activeWidget: TerminalWidget | null = null;
-  for (const pane of state.terminals) {
-    if (pane.workspaceId !== state.activeWorkspaceId) continue;
-    const widget = terminalWidgetForPane(pane);
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId !== state.activeWorkspaceId) continue;
     if (!firstWidget) firstWidget = widget;
-    if (pane.paneId === state.activePaneId) {
-      activeTerminalIndex = terminals.length;
-      activeWidget = widget;
+    for (const group of terminalGroupsForWidget(widget)) {
+      const groupPaneIds = terminalGroupPaneIds(group);
+      const groupHasPanes = groupPaneIds.some((paneId) => {
+        const pane = terminalPaneById.get(paneId);
+        return pane?.workspaceId === state.activeWorkspaceId;
+      });
+      if (groupHasPanes) {
+        const groupSnapshotRoot = workspaceTerminalSplitSnapshotForGroup(group);
+        if (groupSnapshotRoot) {
+          terminalGroups.push({
+            widgetId: widget.widgetId,
+            groupId: group.groupId,
+            customTitle: group.customTitle,
+            typingPadOpen: Boolean(widget.typingPadOpen),
+            activeSnapshotPaneId: group.activePaneId,
+            root: groupSnapshotRoot
+          });
+        }
+      }
+      for (const paneId of groupPaneIds) {
+        const pane = terminalPaneById.get(paneId);
+        if (!pane || pane.workspaceId !== state.activeWorkspaceId) continue;
+        if (pane.paneId === state.activePaneId) {
+          activeTerminalIndex = terminals.length;
+          activeWidget = widget;
+        }
+        terminals.push({
+          snapshotPaneId: pane.paneId,
+          title: pane.title.replace(/\s+\(exited\)$/i, ''),
+          customTitle: pane.customTitle,
+          command: pane.command,
+          llmId: pane.llmId,
+          widgetId: pane.widgetId,
+          groupId: group.groupId,
+          profileId: pane.profileId,
+          cwd: pane.cwd,
+          typingPadOpen: Boolean(widget.typingPadOpen),
+          rect: elementLayoutRatio(pane.element, { preferCache: true })
+        });
+      }
     }
-    terminals.push({
-      title: pane.title.replace(/\s+\(exited\)$/i, ''),
-      customTitle: pane.customTitle,
-      command: pane.command,
-      llmId: pane.llmId,
-      widgetId: pane.widgetId,
-      profileId: pane.profileId,
-      cwd: pane.cwd,
-      typingPadOpen: Boolean(widget?.typingPadOpen ?? pane.typingPadOpen),
-      rect: elementLayoutRatio(pane.element, { preferCache: true })
-    });
   }
   const spawnWidget = activeWidget ?? firstWidget ?? firstActiveWorkspaceTerminalWidget();
   return {
     terminals,
+    terminalGroups,
     activeTerminalIndex: Math.max(0, activeTerminalIndex),
     terminalSpawnRect: spawnWidget
       ? elementLayoutRatio(spawnWidget.element, { preferCache: true })
       : activeWorkspaceSnapshot()?.terminalSpawnRect
+  };
+}
+
+function workspaceTerminalSplitSnapshotForGroup(group: TerminalTabGroup) {
+  return workspaceTerminalSplitSnapshotForNode(group.root);
+}
+
+function workspaceTerminalSplitSnapshotForNode(node: TerminalSplitNode): WorkspaceTerminalSplitSnapshot | null {
+  if (node.kind === 'pane') {
+    return terminalPaneById.has(node.paneId) ? { kind: 'pane', snapshotPaneId: node.paneId } : null;
+  }
+  const first = workspaceTerminalSplitSnapshotForNode(node.first);
+  const second = workspaceTerminalSplitSnapshotForNode(node.second);
+  if (!first) return second;
+  if (!second) return first;
+  return {
+    kind: 'split',
+    direction: node.direction,
+    ratio: clampTerminalSplitRatio(node.ratio),
+    first,
+    second
   };
 }
 
@@ -4535,7 +4856,7 @@ function deferExplorerDirectoryRestore(path: string, profileId: string, workspac
 async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
   const profile = profileForId(snapshot.profileId);
   if (!profile) {
-    setStatus(`Workspace profile is unavailable: ${snapshot.label}`, true);
+    setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} profile is unavailable: ${snapshot.label}`, true);
     return;
   }
 
@@ -4589,7 +4910,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     if (isPanelVisible('calculator')) renderCalculator();
     if (isPanelVisible('settings')) renderSettings();
     refreshTitle();
-    setStatus(`Switching workspace: ${snapshot.label}`);
+    setStatus(`${IS_TERMINAL_APP ? 'Loading layout' : 'Switching workspace'}: ${snapshot.label}`);
     await yieldToUi();
     if (state.activeWorkspaceId !== snapshot.id) return;
 
@@ -4614,7 +4935,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
 
     if (!hasLiveTerminals) scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken);
     refreshTitle();
-    setStatus(`Workspace loaded: ${snapshot.label}${hasLiveTerminals ? '' : ' (shells starting)'}`);
+    setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}${hasLiveTerminals ? '' : ' (shells starting)'}`);
   } finally {
     restoringWorkspace = false;
     scheduleActiveWorkspaceSnapshotSave(WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS);
@@ -4672,6 +4993,7 @@ async function restoreWorkspaceTerminals(
       ? snapshot.terminals
       : [{ title: 'shell', command: null, rect: undefined }];
     const widgetsBySnapshotId = new Map<string, TerminalWidget>();
+    const paneIdBySnapshotPaneId = new Map<string, string>();
     for (const terminal of terminalSnapshots) {
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
       const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
@@ -4681,7 +5003,8 @@ async function restoreWorkspaceTerminals(
         focus: false,
         profile: terminalProfile,
         cwd: terminal.cwd || workspaceShellCwd(),
-        skipSnapshotSave: true
+        skipSnapshotSave: true,
+        groupId: terminal.groupId
       };
       const terminalTitle = terminal.title || 'shell';
       // An LLM-launcher terminal (codex/claude/grok button) is restored by spawning a plain shell
@@ -4704,6 +5027,8 @@ async function restoreWorkspaceTerminals(
         }
       }
       if (restoredPane) {
+        const snapshotPaneId = terminal.snapshotPaneId || `${widgetKey}:${terminal.groupId ?? restoredPane.groupId}:${terminalSnapshots.indexOf(terminal)}`;
+        paneIdBySnapshotPaneId.set(snapshotPaneId, restoredPane.paneId);
         restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
         const typingPadOpen = Boolean(terminal.typingPadOpen);
         restoredPane.typingPadOpen = typingPadOpen;
@@ -4715,6 +5040,7 @@ async function restoreWorkspaceTerminals(
       }
       if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
+        markWorkspaceLlmActivityForPane(restoredPane, WORKSPACE_LLM_START_ACTIVE_MS);
         await sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined);
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
@@ -4723,6 +5049,7 @@ async function restoreWorkspaceTerminals(
       }
       await yieldToUi();
     }
+    restoreTerminalGroupLayouts(snapshot, widgetsBySnapshotId, paneIdBySnapshotPaneId);
   }
 
   const active = activeWorkspaceTerminalPaneAtClamped(snapshot.activeTerminalIndex || 0);
@@ -4733,6 +5060,84 @@ async function restoreWorkspaceTerminals(
     state.activePaneId = '';
     syncActivePaneClass();
   }
+}
+
+function restoreTerminalGroupLayouts(
+  snapshot: WorkspaceSnapshot,
+  widgetsBySnapshotId: Map<string, TerminalWidget>,
+  paneIdBySnapshotPaneId: Map<string, string>
+) {
+  if (!snapshot.terminalGroups?.length) {
+    for (const widget of widgetsBySnapshotId.values()) {
+      renderTerminalWidgetTabs(widget);
+      renderTerminalWidgetSplitLayout(widget);
+    }
+    return;
+  }
+  const typingPadOpenByWidgetId = new Map<string, boolean>();
+  const typingPadStateKnownWidgetIds = new Set<string>();
+  for (const groupSnapshot of snapshot.terminalGroups) {
+    const widget = widgetsBySnapshotId.get(groupSnapshot.widgetId);
+    if (!widget) continue;
+    if (typeof groupSnapshot.typingPadOpen === 'boolean') {
+      typingPadStateKnownWidgetIds.add(widget.widgetId);
+      typingPadOpenByWidgetId.set(
+        widget.widgetId,
+        Boolean(typingPadOpenByWidgetId.get(widget.widgetId) || groupSnapshot.typingPadOpen)
+      );
+    }
+    const group = terminalGroupById(widget, groupSnapshot.groupId);
+    if (!group) continue;
+    const root = terminalSplitNodeFromSnapshot(groupSnapshot.root, paneIdBySnapshotPaneId);
+    if (!root) continue;
+    group.root = root;
+    group.customTitle = groupSnapshot.customTitle;
+    const activePaneId = groupSnapshot.activeSnapshotPaneId
+      ? paneIdBySnapshotPaneId.get(groupSnapshot.activeSnapshotPaneId)
+      : '';
+    group.activePaneId = activePaneId && terminalSplitNodeContainsPane(root, activePaneId)
+      ? activePaneId
+      : firstPaneIdInTerminalSplit(root);
+    for (const paneId of terminalGroupPaneIds(group)) {
+      const pane = terminalPaneById.get(paneId);
+      if (pane) pane.groupId = group.groupId;
+    }
+  }
+  for (const widget of widgetsBySnapshotId.values()) {
+    if (typingPadStateKnownWidgetIds.has(widget.widgetId)) {
+      widget.typingPadOpen = Boolean(typingPadOpenByWidgetId.get(widget.widgetId));
+      syncTerminalTypingPadOpenToPanes(widget, widget.typingPadOpen);
+    }
+    const activeGroup = activeTerminalGroupForWidget(widget);
+    if (activeGroup) {
+      widget.activeGroupId = activeGroup.groupId;
+      widget.activePaneId = activeGroup.activePaneId;
+    }
+    renderTerminalWidgetTabs(widget);
+    renderTerminalWidgetSplitLayout(widget);
+  }
+}
+
+function terminalSplitNodeFromSnapshot(
+  snapshot: WorkspaceTerminalSplitSnapshot,
+  paneIdBySnapshotPaneId: Map<string, string>
+): TerminalSplitNode | null {
+  if (snapshot.kind === 'pane') {
+    const paneId = paneIdBySnapshotPaneId.get(snapshot.snapshotPaneId);
+    return paneId ? { kind: 'pane', paneId } : null;
+  }
+  const first = terminalSplitNodeFromSnapshot(snapshot.first, paneIdBySnapshotPaneId);
+  const second = terminalSplitNodeFromSnapshot(snapshot.second, paneIdBySnapshotPaneId);
+  if (!first) return second;
+  if (!second) return first;
+  return {
+    kind: 'split',
+    splitId: crypto.randomUUID(),
+    direction: snapshot.direction,
+    ratio: clampTerminalSplitRatio(snapshot.ratio),
+    first,
+    second
+  };
 }
 
 async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
@@ -5138,10 +5543,13 @@ function closeNoteTab(id: string) {
 function renameNoteTab(id: string) {
   const tab = noteTabForId(id);
   if (!tab) return;
-  const current = noteTabCustomTitle(tab) || noteTabAutoLabel(tab);
-  const next = window.prompt('Note tab name. Leave empty to use the automatic title.', current);
-  if (next === null) return;
-  setNoteTabCustomTitle(id, next);
+  const row = connectedNoteTabElement(id);
+  if (!row) return;
+  const input = noteTabNameInput(row);
+  row.classList.add('renaming');
+  input.value = noteTabCustomTitle(tab) || noteTabAutoLabel(tab);
+  input.focus({ preventScroll: true });
+  input.select();
 }
 
 function setNoteTabCustomTitle(id: string, title: string) {
@@ -5237,7 +5645,26 @@ function noteTabElement(id: string) {
     const id = row.dataset.noteTabId ?? '';
     if (id) closeNoteTab(id);
   });
-  row.append(labelButton, closeButton);
+  const input = document.createElement('input');
+  input.className = 'widget-tab-name-input';
+  input.type = 'text';
+  input.maxLength = 64;
+  input.spellcheck = false;
+  input.setAttribute('aria-label', 'Note tab name');
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      finishNoteTabRename(row, true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      finishNoteTabRename(row, false);
+    }
+  });
+  input.addEventListener('blur', () => finishNoteTabRename(row, true));
+  input.addEventListener('pointerdown', (event) => event.stopPropagation());
+  input.addEventListener('click', (event) => event.stopPropagation());
+  row.append(labelButton, closeButton, input);
   noteTabElementCache.set(id, row);
   return row;
 }
@@ -5268,6 +5695,23 @@ function noteTabLabelButton(row: HTMLElement) {
   return row.firstElementChild as HTMLButtonElement;
 }
 
+function noteTabNameInput(row: HTMLElement) {
+  return row.querySelector<HTMLInputElement>('.widget-tab-name-input')!;
+}
+
+function finishNoteTabRename(row: HTMLElement, commit: boolean) {
+  if (!row.classList.contains('renaming')) return;
+  const id = row.dataset.noteTabId ?? '';
+  const input = noteTabNameInput(row);
+  row.classList.remove('renaming');
+  if (commit && id) setNoteTabCustomTitle(id, input.value);
+  else {
+    input.value = '';
+    const tab = noteTabForId(id);
+    if (tab) updateNoteTabElement(row, tab);
+  }
+}
+
 function pruneNoteTabElementCache(seen: Set<string>) {
   for (const id of noteTabElementCache.keys()) {
     if (!seen.has(id)) noteTabElementCache.delete(id);
@@ -5296,6 +5740,7 @@ function noteTabsOrderSignature() {
 function renderNotes() {
   const tab = activeNoteTab();
   setDisabledIfChanged(el.notesBody, !tab || Boolean(tab.loading));
+  setDisabledIfChanged(el.notesChecklist, !tab || Boolean(tab.loading));
   setInputValueIfChanged(el.notesBody, tab?.content ?? '');
   setDisabledIfChanged(el.notesTheme, !tab);
   setInputValueIfChanged(el.notesTheme, tab?.theme ?? 'default');
@@ -5367,6 +5812,102 @@ function handleNoteInput() {
   if (noteTabLabel(tab) !== previousLabel) renderNoteTabs();
   renderNoteStatus();
   scheduleNoteSave(tab, NOTES_AUTOSAVE_DELAY_MS);
+}
+
+type ChecklistLineState = 'none' | 'unchecked' | 'checked';
+
+function toggleNoteChecklistSelection() {
+  const tab = activeNoteTab();
+  if (!tab || tab.loading || el.notesBody.disabled) return;
+  const edit = checklistEditForSelection(el.notesBody.value, el.notesBody.selectionStart ?? 0, el.notesBody.selectionEnd ?? 0);
+  if (!edit) return;
+  applyNotesBodyEdit(edit.value, edit.selectionStart, edit.selectionEnd);
+  setStatus('Checklist updated');
+}
+
+function checklistEditForSelection(value: string, selectionStart: number, selectionEnd: number) {
+  const range = selectedNoteLineRange(value, selectionStart, selectionEnd);
+  const block = value.slice(range.start, range.end);
+  const lines = block.split('\n');
+  const states = lines.map(checklistLineState);
+  const checkableLines = states.filter((state) => state !== 'none');
+  const targetChecked = checkableLines.length === lines.length && checkableLines.some((state) => state === 'unchecked');
+  const nextLines = lines.map((line, index) => {
+    const state = states[index];
+    if (state === 'none') return checklistLineWithState(line, 'unchecked');
+    return checklistLineWithState(line, targetChecked ? 'checked' : 'unchecked');
+  });
+  const nextBlock = nextLines.join('\n');
+  const nextValue = `${value.slice(0, range.start)}${nextBlock}${value.slice(range.end)}`;
+  const delta = nextBlock.length - block.length;
+  const collapsed = selectionStart === selectionEnd;
+  const nextSelectionStart = collapsed ? selectionStart + delta : range.start;
+  const nextSelectionEnd = collapsed ? nextSelectionStart : range.end + delta;
+  return { value: nextValue, selectionStart: nextSelectionStart, selectionEnd: nextSelectionEnd };
+}
+
+function selectedNoteLineRange(value: string, selectionStart: number, selectionEnd: number) {
+  const start = clamp(selectionStart, 0, value.length);
+  const rawEnd = clamp(selectionEnd, 0, value.length);
+  const endForLine = rawEnd > start && value.charAt(rawEnd - 1) === '\n' ? rawEnd - 1 : rawEnd;
+  const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+  const nextLineBreak = value.indexOf('\n', endForLine);
+  const lineEnd = nextLineBreak >= 0 ? nextLineBreak : value.length;
+  return { start: lineStart, end: lineEnd };
+}
+
+function checklistLineState(line: string): ChecklistLineState {
+  const match = /^(\s*)(?:[-*]\s+)?\[( |x|X)\](?:\s+|$)/.exec(line);
+  if (!match) return 'none';
+  return match[2].toLowerCase() === 'x' ? 'checked' : 'unchecked';
+}
+
+function checklistLineWithState(line: string, state: Exclude<ChecklistLineState, 'none'>) {
+  const mark = state === 'checked' ? 'x' : ' ';
+  const existing = /^(\s*)(?:[-*]\s+)?\[( |x|X)\](?:\s+|$)(.*)$/.exec(line);
+  if (existing) return `${existing[1]}- [${mark}] ${existing[3]}`.replace(/\s+$/, '');
+  const indent = /^(\s*)/.exec(line)?.[1] ?? '';
+  const content = line.slice(indent.length);
+  return `${indent}- [${mark}] ${content}`;
+}
+
+function handleNoteChecklistEnter(event: KeyboardEvent) {
+  if (event.key !== 'Enter' || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.isComposing) return false;
+  const textarea = el.notesBody;
+  const start = textarea.selectionStart ?? 0;
+  const end = textarea.selectionEnd ?? start;
+  if (start !== end) return false;
+  const value = textarea.value;
+  const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+  const lineEndIndex = value.indexOf('\n', start);
+  const lineEnd = lineEndIndex >= 0 ? lineEndIndex : value.length;
+  const beforeCursor = value.slice(lineStart, start);
+  const currentLine = value.slice(lineStart, lineEnd);
+  const match = /^(\s*)-\s+\[( |x|X)\]\s*(.*)$/.exec(currentLine);
+  if (!match) return false;
+
+  event.preventDefault();
+  event.stopPropagation();
+  if (!match[3].trim() && start >= lineStart + match[0].length) {
+    const nextValue = `${value.slice(0, lineStart)}${match[1]}${value.slice(lineEnd)}`;
+    applyNotesBodyEdit(nextValue, lineStart + match[1].length, lineStart + match[1].length);
+    return true;
+  }
+
+  const prefixMatch = /^(\s*)-\s+\[(?: |x|X)\]\s*/.exec(beforeCursor);
+  if (!prefixMatch) return false;
+  const insert = `\n${prefixMatch[1]}- [ ] `;
+  const nextValue = `${value.slice(0, start)}${insert}${value.slice(start)}`;
+  const nextCursor = start + insert.length;
+  applyNotesBodyEdit(nextValue, nextCursor, nextCursor);
+  return true;
+}
+
+function applyNotesBodyEdit(value: string, selectionStart: number, selectionEnd: number) {
+  setInputValueIfChanged(el.notesBody, value);
+  el.notesBody.setSelectionRange(selectionStart, selectionEnd);
+  handleNoteInput();
+  el.notesBody.focus();
 }
 
 function scheduleNoteSave(tab: NoteTabState, delayMs: number) {
@@ -6151,6 +6692,7 @@ function bindEvents() {
     void createNoteTab({ focus: true });
   });
   el.notesPin.addEventListener('click', toggleNotePin);
+  el.notesChecklist.addEventListener('click', toggleNoteChecklistSelection);
   el.notesTheme.addEventListener('change', () => {
     setActiveNoteTheme(el.notesTheme.value as NoteThemeId);
   });
@@ -6163,6 +6705,13 @@ function bindEvents() {
   el.notesBody.addEventListener('input', handleNoteInput);
   el.notesBody.addEventListener('blur', () => void saveActiveNoteNow());
   el.notesBody.addEventListener('keydown', (event) => {
+    if (handleNoteChecklistEnter(event)) return;
+    if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'l') {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleNoteChecklistSelection();
+      return;
+    }
     if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 's') return;
     event.preventDefault();
     event.stopPropagation();
@@ -6512,15 +7061,21 @@ function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMe
     : activePaneForElement(card);
   if (pane) setActivePane(pane.paneId);
   const widget = terminalWidgetForElement(card);
+  const group = widget ? activeTerminalGroupForWidget(widget) : null;
+  const groupPaneCount = group ? terminalGroupPaneIds(group).length : 0;
   const selected = pane?.term.getSelection() ?? '';
   return [
     { label: 'Copy', action: () => copyTextToClipboard(selected, 'Copied terminal selection'), disabled: !selected },
     { label: 'Paste', action: () => pasteIntoTerminal(pane), disabled: !pane },
     { label: 'Clear', action: () => pane?.term.clear(), disabled: !pane },
     { separator: true },
-    { label: 'Rename shell tab', action: () => { if (pane) renameTerminalTab(pane.paneId); }, disabled: !pane },
+    { label: 'Split right', action: () => { if (pane) void splitTerminalPane(pane, 'row'); }, disabled: !pane },
+    { label: 'Split down', action: () => { if (pane) void splitTerminalPane(pane, 'column'); }, disabled: !pane },
+    { label: 'Close split pane', action: () => { if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane || groupPaneCount <= 1, danger: true },
+    { separator: true },
+    { label: 'Rename shell tab', action: () => { if (widget && group) renameTerminalGroup(widget, group.groupId); else if (pane) renameTerminalTab(pane.paneId); }, disabled: !pane },
     { label: 'New shell tab', action: () => { if (widget) void createShellTabInWidget(widget); }, disabled: !widget },
-    { label: 'Close shell tab', action: () => { if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane, danger: true },
+    { label: 'Close shell tab', action: () => { if (widget && group) void closeTerminalGroup(widget, group.groupId); else if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane, danger: true },
     { label: 'Close shell widget', action: () => { if (widget) void closeTerminalWidget(widget.widgetId); }, disabled: !widget, danger: true }
   ];
 }
@@ -6779,6 +7334,7 @@ async function startLlmLauncher(id: string) {
   if (!pane?.backendId) return;
   // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
   pane.llmId = id;
+  markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
   await sendTerminalInputNow(pane, `${call}\r`).catch((error) => {
     setStatus(`Failed to launch ${id}: ${String(error)}`, true);
   });
@@ -7203,7 +7759,10 @@ function setKeyboardResizeTarget(target: ResizeTarget) {
 
 function keyboardResizeElementForTarget(target: ResizeTarget) {
   if (target.kind === 'panel') return getPanel(target.id);
-  if (target.kind === 'terminal') return terminalPaneById.get(target.paneId)?.element ?? null;
+  if (target.kind === 'terminal') {
+    const pane = terminalPaneById.get(target.paneId);
+    return pane?.host.closest<HTMLElement>('.terminal-split-leaf') ?? pane?.element ?? null;
+  }
   return null;
 }
 
@@ -7812,6 +8371,10 @@ function clamp(value: number, min: number, max: number) {
 
 async function openWorkspace(path: string) {
   state.currentDir = path;
+  if (IS_TERMINAL_APP) {
+    refreshTitle();
+    return;
+  }
   await loadDirectory(path);
   refreshTitle();
 }
@@ -7898,6 +8461,7 @@ async function closeAllTerminals() {
     forgetTerminalWidget(widget);
     widget.element.remove();
   }
+  for (const workspaceId of [...workspaceLlmActivityExpiresAt.keys()]) clearWorkspaceLlmActivity(workspaceId);
   syncActivePaneClass();
   renderShellTabs();
 }
@@ -8160,7 +8724,7 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
     }
   }
   if (!open) setKeyboardResizeTarget({ kind: 'ide' });
-  if (open) scheduleExplorerWatch(1200);
+  if (open && !IS_TERMINAL_APP) scheduleExplorerWatch(1200);
   else stopExplorerWatch();
   renderShellTabs();
 }
@@ -12489,6 +13053,8 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     typePad,
     typePadInput,
     typePadPaste,
+    tabGroups: [],
+    activeGroupId: '',
     activePaneId: '',
     typingPadOpen: false
   };
@@ -12498,7 +13064,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   if (workspaceId === state.activeWorkspaceId) visibleTerminalWorkspaceId = workspaceId;
 
   card.addEventListener('pointerdown', (event) => {
-    const pane = activePaneForWidget(widget);
+    const pane = terminalPaneForWidgetPointerTarget(widget, event.target) ?? activePaneForWidget(widget);
     const fromTypePad = event.target instanceof Element && Boolean(event.target.closest('.terminal-type-pad'));
     if (pane) setActivePane(pane.paneId, { focus: !fromTypePad });
     bringPanelToFront(card);
@@ -12586,6 +13152,34 @@ function focusTerminalTypingPad(widget: TerminalWidget) {
   widget.typePadInput.setSelectionRange(end, end);
 }
 
+function focusTerminalTypingPadWhenReady(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane || !terminalTypingPadIsOpen(widget)) return;
+  setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
+  setTerminalTextTarget('typing-pad');
+  cancelTerminalFocusRequest(pane);
+  pane.focusFrame = requestAnimationFrame(() => {
+    pane.focusFrame = undefined;
+    focusTerminalTypingPadInputNow(widget);
+    if (pane.focusRetryTimer) window.clearTimeout(pane.focusRetryTimer);
+    pane.focusRetryTimer = window.setTimeout(() => {
+      pane.focusRetryTimer = undefined;
+      if (document.activeElement !== widget.typePadInput) focusTerminalTypingPadInputNow(widget);
+    }, TERMINAL_FOCUS_RETRY_MS);
+  });
+}
+
+function focusTerminalTypingPadInputNow(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane || !terminalTypingPadIsOpen(widget)) return;
+  if (widget.element.classList.contains('hidden') || !widget.typePadInput.isConnected) return;
+  try {
+    widget.typePadInput.focus({ preventScroll: true });
+  } catch {
+    // The WebView can reject focus while returning from an OS-level app switch.
+  }
+}
+
 function focusTerminalFromTypingPad(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   if (!pane) return;
@@ -12611,6 +13205,7 @@ async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
   }
   try {
     markTerminalUserInput(pane);
+    markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
     await sendTerminalInputNow(pane, terminalPastePayload(value));
     pane.typingPadDraft = '';
     widget.typePadInput.value = '';
@@ -12720,6 +13315,180 @@ function cancelTerminalFocusRequest(pane: TerminalPane) {
   }
 }
 
+const TERMINAL_SPLIT_MIN_RATIO = 0.15;
+const TERMINAL_SPLIT_MAX_RATIO = 0.85;
+const TERMINAL_SPLIT_SNAP_RATIO = 0.5;
+const TERMINAL_SPLIT_SNAP_THRESHOLD = 0.025;
+const terminalSplitResizeWidgetIds = new Set<string>();
+
+function terminalGroupById(widget: TerminalWidget, groupId: string | undefined) {
+  if (!groupId) return null;
+  return widget.tabGroups.find((group) => group.groupId === groupId) ?? null;
+}
+
+function terminalGroupsForWidget(widget: TerminalWidget) {
+  return widget.tabGroups;
+}
+
+function terminalGroupPaneIds(group: TerminalTabGroup) {
+  return terminalSplitPaneIds(group.root);
+}
+
+function terminalSplitPaneIds(node: TerminalSplitNode | null | undefined, out: string[] = []) {
+  if (!node) return out;
+  if (node.kind === 'pane') out.push(node.paneId);
+  else {
+    terminalSplitPaneIds(node.first, out);
+    terminalSplitPaneIds(node.second, out);
+  }
+  return out;
+}
+
+function terminalSplitNodeContainsPane(node: TerminalSplitNode | null | undefined, paneId: string): boolean {
+  if (!node) return false;
+  if (node.kind === 'pane') return node.paneId === paneId;
+  return terminalSplitNodeContainsPane(node.first, paneId) || terminalSplitNodeContainsPane(node.second, paneId);
+}
+
+function firstPaneIdInTerminalSplit(node: TerminalSplitNode | null | undefined): string {
+  if (!node) return '';
+  if (node.kind === 'pane') return node.paneId;
+  return firstPaneIdInTerminalSplit(node.first) || firstPaneIdInTerminalSplit(node.second);
+}
+
+function terminalGroupForPaneId(widget: TerminalWidget | null | undefined, paneId: string | undefined) {
+  if (!widget || !paneId) return null;
+  return widget.tabGroups.find((group) => terminalSplitNodeContainsPane(group.root, paneId)) ?? null;
+}
+
+function terminalGroupForPane(pane: TerminalPane | null | undefined) {
+  if (!pane) return null;
+  return terminalGroupForPaneId(terminalWidgetForPane(pane), pane.paneId);
+}
+
+function activeTerminalGroupForWidget(widget: TerminalWidget) {
+  return terminalGroupById(widget, widget.activeGroupId)
+    ?? terminalGroupForPaneId(widget, widget.activePaneId)
+    ?? widget.tabGroups[0]
+    ?? null;
+}
+
+function activePaneForTerminalGroup(group: TerminalTabGroup | null | undefined) {
+  if (!group) return null;
+  const pane = terminalPaneById.get(group.activePaneId);
+  if (pane?.groupId === group.groupId) return pane;
+  const firstPaneId = firstPaneIdInTerminalSplit(group.root);
+  return firstPaneId ? terminalPaneById.get(firstPaneId) ?? null : null;
+}
+
+function createTerminalGroup(widget: TerminalWidget, paneId: string, groupId: string = crypto.randomUUID()) {
+  const group: TerminalTabGroup = {
+    groupId,
+    widgetId: widget.widgetId,
+    activePaneId: paneId,
+    root: { kind: 'pane', paneId }
+  };
+  widget.tabGroups.push(group);
+  if (!widget.activeGroupId) widget.activeGroupId = group.groupId;
+  return group;
+}
+
+function rememberPaneInTerminalGroup(
+  widget: TerminalWidget,
+  pane: TerminalPane,
+  options: Pick<CreateTerminalOptions, 'groupId' | 'splitTargetPaneId' | 'splitDirection' | 'focus'> = {}
+) {
+  const splitGroup = terminalGroupForPaneId(widget, options.splitTargetPaneId);
+  let group = splitGroup ?? terminalGroupById(widget, options.groupId);
+  if (!group) {
+    group = createTerminalGroup(widget, pane.paneId, options.groupId ?? crypto.randomUUID());
+  } else if (!terminalSplitNodeContainsPane(group.root, pane.paneId)) {
+    if (options.splitTargetPaneId && terminalSplitNodeContainsPane(group.root, options.splitTargetPaneId)) {
+      group.root = insertPaneIntoTerminalSplit(
+        group.root,
+        options.splitTargetPaneId,
+        pane.paneId,
+        options.splitDirection ?? 'row'
+      );
+    } else {
+      group.root = appendPaneToTerminalSplit(group.root, pane.paneId);
+    }
+  }
+  pane.groupId = group.groupId;
+  if (options.focus !== false || !group.activePaneId) {
+    group.activePaneId = pane.paneId;
+    widget.activeGroupId = group.groupId;
+  }
+  return group;
+}
+
+function insertPaneIntoTerminalSplit(
+  node: TerminalSplitNode,
+  targetPaneId: string,
+  newPaneId: string,
+  direction: TerminalSplitDirection
+): TerminalSplitNode {
+  if (node.kind === 'pane') {
+    if (node.paneId !== targetPaneId) return node;
+    return {
+      kind: 'split',
+      splitId: crypto.randomUUID(),
+      direction,
+      ratio: 0.5,
+      first: { kind: 'pane', paneId: targetPaneId },
+      second: { kind: 'pane', paneId: newPaneId }
+    };
+  }
+  return {
+    ...node,
+    first: insertPaneIntoTerminalSplit(node.first, targetPaneId, newPaneId, direction),
+    second: insertPaneIntoTerminalSplit(node.second, targetPaneId, newPaneId, direction)
+  };
+}
+
+function appendPaneToTerminalSplit(node: TerminalSplitNode, paneId: string): TerminalSplitNode {
+  return {
+    kind: 'split',
+    splitId: crypto.randomUUID(),
+    direction: 'row',
+    ratio: 0.5,
+    first: node,
+    second: { kind: 'pane', paneId }
+  };
+}
+
+function removePaneFromTerminalSplit(node: TerminalSplitNode, paneId: string): TerminalSplitNode | null {
+  if (node.kind === 'pane') return node.paneId === paneId ? null : node;
+  const first = removePaneFromTerminalSplit(node.first, paneId);
+  const second = removePaneFromTerminalSplit(node.second, paneId);
+  if (!first) return second;
+  if (!second) return first;
+  if (first === node.first && second === node.second) return node;
+  return { ...node, first, second };
+}
+
+function removePaneFromTerminalGroup(widget: TerminalWidget, pane: TerminalPane) {
+  const group = terminalGroupForPaneId(widget, pane.paneId) ?? terminalGroupById(widget, pane.groupId);
+  if (!group) return null;
+  const nextRoot = removePaneFromTerminalSplit(group.root, pane.paneId);
+  if (!nextRoot) {
+    const groupIndex = widget.tabGroups.indexOf(group);
+    if (groupIndex >= 0) widget.tabGroups.splice(groupIndex, 1);
+    if (widget.activeGroupId === group.groupId) widget.activeGroupId = widget.tabGroups[groupIndex]?.groupId ?? widget.tabGroups[groupIndex - 1]?.groupId ?? widget.tabGroups[0]?.groupId ?? '';
+    return null;
+  }
+  group.root = nextRoot;
+  if (group.activePaneId === pane.paneId) group.activePaneId = firstPaneIdInTerminalSplit(nextRoot);
+  return group;
+}
+
+function clampTerminalSplitRatio(value: number) {
+  const clamped = clamp(value, TERMINAL_SPLIT_MIN_RATIO, TERMINAL_SPLIT_MAX_RATIO);
+  return Math.abs(clamped - TERMINAL_SPLIT_SNAP_RATIO) <= TERMINAL_SPLIT_SNAP_THRESHOLD
+    ? TERMINAL_SPLIT_SNAP_RATIO
+    : clamped;
+}
+
 async function createTerminalTab(
   widget: TerminalWidget,
   command: string | null,
@@ -12729,6 +13498,8 @@ async function createTerminalTab(
   const terminalProfile = options.profile ?? profileForTerminalWidget(widget) ?? state.activeProfile;
   if (!terminalProfile) return null;
   const terminalCwd = options.cwd ?? activePaneForWidget(widget)?.cwd ?? workspaceShellCwd();
+  const splitGroup = terminalGroupForPaneId(widget, options.splitTargetPaneId);
+  const initialGroupId = splitGroup?.groupId ?? options.groupId ?? crypto.randomUUID();
   const paneId = crypto.randomUUID();
   const host = document.createElement('div');
   host.className = 'terminal-host hidden';
@@ -12754,6 +13525,7 @@ async function createTerminalTab(
   const pane: TerminalPane = {
     paneId,
     widgetId: widget.widgetId,
+    groupId: initialGroupId,
     workspaceId: widget.workspaceId,
     title,
     command,
@@ -12777,15 +13549,18 @@ async function createTerminalTab(
   state.terminals.push(pane);
   terminalPaneById.set(pane.paneId, pane);
   rememberTerminalPane(pane);
+  const group = rememberPaneInTerminalGroup(widget, pane, options);
   registerTerminalFileLinks(pane);
   if (options.focus !== false) {
     setActivePane(paneId);
     bringPanelToFront(widget.element);
   } else {
-    if (!widget.activePaneId) widget.activePaneId = paneId;
+    if (!widget.activeGroupId) widget.activeGroupId = group.groupId;
+    if (!widget.activePaneId) widget.activePaneId = group.activePaneId || paneId;
     syncActivePaneClass();
   }
   renderTerminalWidgetTabs(widget);
+  renderTerminalWidgetSplitLayout(widget);
   if (pane.paneId === widget.activePaneId) scheduleFitTerminal(pane);
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
@@ -12793,6 +13568,7 @@ async function createTerminalTab(
     const inputData = filterTerminalInputData(pane, data);
     if (!inputData) return;
     markTerminalUserInput(pane);
+    markWorkspaceLlmInputActivityForPane(pane, inputData);
     trackTerminalCwdFromInput(pane, inputData);
     if (terminalInputShouldSendImmediately(inputData)) {
       void sendTerminalInputNow(pane, inputData).catch((error) => {
@@ -12839,7 +13615,9 @@ async function createTerminalTab(
 async function closeTerminalPane(paneId: string, options: CloseTerminalOptions = {}) {
   const pane = terminalPaneById.get(paneId) ?? state.terminals.find((item) => item.paneId === paneId);
   if (!pane) return;
+  const workspaceId = pane.workspaceId;
   const widget = terminalWidgetForPane(pane);
+  if (widget) removePaneFromTerminalGroup(widget, pane);
   const backendClose = closeTerminalBackend(pane);
   if (options.backgroundKill) void backendClose;
   else await backendClose;
@@ -12860,18 +13638,22 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
     forgetTerminalWidget(widget);
     widget.element.remove();
   } else if (widget && widget.activePaneId === paneId) {
-    widget.activePaneId = nextInWidget?.paneId ?? '';
+    const activeGroup = activeTerminalGroupForWidget(widget);
+    widget.activePaneId = activeGroup?.activePaneId || nextInWidget?.paneId || '';
+    widget.activeGroupId = activeGroup?.groupId || '';
   }
 
   if (state.activePaneId === paneId) {
-    const next = nextInWidget ?? firstActiveWorkspaceTerminalPane();
+    const next = widget ? activePaneForWidget(widget) ?? firstActiveWorkspaceTerminalPane() : firstActiveWorkspaceTerminalPane();
     state.activePaneId = '';
     if (next) setActivePane(next.paneId);
     else setKeyboardResizeTarget({ kind: 'ide' });
   }
+  if (widget && nextInWidget) renderTerminalWidgetSplitLayout(widget);
   syncActivePaneClass();
   if (options.renderShellTabs !== false) renderShellTabs();
   if (options.saveSnapshot !== false) saveActiveWorkspaceSnapshot();
+  refreshWorkspaceLlmActivityAfterPaneChange(workspaceId);
 }
 
 function closeTerminalBackend(pane: TerminalPane) {
@@ -12889,6 +13671,166 @@ async function closeTerminalWidget(widgetId: string, options: CloseTerminalOptio
   for (const paneId of paneIds) {
     await closeTerminalPane(paneId, options);
   }
+}
+
+async function closeTerminalGroup(widget: TerminalWidget, groupId: string) {
+  const group = terminalGroupById(widget, groupId);
+  if (!group) return;
+  const paneIds = terminalGroupPaneIds(group);
+  for (const paneId of paneIds) {
+    await closeTerminalPane(paneId, {
+      renderShellTabs: false,
+      saveSnapshot: false
+    });
+  }
+  renderShellTabs();
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderTerminalWidgetSplitLayout(widget: TerminalWidget) {
+  const group = activeTerminalGroupForWidget(widget);
+  const activePaneIds = new Set(group ? terminalGroupPaneIds(group) : []);
+  widget.hostStack.classList.toggle('terminal-split-active', Boolean(group));
+  const signature = group ? `${group.groupId}:${terminalSplitLayoutSignature(group.root)}` : '';
+  if (widget.hostStack.dataset.splitLayoutSignature === signature) {
+    syncTerminalHostVisibility(widget, activePaneIds);
+    return;
+  }
+  widget.hostStack.dataset.splitLayoutSignature = signature;
+  const fragment = document.createDocumentFragment();
+  if (group) {
+    const root = document.createElement('div');
+    root.className = 'terminal-split-root';
+    const rendered = renderTerminalSplitNode(widget, group.root);
+    if (rendered) root.append(rendered);
+    fragment.append(root);
+  }
+  for (const pane of terminalPanesForWidget(widget)) {
+    if (activePaneIds.has(pane.paneId)) continue;
+    pane.host.classList.add('hidden');
+    pane.host.classList.remove('active');
+    fragment.append(pane.host);
+  }
+  widget.hostStack.replaceChildren(fragment);
+  syncTerminalHostVisibility(widget, activePaneIds);
+  scheduleFitTerminalWidget(widget);
+}
+
+function terminalSplitLayoutSignature(node: TerminalSplitNode): string {
+  if (node.kind === 'pane') return `p:${node.paneId}`;
+  return `s:${node.splitId}:${node.direction}:${node.ratio.toFixed(4)}(${terminalSplitLayoutSignature(node.first)}|${terminalSplitLayoutSignature(node.second)})`;
+}
+
+function syncTerminalHostVisibility(widget: TerminalWidget, activePaneIds: Set<string>) {
+  for (const pane of terminalPanesForWidget(widget)) {
+    const visible = activePaneIds.has(pane.paneId)
+      && widget.workspaceId === state.activeWorkspaceId
+      && !widget.element.classList.contains('hidden');
+    toggleClassIfChanged(pane.host, 'hidden', !visible);
+    toggleClassIfChanged(pane.host, 'active', pane.paneId === widget.activePaneId);
+    const leaf = pane.host.closest<HTMLElement>('.terminal-split-leaf');
+    if (leaf) toggleClassIfChanged(leaf, 'active', visible && pane.paneId === widget.activePaneId);
+  }
+}
+
+function renderTerminalSplitNode(widget: TerminalWidget, node: TerminalSplitNode): HTMLElement | null {
+  if (node.kind === 'pane') {
+    const pane = terminalPaneById.get(node.paneId);
+    if (!pane) return null;
+    const leaf = document.createElement('div');
+    leaf.className = `terminal-split-leaf${pane.paneId === widget.activePaneId ? ' active' : ''}`;
+    leaf.dataset.paneId = pane.paneId;
+    pane.host.classList.remove('hidden');
+    leaf.append(pane.host);
+    return leaf;
+  }
+
+  const split = document.createElement('div');
+  split.className = `terminal-split ${node.direction}`;
+  split.dataset.splitId = node.splitId;
+  setTerminalSplitElementRatio(split, node.ratio);
+
+  const first = document.createElement('div');
+  first.className = 'terminal-split-branch first';
+  const firstChild = renderTerminalSplitNode(widget, node.first);
+  if (firstChild) first.append(firstChild);
+
+  const second = document.createElement('div');
+  second.className = 'terminal-split-branch second';
+  const secondChild = renderTerminalSplitNode(widget, node.second);
+  if (secondChild) second.append(secondChild);
+
+  const resizer = document.createElement('div');
+  resizer.className = 'terminal-split-resizer';
+  resizer.title = 'Drag to resize split';
+  resizer.addEventListener('pointerdown', (event) => startTerminalSplitResize(event, widget, node, split));
+
+  split.append(first, resizer, second);
+  return split;
+}
+
+function setTerminalSplitElementRatio(element: HTMLElement, ratio: number) {
+  element.style.setProperty('--terminal-split-ratio', `${(clampTerminalSplitRatio(ratio) * 100).toFixed(2)}%`);
+}
+
+function startTerminalSplitResize(
+  event: PointerEvent,
+  widget: TerminalWidget,
+  node: Extract<TerminalSplitNode, { kind: 'split' }>,
+  element: HTMLElement
+) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  bringPanelToFront(widget.element);
+  terminalSplitResizeWidgetIds.add(widget.widgetId);
+  widget.hostStack.classList.add('terminal-split-resizing');
+  let frame = 0;
+  let latestClientX = event.clientX;
+  let latestClientY = event.clientY;
+  const updateRatio = (clientX: number, clientY: number) => {
+    const rect = element.getBoundingClientRect();
+    const rawRatio = node.direction === 'row'
+      ? (clientX - rect.left) / Math.max(1, rect.width)
+      : (clientY - rect.top) / Math.max(1, rect.height);
+    node.ratio = clampTerminalSplitRatio(rawRatio);
+    setTerminalSplitElementRatio(element, node.ratio);
+  };
+  const applyPendingRatio = () => {
+    frame = 0;
+    updateRatio(latestClientX, latestClientY);
+  };
+  const scheduleRatioUpdate = () => {
+    if (!frame) {
+      frame = requestAnimationFrame(() => {
+        applyPendingRatio();
+      });
+    }
+  };
+  const onMove = (moveEvent: PointerEvent) => {
+    moveEvent.preventDefault();
+    latestClientX = moveEvent.clientX;
+    latestClientY = moveEvent.clientY;
+    scheduleRatioUpdate();
+  };
+  const onEnd = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onEnd);
+    window.removeEventListener('pointercancel', onEnd);
+    if (frame) {
+      cancelAnimationFrame(frame);
+      applyPendingRatio();
+    }
+    terminalSplitResizeWidgetIds.delete(widget.widgetId);
+    widget.hostStack.classList.remove('terminal-split-resizing');
+    scheduleFitTerminalWidget(widget);
+    window.setTimeout(() => scheduleFitTerminalWidget(widget), 80);
+    window.setTimeout(() => scheduleFitTerminalWidget(widget), 180);
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onEnd, { once: true });
+  window.addEventListener('pointercancel', onEnd, { once: true });
 }
 
 function renderShellTabs() {
@@ -12913,8 +13855,8 @@ function shellTabsSignature() {
 }
 
 function renderTerminalWidgetTabs(widget: TerminalWidget) {
-  const panes = terminalPanesForWidget(widget);
-  const renderState = terminalWidgetTabsRenderState(widget, panes);
+  const groups = terminalGroupsForWidget(widget);
+  const renderState = terminalWidgetTabsRenderState(widget, groups);
   if (terminalWidgetTabsRenderSignatures.get(widget) === renderState.signature) {
     updateTerminalWidgetTitle(widget);
     return;
@@ -12924,8 +13866,8 @@ function renderTerminalWidgetTabs(widget: TerminalWidget) {
     && widget.tabList.childElementCount === renderState.count;
 
   if (sameOrder) {
-    for (const pane of panes) {
-      updateTerminalWidgetTabElement(terminalWidgetTabElement(widget, pane.paneId), widget, pane);
+    for (const group of groups) {
+      updateTerminalWidgetTabElement(terminalWidgetTabElement(widget, group.groupId), widget, group);
     }
     updateTerminalWidgetTitle(widget);
     return;
@@ -12934,10 +13876,10 @@ function renderTerminalWidgetTabs(widget: TerminalWidget) {
   terminalWidgetTabsOrderRenderSignatures.set(widget, renderState.orderSignature);
   const fragment = document.createDocumentFragment();
   const seen = new Set<string>();
-  for (const pane of panes) {
-    seen.add(pane.paneId);
-    const item = terminalWidgetTabElement(widget, pane.paneId);
-    updateTerminalWidgetTabElement(item, widget, pane);
+  for (const group of groups) {
+    seen.add(group.groupId);
+    const item = terminalWidgetTabElement(widget, group.groupId);
+    updateTerminalWidgetTabElement(item, widget, group);
     fragment.append(item);
   }
   widget.tabList.replaceChildren(fragment);
@@ -12945,9 +13887,9 @@ function renderTerminalWidgetTabs(widget: TerminalWidget) {
   updateTerminalWidgetTitle(widget);
 }
 
-function terminalWidgetTabElement(widget: TerminalWidget, paneId: string) {
+function terminalWidgetTabElement(widget: TerminalWidget, groupId: string) {
   const cache = terminalWidgetTabCache(widget);
-  const cached = cache.get(paneId);
+  const cached = cache.get(groupId);
   if (cached) return cached;
   const item = document.createElement('div');
   item.className = 'widget-tab';
@@ -12955,7 +13897,8 @@ function terminalWidgetTabElement(widget: TerminalWidget, paneId: string) {
   labelButton.className = 'widget-tab-label';
   labelButton.type = 'button';
   labelButton.addEventListener('click', () => {
-    const pane = terminalPaneById.get(item.dataset.paneId ?? '');
+    const group = terminalGroupById(widget, item.dataset.groupId ?? '');
+    const pane = activePaneForTerminalGroup(group);
     if (!pane) return;
     setActivePane(pane.paneId);
     bringPanelToFront(pane.element);
@@ -12964,15 +13907,15 @@ function terminalWidgetTabElement(widget: TerminalWidget, paneId: string) {
   labelButton.addEventListener('dblclick', (event) => {
     event.preventDefault();
     event.stopPropagation();
-    const paneId = item.dataset.paneId ?? '';
-    if (paneId) renameTerminalTab(paneId);
+    const groupId = item.dataset.groupId ?? '';
+    if (groupId) renameTerminalGroup(widget, groupId);
   });
   labelButton.addEventListener('keydown', (event) => {
     if (event.key !== 'F2') return;
     event.preventDefault();
     event.stopPropagation();
-    const paneId = item.dataset.paneId ?? '';
-    if (paneId) renameTerminalTab(paneId);
+    const groupId = item.dataset.groupId ?? '';
+    if (groupId) renameTerminalGroup(widget, groupId);
   });
   const closeButton = document.createElement('button');
   closeButton.className = 'widget-tab-close';
@@ -12982,11 +13925,30 @@ function terminalWidgetTabElement(widget: TerminalWidget, paneId: string) {
   closeButton.textContent = 'x';
   closeButton.addEventListener('click', (event) => {
     event.stopPropagation();
-    const paneId = item.dataset.paneId ?? '';
-    if (paneId) void closeTerminalPane(paneId);
+    const groupId = item.dataset.groupId ?? '';
+    if (groupId) void closeTerminalGroup(widget, groupId);
   });
-  item.append(labelButton, closeButton);
-  cache.set(paneId, item);
+  const input = document.createElement('input');
+  input.className = 'widget-tab-name-input';
+  input.type = 'text';
+  input.maxLength = 64;
+  input.spellcheck = false;
+  input.setAttribute('aria-label', 'Shell tab name');
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      finishTerminalGroupRename(widget, item, true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      finishTerminalGroupRename(widget, item, false);
+    }
+  });
+  input.addEventListener('blur', () => finishTerminalGroupRename(widget, item, true));
+  input.addEventListener('pointerdown', (event) => event.stopPropagation());
+  input.addEventListener('click', (event) => event.stopPropagation());
+  item.append(labelButton, closeButton, input);
+  cache.set(groupId, item);
   return item;
 }
 
@@ -12999,15 +13961,20 @@ function terminalWidgetTabCache(widget: TerminalWidget) {
   return cache;
 }
 
-function updateTerminalWidgetTabElement(item: HTMLElement, widget: TerminalWidget, pane: TerminalPane) {
-  const active = pane.paneId === widget.activePaneId;
-  const label = terminalPaneLabel(pane);
-  const signature = `${pane.paneId}\t${active ? '1' : '0'}\t${pane.title}\t${pane.customTitle ?? ''}\t${pane.command ?? ''}`;
-  item.dataset.paneId = pane.paneId;
+function updateTerminalWidgetTabElement(item: HTMLElement, widget: TerminalWidget, group: TerminalTabGroup) {
+  const pane = activePaneForTerminalGroup(group);
+  const active = group.groupId === widget.activeGroupId;
+  const label = terminalGroupLabel(group);
+  const signature = `${group.groupId}\t${active ? '1' : '0'}\t${group.customTitle ?? ''}\t${pane?.title ?? ''}\t${pane?.customTitle ?? ''}\t${pane?.command ?? ''}\t${terminalGroupPaneIds(group).join(',')}`;
+  item.dataset.groupId = group.groupId;
   if (item.dataset.renderSignature === signature) return;
   item.dataset.renderSignature = signature;
   item.className = `widget-tab${active ? ' active' : ''}`;
-  item.title = pane.customTitle ? `${pane.customTitle} (${pane.title})` : (pane.command || pane.title);
+  item.title = group.customTitle
+    ? `${group.customTitle}${pane ? ` (${pane.title})` : ''}`
+    : pane
+      ? (pane.customTitle ? `${pane.customTitle} (${pane.title})` : (pane.command || pane.title))
+      : 'shell';
   setTextContentIfChanged(terminalWidgetTabLabelButton(item), label);
 }
 
@@ -13015,17 +13982,28 @@ function terminalWidgetTabLabelButton(item: HTMLElement) {
   return item.firstElementChild as HTMLButtonElement;
 }
 
+function terminalWidgetTabNameInput(item: HTMLElement) {
+  return item.querySelector<HTMLInputElement>('.widget-tab-name-input')!;
+}
+
 function terminalPaneLabel(pane: TerminalPane) {
   return pane.customTitle?.trim() || pane.title;
+}
+
+function terminalGroupLabel(group: TerminalTabGroup) {
+  if (group.customTitle?.trim()) return group.customTitle.trim();
+  const pane = activePaneForTerminalGroup(group);
+  const label = pane ? terminalPaneLabel(pane) : 'shell';
+  const count = terminalGroupPaneIds(group).length;
+  return count > 1 ? `${label} (${count})` : label;
 }
 
 function renameTerminalTab(paneId: string) {
   const pane = terminalPaneById.get(paneId);
   if (!pane) return;
-  const current = pane.customTitle?.trim() || pane.title;
-  const next = window.prompt('Shell tab name. Leave empty to use the automatic title.', current);
-  if (next === null) return;
-  setTerminalTabCustomTitle(pane, next);
+  const widget = terminalWidgetForPane(pane);
+  const group = terminalGroupForPane(pane);
+  if (widget && group) renameTerminalGroup(widget, group.groupId);
 }
 
 function setTerminalTabCustomTitle(pane: TerminalPane, title: string) {
@@ -13041,25 +14019,61 @@ function setTerminalTabCustomTitle(pane: TerminalPane, title: string) {
   setStatus(customTitle ? `Shell tab renamed: ${customTitle}` : 'Shell tab uses automatic title');
 }
 
-function pruneTerminalWidgetTabElementCache(widget: TerminalWidget, seen: Set<string>) {
-  const cache = terminalWidgetTabElementCaches.get(widget);
-  if (!cache) return;
-  for (const paneId of cache.keys()) {
-    if (!seen.has(paneId)) cache.delete(paneId);
+function renameTerminalGroup(widget: TerminalWidget, groupId: string) {
+  const group = terminalGroupById(widget, groupId);
+  if (!group) return;
+  const item = terminalWidgetTabElement(widget, groupId);
+  if (!item.isConnected) return;
+  const input = terminalWidgetTabNameInput(item);
+  item.classList.add('renaming');
+  input.value = group.customTitle?.trim() || terminalGroupLabel(group);
+  input.focus({ preventScroll: true });
+  input.select();
+}
+
+function setTerminalGroupCustomTitle(widget: TerminalWidget, group: TerminalTabGroup, title: string) {
+  const customTitle = title.trim();
+  group.customTitle = customTitle || undefined;
+  terminalWidgetTabsRenderSignatures.delete(widget);
+  renderTerminalWidgetTabs(widget);
+  updateTerminalWidgetTitle(widget, { force: true });
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  setStatus(customTitle ? `Shell tab renamed: ${customTitle}` : 'Shell tab uses active shell title');
+}
+
+function finishTerminalGroupRename(widget: TerminalWidget, item: HTMLElement, commit: boolean) {
+  if (!item.classList.contains('renaming')) return;
+  const groupId = item.dataset.groupId ?? '';
+  const input = terminalWidgetTabNameInput(item);
+  item.classList.remove('renaming');
+  const group = terminalGroupById(widget, groupId);
+  if (commit && group) setTerminalGroupCustomTitle(widget, group, input.value);
+  else {
+    input.value = '';
+    if (group) updateTerminalWidgetTabElement(item, widget, group);
   }
 }
 
-function terminalWidgetTabsRenderState(widget: TerminalWidget, panes = terminalPanesForWidget(widget)) {
+function pruneTerminalWidgetTabElementCache(widget: TerminalWidget, seen: Set<string>) {
+  const cache = terminalWidgetTabElementCaches.get(widget);
+  if (!cache) return;
+  for (const groupId of cache.keys()) {
+    if (!seen.has(groupId)) cache.delete(groupId);
+  }
+}
+
+function terminalWidgetTabsRenderState(widget: TerminalWidget, groups = terminalGroupsForWidget(widget)) {
   let signature = '';
   let orderSignature = '';
   let count = 0;
-  for (const pane of panes) {
+  for (const group of groups) {
+    const pane = activePaneForTerminalGroup(group);
     if (count) {
       signature += '\n';
       orderSignature += '\n';
     }
-    signature += `${pane.paneId}\t${pane.paneId === widget.activePaneId ? '1' : '0'}\t${pane.title}\t${pane.customTitle ?? ''}\t${pane.command ?? ''}`;
-    orderSignature += pane.paneId;
+    signature += `${group.groupId}\t${group.groupId === widget.activeGroupId ? '1' : '0'}\t${group.customTitle ?? ''}\t${pane?.paneId ?? ''}\t${pane?.title ?? ''}\t${pane?.customTitle ?? ''}\t${pane?.command ?? ''}\t${terminalSplitLayoutSignature(group.root)}`;
+    orderSignature += group.groupId;
     count += 1;
   }
   return { signature, orderSignature, count };
@@ -13098,7 +14112,8 @@ function terminalPanesForWidgetId(widgetId: string) {
 }
 
 function firstTerminalPaneForWidget(widget: TerminalWidget) {
-  return terminalPanesForWidget(widget)[0] ?? null;
+  const group = activeTerminalGroupForWidget(widget);
+  return activePaneForTerminalGroup(group) ?? terminalPanesForWidget(widget)[0] ?? null;
 }
 
 function forEachActiveWorkspaceTerminalWidget(callback: (widget: TerminalWidget) => void) {
@@ -13166,7 +14181,8 @@ function terminalWidgetForElement(element: HTMLElement) {
 }
 
 function activePaneForWidget(widget: TerminalWidget) {
-  const pane = terminalPaneById.get(widget.activePaneId);
+  const group = activeTerminalGroupForWidget(widget);
+  const pane = terminalPaneById.get(group?.activePaneId || widget.activePaneId);
   return pane?.widgetId === widget.widgetId ? pane : firstTerminalPaneForWidget(widget);
 }
 
@@ -13181,6 +14197,14 @@ function activeTerminalWidget() {
 function activePaneForElement(element: HTMLElement) {
   const widget = terminalWidgetForElement(element);
   return widget ? activePaneForWidget(widget) : null;
+}
+
+function terminalPaneForWidgetPointerTarget(widget: TerminalWidget, target: EventTarget | null) {
+  if (!(target instanceof Element)) return null;
+  const host = target.closest<HTMLElement>('.terminal-host');
+  if (!host?.dataset.paneId) return null;
+  const pane = terminalPaneById.get(host.dataset.paneId) ?? null;
+  return pane?.widgetId === widget.widgetId ? pane : null;
 }
 
 function profileForTerminalWidget(widget: TerminalWidget) {
@@ -13204,6 +14228,31 @@ async function createShellTabInWidget(widget: TerminalWidget) {
   const profile = profileForTerminalWidget(widget) ?? state.activeProfile;
   const cwd = active?.cwd ?? workspaceShellCwd();
   await createTerminalTab(widget, null, 'shell', { profile: profile ?? undefined, cwd });
+}
+
+async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDirection) {
+  const widget = terminalWidgetForPane(pane);
+  if (!widget) return;
+  const profile = profileForIdWithWindowsFallback(pane.profileId) ?? state.activeProfile;
+  if (!profile) return;
+  const llmParts = pane.llmId ? llmLauncherParts(pane.llmId, profile.kind) : null;
+  const command = llmParts ? llmParts.define : pane.command;
+  const title = pane.title.replace(/\s+\(exited\)$/i, '') || 'shell';
+  const newPane = await createTerminalTab(widget, command, title, {
+    profile,
+    cwd: pane.cwd,
+    splitTargetPaneId: pane.paneId,
+    splitDirection: direction
+  });
+  if (!newPane) return;
+  if (pane.llmId) newPane.llmId = pane.llmId;
+  if (llmParts && newPane.backendId) {
+    markWorkspaceLlmActivityForPane(newPane, WORKSPACE_LLM_START_ACTIVE_MS);
+    await sendTerminalInputNow(newPane, `${llmParts.call}\r`).catch((error) => {
+      setStatus(`Failed to launch ${pane.llmId}: ${String(error)}`, true);
+    });
+  }
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
 }
 
 function workspaceShellCwd() {
@@ -13230,10 +14279,15 @@ async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: strin
 }
 
 function updateTerminalWidgetTitle(widget: TerminalWidget, options: { force?: boolean } = {}) {
+  const group = activeTerminalGroupForWidget(widget);
   const pane = activePaneForWidget(widget);
   widget.activePaneId = pane?.paneId ?? '';
+  if (group) {
+    widget.activeGroupId = group.groupId;
+    if (pane) group.activePaneId = pane.paneId;
+  }
   if (!options.force && widget.element.classList.contains('hidden')) return;
-  setTextContentIfChanged(widget.title, pane ? terminalPaneLabel(pane) : 'shell');
+  setTextContentIfChanged(widget.title, group ? terminalGroupLabel(group) : pane ? terminalPaneLabel(pane) : 'shell');
   setTextContentIfChanged(widget.cwd, pane?.cwd ?? '');
   syncTerminalTypingPadForWidget(widget);
 }
@@ -13415,10 +14469,35 @@ function markTerminalUserInput(pane: TerminalPane) {
   pane.lastUserInputAt = performance.now();
 }
 
+function markWorkspaceLlmInputActivityForPane(pane: TerminalPane, data: string) {
+  if (!terminalInputCountsAsWorkspaceLlmActivity(data)) return;
+  markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
+}
+
+function terminalInputCountsAsWorkspaceLlmActivity(data: string) {
+  if (!data) return false;
+  const meaningful = data
+    // xterm focus events and app cursor/mouse protocols are emitted just by clicking/focusing
+    // an existing TUI. They must not make the workspace look like the LLM is working.
+    .replace(/\x1b\[M[\s\S]{3}/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '');
+  return /[\r\n]/.test(meaningful) || /[^\x00-\x1F\x7F]/.test(meaningful);
+}
+
 function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly?: boolean } = {}) {
   if (options.activeOnly) {
-    const pane = activePaneForWidget(widget);
-    if (pane) scheduleFitTerminal(pane);
+    const group = activeTerminalGroupForWidget(widget);
+    const paneIds = group ? terminalGroupPaneIds(group) : [];
+    if (paneIds.length > 1) {
+      for (const paneId of paneIds) {
+        const pane = terminalPaneById.get(paneId);
+        if (pane) scheduleFitTerminal(pane);
+      }
+    } else {
+      const pane = activePaneForWidget(widget);
+      if (pane) scheduleFitTerminal(pane);
+    }
     return;
   }
   for (const pane of terminalPanesForWidget(widget)) scheduleFitTerminal(pane);
@@ -13429,13 +14508,21 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
     return true;
   }
   setTerminalTextTarget('shell');
-  if (event.type === 'keydown') markTerminalUserInput(pane);
 
   if (isWidgetFocusShortcut(event)) {
     if (terminalUsesAlternateBuffer(pane)) return true;
     event.preventDefault();
     event.stopPropagation();
     cycleWidgetFocus(event.shiftKey ? -1 : 1, pane.paneId);
+    return false;
+  }
+
+  const splitNavigationDirection = terminalSplitNavigationDirection(event);
+  if (splitNavigationDirection) {
+    if (terminalUsesAlternateBuffer(pane)) return true;
+    event.preventDefault();
+    event.stopPropagation();
+    focusAdjacentTerminalSplitPane(pane, splitNavigationDirection);
     return false;
   }
 
@@ -13466,6 +14553,72 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
 
 function terminalUsesAlternateBuffer(pane: TerminalPane) {
   return (pane.term.buffer.active as { type?: string }).type === 'alternate';
+}
+
+type TerminalSplitNavigationDirection = 'left' | 'right' | 'up' | 'down';
+
+function terminalSplitNavigationDirection(event: KeyboardEvent): TerminalSplitNavigationDirection | null {
+  if (event.type !== 'keydown' || !(event.ctrlKey || event.metaKey) || !event.altKey || event.shiftKey) return null;
+  const key = event.key.toLowerCase();
+  if (key === 'arrowleft' || key === 'h') return 'left';
+  if (key === 'arrowright' || key === 'l') return 'right';
+  if (key === 'arrowup' || key === 'k') return 'up';
+  if (key === 'arrowdown' || key === 'j') return 'down';
+  return null;
+}
+
+function focusAdjacentTerminalSplitPane(pane: TerminalPane, direction: TerminalSplitNavigationDirection) {
+  const widget = terminalWidgetForPane(pane);
+  const group = terminalGroupForPane(pane);
+  if (!widget || !group) return false;
+  const paneIds = terminalGroupPaneIds(group);
+  if (paneIds.length <= 1) return false;
+  const currentRect = pane.host.getBoundingClientRect();
+  if (!currentRect.width || !currentRect.height) return false;
+  const currentCenter = rectCenter(currentRect);
+  let bestPane: TerminalPane | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (const candidateId of paneIds) {
+    if (candidateId === pane.paneId) continue;
+    const candidate = terminalPaneById.get(candidateId);
+    if (!candidate || candidate.host.classList.contains('hidden')) continue;
+    const rect = candidate.host.getBoundingClientRect();
+    if (!rect.width || !rect.height) continue;
+    const center = rectCenter(rect);
+    const dx = center.x - currentCenter.x;
+    const dy = center.y - currentCenter.y;
+    const primary = direction === 'left' ? -dx
+      : direction === 'right' ? dx
+        : direction === 'up' ? -dy
+          : dy;
+    if (primary <= 1) continue;
+    const perpendicular = direction === 'left' || direction === 'right' ? Math.abs(dy) : Math.abs(dx);
+    const score = primary + perpendicular * 0.45;
+    if (score < bestScore) {
+      bestScore = score;
+      bestPane = candidate;
+    }
+  }
+  if (!bestPane) return false;
+  setActivePane(bestPane.paneId);
+  bringPanelToFront(widget.element);
+  focusTerminalPaneWhenReady(bestPane);
+  setStatus(`Focused split ${terminalSplitNavigationLabel(direction)}`);
+  return true;
+}
+
+function rectCenter(rect: DOMRect) {
+  return {
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2
+  };
+}
+
+function terminalSplitNavigationLabel(direction: TerminalSplitNavigationDirection) {
+  if (direction === 'left') return 'left';
+  if (direction === 'right') return 'right';
+  if (direction === 'up') return 'up';
+  return 'down';
 }
 
 async function copyTerminalSelection(pane: TerminalPane) {
@@ -13502,6 +14655,7 @@ async function pasteTerminalText(pane: TerminalPane, text?: string) {
     if (!value) return;
     setTerminalTextTarget('shell');
     markTerminalUserInput(pane);
+    markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
     await sendTerminalInputNow(pane, terminalPastePayload(value));
   } catch (error) {
     setStatus(`Failed to paste terminal text: ${String(error)}`, true);
@@ -13570,9 +14724,12 @@ function queueTerminalFitBurst(pane: TerminalPane) {
 }
 
 function terminalPaneCanFit(pane: TerminalPane) {
+  const widget = terminalWidgetForPane(pane);
   return pane.workspaceId === state.activeWorkspaceId
     && !pane.element.classList.contains('hidden')
-    && !pane.host.classList.contains('hidden');
+    && pane.host.isConnected
+    && !pane.host.classList.contains('hidden')
+    && !(widget && terminalSplitResizeWidgetIds.has(widget.widgetId));
 }
 
 function fitTerminal(pane: TerminalPane) {
@@ -13637,6 +14794,11 @@ function focusActiveTerminalPaneWhenItOwnsKeyboard() {
   const pane = activeTerminalPane();
   if (!pane) return;
   if (keyboardResizeTarget.kind !== 'terminal' || keyboardResizeTarget.paneId !== pane.paneId) return;
+  const widget = terminalWidgetForPane(pane);
+  if (widget && terminalTextTarget === 'typing-pad' && terminalTypingPadIsOpen(widget)) {
+    focusTerminalTypingPadWhenReady(widget);
+    return;
+  }
   focusTerminalPaneWhenReady(pane);
 }
 
@@ -13657,7 +14819,14 @@ function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
   }
   const previousPane = previousPaneId ? terminalPaneById.get(previousPaneId) ?? null : null;
   const previousWidget = previousPane ? terminalWidgetForPane(previousPane) : null;
-  if (widget) widget.activePaneId = paneId;
+  if (widget) {
+    const group = terminalGroupForPane(pane);
+    if (group) {
+      group.activePaneId = paneId;
+      widget.activeGroupId = group.groupId;
+    }
+    widget.activePaneId = paneId;
+  }
   state.activePaneId = paneId;
   setKeyboardResizeTarget({ kind: 'terminal', paneId });
   if (previousWidget && previousWidget !== widget) {
@@ -13667,6 +14836,7 @@ function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
   if (widget) {
     syncTerminalWidgetActiveState(widget);
     renderTerminalWidgetTabs(widget);
+    renderTerminalWidgetSplitLayout(widget);
   }
   shellTabsRenderSignature = shellTabsSignature();
   flushTerminalWriteBuffer(pane);
@@ -13685,9 +14855,12 @@ function syncActivePaneClass(options: { workspaceId?: string } = {}) {
 }
 
 function syncTerminalWidgetActiveState(widget: TerminalWidget) {
-  const current = terminalPaneById.get(widget.activePaneId);
+  const activeGroup = activeTerminalGroupForWidget(widget);
+  if (activeGroup) widget.activeGroupId = activeGroup.groupId;
+  const current = terminalPaneById.get(activeGroup?.activePaneId || widget.activePaneId);
   const activePane = current?.widgetId === widget.widgetId ? current : firstTerminalPaneForWidget(widget);
   widget.activePaneId = activePane?.paneId ?? '';
+  if (activeGroup && activePane) activeGroup.activePaneId = activePane.paneId;
   toggleClassIfChanged(
     widget.element,
     'active',
@@ -13697,9 +14870,7 @@ function syncTerminalWidgetActiveState(widget: TerminalWidget) {
     updateTerminalWidgetTitle(widget);
     return;
   }
-  for (const pane of terminalPanesForWidget(widget)) {
-    toggleClassIfChanged(pane.host, 'hidden', pane.paneId !== widget.activePaneId);
-  }
+  renderTerminalWidgetSplitLayout(widget);
   syncTerminalTypingPadForWidget(widget);
   updateTerminalWidgetTitle(widget);
 }
@@ -14680,6 +15851,7 @@ async function canUseDirectLocalPreview(url: string) {
 
 function handleTerminalData(pane: TerminalPane, data: string) {
   pane.backendOutputChars += data.length;
+  markWorkspaceLlmOutputActivityForPane(pane, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
   const visibility = enqueueTerminalWrite(pane, data);
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
@@ -14753,7 +15925,7 @@ function flushTerminalWriteBufferWhenReady(pane: TerminalPane, timeout = TERMINA
 
 function terminalPaneVisibility(pane: TerminalPane): TerminalVisibility {
   if (document.hidden || pane.workspaceId !== state.activeWorkspaceId) return 'background';
-  if (!pane.element.classList.contains('hidden') && !pane.host.classList.contains('hidden')) return 'visible';
+  if (pane.host.isConnected && !pane.element.classList.contains('hidden') && !pane.host.classList.contains('hidden')) return 'visible';
   return 'inactive';
 }
 

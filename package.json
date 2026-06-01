@@ -6,11 +6,15 @@
   "description": "A Windows-first lightweight bash-grid IDE for WSL/SSH LLM coding sessions.",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "dev:terminal": "vite --config vite.terminal.config.ts --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
+    "build:terminal": "tsc --noEmit && vite build --config vite.terminal.config.ts",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:terminal:dev": "tauri dev --config src-tauri/tauri.terminal.conf.json",
+    "tauri:terminal:build": "tauri build --config src-tauri/tauri.terminal.conf.json --no-bundle",
     "check": "tsc --noEmit"
   },
   "dependencies": {

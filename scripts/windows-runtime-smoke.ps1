@@ -35,11 +35,13 @@ function Invoke-Step {
 }
 
 function Find-BuiltExe {
+  param([string]$BinaryName = "simple-vibe-ide")
+
   $candidates = @()
   if ($env:CARGO_TARGET_DIR) {
-    $candidates += Join-Path $env:CARGO_TARGET_DIR "release\simple-vibe-ide.exe"
+    $candidates += Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"
   }
-  $candidates += Join-Path $PSScriptRoot "..\src-tauri\target\release\simple-vibe-ide.exe"
+  $candidates += Join-Path $PSScriptRoot "..\src-tauri\target\release\$BinaryName.exe"
 
   foreach ($candidate in $candidates) {
     $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
@@ -47,8 +49,9 @@ function Find-BuiltExe {
   }
 
   $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-  $found = Get-ChildItem -Path $repoRoot -Filter "simple-vibe-ide.exe" -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match "\\release\\simple-vibe-ide\.exe$" } |
+  $escapedBinary = [regex]::Escape($BinaryName)
+  $found = Get-ChildItem -Path $repoRoot -Filter "$BinaryName.exe" -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -match "\\release\\$escapedBinary\.exe$" } |
     Select-Object -First 1
   if ($found) { return $found.FullName }
   return $null
@@ -98,20 +101,27 @@ if (-not $SkipNpmInstall -and -not (Test-Path "node_modules")) {
 
 Invoke-Step "TypeScript check" { npm.cmd run check }
 Invoke-Step "Frontend build" { npm.cmd run build }
+Invoke-Step "Terminal frontend build" { npm.cmd run build:terminal }
 Invoke-Step "Rust check" { cargo check --manifest-path src-tauri/Cargo.toml }
-Invoke-Step "Tauri release no-bundle build" { npm.cmd run tauri -- build --no-bundle }
+Invoke-Step "Tauri IDE release no-bundle build" { npm.cmd run tauri -- build --no-bundle }
+Invoke-Step "Tauri Terminal release no-bundle build" { npm.cmd run tauri:terminal:build }
 
-$exe = Find-BuiltExe
-if (-not $exe) {
+$ideExe = Find-BuiltExe "simple-vibe-ide"
+$terminalExe = Find-BuiltExe "simple-vibe-terminal"
+if (-not $ideExe) {
   throw "Could not find built simple-vibe-ide.exe after Tauri build."
+}
+if (-not $terminalExe) {
+  throw "Could not find built simple-vibe-terminal.exe after Tauri terminal build."
 }
 
 Write-Host ""
-Write-Host "Built exe: $(Format-DisplayPath $exe)" -ForegroundColor Green
+Write-Host "Built IDE exe: $(Format-DisplayPath $ideExe)" -ForegroundColor Green
+Write-Host "Built Terminal exe: $(Format-DisplayPath $terminalExe)" -ForegroundColor Green
 
 if (-not $NoLaunch) {
   Invoke-Step "Launch built app" {
-    Start-Process -FilePath $exe -WorkingDirectory $repoRoot
+    Start-Process -FilePath $ideExe -WorkingDirectory $repoRoot
   }
 }
 

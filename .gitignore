@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-terminal/
 src-tauri/target/
 src-tauri/gen/
 .handoff/

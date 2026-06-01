@@ -4703,6 +4703,19 @@ fn rewrite_preview_request_headers(
             saw_forwarded_host = true;
             rewritten.push_str(line.trim_end());
             rewritten.push_str("\r\n");
+        } else if header_name_in(
+            name,
+            &[
+                "if-none-match",
+                "if-modified-since",
+                "if-match",
+                "if-unmodified-since",
+                "if-range",
+                "cache-control",
+                "pragma",
+            ],
+        ) {
+            continue;
         } else if header_name_in(name, &["connection", "proxy-connection", "accept-encoding"]) {
             continue;
         } else {
@@ -4717,6 +4730,8 @@ fn rewrite_preview_request_headers(
         push_preview_header(&mut rewritten, "X-Forwarded-Host", proxy_host);
         rewritten.push_str("X-Forwarded-Proto: http\r\n");
     }
+    rewritten.push_str("Cache-Control: no-cache\r\n");
+    rewritten.push_str("Pragma: no-cache\r\n");
     rewritten.push_str("Accept-Encoding: identity\r\n");
     rewritten.push_str("Connection: close\r\n\r\n");
     rewritten
@@ -4873,16 +4888,20 @@ fn rewrite_preview_response_headers(
         ) {
             continue;
         }
+        if header_name_in(
+            name_trimmed,
+            &[
+                "cache-control",
+                "etag",
+                "expires",
+                "pragma",
+                "last-modified",
+            ],
+        ) {
+            continue;
+        }
         if content_length.is_some()
-            && header_name_in(
-                name_trimmed,
-                &[
-                    "content-length",
-                    "transfer-encoding",
-                    "cache-control",
-                    "etag",
-                ],
-            )
+            && header_name_in(name_trimmed, &["content-length", "transfer-encoding"])
         {
             continue;
         }
@@ -4913,8 +4932,10 @@ fn rewrite_preview_response_headers(
         rewritten.push_str(line.trim_end());
         rewritten.push_str("\r\n");
     }
+    rewritten.push_str("Cache-Control: no-store, no-cache, max-age=0, must-revalidate\r\n");
+    rewritten.push_str("Pragma: no-cache\r\n");
+    rewritten.push_str("Expires: 0\r\n");
     if let Some(length) = content_length {
-        rewritten.push_str("Cache-Control: no-store\r\n");
         push_usize_header(&mut rewritten, "Content-Length", length);
     }
     rewritten.push_str("\r\n");
@@ -5018,7 +5039,17 @@ mod preview_proxy_tests {
         let port = listener.local_addr().expect("proxy addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("proxy accept");
-            proxy_http_preview(stream, "127.0.0.1".to_string(), target_port).expect("proxy");
+            match proxy_http_preview(stream, "127.0.0.1".to_string(), target_port) {
+                Ok(()) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) => {}
+                Err(err) => panic!("proxy: {err}"),
+            }
         });
         port
     }
@@ -5066,6 +5097,57 @@ Connection: close\r\n\r\n"
         assert!(should_inject_preview_console_bridge(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
         ));
+    }
+
+    #[test]
+    fn preview_proxy_request_strips_cache_validators() {
+        let rewritten = rewrite_preview_request_headers(
+            "GET /main.dart.js HTTP/1.1\r\n\
+Host: 127.0.0.1:12547\r\n\
+If-None-Match: \"abc\"\r\n\
+If-Modified-Since: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
+Cache-Control: max-age=0\r\n\
+Pragma: no-cache\r\n\
+Connection: keep-alive\r\n\r\n",
+            "127.0.0.1",
+            8080,
+            "http://127.0.0.1:12547",
+        );
+
+        assert!(rewritten.contains("Host: 127.0.0.1:8080\r\n"));
+        assert!(!rewritten.to_ascii_lowercase().contains("if-none-match"));
+        assert!(!rewritten.to_ascii_lowercase().contains("if-modified-since"));
+        assert!(rewritten.contains("Cache-Control: no-cache\r\n"));
+        assert!(rewritten.contains("Accept-Encoding: identity\r\n"));
+        assert!(rewritten.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn preview_proxy_response_disables_asset_cache_validators() {
+        let rewritten = rewrite_preview_response_headers(
+            "HTTP/1.1 200 OK\r\n\
+Content-Type: application/javascript\r\n\
+Content-Length: 42\r\n\
+Cache-Control: public, max-age=3600\r\n\
+ETag: \"abc\"\r\n\
+Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
+Expires: Tue, 02 Jan 2024 00:00:00 GMT\r\n\r\n",
+            None,
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:12547",
+            "127.0.0.1",
+        );
+
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(rewritten.contains("Content-Length: 42\r\n"));
+        assert!(!lower.contains("etag:"));
+        assert!(!lower.contains("last-modified:"));
+        assert!(!lower.contains("cache-control: public"));
+        assert!(
+            rewritten.contains("Cache-Control: no-store, no-cache, max-age=0, must-revalidate\r\n")
+        );
+        assert!(rewritten.contains("Pragma: no-cache\r\n"));
+        assert!(rewritten.contains("Expires: 0\r\n"));
     }
 }
 

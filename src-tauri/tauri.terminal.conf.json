@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Simple Vibe Terminal",
+  "mainBinaryName": "simple-vibe-terminal",
+  "identifier": "dev.nastream.simple-vibe-terminal",
+  "build": {
+    "beforeDevCommand": "npm run dev:terminal",
+    "beforeBuildCommand": "npm run build:terminal",
+    "devUrl": "http://127.0.0.1:15321",
+    "frontendDist": "../dist-terminal"
+  },
+  "app": {
+    "windows": [
+      {
+        "url": "terminal.html",
+        "title": "Simple Vibe Terminal",
+        "width": 1200,
+        "height": 780,
+        "minWidth": 760,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "dragDropEnabled": true
+      }
+    ]
+  }
+}

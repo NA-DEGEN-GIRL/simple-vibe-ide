@@ -13,6 +13,8 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, 로컬 Windows shell을 빠르게 오
 
 목표는 거창한 범용 IDE가 아니라, 바이브 코딩 중 자주 반복되는 흐름을 빠릿빠릿하게 만드는 것입니다. 작업공간을 열고, shell을 여러 개 띄우고, Codex/Claude/Grok/Antigravity를 바로 실행하고, 이미지나 스크린샷을 붙여넣고, 로컬 서버를 브라우저 탭으로 확인하는 과정을 한 화면 안에서 짧게 이어가도록 설계했습니다.
 
+같은 코드베이스에서 `Simple Vibe Terminal` 별도 앱도 빌드할 수 있습니다. IDE의 Explorer/Editor/Browser 같은 패널 없이 terminal tab, split, Type pad, 저장된 terminal layout만 쓰고 싶은 사람을 위한 가벼운 terminal flavor입니다.
+
 현재 상태: Windows-only, Tauri v2, pre-1.0, experimental.
 
 LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent Build Guide](docs/LLM_INSTALL_GUIDE.md)를 함께 넘기면 됩니다.
@@ -20,6 +22,10 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 ![Simple Vibe IDE safe demo screenshot](docs/simple-vibe-ide-demo.png)
 
 위 스크린샷은 임시 SSH 데모 workspace와 localhost preview만 사용했습니다. 개인 경로, secret, 사용자 데이터는 포함하지 않았습니다.
+
+![Simple Vibe Terminal safe demo screenshot](docs/simple-vibe-terminal-demo.png)
+
+Simple Vibe Terminal 스크린샷은 실제 앱 화면을 기반으로 하되, README용으로 profile alias와 home path를 demo 값으로 바꾼 안전한 캡처입니다. terminal split, Codex/Claude CLI 화면, 하단 Type pad가 함께 열린 상태를 보여줍니다.
 
 ## 주요 기능
 
@@ -32,6 +38,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - 상단 market ticker: Binance USD-M WebSocket 기반 BTC와 NAS100 proxy 표시, custom Binance symbol 1개 추가 가능
 - Explorer, Editor, Image Preview, Browser, Terminal widget 이동/리사이즈/스냅 지원
 - Terminal widget 내부 shell tab 지원
+- Simple Vibe Terminal 별도 exe: terminal tab, split, Type pad, 저장된 layout만 쓰는 standalone terminal flavor
 - workspace별 sticky-note 스타일 Notes 패널, always-on-top pin, tab별 테마, 자동 저장되는 메모 탭
 - workspace별 Calculator 위젯과 계산 history
 - Codex, Claude, Grok, Antigravity launcher 버튼
@@ -59,7 +66,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - WSL distro
 - Windows OpenSSH client
 - Microsoft Edge 또는 Chrome: Browser 위젯의 hidden DevTools/CDP preview에 사용
-- 실행하려는 LLM CLI: `codex`, `claude`, `grok`, `antigravity`
+- 실행하려는 LLM CLI: `codex`, `claude`, `grok`, `agy`
 
 ## 빠른 시작
 
@@ -109,6 +116,18 @@ $env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
 npm run tauri:build
 ```
 
+Simple Vibe Terminal만 빌드:
+
+```powershell
+npm run tauri:terminal:build
+```
+
+IDE와 Terminal을 한 번에 빌드하고 `%TEMP%\simple-vibe-ide-target\release`로 복사:
+
+```powershell
+.\build-and-copy.cmd
+```
+
 빌드 후 실행:
 
 ```powershell
@@ -119,6 +138,8 @@ npm run tauri:build
 - `run-built.cmd`: 디버깅용으로 console 창을 보면서 실행하는 launcher
 
 두 launcher 모두 실행 파일을 Windows-local working directory에서 시작하고 repo root는 별도로 넘깁니다. WSL checkout에서 빌드한 앱이 `wsl.exe` path translation 문제를 내는 것을 줄이기 위한 방식입니다.
+
+`build-and-copy.cmd`는 `simple-vibe-ide.exe`와 `simple-vibe-terminal.exe`를 모두 빌드한 뒤 temp release 폴더에 복사하고 `run-simple-vibe-ide.cmd`, `run-simple-vibe-terminal.cmd` launcher를 만들어 줍니다.
 
 ## 첫 사용 흐름
 
@@ -201,16 +222,18 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 
 - Terminal pane은 Windows, WSL, SSH shell을 PTY로 실행합니다.
 - 각 terminal widget은 내부 shell tab을 가집니다.
+- split right/down, split resize, `Ctrl+Alt+Arrow` pane 이동, Type pad를 지원합니다.
 - terminal text가 선택되어 있을 때 `Ctrl+C`는 copy로 동작하고, 선택이 없을 때는 interrupt로 동작합니다.
 - `Ctrl+V`는 clipboard text를 shell에 붙여넣습니다.
 - Codex, Claude, Grok, Antigravity 버튼은 새 terminal session을 엽니다.
+- `Simple Vibe Terminal` 앱은 이 terminal 기능만 따로 쓰는 별도 exe입니다. IDE 패널 없이 profile/root를 열고, tab/split/Type pad 상태를 saved layout으로 저장하고 다시 불러올 수 있습니다.
 
 기본 launcher flag:
 
 - Codex: `--dangerously-bypass-approvals-and-sandbox --enable goals`
 - Claude: `--dangerously-skip-permissions`
-- Grok: `--permission-mode bypassPermissions`
-- Antigravity: 호환되는 local bypass flag가 확인되기 전까지 기본 실행
+- Grok: `--always-approve --permission-mode bypassPermissions`
+- Antigravity/Agy: `agy --dangerously-skip-permissions`
 
 실행 전에 alias/function/wrapper script를 확인해서 이미 들어간 flag는 다시 붙이지 않습니다. 이 flag들은 의도적으로 approval/permission prompt를 줄이기 위한 것입니다. 더 보수적으로 쓰고 싶다면 일반 terminal에서 직접 CLI를 실행하세요.
 
@@ -314,7 +337,7 @@ Windows OpenSSH config의 literal `Host` alias만 자동 import됩니다. wildca
 - `src/`: TypeScript UI
 - `src-tauri/`: Rust backend와 Tauri config
 - `public/`: capture cover 같은 static WebView asset
-- `docs/`: README용 안전한 demo screenshot과 LLM/agent build guide
+- `docs/`: README용 안전한 demo screenshot들과 LLM/agent build guide
 - `run-built.vbs`, `run-built.cmd`: 빌드된 앱 실행 helper
 - `codex.md`: privacy-safe implementation notes와 patch notes
 
@@ -333,6 +356,8 @@ Simple Vibe IDE is a Windows-only lightweight desktop IDE for LLM-heavy coding s
 
 It is not trying to be a full general-purpose IDE. The goal is a fast practical loop for vibe coding: open a workspace, split shells, launch Codex/Claude/Grok/Antigravity, paste screenshots, preview local servers, and keep that working state close at hand.
 
+The same codebase can also build `Simple Vibe Terminal`, a separate lightweight terminal flavor for people who only want shell tabs, splits, the Type pad, and saved terminal layouts without the IDE panels.
+
 Status: Windows-only, Tauri v2, pre-1.0, experimental.
 
 When asking an LLM or coding agent to install, build, or verify the app, provide the [LLM / Agent Build Guide](docs/LLM_INSTALL_GUIDE.md) with the task.
@@ -340,6 +365,10 @@ When asking an LLM or coding agent to install, build, or verify the app, provide
 ![Simple Vibe IDE safe demo screenshot](docs/simple-vibe-ide-demo.png)
 
 The screenshot uses a disposable SSH demo workspace and localhost preview. It does not contain private paths, secrets, or user data.
+
+![Simple Vibe Terminal safe demo screenshot](docs/simple-vibe-terminal-demo.png)
+
+The Simple Vibe Terminal screenshot is based on the actual app UI, with the profile alias and home path replaced by demo values for README safety. It shows terminal splits, Codex/Claude CLI screens, and the bottom Type pad open together.
 
 ## Highlights
 
@@ -352,6 +381,7 @@ The screenshot uses a disposable SSH demo workspace and localhost preview. It do
 - Top market ticker for BTC and a NAS100 proxy via Binance USD-M WebSocket, plus one custom Binance symbol
 - Movable, resizable, snapping Explorer, Editor, Image Preview, Browser, and Terminal widgets
 - Shell tabs inside each terminal widget
+- Separate Simple Vibe Terminal exe for standalone shell tabs, splits, Type pad, and saved terminal layouts
 - Workspace-level sticky-note style Notes panel with always-on-top pinning, per-tab themes, and autosaved note tabs
 - Workspace-level Calculator widget with calculation history
 - Launcher buttons for Codex, Claude, Grok, and Antigravity
@@ -379,7 +409,7 @@ Optional depending on your workflow:
 - One or more WSL distros
 - Windows OpenSSH client
 - Microsoft Edge or Chrome for the Browser widget's hidden DevTools/CDP preview
-- LLM CLIs you want to launch: `codex`, `claude`, `grok`, or `antigravity`
+- LLM CLIs you want to launch: `codex`, `claude`, `grok`, or `agy`
 
 ## Quick Start
 
@@ -429,6 +459,18 @@ $env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
 npm run tauri:build
 ```
 
+Build only Simple Vibe Terminal:
+
+```powershell
+npm run tauri:terminal:build
+```
+
+Build both IDE and Terminal, then copy both exes to `%TEMP%\simple-vibe-ide-target\release`:
+
+```powershell
+.\build-and-copy.cmd
+```
+
 After building:
 
 ```powershell
@@ -439,6 +481,8 @@ After building:
 - `run-built.cmd`: debug launcher with a visible console window
 
 Both helpers start the executable from a Windows-local working directory and pass the repo root separately. That reduces `wsl.exe` path translation problems when the app was built from a WSL checkout.
+
+`build-and-copy.cmd` builds `simple-vibe-ide.exe` and `simple-vibe-terminal.exe`, copies both into the temp release folder, and writes `run-simple-vibe-ide.cmd` plus `run-simple-vibe-terminal.cmd` launchers.
 
 ## First Run
 
@@ -521,16 +565,18 @@ WSL profiles are loaded in the background after the first screen is interactive.
 
 - Terminal panes use PTYs for Windows, WSL, and SSH shells.
 - Each terminal widget has its own shell tabs.
+- Terminal widgets support right/down splits, split resizing, `Ctrl+Alt+Arrow` pane navigation, and the Type pad.
 - `Ctrl+C` copies selected terminal text; with no selection, it sends interrupt.
 - `Ctrl+V` pastes clipboard text into the shell.
 - Codex, Claude, Grok, and Antigravity buttons open new terminal sessions.
+- `Simple Vibe Terminal` is a separate exe for using only these terminal features. It opens a profile/root, keeps tab/split/Type pad state, and saves or reloads terminal layouts without the IDE panels.
 
 Default launcher flags:
 
 - Codex: `--dangerously-bypass-approvals-and-sandbox --enable goals`
 - Claude: `--dangerously-skip-permissions`
-- Grok: `--permission-mode bypassPermissions`
-- Antigravity: launches normally until a compatible local bypass flag is known
+- Grok: `--always-approve --permission-mode bypassPermissions`
+- Antigravity/Agy: `agy --dangerously-skip-permissions`
 
 Before launching, the app checks aliases, functions, and wrapper scripts, then skips flags that are already present. These flags intentionally reduce approval/permission prompts. If you want the normal prompts, launch the CLI manually in a terminal instead.
 
@@ -635,7 +681,7 @@ Static pages, browser cache, or an existing preview session can remain visible. 
 - `src/`: TypeScript UI
 - `src-tauri/`: Rust backend and Tauri configuration
 - `public/`: static WebView assets such as the capture cover
-- `docs/`: safe demo screenshot for README and the LLM/agent build guide
+- `docs/`: safe demo screenshots for README and the LLM/agent build guide
 - `run-built.vbs`, `run-built.cmd`: helpers for launching built artifacts
 - `codex.md`: privacy-safe implementation notes and patch notes
 
