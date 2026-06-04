@@ -51,6 +51,30 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-04 - SSH/WSL passphrase-safe shell startup
+
+#### Changed
+
+- SSH and WSL terminal panes now delay automatic startup input until the
+  bootstrap shell emits its OSC7 ready marker. This keeps LLM launcher calls and
+  restored Python venv activation from being typed into an SSH key passphrase
+  prompt or another login-time prompt.
+- Opening or restoring an SSH/WSL workspace starts the shell first and defers
+  Explorer directory loading/watch refresh until that shell is ready, so a
+  passphrase prompt remains interactive instead of being hidden behind a
+  background file-list command.
+- Background SSH file operations and port forwards now use noninteractive
+  `BatchMode=yes`; they fail fast when authentication is not already available
+  instead of consuming or hanging on a passphrase prompt.
+
+#### Verified
+
+- `git diff --check`
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+
 ### 2026-06-02 - LLM status dot and Codex TUI cursor query fixes
 
 #### Changed

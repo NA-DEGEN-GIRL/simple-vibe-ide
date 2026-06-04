@@ -40,6 +40,8 @@ interface TerminalPane {
   inputWriteBuffer: string;
   inputFlushTimer?: number;
   inputWritePromise?: Promise<void>;
+  shellReadyAt?: number;
+  pendingShellReadyActions?: TerminalShellReadyAction[];
   typingPadOpen?: boolean;
   typingPadDraft?: string;
   imeComposing?: boolean;
@@ -546,6 +548,10 @@ type CloseTerminalOptions = {
 };
 type TerminalTextTarget = 'shell' | 'typing-pad';
 type TerminalDefaultFocusTarget = 'shell' | 'typing-pad';
+type TerminalShellReadyAction = {
+  label: string;
+  run: () => void | Promise<void>;
+};
 type TerminalPythonEnvShell = 'posix' | 'powershell';
 type ImageTagPasteTarget = TerminalTextTarget | 'none';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
@@ -5335,7 +5341,8 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     updateExplorerFileSizeMode();
     await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
 
-    setWorkspaceOpen(true, { preserveVisibility: true });
+    const deferExplorerUntilShellReady = profileNeedsShellReadyGate(profile);
+    setWorkspaceOpen(true, { preserveVisibility: true, deferExplorerWatch: deferExplorerUntilShellReady });
     restorePanelSnapshots(snapshot.panels);
     if (isPanelVisible('calculator')) renderCalculator();
     if (isPanelVisible('settings')) renderSettings();
@@ -5351,8 +5358,21 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     }
 
     const explorerRuntimeRestored = restoreExplorerRuntimeCache(snapshot.id, state.currentDir);
+    const waitForExplorerShellReady = deferExplorerUntilShellReady && !activeWorkspaceHasReadyShell(profile);
     if (!explorerRuntimeRestored && isPanelVisible('explorer')) {
-      await openWorkspace(state.currentDir);
+      if (waitForExplorerShellReady) {
+        deferExplorerDirectoryRestore(state.currentDir, profile.id, snapshot.id);
+        const existingPane = state.terminals.find((pane) => (
+          pane.workspaceId === snapshot.id
+          && pane.profileId === profile.id
+          && Boolean(pane.backendId)
+        ));
+        if (existingPane) {
+          queueWorkspaceDirectoryLoadAfterShellReady(existingPane, state.currentDir, profile, 'restoring workspace files');
+        }
+      } else {
+        await openWorkspace(state.currentDir);
+      }
     } else if (!explorerRuntimeRestored) {
       deferExplorerDirectoryRestore(state.currentDir, profile.id, snapshot.id);
     }
@@ -5363,7 +5383,12 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     await restoreNoteTabs(snapshot);
     restoreBrowserState(snapshot);
 
-    if (!hasLiveTerminals) scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken);
+    if (!hasLiveTerminals) {
+      scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken, {
+        loadExplorerAfterFirstReady: waitForExplorerShellReady && !explorerRuntimeRestored && isPanelVisible('explorer'),
+        loadExplorerPath: state.currentDir
+      });
+    }
     refreshTitle();
     setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}${hasLiveTerminals ? '' : ' (shells starting)'}`);
   } finally {
@@ -5375,11 +5400,12 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
 function scheduleWorkspaceTerminalRestore(
   snapshot: WorkspaceSnapshot,
   profile: ConnectionProfile,
-  token: number
+  token: number,
+  options: { loadExplorerAfterFirstReady?: boolean; loadExplorerPath?: string } = {}
 ) {
   runWhenUiIdle(() => {
     if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
-    void restoreWorkspaceTerminals(snapshot, profile, { token })
+    void restoreWorkspaceTerminals(snapshot, profile, { token, ...options })
       .then(() => {
         if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
         refreshTitle();
@@ -5414,7 +5440,7 @@ function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
 async function restoreWorkspaceTerminals(
   snapshot: WorkspaceSnapshot,
   profile: ConnectionProfile,
-  options: { token?: number } = {}
+  options: { token?: number; loadExplorerAfterFirstReady?: boolean; loadExplorerPath?: string } = {}
 ) {
   if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
   showTerminalWidgetsForWorkspace(snapshot.id);
@@ -5424,6 +5450,7 @@ async function restoreWorkspaceTerminals(
       : [{ title: 'shell', command: null, rect: undefined }];
     const widgetsBySnapshotId = new Map<string, TerminalWidget>();
     const paneIdBySnapshotPaneId = new Map<string, string>();
+    let queuedExplorerLoadAfterReady = false;
     for (const terminal of terminalSnapshots) {
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
       const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
@@ -5476,9 +5503,23 @@ async function restoreWorkspaceTerminals(
       if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
         markWorkspaceLlmActivityForPane(restoredPane, WORKSPACE_LLM_START_ACTIVE_MS);
-        await sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined);
+        queueTerminalShellReadyAction(
+          restoredPane,
+          `launch ${llmId}`,
+          () => sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined),
+          { waitingStatus: `Waiting for ${terminalShellReadyProfile(restoredPane)?.kind.toUpperCase() ?? 'remote'} shell login before launching ${llmId}...` }
+        );
       } else if (restoredPane?.backendId) {
         await restoreTerminalPythonEnvForPane(restoredPane);
+      }
+      if (options.loadExplorerAfterFirstReady && !queuedExplorerLoadAfterReady && restoredPane?.backendId) {
+        queuedExplorerLoadAfterReady = true;
+        queueWorkspaceDirectoryLoadAfterShellReady(
+          restoredPane,
+          options.loadExplorerPath || snapshot.currentDir || snapshot.root || profile.root,
+          profile,
+          'restoring workspace files'
+        );
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
         hideTerminalWidgetsForWorkspace(snapshot.id);
@@ -7808,9 +7849,14 @@ async function startLlmLauncher(id: string) {
   // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
   pane.llmId = id;
   markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
-  await sendTerminalInputNow(pane, `${call}\r`).catch((error) => {
-    setStatus(`Failed to launch ${id}: ${String(error)}`, true);
-  });
+  queueTerminalShellReadyAction(
+    pane,
+    `launch ${id}`,
+    () => sendTerminalInputNow(pane, `${call}\r`).catch((error) => {
+      setStatus(`Failed to launch ${id}: ${String(error)}`, true);
+    }),
+    { waitingStatus: `Waiting for ${terminalShellReadyProfile(pane)?.kind.toUpperCase() ?? 'remote'} shell login before launching ${id}...` }
+  );
   saveActiveWorkspaceSnapshot();
 }
 
@@ -8950,6 +8996,7 @@ async function switchWorkspace(path: string) {
     setStatus('Select a profile first', true);
     return;
   }
+  const profile = state.activeProfile;
   await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   state.workspaceRoot = path;
@@ -8959,6 +9006,20 @@ async function switchWorkspace(path: string) {
   await closeTerminalsForWorkspace(state.activeWorkspaceId);
   discardWorkspacePreviewRuntime(state.activeWorkspaceId);
   clearWorkspacePanels();
+  if (profileNeedsShellReadyGate(profile) && !IS_TERMINAL_APP) {
+    refreshTitle();
+    deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
+    setWorkspaceOpen(true, { deferExplorerWatch: true });
+    const widget = await createTerminal(null, 'shell', { cwd: path });
+    const pane = widget ? activePaneForWidget(widget) : null;
+    if (pane?.backendId) {
+      queueWorkspaceDirectoryLoadAfterShellReady(pane, path, profile);
+    } else {
+      setStatus(`${profile.kind.toUpperCase()} shell did not start; workspace files were not loaded`, true);
+    }
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+    return;
+  }
   await openWorkspace(path);
   setWorkspaceOpen(true);
   await createTerminal(null, 'shell', { cwd: path });
@@ -9184,6 +9245,114 @@ async function sendTerminalInputNow(pane: TerminalPane, data: string) {
   await api.writeTerminal(pane.backendId, data);
 }
 
+function profileNeedsShellReadyGate(profile: ConnectionProfile | null | undefined) {
+  return profile?.kind === 'ssh' || profile?.kind === 'wsl';
+}
+
+function terminalShellReadyProfile(pane: TerminalPane) {
+  return profileForIdWithWindowsFallback(pane.profileId) ?? state.activeProfile;
+}
+
+function terminalNeedsShellReadyGate(pane: TerminalPane) {
+  return profileNeedsShellReadyGate(terminalShellReadyProfile(pane));
+}
+
+function activeWorkspaceHasReadyShell(profile: ConnectionProfile | null | undefined = state.activeProfile) {
+  return workspaceHasReadyShell(profile, state.activeWorkspaceId);
+}
+
+function workspaceHasReadyShell(profile: ConnectionProfile | null | undefined, workspaceId: string) {
+  if (!profileNeedsShellReadyGate(profile)) return true;
+  return state.terminals.some((pane) => (
+    pane.workspaceId === workspaceId
+    && pane.profileId === profile?.id
+    && Boolean(pane.shellReadyAt)
+  ));
+}
+
+function shouldDeferRemoteDirectoryRead(profileId: string, workspaceId = state.activeWorkspaceId) {
+  const profile = profileForIdWithWindowsFallback(profileId);
+  return Boolean(profileNeedsShellReadyGate(profile) && !workspaceHasReadyShell(profile, workspaceId));
+}
+
+function remoteDirectoryReadWaitMessage(profileId: string) {
+  const profile = profileForIdWithWindowsFallback(profileId);
+  return `Waiting for ${profile?.kind.toUpperCase() ?? 'remote'} shell login before reading workspace files`;
+}
+
+function shouldDeferRemoteWorkspaceDirectoryLoad(profile: ConnectionProfile | null | undefined = state.activeProfile) {
+  return Boolean(
+    profileNeedsShellReadyGate(profile)
+    && state.workspaceOpen
+    && state.currentDir
+    && !activeWorkspaceHasReadyShell(profile)
+  );
+}
+
+function queueTerminalShellReadyAction(
+  pane: TerminalPane,
+  label: string,
+  action: () => void | Promise<void>,
+  options: { waitingStatus?: string } = {}
+) {
+  if (!pane.backendId) return;
+  if (!terminalNeedsShellReadyGate(pane) || pane.shellReadyAt) {
+    void runTerminalShellReadyAction(pane, { label, run: action });
+    return;
+  }
+  const actions = pane.pendingShellReadyActions ?? [];
+  actions.push({ label, run: action });
+  pane.pendingShellReadyActions = actions;
+  if (options.waitingStatus) setStatus(options.waitingStatus);
+}
+
+function markTerminalShellReady(pane: TerminalPane) {
+  if (!pane.backendId) return;
+  if (!pane.shellReadyAt) pane.shellReadyAt = performance.now();
+  const actions = pane.pendingShellReadyActions;
+  if (!actions?.length) return;
+  pane.pendingShellReadyActions = undefined;
+  for (const action of actions) void runTerminalShellReadyAction(pane, action);
+}
+
+async function runTerminalShellReadyAction(pane: TerminalPane, action: TerminalShellReadyAction) {
+  if (!pane.backendId) return;
+  try {
+    await action.run();
+  } catch (error) {
+    setStatus(`Failed after shell login (${action.label}): ${String(error)}`, true);
+  }
+}
+
+function queueWorkspaceDirectoryLoadAfterShellReady(
+  pane: TerminalPane,
+  path: string,
+  profile: ConnectionProfile,
+  label = 'loading workspace files'
+) {
+  if (!path || !pane.backendId) return;
+  const workspaceId = pane.workspaceId;
+  queueTerminalShellReadyAction(
+    pane,
+    label,
+    async () => {
+      if (state.activeWorkspaceId !== workspaceId) return;
+      if (state.activeProfile?.id !== profile.id || !state.workspaceOpen) return;
+      if (state.explorerSignatures.has(path)) {
+        scheduleExplorerWatch(1200);
+        return;
+      }
+      await openWorkspace(path);
+      if (state.activeWorkspaceId === workspaceId && state.activeProfile?.id === profile.id) {
+        scheduleExplorerWatch(1200);
+      }
+    },
+    {
+      waitingStatus: `Waiting for ${profile.kind.toUpperCase()} shell login before ${label}...`
+    }
+  );
+}
+
 async function flushTerminalInput(pane: TerminalPane): Promise<void> {
   if (pane.inputFlushTimer) {
     window.clearTimeout(pane.inputFlushTimer);
@@ -9222,7 +9391,12 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
   if (!backendId) clearWorkspaceLlmWaitingForPane(pane);
   pane.backendId = backendId;
   pane.backendOutputChars = 0;
-  if (backendId) pane.llmWaitingDetectionBuffer = '';
+  pane.shellReadyAt = undefined;
+  pane.pendingShellReadyActions = undefined;
+  if (backendId) {
+    pane.llmWaitingDetectionBuffer = '';
+    if (!terminalNeedsShellReadyGate(pane)) pane.shellReadyAt = performance.now();
+  }
   if (backendId) terminalPaneByBackendId.set(backendId, pane);
 }
 
@@ -9368,7 +9542,7 @@ function cancelCachedExplorerDirectoryRefreshes() {
   explorerCachedRefreshTimers.clear();
 }
 
-function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean } = {}) {
+function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean; deferExplorerWatch?: boolean } = {}) {
   state.workspaceOpen = open;
   renderWorkspaceControls(open);
 
@@ -9378,7 +9552,7 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
     }
   }
   if (!open) setKeyboardResizeTarget({ kind: 'ide' });
-  if (open && !IS_TERMINAL_APP) scheduleExplorerWatch(1200);
+  if (open && !IS_TERMINAL_APP && !options.deferExplorerWatch) scheduleExplorerWatch(1200);
   else stopExplorerWatch();
   renderShellTabs();
 }
@@ -9527,6 +9701,9 @@ async function readExplorerDirectoryCached(profileId: string, path: string, work
 }
 
 async function fetchExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId, force = false) {
+  if (shouldDeferRemoteDirectoryRead(profileId, workspaceId)) {
+    throw new Error(remoteDirectoryReadWaitMessage(profileId));
+  }
   const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
   if (!force) {
     const cached = cachedFreshExplorerDirectoryByKey(key, profileId);
@@ -9555,6 +9732,13 @@ async function fetchExplorerDirectories(
   force = false
 ) {
   const results = new Map<string, DirectoryListingResult>();
+  if (shouldDeferRemoteDirectoryRead(profileId, workspaceId)) {
+    const message = remoteDirectoryReadWaitMessage(profileId);
+    for (const path of paths) {
+      results.set(explorerPathKey(path), { path, entries: [], error: message });
+    }
+    return results;
+  }
   const misses: string[] = [];
   const missKeys = new Set<string>();
   const pendingReads: Array<Promise<void>> = [];
@@ -9700,6 +9884,7 @@ function shouldLoadExplorerDirectoryOnShow() {
     state.activeProfile
     && state.workspaceOpen
     && state.currentDir
+    && !shouldDeferRemoteWorkspaceDirectoryLoad()
     && !state.explorerSignatures.has(state.currentDir)
   );
 }
@@ -11435,6 +11620,12 @@ async function refreshExplorerDirectory(
 
 async function refreshExplorerTree(options: { manual?: boolean; silent?: boolean } = {}) {
   if (!state.activeProfile || !state.workspaceOpen || !state.currentDir) return;
+  if (shouldDeferRemoteWorkspaceDirectoryLoad()) {
+    if (options.manual && !options.silent) {
+      setStatus(`Waiting for ${state.activeProfile.kind.toUpperCase()} shell login before refreshing Explorer...`);
+    }
+    return;
+  }
   if (explorerWatchInFlight && !options.manual) return;
 
   const previousLabel = el.refreshExplorer.textContent;
@@ -11463,6 +11654,7 @@ function scheduleExplorerWatch(delayMs = explorerWatchInterval()) {
   if (explorerWatchTimer) window.clearTimeout(explorerWatchTimer);
   explorerWatchIdleToken += 1;
   if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  if (shouldDeferRemoteWorkspaceDirectoryLoad()) return;
   explorerWatchTimer = window.setTimeout(() => void runExplorerWatch(), delayMs);
 }
 
@@ -11474,6 +11666,7 @@ function stopExplorerWatch() {
 function runExplorerWatch() {
   explorerWatchTimer = 0;
   if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  if (shouldDeferRemoteWorkspaceDirectoryLoad()) return;
   if (document.hidden) {
     scheduleExplorerWatch(explorerWatchInterval() * EXPLORER_WATCH_HIDDEN_FACTOR);
     return;
@@ -11494,6 +11687,7 @@ function runExplorerWatch() {
 async function runExplorerWatchWhenIdle(token: number) {
   if (token !== explorerWatchIdleToken) return;
   if (!state.workspaceOpen || !state.activeProfile || !state.currentDir) return;
+  if (shouldDeferRemoteWorkspaceDirectoryLoad()) return;
   if (document.hidden) {
     if (token === explorerWatchIdleToken) scheduleExplorerWatch(explorerWatchInterval() * EXPLORER_WATCH_HIDDEN_FACTOR);
     return;
@@ -11585,6 +11779,7 @@ async function pollExplorerDirectories(options: { manual?: boolean } = {}) {
 async function changedExplorerWatchPaths(profileId: string, paths: string[], workspaceId: string) {
   const changedPaths: string[] = [];
   const signaturePaths: string[] = [];
+  if (shouldDeferRemoteDirectoryRead(profileId, workspaceId)) return changedPaths;
   for (const path of paths) {
     if (shouldPauseExplorerBackgroundWork()) return changedPaths;
     const cached = cachedFreshExplorerDirectory(profileId, path, workspaceId);
@@ -11986,6 +12181,7 @@ function runExplorerDirectoryPrefetchWhenReady(profileId: string, workspaceId: s
 function canStartExplorerDirectoryPrefetch(profileId: string, workspaceId: string, entry: FileEntry, key: string) {
   if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return false;
   if (document.hidden || getPanel('explorer').classList.contains('hidden')) return false;
+  if (shouldDeferRemoteDirectoryRead(profileId, workspaceId)) return false;
   if (entry.kind !== 'dir') return false;
   if (state.explorerChildren.has(entry.path) || state.explorerLoading.has(entry.path)) return false;
   return !hasCachedExplorerDirectoryKey(key) && !explorerDirectoryReads.has(key);
@@ -15006,9 +15202,14 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
   if (pane.llmId) newPane.llmId = pane.llmId;
   if (llmParts && newPane.backendId) {
     markWorkspaceLlmActivityForPane(newPane, WORKSPACE_LLM_START_ACTIVE_MS);
-    await sendTerminalInputNow(newPane, `${llmParts.call}\r`).catch((error) => {
-      setStatus(`Failed to launch ${pane.llmId}: ${String(error)}`, true);
-    });
+    queueTerminalShellReadyAction(
+      newPane,
+      `launch ${pane.llmId}`,
+      () => sendTerminalInputNow(newPane, `${llmParts.call}\r`).catch((error) => {
+        setStatus(`Failed to launch ${pane.llmId}: ${String(error)}`, true);
+      }),
+      { waitingStatus: `Waiting for ${profile.kind.toUpperCase()} shell login before launching ${pane.llmId}...` }
+    );
   } else {
     await restoreTerminalPythonEnvForPane(newPane);
   }
@@ -16668,6 +16869,7 @@ function handleTerminalData(pane: TerminalPane, data: string) {
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
     if (oscCwd) updateTerminalCwd(pane, oscCwd);
+    if (oscCwd || data.includes('\x1b]7;file://simple-vibe-ide')) markTerminalShellReady(pane);
   }
 
   const shouldTrackPromptCwd = terminalDataMayContainPromptCwdHint(pane, data, visibility);
@@ -16833,6 +17035,8 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.imeFallbackTimer = undefined;
   pane.imeReleaseTimer = undefined;
   pane.inputBuffer = '';
+  pane.shellReadyAt = undefined;
+  pane.pendingShellReadyActions = undefined;
   pane.inputWritePromise = undefined;
   pane.imeComposing = false;
   pane.writeBuffer = '';
@@ -17078,6 +17282,22 @@ async function restoreTerminalPythonEnvForPane(pane: TerminalPane) {
   if (!pane.backendId || pane.command || pane.llmId || !pane.activePythonEnv) return;
   const command = terminalPythonEnvRestoreCommand(pane.activePythonEnv);
   if (!command) return;
+  if (terminalNeedsShellReadyGate(pane) && !pane.shellReadyAt) {
+    queueTerminalShellReadyAction(
+      pane,
+      'restore Python venv',
+      () => {
+        if (!pane.activePythonEnv) return;
+        const readyCommand = terminalPythonEnvRestoreCommand(pane.activePythonEnv);
+        if (!readyCommand) return;
+        return sendTerminalInputNow(pane, `${readyCommand}\r`).catch((error) => {
+          setStatus(`Failed to restore Python venv: ${String(error)}`, true);
+        });
+      },
+      { waitingStatus: `Waiting for ${terminalShellReadyProfile(pane)?.kind.toUpperCase() ?? 'remote'} shell login before restoring Python venv...` }
+    );
+    return;
+  }
   await sendTerminalInputNow(pane, `${command}\r`).catch((error) => {
     setStatus(`Failed to restore Python venv: ${String(error)}`, true);
   });

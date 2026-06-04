@@ -1756,6 +1756,8 @@ fn start_port_forward_host(
         let alias = profile.ssh_alias.unwrap_or_else(|| "default".to_string());
         let mut command = Command::new("ssh.exe");
         command
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg("-N")
             .arg("-L")
             .arg(format!("127.0.0.1:{actual_local}:127.0.0.1:{remote_port}"))
@@ -4252,6 +4254,8 @@ fn profile_shell_command(profile: &ConnectionProfile, script: &str) -> Result<Co
             let mut command = Command::new("ssh.exe");
             command
                 .current_dir(windows_spawn_cwd())
+                .arg("-o")
+                .arg("BatchMode=yes")
                 .arg("-T")
                 .arg(alias)
                 .arg(remote);
@@ -4584,6 +4588,8 @@ fn run_profile_shell(
             let mut command = Command::new("ssh.exe");
             command
                 .current_dir(windows_spawn_cwd())
+                .arg("-o")
+                .arg("BatchMode=yes")
                 .arg("-T")
                 .arg(alias)
                 .arg(remote);

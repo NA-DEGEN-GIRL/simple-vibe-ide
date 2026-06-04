@@ -60,6 +60,13 @@ If `%TEMP%` is too small, use a spacious local path such as
   frontend cursor coordinates after pending terminal writes drain.
 - Normal shell semantics must remain: selected text + `Ctrl+C` copies; no
   selection + `Ctrl+C` interrupts; `Ctrl+V` pastes.
+- SSH/WSL startup injections must wait for the shell-ready OSC7 marker. Do not
+  type LLM launcher calls, restored venv activation, or deferred workspace file
+  loading into a login/passphrase prompt.
+- Background SSH file operations are intentionally noninteractive
+  (`BatchMode=yes`). If authentication needs a passphrase, unlock it in an
+  interactive shell or agent first instead of prompting from hidden Explorer
+  jobs.
 
 ## Release Portability
 
