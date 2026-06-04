@@ -22,15 +22,30 @@ small terminal-output heuristic in `src/main.ts`:
 - currently `codex`, `claude`, `grok`, and `antigravity`/`agy` launcher panes
   are checked;
 - ANSI/control sequences are stripped from recent output;
-- prompt-like text such as `waiting for your answer`, `choose/select`,
-  `Would you like to run the following command?`, `Press enter to confirm`, and
-  Korean `선택/골라/응답/답변` style prompts can set the red state.
+- actual interactive prompts such as trust/approval menus, permission prompts,
+  and structured choice menus can set the red state;
+- plain assistant text that merely asks a question or lists choices should not
+  set the red state unless the terminal also shows a real selectable menu.
 
 The red state clears when either:
 
 - the user sends meaningful input to that LLM pane; or
-- later output arrives that no longer looks like a waiting prompt; or
+- immediately after that input, the CLI repaints stale prompt/menu text while it
+  begins work; or
+- later output arrives that clearly looks idle/completed, such as usage/status,
+  completed-turn, resume/quit, or connection-status screens; or
+- a failed/unavailable choice-menu tool result arrives, such as
+  `request_user_input is unavailable`; or
+- the terminal screen is cleared from the shell context menu; or
 - the pane exits or is removed.
+
+Red is sticky across ambiguous output chunks. TUI apps often repaint a prompt in
+several chunks, so a single non-prompt chunk must not bounce the indicator back
+to green while the same prompt is still on screen.
+
+When a completed-work marker and an interactive menu are emitted together, the
+menu wins. For example, Codex Plan Mode can print `Worked for ...` immediately
+above `Implement this plan?`; that should still turn the workspace dot red.
 
 ## Codex cases tested
 
@@ -48,13 +63,10 @@ Covered cases:
   - `Would you like to run the following command?`
   - `Yes, proceed`
   - `Press enter to confirm or esc to cancel`
-- Codex English answer prompt:
-  - `Please choose one meaningless option`
-  - `Waiting for your answer`
-- Codex Korean answer prompt:
-  - `하나만 골라주세요: ...`
 
-These cases should turn the workspace dot red.
+Plain assistant answer prompts, including English/Korean text that asks the user
+to choose from a normal numbered list, should complete green. They should only
+turn red when Codex shows an actual selectable menu or approval/trust prompt.
 
 ## Grok cases tested
 
@@ -63,17 +75,14 @@ were modified by these probes.
 
 Covered cases:
 
-- Grok English answer prompt:
-  - user-prompted choice request;
-  - model response containing `for your input`;
-  - turn returns to the prompt after the answer request.
 - Grok command approval prompt:
   - `Yes, and don't ask again for anything (always-approve mode)`;
   - `Yes, proceed`;
   - `No, reject`;
   - `Ctrl+o:yolo`.
 
-These cases should turn the workspace dot red.
+Approval cases should turn the workspace dot red. Plain text choice requests
+without a selectable menu should not.
 
 ## Antigravity/Agy cases tested
 
@@ -87,24 +96,31 @@ Covered cases:
   - `Do you trust the contents of this project?`;
   - `Antigravity CLI requires permission to read, edit, and execute files here`;
   - `Yes, I trust this folder`.
-- Agy English answer prompt:
-  - `I am waiting for your input to proceed`;
-  - `Please choose one of the following options`;
-  - `Please reply with your choice`.
 - Agy command permission prompt:
   - `Requesting permission for:`;
   - `Do you want to proceed?`;
   - `Yes` / `No`;
   - `tab Amend` and `esc to cancel`.
 
-These cases should turn the workspace dot red.
+Permission cases should turn the workspace dot red. Plain text choice requests
+without a selectable menu should not.
+
+## False-positive guardrails
+
+Usage/status screens, idle menus, failed tool-call results, and plain text
+questions should not turn the dot red just because they include key hints or
+choice wording. In particular, standalone hints such as `Esc to cancel`,
+`Resume session`, `Quit`, `Turn completed`, `Usage:`, `Connecting MCPs`, or
+`request_user_input is unavailable` should clear or keep off the red waiting
+state unless they are paired with a real approval/trust/selectable-menu prompt.
 
 ## Claude cases still pending
 
 Claude could not be tested fully in the original implementation pass because
 the available account was quota-limited. When quota is available, test at least:
 
-- a normal Claude question asking the user to choose/confirm something;
+- a normal Claude question asking the user to choose/confirm something, which
+  should stay green unless Claude renders a real selectable menu;
 - a Claude permission prompt for running a command or editing a file;
 - a non-waiting Claude output stream to check false positives;
 - user answer input to verify red clears and green activity resumes.

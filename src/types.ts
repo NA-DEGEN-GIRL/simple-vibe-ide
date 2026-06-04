@@ -65,9 +65,18 @@ export interface EdgeDevtoolsPage {
   webSocketDebuggerUrl: string;
 }
 
+export interface BrowserWebviewPageLoadEvent {
+  url: string;
+  event: 'started' | 'finished';
+}
+
 export interface TerminalDataEvent {
   id: string;
   data: string;
+}
+
+export interface TerminalCursorQueryEvent {
+  id: string;
 }
 
 export interface TerminalExitEvent {

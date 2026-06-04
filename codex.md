@@ -51,6 +51,84 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-02 - LLM status dot and Codex TUI cursor query fixes
+
+#### Changed
+
+- Narrowed the red workspace LLM waiting dot so plain assistant text that asks a
+  question or lists choices completes green unless a real selectable menu,
+  trust prompt, approval prompt, or permission prompt is visible.
+- Treat failed/unavailable choice-menu tool results such as
+  `request_user_input is unavailable` as completed/not-waiting output.
+- Fixed Codex Plan Mode menus where `Worked for ...` appears directly above
+  `Implement this plan?`; the real interactive menu now takes priority over the
+  completed-work marker and should show the workspace dot in red.
+- After a user confirms a waiting menu, stale menu repaint output is suppressed
+  briefly for waiting detection so the workspace dot clears red and switches
+  back to green working activity.
+- When answering terminal cursor-position queries for TUI apps, the frontend now
+  drains already-queued xterm output before sending the cursor-position reply to
+  the backend. This avoids stale cursor coordinates that could make Codex slash
+  commands render offset, such as `/resume` appearing split or shifted.
+- Added per-pane Python venv restore for plain shell panes. Bash/zsh-style
+  `source .venv/bin/activate` / `. .venv/bin/activate` and Windows PowerShell
+  `.venv\Scripts\Activate.ps1` commands are detected, saved in workspace
+  snapshots, replayed after app/workspace restore, and inherited by new shell
+  tabs/split panes. `deactivate` clears the saved venv state.
+
+#### Verified
+
+- `git diff --check`
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+
+### 2026-06-03 - Browser toolbar wrap, native WebView preview, and fallback cleanup
+
+#### Changed
+
+- Tightened Browser panel control wrapping so Back/Forward, address, Go, Reload,
+  and Clear cache stay in one aligned row at normal panel widths. Device and
+  console controls also keep compact columns before falling back to wrapped rows
+  on narrow panels.
+- Switched the in-app Browser away from iframe/proxy-first loading and away
+  from the external headless Edge/CDP screencast attempt. The active path is now
+  a Tauri child WebView2 surface positioned over the Browser preview area, so
+  localhost apps load directly in an Edge/WebView runtime without waiting on a
+  separate `msedge.exe --remote-debugging-port` endpoint.
+- Added a local-preview fallback path after repeated preview-proxy asset
+  failures. If critical assets such as app scripts keep failing through the
+  proxy, the active local tab falls back to the direct local URL so the page can
+  still render instead of stopping on a blank white preview.
+- The earlier external Edge DevTools path remains compiled but is no longer the
+  default because local runtime logs showed the DevTools endpoint never became
+  ready even after the launcher exited successfully.
+- Native Browser WebView bounds are synced from the DOM preview area on
+  resize/zoom/panel drag so it stays in the Browser panel instead of relying on
+  a canvas screencast.
+- Native Browser WebView bounds are clipped to the visible preview grid cell,
+  preventing non-fit device previews from painting over the Browser console or
+  other IDE UI while the preview shell remains scrollable.
+- Browser Fit is now a toggle: pressing Fit again restores the previous manual
+  zoom instead of requiring `+` or `-` to leave fit mode.
+- Enabled Tauri's `unstable` feature to use the child-WebView API required for
+  the native Browser preview surface.
+
+#### Verified
+
+- `git diff --check`
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+
+#### Known Limits
+
+- Native Browser WebView preview still needs a manual smoke test in the Windows
+  Tauri app because WSL-side checks cannot launch and interact with the child
+  WebView2 surface.
+
 ### 2026-05-28 - Saved workspaces and faster close
 
 #### Changed

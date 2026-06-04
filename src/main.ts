@@ -9,7 +9,7 @@ import type { FitAddon as XTermFitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 declare const __SVIDE_BUILD_ID__: string;
@@ -49,6 +49,12 @@ interface TerminalPane {
   focusRetryTimer?: number;
   lastUserInputAt?: number;
   llmWaitingDetectionBuffer?: string;
+  llmWaitingSuppressUntil?: number;
+  activePythonEnv?: TerminalPythonEnvSnapshot;
+  pendingTerminalWrites?: number;
+  writeDrainPromise?: Promise<void>;
+  writeDrainResolve?: () => void;
+  cursorQueryResponsePromise?: Promise<void>;
   suppressTerminalQueryResponsesUntil?: number;
   seenPorts: Set<number>;
   fitFrame?: number;
@@ -136,6 +142,7 @@ interface BrowserTab {
   orientation?: BrowserOrientation;
   zoom?: number;
   zoomMode?: BrowserZoomMode;
+  manualZoomBeforeFit?: number;
   frameUrl?: string;
   edge?: EdgeBrowserTarget;
 }
@@ -333,6 +340,7 @@ interface WorkspaceTerminalSnapshot {
   groupId?: string;
   profileId?: string;
   cwd?: string;
+  activePythonEnv?: TerminalPythonEnvSnapshot;
   typingPadOpen?: boolean;
   defaultFocusTarget?: TerminalDefaultFocusTarget;
   rect?: LayoutRatio;
@@ -538,6 +546,7 @@ type CloseTerminalOptions = {
 };
 type TerminalTextTarget = 'shell' | 'typing-pad';
 type TerminalDefaultFocusTarget = 'shell' | 'typing-pad';
+type TerminalPythonEnvShell = 'posix' | 'powershell';
 type ImageTagPasteTarget = TerminalTextTarget | 'none';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
@@ -579,7 +588,14 @@ type CreateTerminalOptions = {
   splitTargetPaneId?: string;
   splitDirection?: TerminalSplitDirection;
   defaultFocusTarget?: TerminalDefaultFocusTarget;
+  pythonEnv?: TerminalPythonEnvSnapshot;
 };
+
+interface TerminalPythonEnvSnapshot {
+  kind: 'python-venv';
+  shell: TerminalPythonEnvShell;
+  activatePath: string;
+}
 
 type LlmLauncherFlag = {
   // Two questions decide whether to add the flag: is it already in the command, and is it root?
@@ -734,12 +750,15 @@ const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 64 * 1024;
 const TERMINAL_VISIBLE_WRITE_CHUNK_CHARS = 16 * 1024;
 const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 8 * 1024;
 const TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS = 2 * 1024;
+const TERMINAL_CURSOR_QUERY_FLUSH_LIMIT_CHARS = 64 * 1024;
+const TERMINAL_CURSOR_QUERY_DRAIN_TIMEOUT_MS = 160;
 const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
 const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
 const WORKSPACE_LLM_OUTPUT_ACTIVE_MS = 2500;
 const WORKSPACE_LLM_INPUT_ACTIVE_MS = 3500;
 const WORKSPACE_LLM_START_ACTIVE_MS = 4000;
 const WORKSPACE_LLM_WAITING_BUFFER_CHARS = 6000;
+const WORKSPACE_LLM_WAITING_AFTER_INPUT_SUPPRESS_MS = 1800;
 const DEFAULT_TERMINAL_FOCUS_TARGET: TerminalDefaultFocusTarget = 'shell';
 // Defer post-composition repaint/refocus well past xterm's own setTimeout(0) finalize (which
 // re-reads the helper-textarea), so our DOM/focus churn can't clobber the committed Hangul tail.
@@ -817,12 +836,16 @@ const BROWSER_ZOOM_LEVELS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25
 const IMAGE_PREVIEW_MIN_ZOOM = 0.1;
 const IMAGE_PREVIEW_MAX_ZOOM = 12;
 const IMAGE_PREVIEW_WHEEL_FACTOR = 1.12;
+// Use a Tauri child WebView2 surface for the in-app Browser. Launching a
+// separate headless Edge + CDP screencast proved brittle on Windows because the
+// launcher can exit before the remote-debugging endpoint ever binds.
+const USE_NATIVE_BROWSER_WEBVIEW = true;
 const USE_EDGE_CDP_BROWSER = false;
-const USE_PREVIEW_PROXY_BROWSER = true;
+const USE_PREVIEW_PROXY_BROWSER = false;
 const EDGE_SCREENCAST_QUALITY = 66;
 const EDGE_SCREENCAST_EVERY_NTH_FRAME = 2;
 const EDGE_SCREENCAST_MIN_DRAW_INTERVAL_MS = 58;
-const EDGE_START_TIMEOUT_MS = 16000;
+const EDGE_START_TIMEOUT_MS = 60000;
 const EDGE_PAGE_TIMEOUT_MS = 6500;
 const EDGE_CDP_CONNECT_TIMEOUT_MS = 6500;
 const EDGE_CDP_COMMAND_TIMEOUT_MS = 5000;
@@ -1372,6 +1395,12 @@ const explorerDirectoryPrefetchTimers = new Map<string, number>();
 const explorerDirectoryPrefetchPending = new Set<string>();
 const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
 const edgeDevtoolsSessions = new Map<string, EdgeDevtoolsSession>();
+const edgeDevtoolsSessionPromises = new Map<string, Promise<EdgeDevtoolsSession>>();
+let nativeBrowserWebviewTabId = '';
+let nativeBrowserWebviewUrl = '';
+let nativeBrowserWebviewVisible = false;
+let nativeBrowserWebviewSyncFrame = 0;
+let nativeBrowserWebviewRequestSeq = 0;
 const noteSaveTimers = new Map<string, number>();
 const previewProxyProbeAt = new Map<string, number>();
 const previewProxyStarts = new Map<string, Promise<PortForwardResult>>();
@@ -2028,6 +2057,14 @@ async function init() {
     const pane = terminalPaneByBackendId.get(event.payload.id);
     if (!pane) return;
     handleTerminalData(pane, event.payload.data);
+  });
+  await listen<TerminalCursorQueryEvent>('terminal-cursor-query', (event) => {
+    const pane = terminalPaneByBackendId.get(event.payload.id);
+    if (!pane) return;
+    void respondToTerminalCursorQuery(pane);
+  });
+  await listen<BrowserWebviewPageLoadEvent>('browser-webview-page-load', (event) => {
+    handleBrowserWebviewPageLoad(event.payload);
   });
   await listen<TerminalExitEvent>('terminal-exit', (event) => {
     const pane = terminalPaneByBackendId.get(event.payload.id);
@@ -3791,6 +3828,7 @@ function markWorkspaceLlmActivityForPane(pane: TerminalPane, durationMs = WORKSP
 
 function markWorkspaceLlmUserActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_INPUT_ACTIVE_MS) {
   if (!pane.llmId || !pane.workspaceId) return;
+  pane.llmWaitingSuppressUntil = performance.now() + WORKSPACE_LLM_WAITING_AFTER_INPUT_SUPPRESS_MS;
   clearWorkspaceLlmWaitingForPane(pane);
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
@@ -3892,6 +3930,7 @@ function workspaceHasWaitingLlmPane(workspaceId: string) {
 
 function clearWorkspaceLlmWaitingForPane(pane: TerminalPane) {
   const hadWaiting = workspaceLlmWaitingByPaneId.delete(pane.paneId);
+  pane.llmWaitingDetectionBuffer = '';
   if (hadWaiting) renderWorkspaceLlmActivityTab(pane.workspaceId);
 }
 
@@ -3922,6 +3961,10 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
   const normalized = normalizeTerminalOutputForLlmWaitingDetection(data);
   const meaningful = normalized.trim();
   if (!meaningful) return workspaceLlmWaitingByPaneId.has(pane.paneId);
+  if (llmWaitingDetectionSuppressedAfterInput(pane)) {
+    pane.llmWaitingDetectionBuffer = '';
+    return false;
+  }
   pane.llmWaitingDetectionBuffer = trimLlmWaitingDetectionBuffer(`${pane.llmWaitingDetectionBuffer ?? ''}\n${meaningful}`);
   const wasWaiting = workspaceLlmWaitingByPaneId.has(pane.paneId);
   const looksWaiting = llmOutputLooksLikeUserPrompt(pane.llmId, wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer);
@@ -3929,8 +3972,32 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
     markWorkspaceLlmWaitingForPane(pane);
     return true;
   }
-  if (wasWaiting) clearWorkspaceLlmWaitingForPane(pane);
+  if (llmOutputLooksClearlyNotWaiting(meaningful)) {
+    clearWorkspaceLlmWaitingForPane(pane);
+    return false;
+  }
+  // TUI apps frequently repaint the prompt/status area in several chunks. A later chunk can be
+  // plain text with no prompt keywords even though the screen is still waiting for the user.
+  // Keep the red state until explicit user input, terminal clear/close, or a clearly-not-waiting
+  // status line arrives; otherwise the workspace dot flickers red/green during one repaint.
+  if (wasWaiting) return true;
   return false;
+}
+
+function llmWaitingDetectionSuppressedAfterInput(pane: TerminalPane) {
+  const suppressUntil = pane.llmWaitingSuppressUntil ?? 0;
+  if (!suppressUntil) return false;
+  if (performance.now() < suppressUntil) return true;
+  pane.llmWaitingSuppressUntil = undefined;
+  return false;
+}
+
+function clearTerminalPaneScreen(pane: TerminalPane | null | undefined) {
+  if (!pane) return;
+  pane.term.clear();
+  pane.llmWaitingDetectionBuffer = '';
+  pane.llmWaitingSuppressUntil = undefined;
+  clearWorkspaceLlmWaitingForPane(pane);
 }
 
 function markWorkspaceLlmWaitingForPane(pane: TerminalPane) {
@@ -3968,18 +4035,12 @@ function normalizeTerminalOutputForLlmWaitingDetection(data: string) {
 
 function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
   if (!text.trim()) return false;
+  if (llmOutputLooksLikeStructuredChoiceMenu(text)) return true;
   const lower = text.toLowerCase();
-  if (!/(amend|answer|approval|approve|choice|choose|confirm|continue|input|option|permission|pick|plan mode|proceed|project|question|reply|requesting permission|request_user_input|respond|select|trust|waiting|yolo|고르|골라|답변|선택|승인|응답|입력|질문|확인)/.test(lower)) {
+  if (!/(amend|approval|approve|confirm|continue|permission|proceed|project|requesting permission|trust|yolo|승인|확인)/.test(lower)) {
     return false;
   }
   const genericPromptPatterns = [
-    /\bwaiting for (?:your|user) (?:input|response|reply|answer|confirmation|approval)\b/i,
-    /\bfor your input\b/i,
-    /\b(?:your|user) (?:input|response|reply|answer|confirmation|approval) (?:is )?(?:required|needed|requested)\b/i,
-    /\brequest(?:ed|ing)? user input\b/i,
-    /\b(?:please )?(?:select|choose|pick) (?:one|an option|a choice|an answer)\b/i,
-    /\b(?:answer|respond to|reply to) (?:the )?(?:question|prompt)\b/i,
-    /\bquestion\b[\s\S]{0,420}\b(?:options?|choices?|select|choose|pick|recommended|1[.)])/i,
     /\bdo you trust the contents of this (?:directory|project)\b/i,
     /\b(?:trusting the directory|yes,\s*continue|yes,\s*i trust this folder)\b/i,
     /\bpress enter to (?:continue|confirm)\b/i,
@@ -3992,24 +4053,19 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
     /\bwould you like to run the following command\b/i,
     /\b(?:do you want|would you like|should i) .*\b(?:continue|proceed|apply|approve|allow|run)\b/i,
     /\bdo you want to proceed\?/i,
-    /\b(?:ctrl\+o:yolo|tab amend|esc to cancel)\b/i,
     /\b(?:continue|proceed|apply|approve|allow|run)\?\b/i,
-    /(?:사용자|유저).{0,24}(?:응답|입력|답변).{0,24}(?:대기|필요|요청)/,
-    /(?:질문|답변).{0,80}(?:선택|고르|골라|응답)/,
-    /(?:선택|고르|골라).{0,30}(?:주세요|십시오|하세요|필요|옵션)/
+    /(?:승인|확인).{0,24}(?:필요|요청|하세요|하십시오)/
   ];
   if (genericPromptPatterns.some((pattern) => pattern.test(text))) return true;
   if (llmId === 'codex') {
-    return /\bplan mode\b[\s\S]{0,360}\b(?:question|select|choose|answer|respond|reply|user input|option)\b/i.test(text)
-      || /\brequest_user_input\b/i.test(text)
-      || /\bwhich (?:option|approach|plan)\b/i.test(text);
+    return /\bplan mode\b[\s\S]{0,360}\b(?:approve|confirm|continue|permission|proceed)\b/i.test(text);
   }
   if (llmId === 'claude') {
     return /\b(?:allow|approve|confirm) .*\?/i.test(text)
       || /\b(?:do you want|would you like) .*\b(?:edit|run|proceed|continue|allow|approve)\b/i.test(text);
   }
   if (llmId === 'grok') {
-    return /\b(?:ctrl\+o:yolo|yes,\s*proceed|no,\s*reject|select)\b/i.test(text)
+    return /\b(?:ctrl\+o:yolo|yes,\s*proceed|no,\s*reject)\b/i.test(text)
       || /\bexecute .*\b(?:command|tool)\b[\s\S]{0,420}\b\d+\s*\([●○]\)\s*yes\b/i.test(text);
   }
   if (llmId === 'antigravity') {
@@ -4019,6 +4075,23 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
       || /\byes,\s*i trust this folder\b/i.test(text);
   }
   return false;
+}
+
+function llmOutputLooksLikeStructuredChoiceMenu(text: string) {
+  if (/\brequest_user_input\b[\s\S]{0,220}\b(?:unavailable|failed|error|not available)\b/i.test(text)) return false;
+  const structuredChoicePatterns = [
+    /\brequest_user_input\b[\s\S]{0,900}\b(?:questions?|options?|choices?|recommended|label)\b/i,
+    /(?:^|\n)\s*[›>]\s*(?:\d+[.)]|\d+\s*\([●○]\)|[●○])[\s\S]{0,100}\b(?:yes|no|continue|proceed|allow|approve|trust|recommended)\b/i,
+    /(?:^|\n)\s*[›>]\s*\d+[.)]\s+.{1,100}\n\s*(?:\d+[.)]|[›>]\s*\d+[.)])/i
+  ];
+  return structuredChoicePatterns.some((pattern) => pattern.test(text));
+}
+
+function llmOutputLooksClearlyNotWaiting(text: string) {
+  return /\b(?:turn completed|worked for|model changed to|usage:|total cost|total duration|current session|current week|resets|nothing over|resume session|quit|connecting mcps|user prompt submit|thought for|stop\s+\[hooks|tip:)\b/i.test(text)
+    || /\brequest_user_input\b[\s\S]{0,220}\b(?:unavailable|failed|error|not available)\b/i.test(text)
+    || /\bunavailable in default mode\b/i.test(text)
+    || /(?:작업|턴).{0,20}(?:완료|종료)/.test(text);
 }
 
 function renderWorkspaceLlmActivityTab(workspaceId: string) {
@@ -4356,9 +4429,19 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
 function cloneTerminalSnapshots(terminals: WorkspaceTerminalSnapshot[]) {
   const cloned: WorkspaceTerminalSnapshot[] = [];
   for (const terminal of terminals) {
-    cloned.push({ ...terminal, rect: terminal.rect ? { ...terminal.rect } : undefined });
+    cloned.push({
+      ...terminal,
+      activePythonEnv: cloneTerminalPythonEnvSnapshot(terminal.activePythonEnv),
+      rect: terminal.rect ? { ...terminal.rect } : undefined
+    });
   }
   return cloned;
+}
+
+function cloneTerminalPythonEnvSnapshot(env: TerminalPythonEnvSnapshot | null | undefined): TerminalPythonEnvSnapshot | undefined {
+  return env
+    ? { kind: 'python-venv', shell: env.shell, activatePath: env.activatePath }
+    : undefined;
 }
 
 function cloneTerminalGroupSnapshots(groups?: WorkspaceTerminalGroupSnapshot[]) {
@@ -4718,7 +4801,8 @@ function browserTabSnapshot(tab: BrowserTab): BrowserTab {
     deviceId: normalizedBrowserDeviceId(tab.deviceId ?? state.browserDeviceId),
     orientation: normalizedBrowserOrientation(tab.orientation ?? state.browserOrientation),
     zoom: normalizedBrowserZoom(tab.zoom ?? state.browserZoom),
-    zoomMode: normalizedBrowserZoomMode(tab.zoomMode ?? state.browserZoomMode)
+    zoomMode: normalizedBrowserZoomMode(tab.zoomMode ?? state.browserZoomMode),
+    manualZoomBeforeFit: normalizedBrowserZoom(tab.manualZoomBeforeFit ?? tab.zoom ?? state.browserZoom)
   };
 }
 
@@ -4801,7 +4885,13 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
+}
+
+function terminalPythonEnvSignature(env: TerminalPythonEnvSnapshot | null | undefined) {
+  return env
+    ? `${workspaceSignaturePart(env.kind)},${workspaceSignaturePart(env.shell)},${workspaceSignaturePart(env.activatePath)}`
+    : '';
 }
 
 function terminalGroupsSignature(groups?: WorkspaceTerminalGroupSnapshot[]) {
@@ -4991,6 +5081,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
           groupId: group.groupId,
           profileId: pane.profileId,
           cwd: pane.cwd,
+          activePythonEnv: cloneTerminalPythonEnvSnapshot(pane.activePythonEnv),
           typingPadOpen: Boolean(widget.typingPadOpen),
           defaultFocusTarget: widget.defaultFocusTarget,
           rect: elementLayoutRatio(pane.element, { preferCache: true })
@@ -5064,6 +5155,7 @@ function saveActiveWorkspaceRuntimeCache() {
     disconnectActiveEdgeCdp();
     setEdgePreviewVisible(false);
   }
+  hideNativeBrowserWebview();
 }
 
 function restoreWorkspaceRuntimeCache(workspaceId: string) {
@@ -5344,7 +5436,8 @@ async function restoreWorkspaceTerminals(
         cwd: terminal.cwd || workspaceShellCwd(),
         skipSnapshotSave: true,
         groupId: terminal.groupId,
-        defaultFocusTarget
+        defaultFocusTarget,
+        pythonEnv: terminal.activePythonEnv
       };
       const terminalTitle = terminal.title || 'shell';
       // An LLM-launcher terminal (codex/claude/grok button) is restored by spawning a plain shell
@@ -5370,6 +5463,7 @@ async function restoreWorkspaceTerminals(
         const snapshotPaneId = terminal.snapshotPaneId || `${widgetKey}:${terminal.groupId ?? restoredPane.groupId}:${terminalSnapshots.indexOf(terminal)}`;
         paneIdBySnapshotPaneId.set(snapshotPaneId, restoredPane.paneId);
         restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
+        restoredPane.activePythonEnv = cloneTerminalPythonEnvSnapshot(terminal.activePythonEnv);
         const typingPadOpen = Boolean(terminal.typingPadOpen);
         restoredPane.typingPadOpen = typingPadOpen;
         const restoredWidget = terminalWidgetForPane(restoredPane);
@@ -5383,6 +5477,8 @@ async function restoreWorkspaceTerminals(
         restoredPane.llmId = llmId;
         markWorkspaceLlmActivityForPane(restoredPane, WORKSPACE_LLM_START_ACTIVE_MS);
         await sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined);
+      } else if (restoredPane?.backendId) {
+        await restoreTerminalPythonEnvForPane(restoredPane);
       }
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
         hideTerminalWidgetsForWorkspace(snapshot.id);
@@ -6906,7 +7002,8 @@ function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRunt
       deviceId: tab.deviceId,
       orientation: tab.orientation,
       zoom: tab.zoom,
-      zoomMode: tab.zoomMode
+      zoomMode: tab.zoomMode,
+      manualZoomBeforeFit: tab.manualZoomBeforeFit
     }, fallbackDeviceId, fallbackOrientation, fallbackZoom, fallbackZoomMode));
   }
   return tabs;
@@ -6949,6 +7046,9 @@ function normalizeBrowserTabForCurrentMode(
   normalized.orientation = normalizedBrowserOrientation(normalized.orientation ?? fallbackOrientation);
   normalized.zoom = normalizedBrowserZoom(normalized.zoom ?? fallbackZoom);
   normalized.zoomMode = normalizedBrowserZoomMode(normalized.zoomMode ?? fallbackZoomMode);
+  normalized.manualZoomBeforeFit = normalizedBrowserZoom(normalized.manualZoomBeforeFit ?? (
+    normalized.zoomMode === 'fit' ? fallbackZoom : normalized.zoom
+  ));
   if (!USE_EDGE_CDP_BROWSER) normalized.edge = undefined;
   if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(normalized.url)) {
     normalized.frameUrl = undefined;
@@ -6959,6 +7059,7 @@ function normalizeBrowserTabForCurrentMode(
 }
 
 function showRestoredBrowserIdle(tab: BrowserTab) {
+  hideNativeBrowserWebview();
   disconnectActiveEdgeCdp();
   if (!USE_EDGE_CDP_BROWSER) {
     setEdgePreviewVisible(false);
@@ -7199,6 +7300,7 @@ function bindEvents() {
     renderBrowserConsole();
   });
   el.browserShell.addEventListener('pointerdown', activateBrowserPanel);
+  el.browserShell.addEventListener('scroll', scheduleNativeBrowserWebviewSync, { passive: true });
   bindBrowserFrameEvents(el.previewFrame);
   bindEdgePreviewInput();
   el.calculatorExpression.addEventListener('input', () => {
@@ -7235,6 +7337,7 @@ function bindEvents() {
       clearExplorerBackgroundWork();
       pauseMarketTickerForHidden();
       cancelBrowserFrameSuspend();
+      hideNativeBrowserWebview();
       suspendBrowserFramesForAllWorkspaces();
     } else if (state.workspaceOpen) {
       cancelBrowserFrameSuspend();
@@ -7437,7 +7540,7 @@ function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMe
   return [
     { label: 'Copy', action: () => copyTextToClipboard(selected, 'Copied terminal selection'), disabled: !selected },
     { label: 'Paste', action: () => pasteIntoTerminal(pane), disabled: !pane },
-    { label: 'Clear', action: () => pane?.term.clear(), disabled: !pane },
+    { label: 'Clear', action: () => clearTerminalPaneScreen(pane), disabled: !pane },
     { separator: true },
     { label: 'Split right', action: () => { if (pane) void splitTerminalPane(pane, 'row'); }, disabled: !pane },
     { label: 'Split down', action: () => { if (pane) void splitTerminalPane(pane, 'column'); }, disabled: !pane },
@@ -8079,6 +8182,19 @@ function resetBrowserZoom() {
 }
 
 function fitBrowserZoom(options: { silent?: boolean; skipSave?: boolean } = {}) {
+  const tab = currentBrowserTab();
+  if (state.browserZoomMode === 'fit') {
+    const restoredZoom = normalizedBrowserZoom(tab?.manualZoomBeforeFit ?? 1);
+    state.browserZoomMode = 'manual';
+    state.browserZoom = restoredZoom;
+    if (tab) tab.manualZoomBeforeFit = restoredZoom;
+    syncActiveBrowserTabViewport();
+    applyBrowserZoom();
+    if (!options.silent) setStatus(`Browser fit off (${Math.round(restoredZoom * 100)}%)`);
+    if (!options.skipSave) saveActiveWorkspaceSnapshot();
+    return;
+  }
+  if (tab) tab.manualZoomBeforeFit = normalizedBrowserZoom(state.browserZoom);
   state.browserZoomMode = 'fit';
   refreshBrowserFitZoom(options);
 }
@@ -8140,14 +8256,17 @@ function applyBrowserZoom() {
   applyBrowserFrameSizingForActiveFrame();
   applyEdgePreviewSizing();
   scheduleConfigureEdgeViewport();
+  scheduleNativeBrowserWebviewSync();
 }
 
 function syncBrowserZoomControls() {
   const zoomLabel = `${Math.round(normalizedBrowserZoom(state.browserZoom) * 100)}%`;
+  const fitActive = state.browserZoomMode === 'fit';
   setElementTextIfChanged(el.browserZoomReset, zoomLabel);
   setAttributeIfChanged(el.browserZoomReset, 'title', `Reset browser preview zoom (currently ${zoomLabel})`);
-  toggleClassIfChanged(el.browserZoomFit, 'active', state.browserZoomMode === 'fit');
-  setAttributeIfChanged(el.browserZoomFit, 'aria-pressed', state.browserZoomMode === 'fit' ? 'true' : 'false');
+  setAttributeIfChanged(el.browserZoomFit, 'title', fitActive ? 'Turn off fit zoom' : 'Fit browser preview');
+  toggleClassIfChanged(el.browserZoomFit, 'active', fitActive);
+  setAttributeIfChanged(el.browserZoomFit, 'aria-pressed', fitActive ? 'true' : 'false');
 }
 
 function syncBrowserPreviewScaleBox() {
@@ -8437,6 +8556,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       syncBrowserConsoleCaptureForActiveFrame();
       trimBrowserConsoleLogs();
       cancelBrowserFrameSuspend();
+      hideNativeBrowserWebview();
       suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
     }
     if (!wasHidden && keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
@@ -8500,6 +8620,7 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
       height: panelHeight
     };
     applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }, snapGuides));
+    if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
   };
 
   const up = (upEvent: PointerEvent) => {
@@ -8508,6 +8629,7 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
     panel.removeEventListener('pointermove', move);
     panel.removeEventListener('pointerup', up);
     panel.removeEventListener('pointercancel', up);
+    if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
     saveActiveWorkspaceSnapshot();
   };
 
@@ -8581,6 +8703,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     if (panel.dataset.panel === 'editor') requestCodeEditorMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
+    if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
   };
 
   const up = (upEvent: PointerEvent) => {
@@ -8592,6 +8715,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     requestCodeEditorMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
+    if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
     saveActiveWorkspaceSnapshot();
   };
 
@@ -8949,6 +9073,88 @@ function filterTerminalInputData(pane: TerminalPane, data: string) {
   return data.replace(TERMINAL_CPR_RESPONSE_PATTERN, '');
 }
 
+async function respondToTerminalCursorQuery(pane: TerminalPane) {
+  const previous = pane.cursorQueryResponsePromise ?? Promise.resolve();
+  const current = previous
+    .catch(() => undefined)
+    .then(() => respondToTerminalCursorQueryNow(pane));
+  const tracked = current.finally(() => {
+    if (pane.cursorQueryResponsePromise === tracked) pane.cursorQueryResponsePromise = undefined;
+  });
+  pane.cursorQueryResponsePromise = tracked;
+  await tracked;
+}
+
+async function respondToTerminalCursorQueryNow(pane: TerminalPane) {
+  if (!pane.backendId) return;
+  await flushTerminalOutputBeforeCursorResponse(pane);
+  if (!pane.backendId) return;
+  const buffer = pane.term.buffer.active;
+  const row = clamp(Math.floor(buffer.cursorY) + 1, 1, Math.max(1, pane.term.rows));
+  const col = clamp(Math.floor(buffer.cursorX) + 1, 1, Math.max(1, pane.term.cols));
+  const response = `\x1b[${row};${col}R`;
+  try {
+    await api.writeTerminal(pane.backendId, response);
+  } catch {
+    // Cursor-position replies are best-effort; the terminal may exit between query and response.
+  }
+}
+
+async function flushTerminalOutputBeforeCursorResponse(pane: TerminalPane) {
+  let flushed = 0;
+  while (pane.writeBuffer && flushed < TERMINAL_CURSOR_QUERY_FLUSH_LIMIT_CHARS) {
+    const before = pane.writeBuffer.length;
+    flushTerminalWriteBuffer(pane);
+    const after = pane.writeBuffer.length;
+    if (after >= before) break;
+    flushed += before - after;
+  }
+  await waitForTerminalWriteDrain(pane, TERMINAL_CURSOR_QUERY_DRAIN_TIMEOUT_MS);
+}
+
+function waitForTerminalWriteDrain(pane: TerminalPane, timeoutMs: number) {
+  if (terminalWriteDrainReady(pane)) return Promise.resolve();
+  const drain = ensureTerminalWriteDrainPromise(pane);
+  return new Promise<void>((resolve) => {
+    const timer = window.setTimeout(resolve, timeoutMs);
+    drain.finally(() => {
+      window.clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function terminalWriteDrainReady(pane: TerminalPane) {
+  return !pane.writeBuffer && !pane.writeFrame && !pane.writeTimer && (pane.pendingTerminalWrites ?? 0) <= 0;
+}
+
+function ensureTerminalWriteDrainPromise(pane: TerminalPane) {
+  if (!pane.writeDrainPromise) {
+    pane.writeDrainPromise = new Promise<void>((resolve) => {
+      pane.writeDrainResolve = resolve;
+    });
+  }
+  return pane.writeDrainPromise;
+}
+
+function markTerminalWriteStarted(pane: TerminalPane) {
+  pane.pendingTerminalWrites = (pane.pendingTerminalWrites ?? 0) + 1;
+  ensureTerminalWriteDrainPromise(pane);
+}
+
+function markTerminalWriteFinished(pane: TerminalPane) {
+  pane.pendingTerminalWrites = Math.max(0, (pane.pendingTerminalWrites ?? 0) - 1);
+  resolveTerminalWriteDrainIfReady(pane);
+}
+
+function resolveTerminalWriteDrainIfReady(pane: TerminalPane) {
+  if (!terminalWriteDrainReady(pane)) return;
+  const resolve = pane.writeDrainResolve;
+  pane.writeDrainPromise = undefined;
+  pane.writeDrainResolve = undefined;
+  if (resolve) resolve();
+}
+
 function queueTerminalInput(pane: TerminalPane, data: string) {
   if (!data) return;
   pane.inputWriteBuffer += data;
@@ -9111,6 +9317,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   if (state.activeWorkspaceId) hideBrowserFramesForWorkspace(state.activeWorkspaceId);
   else hideAllBrowserFrames();
   disconnectActiveEdgeCdp();
+  hideNativeBrowserWebview();
   setEdgePreviewVisible(false);
   toggleClassIfChanged(el.browserShell, 'has-preview', false);
   if (renderIntermediate && isPanelVisible('editor')) {
@@ -14085,6 +14292,7 @@ async function createTerminalTab(
     inputBuffer: '',
     inputWriteBuffer: '',
     typingPadOpen: widget.typingPadOpen,
+    activePythonEnv: cloneTerminalPythonEnvSnapshot(options.pythonEnv),
     seenPorts: new Set(),
     lastRows: term.rows,
     lastCols: term.cols
@@ -14771,7 +14979,12 @@ async function createShellTabInWidget(widget: TerminalWidget) {
   const active = activePaneForWidget(widget);
   const profile = profileForTerminalWidget(widget) ?? state.activeProfile;
   const cwd = active?.cwd ?? workspaceShellCwd();
-  await createTerminalTab(widget, null, 'shell', { profile: profile ?? undefined, cwd });
+  const pane = await createTerminalTab(widget, null, 'shell', {
+    profile: profile ?? undefined,
+    cwd,
+    pythonEnv: active?.activePythonEnv
+  });
+  if (pane) await restoreTerminalPythonEnvForPane(pane);
 }
 
 async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDirection) {
@@ -14786,7 +14999,8 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
     profile,
     cwd: pane.cwd,
     splitTargetPaneId: pane.paneId,
-    splitDirection: direction
+    splitDirection: direction,
+    pythonEnv: pane.activePythonEnv
   });
   if (!newPane) return;
   if (pane.llmId) newPane.llmId = pane.llmId;
@@ -14795,6 +15009,8 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
     await sendTerminalInputNow(newPane, `${llmParts.call}\r`).catch((error) => {
       setStatus(`Failed to launch ${pane.llmId}: ${String(error)}`, true);
     });
+  } else {
+    await restoreTerminalPythonEnvForPane(newPane);
   }
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
 }
@@ -16550,8 +16766,10 @@ function flushTerminalWriteBuffer(pane: TerminalPane) {
     : pane.writeBuffer.length;
   const output = end === pane.writeBuffer.length ? pane.writeBuffer : pane.writeBuffer.slice(0, end);
   pane.writeBuffer = end === pane.writeBuffer.length ? '' : pane.writeBuffer.slice(end);
-  pane.term.write(output);
+  markTerminalWriteStarted(pane);
+  pane.term.write(output, () => markTerminalWriteFinished(pane));
   scheduleTerminalWriteContinuation(pane, visibility);
+  resolveTerminalWriteDrainIfReady(pane);
 }
 
 function surrogateSafeChunkEnd(text: string, desiredEnd: number) {
@@ -16618,6 +16836,11 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.inputWritePromise = undefined;
   pane.imeComposing = false;
   pane.writeBuffer = '';
+  pane.pendingTerminalWrites = 0;
+  pane.writeDrainResolve?.();
+  pane.writeDrainPromise = undefined;
+  pane.writeDrainResolve = undefined;
+  pane.cursorQueryResponsePromise = undefined;
 }
 
 function terminalDataMayContainPromptCwdHint(pane: TerminalPane, data: string, visibility = terminalPaneVisibility(pane)) {
@@ -16724,6 +16947,7 @@ function trackTerminalCwdFromInput(pane: TerminalPane, data: string) {
   for (const char of data) {
     if (char === '\r' || char === '\n') {
       updateTerminalCwdFromCommand(pane, pane.inputBuffer);
+      updateTerminalPythonEnvFromCommand(pane, pane.inputBuffer);
       pane.inputBuffer = '';
     } else if (char === '\u007f' || char === '\b') {
       pane.inputBuffer = pane.inputBuffer.slice(0, -1);
@@ -16738,6 +16962,132 @@ function updateTerminalCwdFromCommand(pane: TerminalPane, command: string) {
   if (target === null) return;
   const next = resolveTerminalCdTarget(pane, target);
   if (next) updateTerminalCwd(pane, next);
+}
+
+function updateTerminalPythonEnvFromCommand(pane: TerminalPane, command: string) {
+  if (pane.command) return;
+  const event = parseTerminalPythonEnvCommand(pane, command);
+  if (!event) return;
+  if (event.kind === 'deactivate') {
+    if (!pane.activePythonEnv) return;
+    pane.activePythonEnv = undefined;
+    saveTerminalPythonEnvSnapshot(pane);
+    return;
+  }
+  const previous = terminalPythonEnvSignature(pane.activePythonEnv);
+  pane.activePythonEnv = event.env;
+  if (terminalPythonEnvSignature(pane.activePythonEnv) !== previous) saveTerminalPythonEnvSnapshot(pane);
+}
+
+type TerminalPythonEnvCommandEvent =
+  | { kind: 'activate'; index: number; env: TerminalPythonEnvSnapshot }
+  | { kind: 'deactivate'; index: number };
+
+function parseTerminalPythonEnvCommand(pane: TerminalPane, command: string): TerminalPythonEnvCommandEvent | null {
+  const cleaned = stripAnsi(command).trim();
+  if (!cleaned) return null;
+  const profile = profileForId(pane.profileId) ?? state.activeProfile;
+  const shell = terminalPythonEnvShellForProfile(profile);
+  const activate = shell === 'powershell'
+    ? parsePowerShellPythonEnvActivation(pane, cleaned)
+    : parsePosixPythonEnvActivation(pane, cleaned);
+  const deactivate = parsePythonEnvDeactivation(cleaned);
+  if (activate && (!deactivate || activate.index > deactivate.index)) return activate;
+  return deactivate;
+}
+
+function terminalPythonEnvShellForProfile(profile: ConnectionProfile | null | undefined): TerminalPythonEnvShell {
+  return profile?.kind === 'windows' ? 'powershell' : 'posix';
+}
+
+function parsePosixPythonEnvActivation(pane: TerminalPane, command: string): TerminalPythonEnvCommandEvent | null {
+  let found: TerminalPythonEnvCommandEvent | null = null;
+  const pattern = /(?:^|[;&|]\s*)(?:source|\.)\s+("(?:\\.|[^"])*"|'[^']*'|[^\s;&|]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(command))) {
+    const rawPath = unquoteShellToken(match[1] ?? '');
+    if (!terminalPathLooksLikePosixVenvActivation(rawPath)) continue;
+    found = {
+      kind: 'activate',
+      index: match.index,
+      env: {
+        kind: 'python-venv',
+        shell: 'posix',
+        activatePath: resolveTerminalPythonEnvActivatePath(pane, rawPath, 'posix')
+      }
+    };
+  }
+  return found;
+}
+
+function parsePowerShellPythonEnvActivation(pane: TerminalPane, command: string): TerminalPythonEnvCommandEvent | null {
+  let found: TerminalPythonEnvCommandEvent | null = null;
+  const pattern = /(?:^|[;&|]\s*)(?:(?:\.|&)\s+)?("(?:`.|[^"])*"|'[^']*'|[^\s;&|]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(command))) {
+    const rawPath = unquotePowerShellToken(match[1] ?? '');
+    if (!terminalPathLooksLikePowerShellVenvActivation(rawPath)) continue;
+    found = {
+      kind: 'activate',
+      index: match.index,
+      env: {
+        kind: 'python-venv',
+        shell: 'powershell',
+        activatePath: resolveTerminalPythonEnvActivatePath(pane, rawPath, 'powershell')
+      }
+    };
+  }
+  return found;
+}
+
+function parsePythonEnvDeactivation(command: string): TerminalPythonEnvCommandEvent | null {
+  let found: TerminalPythonEnvCommandEvent | null = null;
+  const pattern = /(?:^|[;&|]\s*)deactivate(?:\s*(?=$|[;&|]))/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(command))) {
+    found = { kind: 'deactivate', index: match.index };
+  }
+  return found;
+}
+
+function terminalPathLooksLikePosixVenvActivation(path: string) {
+  return path.replace(/\\/g, '/').toLowerCase().endsWith('/bin/activate');
+}
+
+function terminalPathLooksLikePowerShellVenvActivation(path: string) {
+  return path.replace(/\\/g, '/').toLowerCase().endsWith('/scripts/activate.ps1');
+}
+
+function resolveTerminalPythonEnvActivatePath(
+  pane: TerminalPane,
+  activatePath: string,
+  shell: TerminalPythonEnvShell
+) {
+  const profile = profileForId(pane.profileId) ?? state.activeProfile;
+  return shell === 'powershell'
+    ? normalizeWindowsTerminalPath(resolveWindowsCdTarget(pane.cwd, activatePath, profile?.root))
+    : normalizePosixTerminalPath(resolvePosixCdTarget(pane.cwd, activatePath, profile?.root));
+}
+
+function saveTerminalPythonEnvSnapshot(pane: TerminalPane) {
+  if (restoringWorkspace || pane.workspaceId !== state.activeWorkspaceId || !state.workspaceOpen) return;
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'flush' });
+}
+
+async function restoreTerminalPythonEnvForPane(pane: TerminalPane) {
+  if (!pane.backendId || pane.command || pane.llmId || !pane.activePythonEnv) return;
+  const command = terminalPythonEnvRestoreCommand(pane.activePythonEnv);
+  if (!command) return;
+  await sendTerminalInputNow(pane, `${command}\r`).catch((error) => {
+    setStatus(`Failed to restore Python venv: ${String(error)}`, true);
+  });
+}
+
+function terminalPythonEnvRestoreCommand(env: TerminalPythonEnvSnapshot) {
+  if (env.kind !== 'python-venv' || !env.activatePath) return '';
+  return env.shell === 'powershell'
+    ? `. ${quotePowerShellSingleArg(env.activatePath)}`
+    : `source ${quotePosixShellArg(env.activatePath)}`;
 }
 
 function parseCdTarget(command: string) {
@@ -16758,6 +17108,21 @@ function unquoteShellToken(value: string) {
     return token.slice(1, -1);
   }
   return token.replace(/\\ /g, ' ');
+}
+
+function unquotePowerShellToken(value: string) {
+  const token = value.trim().match(/^("(?:`.|[^"])*"|'[^']*'|[^\s;&|]+)/)?.[1] ?? '';
+  if (token.startsWith("'") && token.endsWith("'")) return token.slice(1, -1).replace(/''/g, "'");
+  if (token.startsWith('"') && token.endsWith('"')) return token.slice(1, -1).replace(/`(.)/g, '$1');
+  return token;
+}
+
+function quotePosixShellArg(value: string) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function quotePowerShellSingleArg(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
 }
 
 function resolveTerminalCdTarget(pane: TerminalPane, target: string) {
@@ -17488,6 +17853,7 @@ function showBrowserFrame(tab: BrowserTab) {
 }
 
 function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean; reload?: boolean } = {}) {
+  hideNativeBrowserWebview();
   if (!USE_PREVIEW_PROXY_BROWSER && !USE_EDGE_CDP_BROWSER) {
     tab.frameUrl = tab.url;
   }
@@ -17610,12 +17976,115 @@ function syncBrowserConsoleCaptureForActiveFrame() {
 }
 
 function loadBrowserTabFallback(tab: BrowserTab) {
+  hideNativeBrowserWebview();
   disconnectActiveEdgeCdp();
   setEdgePreviewVisible(false);
   if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(tab.url)) {
     loadBrowserTabThroughPreviewProxy(tab);
   } else {
     loadBrowserFrame(tab);
+  }
+}
+
+function nativeBrowserPreviewRect() {
+  const scaleRect = el.browserPreviewScaleBox.getBoundingClientRect();
+  const shellRect = el.browserShell.getBoundingClientRect();
+  // Native child WebViews are OS-level siblings of the main WebView, so CSS
+  // overflow/paint containment on `.browser-shell` cannot clip them. Clip the
+  // child WebView bounds to the visible preview grid cell so it cannot paint
+  // over the console or the rest of the IDE when device mode is scrollable.
+  const left = Math.max(scaleRect.left, shellRect.left);
+  const top = Math.max(scaleRect.top, shellRect.top);
+  const right = Math.min(scaleRect.right, shellRect.right);
+  const bottom = Math.min(scaleRect.bottom, shellRect.bottom);
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 1 || height <= 1) return null;
+  return {
+    x: Math.max(0, left),
+    y: Math.max(0, top),
+    width: Math.max(1, width),
+    height: Math.max(1, height)
+  };
+}
+
+function activeBrowserUsesNativeWebview() {
+  return USE_NATIVE_BROWSER_WEBVIEW
+    && nativeBrowserWebviewVisible
+    && nativeBrowserWebviewTabId === state.activeBrowserTabId
+    && !isBrowserPanelHidden()
+    && !document.hidden;
+}
+
+function hideNativeBrowserWebview() {
+  nativeBrowserWebviewRequestSeq += 1;
+  if (nativeBrowserWebviewSyncFrame) {
+    window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
+    nativeBrowserWebviewSyncFrame = 0;
+  }
+  nativeBrowserWebviewTabId = '';
+  nativeBrowserWebviewUrl = '';
+  if (!nativeBrowserWebviewVisible) return;
+  nativeBrowserWebviewVisible = false;
+  void api.hideBrowserWebview().catch(() => undefined);
+}
+
+function scheduleNativeBrowserWebviewSync() {
+  if (!activeBrowserUsesNativeWebview() || nativeBrowserWebviewSyncFrame) return;
+  nativeBrowserWebviewSyncFrame = window.requestAnimationFrame(() => {
+    nativeBrowserWebviewSyncFrame = 0;
+    const tab = browserTabForId(nativeBrowserWebviewTabId);
+    if (!tab || !activeBrowserUsesNativeWebview()) {
+      hideNativeBrowserWebview();
+      return;
+    }
+    void showNativeBrowserWebview(tab, { boundsOnly: true });
+  });
+}
+
+async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?: boolean; loadUrl?: string } = {}) {
+  if (!USE_NATIVE_BROWSER_WEBVIEW) return;
+  if (isBrowserPanelHidden() || document.hidden) {
+    hideNativeBrowserWebview();
+    return;
+  }
+  const requestId = ++nativeBrowserWebviewRequestSeq;
+  nativeBrowserWebviewTabId = tab.id;
+  nativeBrowserWebviewUrl = tab.url;
+  nativeBrowserWebviewVisible = true;
+  hideAllBrowserFrames();
+  disconnectActiveEdgeCdp();
+  setEdgePreviewVisible(false);
+  toggleClassIfChanged(el.browserShell, 'has-preview', true);
+  if (!options.boundsOnly) {
+    logBrowserConsole('info', `Loading native WebView preview ${tab.url}`);
+  }
+  const rect = nativeBrowserPreviewRect();
+  if (!rect) {
+    await api.hideBrowserWebview().catch(() => undefined);
+    return;
+  }
+  const loadUrl = options.loadUrl ?? tab.url;
+  try {
+    await api.showBrowserWebview(loadUrl, rect.x, rect.y, rect.width, rect.height);
+    if (requestId !== nativeBrowserWebviewRequestSeq) return;
+    nativeBrowserWebviewVisible = true;
+  } catch (error) {
+    if (requestId !== nativeBrowserWebviewRequestSeq) return;
+    nativeBrowserWebviewVisible = false;
+    nativeBrowserWebviewTabId = '';
+    nativeBrowserWebviewUrl = '';
+    logBrowserConsole('error', `Native WebView preview failed: ${String(error)}`);
+    setStatus(`Native WebView preview failed: ${String(error)}`, true);
+    loadBrowserTabFallback(tab);
+  }
+}
+
+function handleBrowserWebviewPageLoad(payload: BrowserWebviewPageLoadEvent) {
+  if (!activeBrowserUsesNativeWebview()) return;
+  if (payload.event === 'finished') {
+    logBrowserConsole('info', `Loaded ${nativeBrowserWebviewUrl || payload.url}`);
+    setStatus(`Loaded ${nativeBrowserWebviewUrl || payload.url}`);
   }
 }
 
@@ -17707,9 +18176,23 @@ async function ensureEdgeDevtoolsSession() {
   const workspaceId = state.activeWorkspaceId || 'workspace';
   const existing = edgeDevtoolsSessions.get(workspaceId);
   if (existing) return existing;
-  const session = await api.startEdgeDevtoolsSession(workspaceId);
-  edgeDevtoolsSessions.set(workspaceId, session);
-  return session;
+  const pending = edgeDevtoolsSessionPromises.get(workspaceId);
+  if (pending) return pending;
+  let promise: Promise<EdgeDevtoolsSession>;
+  promise = api.startEdgeDevtoolsSession(workspaceId)
+    .then((session) => {
+      if (edgeDevtoolsSessionPromises.get(workspaceId) === promise) {
+        edgeDevtoolsSessions.set(workspaceId, session);
+      }
+      return session;
+    })
+    .finally(() => {
+      if (edgeDevtoolsSessionPromises.get(workspaceId) === promise) {
+        edgeDevtoolsSessionPromises.delete(workspaceId);
+      }
+    });
+  edgeDevtoolsSessionPromises.set(workspaceId, promise);
+  return promise;
 }
 
 function closeEdgeBrowserTab(tab: BrowserTab) {
@@ -17722,6 +18205,7 @@ function closeEdgeBrowserTab(tab: BrowserTab) {
 
 function stopEdgeDevtoolsForWorkspace(workspaceId: string) {
   const session = edgeDevtoolsSessions.get(workspaceId);
+  edgeDevtoolsSessionPromises.delete(workspaceId);
   if (!session) return;
   if (activeEdgeCdp?.sessionId === session.id) disconnectActiveEdgeCdp();
   edgeDevtoolsSessions.delete(workspaceId);
@@ -17730,6 +18214,7 @@ function stopEdgeDevtoolsForWorkspace(workspaceId: string) {
 
 function stopAllEdgeDevtoolsSessions() {
   disconnectActiveEdgeCdp();
+  edgeDevtoolsSessionPromises.clear();
   for (const session of edgeDevtoolsSessions.values()) {
     void api.stopEdgeDevtoolsSession(session.id).catch(() => undefined);
   }
@@ -18167,6 +18652,7 @@ function bindEdgePreviewInput() {
     if (state.browserZoomMode === 'fit') refreshBrowserFitZoom({ silent: true, skipSave: true });
     else syncBrowserPreviewScaleBox();
     scheduleConfigureEdgeViewport();
+    scheduleNativeBrowserWebviewSync();
   });
   edgePreviewResizeObserver.observe(el.browserShell);
 }
@@ -18435,7 +18921,7 @@ function ensureActiveBrowserFrame() {
   if (isBrowserPanelHidden()) return false;
   const active = browserTabForId(state.activeBrowserTabId) ?? state.browserTabs[0];
   if (!active) return false;
-  if (!USE_EDGE_CDP_BROWSER && browserTabFrameReady(active)) {
+  if (!USE_NATIVE_BROWSER_WEBVIEW && !USE_EDGE_CDP_BROWSER && browserTabFrameReady(active)) {
     showBrowserFrame(active);
     renderBrowserTabs();
     return true;
@@ -18543,9 +19029,16 @@ function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
     if (shouldSave) saveActiveWorkspaceSnapshot();
     return;
   }
-  if (!USE_EDGE_CDP_BROWSER && browserTabFrameReady(tab)) {
+  if (!USE_NATIVE_BROWSER_WEBVIEW && !USE_EDGE_CDP_BROWSER && browserTabFrameReady(tab)) {
     showBrowserFrame(tab);
     renderBrowserTabActivation(previousActiveId, tab);
+    if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
+    if (shouldSave) saveActiveWorkspaceSnapshot();
+    return;
+  }
+  if (USE_NATIVE_BROWSER_WEBVIEW) {
+    renderBrowserTabActivation(previousActiveId, tab);
+    void showNativeBrowserWebview(tab);
     if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
     if (shouldSave) saveActiveWorkspaceSnapshot();
     return;
@@ -18556,6 +19049,9 @@ function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
     void loadEdgeBrowserTab(tab).catch((error) => {
       logBrowserConsole('error', `Edge preview failed: ${String(error)}`);
       setStatus(`Edge preview failed: ${String(error)}`, true);
+      if (state.activeBrowserTabId !== tab.id) return;
+      closeEdgeBrowserTab(tab);
+      logBrowserConsole('warn', `Falling back to direct iframe preview for ${tab.url}`);
       loadBrowserTabFallback(tab);
     });
     if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
@@ -18595,6 +19091,7 @@ function closeBrowserTab(id: string) {
       clearBrowserFrames();
       toggleClassIfChanged(el.browserShell, 'has-preview', false);
       disconnectActiveEdgeCdp();
+      hideNativeBrowserWebview();
       setEdgePreviewVisible(false);
       renderBrowserTabs();
     }
@@ -18835,6 +19332,7 @@ function setBrowserConsoleVisible(
     setAttributeIfChanged(el.browserConsoleToggle, 'aria-pressed', String(visible));
   }
   applyBrowserConsoleSize();
+  scheduleNativeBrowserWebviewSync();
   scheduleBrowserFitZoomRefresh({ skipSave: options.skipSave });
   if (changed && !options.skipFrameSync) syncBrowserConsoleCaptureForActiveFrame();
   if (visible && browserConsoleHiddenPayloadQueue.length) {
@@ -18860,6 +19358,7 @@ function setBrowserConsolePosition(
     setBrowserConsolePositionClass(className);
   }
   applyBrowserConsoleSize();
+  scheduleNativeBrowserWebviewSync();
   scheduleBrowserFitZoomRefresh({ skipSave: options.skipSave });
   if (changed && state.browserConsoleVisible && !options.skipLog) logBrowserConsole('info', `Console moved to ${position}`);
   if (changed && !options.skipSave) saveActiveWorkspaceSnapshot();
@@ -18916,6 +19415,7 @@ function startBrowserConsoleResize(event: PointerEvent) {
           : (moveEvent.clientX - rect.left) / workspaceWidth;
     state.browserConsoleSize = clamp(raw, 0.18, 0.72);
     applyBrowserConsoleSize();
+    scheduleNativeBrowserWebviewSync();
     scheduleBrowserFitZoomRefresh({ skipSave: true });
   };
   const up = (upEvent: PointerEvent) => {
@@ -19364,6 +19864,7 @@ function scheduleBrowserAssetRecovery(tab: BrowserTab) {
   const count = sameUrl ? previous.count + 1 : 1;
   browserAssetRecoveryByTabId.set(tab.id, { url: tab.url, count, at: now });
   if (count > BROWSER_ASSET_RECOVERY_MAX_ATTEMPTS) {
+    if (fallbackBrowserTabToDirectPreview(tab, 'repeated preview-proxy asset failures')) return;
     logBrowserConsole('warn', `Preview asset recovery stopped after repeated failures for ${tab.url}`);
     return;
   }
@@ -19380,6 +19881,19 @@ function scheduleBrowserAssetRecovery(tab: BrowserTab) {
     }
   }, delay);
   browserAssetRecoveryTimers.set(tab.id, timer);
+}
+
+function fallbackBrowserTabToDirectPreview(tab: BrowserTab, reason: string) {
+  const current = browserTabForId(tab.id);
+  if (!current || current.id !== state.activeBrowserTabId || current.url !== tab.url) return false;
+  if (!localHttpPreviewUrl(current.url)) return false;
+  if (!current.frameUrl || current.frameUrl === current.url) return false;
+  clearPreviewProxyForBrowserTab(current);
+  current.frameUrl = current.url;
+  browserAssetRecoveryByTabId.set(current.id, { url: current.url, count: 0, at: Date.now() });
+  logBrowserConsole('warn', `Preview proxy fallback: loading direct local URL after ${reason}`);
+  loadBrowserFrame(current, { hard: true, reload: true });
+  return true;
 }
 
 function cancelBrowserAssetRecovery(tabId: string) {
@@ -19653,6 +20167,23 @@ function refreshPreview(hard: boolean) {
     return;
   }
 
+  if (USE_NATIVE_BROWSER_WEBVIEW) {
+    if (activeBrowserUsesNativeWebview()) {
+      const action = hard
+        ? showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url) })
+        : api.reloadBrowserWebview();
+      void action.then(() => {
+        state.previewUrl = tab.url;
+        setInputValueIfChanged(el.previewUrl, tab.url);
+        logBrowserConsole('info', hard ? `Hard refresh ${tab.url}` : `Reload ${tab.url}`);
+        setStatus(hard ? `Hard refreshed ${tab.url}` : `Reloaded ${tab.url}`);
+      }).catch((error) => setStatus(`Browser reload failed: ${String(error)}`, true));
+    } else {
+      activateBrowserTab(tab.id);
+    }
+    return;
+  }
+
   if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(tab.url)) {
     loadBrowserTabThroughPreviewProxy(tab, { hard, reload: true });
   } else {
@@ -19679,6 +20210,15 @@ async function clearBrowserCacheAndReload() {
       logBrowserConsole('info', `Cleared browser cache and reloaded ${tab.url}`);
       setStatus(`Cleared cache for ${tab.url}`);
     }).catch((error) => setStatus(`Browser cache clear failed: ${String(error)}`, true));
+    return;
+  }
+
+  if (USE_NATIVE_BROWSER_WEBVIEW) {
+    await showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url) });
+    state.previewUrl = tab.url;
+    setInputValueIfChanged(el.previewUrl, tab.url);
+    logBrowserConsole('info', `Cleared preview cache and reloaded ${tab.url}`);
+    setStatus(`Cleared cache for ${tab.url}`);
     return;
   }
 
@@ -19913,6 +20453,11 @@ function syncActiveBrowserTabViewport() {
   tab.orientation = state.browserOrientation;
   tab.zoom = state.browserZoom;
   tab.zoomMode = state.browserZoomMode;
+  if (state.browserZoomMode !== 'fit') {
+    tab.manualZoomBeforeFit = state.browserZoom;
+  } else if (tab.manualZoomBeforeFit === undefined) {
+    tab.manualZoomBeforeFit = 1;
+  }
 }
 
 function setBrowserMode(mode: 'desktop' | 'device', options: { skipFrameSizing?: boolean; skipSave?: boolean } = {}) {

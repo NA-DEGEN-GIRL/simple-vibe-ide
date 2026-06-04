@@ -11,10 +11,11 @@ use std::process::{Child as ProcessChild, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tauri::webview::PageLoadEvent;
 use tauri::{
-    Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindowBuilder,
-    WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
+    State, WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
 
@@ -114,7 +115,7 @@ const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
 const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
 const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
-const TERMINAL_CPR_RESPONSE: &[u8] = b"\x1b[1;1R";
+const BROWSER_NATIVE_WEBVIEW_LABEL: &str = "browser-preview-webview";
 
 type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 
@@ -473,6 +474,19 @@ struct DirectorySignatureEntry {
 struct TerminalDataEvent {
     id: String,
     data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalCursorQueryEvent {
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserWebviewPageLoadEvent {
+    url: String,
+    event: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1487,32 +1501,41 @@ fn spawn_terminal_direct(
 
     let read_id = terminal_id.clone();
     let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone());
-    let read_writer = writer.clone();
     thread::spawn(move || {
         let mut buf = [0_u8; 8192];
         let mut leftover: Vec<u8> = Vec::with_capacity(8);
+        let mut dsr_leftover = String::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     leftover.extend_from_slice(&buf[..n]);
                     let mut data = drain_complete_utf8(&mut leftover);
-                    if data.contains(TERMINAL_DSR_CURSOR_QUERY) {
-                        respond_terminal_cursor_query(&read_writer);
-                        data = data.replace(TERMINAL_DSR_CURSOR_QUERY, "");
+                    if !dsr_leftover.is_empty() {
+                        data.insert_str(0, &dsr_leftover);
+                        dsr_leftover.clear();
+                    }
+                    let trailing_dsr_prefix_len = trailing_terminal_dsr_prefix_len(&data);
+                    if trailing_dsr_prefix_len > 0 {
+                        let keep_at = data.len() - trailing_dsr_prefix_len;
+                        dsr_leftover = data[keep_at..].to_string();
+                        data.truncate(keep_at);
                     }
                     if data.is_empty() {
                         continue;
                     }
-                    read_batcher.push(&data);
+                    push_terminal_output_without_dsr_queries(&read_batcher, &app, &read_id, &data);
                 }
                 Err(_) => break,
             }
         }
+        if !dsr_leftover.is_empty() {
+            read_batcher.push(&dsr_leftover);
+        }
         if !leftover.is_empty() {
             let trailing = String::from_utf8_lossy(&leftover).to_string();
             if !trailing.is_empty() {
-                read_batcher.push(&trailing);
+                push_terminal_output_without_dsr_queries(&read_batcher, &app, &read_id, &trailing);
             }
         }
         read_batcher.flush();
@@ -1573,8 +1596,42 @@ fn write_terminal_bytes(
     writer.flush().map_err(|err| err.to_string())
 }
 
-fn respond_terminal_cursor_query(writer: &Arc<Mutex<Box<dyn Write + Send>>>) {
-    let _ = write_terminal_bytes(writer, TERMINAL_CPR_RESPONSE);
+fn push_terminal_output_without_dsr_queries(
+    batcher: &Arc<AppOutputBatcher>,
+    app: &AppHandle,
+    terminal_id: &str,
+    data: &str,
+) {
+    let mut rest = data;
+    while let Some(index) = rest.find(TERMINAL_DSR_CURSOR_QUERY) {
+        let before = &rest[..index];
+        if !before.is_empty() {
+            batcher.push(before);
+            batcher.flush();
+        }
+        let _ = app.emit(
+            "terminal-cursor-query",
+            TerminalCursorQueryEvent {
+                id: terminal_id.to_string(),
+            },
+        );
+        rest = &rest[index + TERMINAL_DSR_CURSOR_QUERY.len()..];
+    }
+    if !rest.is_empty() {
+        batcher.push(rest);
+    }
+}
+
+fn trailing_terminal_dsr_prefix_len(data: &str) -> usize {
+    let data = data.as_bytes();
+    let query = TERMINAL_DSR_CURSOR_QUERY.as_bytes();
+    let max = data.len().min(query.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if data[data.len() - len..] == query[..len] {
+            return len;
+        }
+    }
+    0
 }
 
 fn resize_terminal_host(state: &IdeState, id: String, rows: u16, cols: u16) -> Result<(), String> {
@@ -1960,6 +2017,82 @@ fn shutdown_runtime_sessions_command(state: State<'_, IdeState>) -> Result<(), S
 }
 
 #[tauri::command]
+async fn show_browser_webview(
+    app: AppHandle,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let parsed_url: tauri::Url = url
+        .parse()
+        .map_err(|err| format!("invalid browser preview URL: {err}"))?;
+    let position = LogicalPosition::new(x.max(0.0), y.max(0.0));
+    let size = LogicalSize::new(width.max(1.0), height.max(1.0));
+
+    if let Some(webview) = app.get_webview(BROWSER_NATIVE_WEBVIEW_LABEL) {
+        webview
+            .set_position(position)
+            .map_err(|error| error.to_string())?;
+        webview.set_size(size).map_err(|error| error.to_string())?;
+        let should_navigate = webview
+            .url()
+            .map(|current| current.as_str() != parsed_url.as_str())
+            .unwrap_or(true);
+        if should_navigate {
+            webview
+                .navigate(parsed_url)
+                .map_err(|error| error.to_string())?;
+        }
+        webview.show().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let main = app
+        .get_window("main")
+        .ok_or_else(|| "main window is not available".to_string())?;
+    let app_for_load = app.clone();
+    let webview_builder = WebviewBuilder::new(
+        BROWSER_NATIVE_WEBVIEW_LABEL,
+        WebviewUrl::External(parsed_url),
+    )
+    .on_page_load(move |_webview, payload| {
+        let event = match payload.event() {
+            PageLoadEvent::Started => "started",
+            PageLoadEvent::Finished => "finished",
+        };
+        let _ = app_for_load.emit(
+            "browser-webview-page-load",
+            BrowserWebviewPageLoadEvent {
+                url: payload.url().to_string(),
+                event: event.to_string(),
+            },
+        );
+    });
+    let webview = main
+        .add_child(webview_builder, position, size)
+        .map_err(|error| error.to_string())?;
+    webview.show().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn hide_browser_webview(app: AppHandle) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(BROWSER_NATIVE_WEBVIEW_LABEL) {
+        webview.hide().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn reload_browser_webview(app: AppHandle) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(BROWSER_NATIVE_WEBVIEW_LABEL) {
+        webview.reload().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_edge_devtools_session(
     state: State<'_, IdeState>,
     workspace_id: String,
@@ -1981,14 +2114,24 @@ fn start_edge_devtools_session_blocking(
         let mut sessions = edge_sessions
             .lock()
             .map_err(|_| "edge session state poisoned".to_string())?;
+        let mut remove_existing = false;
         if let Some(session) = sessions.get_mut(&id) {
-            let alive = match session.child.as_mut() {
-                Some(child) => matches!(child.try_wait(), Ok(None)),
-                None => true,
-            };
-            if alive {
+            let endpoint_ready = edge_devtools_endpoint_ready(session.port);
+            if let Some(child) = session.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) if status.success() && endpoint_ready => {
+                        session.child = None;
+                    }
+                    Ok(Some(_)) | Err(_) => remove_existing = true,
+                    Ok(None) => {}
+                }
+            }
+            if !remove_existing && endpoint_ready {
                 return Ok(edge_session_result(&id, session.port));
             }
+            remove_existing = true;
+        }
+        if remove_existing {
             sessions.remove(&id);
         }
     }
@@ -2003,6 +2146,7 @@ fn start_edge_devtools_session_blocking(
     let mut command = Command::new(resolve_edge_executable());
     command
         .arg(format!("--remote-debugging-port={port}"))
+        .arg("--remote-debugging-address=127.0.0.1")
         .arg("--remote-allow-origins=*")
         .arg(format!(
             "--user-data-dir={}",
@@ -2011,7 +2155,12 @@ fn start_edge_devtools_session_blocking(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-background-networking")
-        .arg("--headless=new")
+        .arg("--disable-component-update")
+        .arg("--disable-extensions")
+        .arg("--disable-gpu")
+        .arg("--disable-sync")
+        .arg("--disable-features=Translate,MediaRouter,OptimizationHints")
+        .arg("--headless")
         .arg("--window-size=1280,900")
         .arg("about:blank")
         .current_dir(windows_spawn_cwd())
@@ -2024,12 +2173,15 @@ fn start_edge_devtools_session_blocking(
         .map_err(|err| format!("failed to start Edge: {err}"))?;
     assign_child_to_cleanup_job(child.id());
 
-    if let Err(err) = wait_for_edge_devtools(port) {
-        kill_process_tree(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
-    }
+    let launcher_alive = match wait_for_edge_devtools(&mut child, port) {
+        Ok(alive) => alive,
+        Err(err) => {
+            kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
 
     edge_sessions
         .lock()
@@ -2037,7 +2189,7 @@ fn start_edge_devtools_session_blocking(
         .insert(
             id.clone(),
             EdgeDevtoolsSessionState {
-                child: Some(child),
+                child: if launcher_alive { Some(child) } else { None },
                 port,
             },
         );
@@ -2152,21 +2304,54 @@ fn allocate_local_port() -> Result<u16, String> {
         .map_err(|err| err.to_string())
 }
 
-fn wait_for_edge_devtools(port: u16) -> Result<(), String> {
-    for _ in 0..36 {
-        if devtools_http_request_with_timeout(
+fn edge_devtools_endpoint_ready(port: u16) -> bool {
+    devtools_http_request_with_timeout(port, "GET", "/json/version", Duration::from_millis(700))
+        .is_ok()
+}
+
+fn wait_for_edge_devtools(child: &mut ProcessChild, port: u16) -> Result<bool, String> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_error = String::new();
+    let mut launcher_exited = false;
+    while Instant::now() < deadline {
+        if !launcher_exited {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|err| format!("failed to query Edge process status: {err}"))?
+            {
+                if status.success() {
+                    launcher_exited = true;
+                } else {
+                    let suffix = if last_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; last DevTools probe: {last_error}")
+                    };
+                    return Err(format!(
+                        "Edge exited before DevTools became ready ({status}{suffix})"
+                    ));
+                }
+            }
+        }
+        match devtools_http_request_with_timeout(
             port,
             "GET",
             "/json/version",
-            Duration::from_millis(350),
-        )
-        .is_ok()
-        {
-            return Ok(());
+            Duration::from_millis(700),
+        ) {
+            Ok(_) => return Ok(!launcher_exited),
+            Err(err) => last_error = err,
         }
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(150));
     }
-    Err("Edge DevTools endpoint did not become ready".to_string())
+    let suffix = if last_error.is_empty() {
+        String::new()
+    } else {
+        format!(" Last DevTools probe: {last_error}.")
+    };
+    Err(format!(
+        "Edge DevTools endpoint did not become ready after 45.0s on 127.0.0.1:{port}.{suffix}"
+    ))
 }
 
 fn resolve_edge_executable() -> PathBuf {
@@ -5880,6 +6065,9 @@ pub fn run() {
             start_port_forward,
             probe_local_http_url,
             start_preview_proxy,
+            show_browser_webview,
+            hide_browser_webview,
+            reload_browser_webview,
             start_edge_devtools_session,
             edge_devtools_new_page,
             edge_devtools_activate_page,
