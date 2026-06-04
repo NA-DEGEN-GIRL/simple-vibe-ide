@@ -445,6 +445,166 @@ fn push_ssh_common_options(command: &mut Command, interactive: bool, batch_mode:
     }
 }
 
+fn ssh_terminal_bootstrap_script(alias: &str, remote_command: &str) -> String {
+    let ssh_args = ssh_common_options(true, false)
+        .into_iter()
+        .chain([
+            "-tt".to_string(),
+            alias.to_string(),
+            remote_command.to_string(),
+        ])
+        .map(|arg| powershell_single_quote(&arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let identity_files = ssh_identity_files_for_alias(alias);
+    let identity_array = if identity_files.is_empty() {
+        "@()".to_string()
+    } else {
+        format!(
+            "@({})",
+            identity_files
+                .iter()
+                .map(|path| powershell_single_quote(path))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        r#"$ErrorActionPreference = 'Continue'
+try {{
+  $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
+  if ($svc -and $svc.Status -ne 'Running') {{
+    Set-Service -Name ssh-agent -StartupType Manual -ErrorAction SilentlyContinue
+    Start-Service -Name ssh-agent -ErrorAction SilentlyContinue
+  }}
+}} catch {{
+  Write-Host "[simple-vibe-ide] ssh-agent service could not be started: $($_.Exception.Message)"
+}}
+$identityFiles = {identity_array}
+& ssh-add -l *> $null
+$hasIdentity = ($LASTEXITCODE -eq 0)
+if (-not $hasIdentity) {{
+  if ($identityFiles.Count -gt 0) {{
+    foreach ($identityFile in $identityFiles) {{
+      if (Test-Path -LiteralPath $identityFile) {{
+        & ssh-add -- $identityFile
+        & ssh-add -l *> $null
+        if ($LASTEXITCODE -eq 0) {{
+          $hasIdentity = $true
+          break
+        }}
+      }}
+    }}
+  }} else {{
+    & ssh-add
+    & ssh-add -l *> $null
+    $hasIdentity = ($LASTEXITCODE -eq 0)
+  }}
+}}
+$sshArgs = @({ssh_args})
+& ssh.exe @sshArgs
+exit $LASTEXITCODE
+"#
+    )
+}
+
+fn ssh_identity_files_for_alias(alias: &str) -> Vec<String> {
+    let mut identities = Vec::new();
+    let mut seen = HashSet::new();
+    for path in ssh_config_paths() {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let mut active = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let Some(keyword) = parts.next() else {
+                continue;
+            };
+            if keyword.eq_ignore_ascii_case("host") {
+                active = parts.any(|pattern| ssh_host_pattern_matches(pattern, alias));
+                continue;
+            }
+            if !active || !keyword.eq_ignore_ascii_case("identityfile") {
+                continue;
+            }
+            let Some(raw_path) = parts.next() else {
+                continue;
+            };
+            let Some(path) = expand_ssh_identity_file_path(raw_path) else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                identities.push(path);
+            }
+        }
+    }
+    identities
+}
+
+fn ssh_host_pattern_matches(pattern: &str, alias: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.starts_with('!') {
+        return false;
+    }
+    if pattern == "*" || pattern.eq_ignore_ascii_case(alias) {
+        return true;
+    }
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return false;
+    }
+    wildcard_match_ascii(pattern, alias)
+}
+
+fn wildcard_match_ascii(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pi, mut vi, mut star, mut star_match) = (0_usize, 0_usize, None, 0_usize);
+    while vi < value.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == value[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star = Some(pi);
+            star_match = vi;
+            pi += 1;
+        } else if let Some(star_index) = star {
+            pi = star_index + 1;
+            star_match += 1;
+            vi = star_match;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn expand_ssh_identity_file_path(raw_path: &str) -> Option<String> {
+    let unquoted = raw_path.trim().trim_matches('"').trim_matches('\'');
+    if unquoted.is_empty() || unquoted.contains('%') {
+        return None;
+    }
+    if unquoted == "~" || unquoted.starts_with("~/") || unquoted.starts_with("~\\") {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()?;
+        let tail = unquoted
+            .trim_start_matches('~')
+            .trim_start_matches(['/', '\\']);
+        return Some(PathBuf::from(home).join(tail).to_string_lossy().to_string());
+    }
+    Some(unquoted.to_string())
+}
+
 /// Forcefully terminate a process *and its entire child tree* by PID.
 ///
 /// On Windows, killing only the directly spawned process (e.g. `wsl.exe` or
@@ -2752,9 +2912,20 @@ fn terminal_command(
                     shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None))
                 )
             };
-            let mut args = ssh_common_options(true, false);
-            args.extend(["-tt".to_string(), alias, remote_command]);
-            ("ssh.exe".to_string(), args)
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-EncodedCommand".to_string(),
+                    powershell_encoded_command(&ssh_terminal_bootstrap_script(
+                        &alias,
+                        &remote_command,
+                    )),
+                ],
+            )
         }
         _ => {
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {

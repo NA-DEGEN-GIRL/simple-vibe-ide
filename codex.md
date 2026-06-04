@@ -73,8 +73,9 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   `BatchMode=yes`; they reuse the Windows agent when available and fail fast
   instead of consuming or hanging on a passphrase prompt when no key has been
   unlocked yet.
-- The bottom status text now keeps the full message in its tooltip so clipped
-  red errors such as permission/authentication failures can be inspected.
+- Red status errors now also render in a wrapped detail row under the workspace
+  toolbar, so permission/authentication failures are visible even when the
+  compact status chip truncates.
 
 #### Verified
 

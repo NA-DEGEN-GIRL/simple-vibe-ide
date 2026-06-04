@@ -1674,6 +1674,7 @@ app.innerHTML = `
         <input id="market-symbol-input" spellcheck="false" placeholder="ETHUSDT" title="Add one Binance USD-M symbol" />
         <button id="market-add-symbol" title="Add ticker symbol">+</button>
       </div>
+      <div id="status-detail" class="status-detail hidden" aria-live="polite"></div>
     </section>
     <main class="main-grid">
       <aside class="explorer panel floating-panel hidden" data-panel="explorer">
@@ -1872,6 +1873,7 @@ const el = {
   llmButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-llm]')),
   titleContext: document.querySelector<HTMLSpanElement>('#title-context')!,
   status: document.querySelector<HTMLDivElement>('#status')!,
+  statusDetail: document.querySelector<HTMLDivElement>('#status-detail')!,
   appClock: document.querySelector<HTMLDivElement>('#app-clock')!,
   captureFreezeFrame: document.querySelector<HTMLDivElement>('#capture-freeze-frame')!,
   workspaceTabs: document.querySelector<HTMLDivElement>('#workspace-tabs')!,
@@ -1998,6 +2000,10 @@ function setStatus(message: string, danger = false) {
     ? `${message}\n${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`
     : `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
   el.status.classList.toggle('danger', danger);
+  const detailVisible = danger && Boolean(message);
+  setTextContentIfChanged(el.statusDetail, detailVisible ? message : '');
+  el.statusDetail.title = detailVisible ? message : '';
+  el.statusDetail.classList.toggle('hidden', !detailVisible);
 }
 
 function setTextContentIfChanged(element: HTMLElement, text: string) {
