@@ -63,12 +63,13 @@ If `%TEMP%` is too small, use a spacious local path such as
 - SSH/WSL startup injections must wait for the shell-ready OSC7 marker. Do not
   type LLM launcher calls, restored venv activation, or deferred workspace file
   loading into a login/passphrase prompt.
-- SSH terminals should share the IDE-session `ssh-agent` environment and pass
+- SSH terminals should try to start the Windows OpenSSH Authentication Agent
+  service once, force `IdentityAgent=\\.\pipe\openssh-ssh-agent`, and pass
   `AddKeysToAgent=yes` on interactive `ssh.exe` sessions, so one successful key
-  passphrase entry can unlock later SSH terminals and Explorer jobs for the
-  lifetime of the IDE process.
+  passphrase entry can unlock later SSH terminals and Explorer jobs through the
+  Windows agent.
 - Background SSH file operations are intentionally noninteractive
-  (`BatchMode=yes`). They should reuse the session agent if a key is unlocked
+  (`BatchMode=yes`). They should reuse the Windows agent if a key is unlocked
   and fail fast instead of prompting from hidden Explorer jobs when no key is
   available.
 

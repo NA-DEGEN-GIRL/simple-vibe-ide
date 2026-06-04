@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
@@ -163,11 +163,6 @@ struct ExportSession {
 struct EdgeDevtoolsSessionState {
     child: Option<ProcessChild>,
     port: u16,
-}
-
-#[derive(Clone)]
-struct SshAgentSession {
-    vars: Vec<(String, String)>,
 }
 
 struct RuntimeShutdownBatch {
@@ -400,134 +395,53 @@ fn assign_child_to_cleanup_job(pid: u32) {
     let _ = pid;
 }
 
-static SSH_AGENT_SESSION: OnceLock<Mutex<Option<SshAgentSession>>> = OnceLock::new();
-static SSH_AGENT_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-fn ssh_agent_store() -> &'static Mutex<Option<SshAgentSession>> {
-    SSH_AGENT_SESSION.get_or_init(|| Mutex::new(None))
-}
-
-fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
-    if let Ok(guard) = ssh_agent_store().lock() {
-        if let Some(session) = guard.as_ref() {
-            return session.vars.clone();
-        }
-    }
-
-    if SSH_AGENT_START_ATTEMPTED.swap(true, Ordering::Relaxed) {
-        return Vec::new();
-    }
-
-    let Some(session) = start_session_ssh_agent() else {
-        return Vec::new();
-    };
-    let vars = session.vars.clone();
-    if let Ok(mut guard) = ssh_agent_store().lock() {
-        *guard = Some(session);
-    }
-    vars
-}
-
-fn start_session_ssh_agent() -> Option<SshAgentSession> {
-    let mut command = Command::new("ssh-agent.exe");
-    command
-        .arg("-s")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let output = hide_command_window(&mut command).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let vars = parse_ssh_agent_shell_vars(&text);
-    if vars
-        .iter()
-        .any(|(key, value)| key == "SSH_AUTH_SOCK" && !value.is_empty())
-    {
-        if let Some(pid) = vars
-            .iter()
-            .find(|(key, _)| key == "SSH_AGENT_PID")
-            .and_then(|(_, value)| value.parse::<u32>().ok())
-        {
-            assign_child_to_cleanup_job(pid);
-        }
-        Some(SshAgentSession { vars })
-    } else {
-        None
-    }
-}
-
-fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
-    let mut vars = Vec::new();
-    for key in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
-        let Some(value) = parse_shell_assignment(output, key) else {
-            continue;
-        };
-        if !value.is_empty() {
-            vars.push((key.to_string(), value));
-        }
-    }
-    vars
-}
-
-fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix(&prefix) else {
-            continue;
-        };
-        let value = rest
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        return Some(value);
-    }
-    None
-}
-
-fn apply_session_ssh_agent_to_command(command: &mut Command) {
-    for (key, value) in ensure_session_ssh_agent_vars() {
-        Command::env(command, key, value);
-    }
-}
-
-fn apply_session_ssh_agent_to_pty(command: &mut CommandBuilder) {
-    for (key, value) in ensure_session_ssh_agent_vars() {
-        CommandBuilder::env(command, key, value);
-    }
-}
-
-fn shutdown_session_ssh_agent() {
-    let session = ssh_agent_store()
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    let Some(session) = session else {
+fn ensure_windows_ssh_agent_service_started() {
+    if WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED.swap(true, Ordering::Relaxed) {
         return;
-    };
-    let mut command = Command::new("ssh-agent.exe");
-    command
-        .arg("-k")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    for (key, value) in &session.vars {
-        Command::env(&mut command, key, value);
     }
-    let _ = hide_command_window(&mut command).status();
-    if let Some(pid) = session
-        .vars
-        .iter()
-        .find(|(key, _)| key == "SSH_AGENT_PID")
-        .and_then(|(_, value)| value.parse::<u32>().ok())
+    #[cfg(windows)]
     {
-        kill_process_tree(pid);
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(
+                "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
+                 if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name ssh-agent -ErrorAction SilentlyContinue } } catch {}",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = hide_command_window(&mut command).status();
+    }
+}
+
+fn ssh_common_options(interactive: bool, batch_mode: bool) -> Vec<String> {
+    ensure_windows_ssh_agent_service_started();
+    let mut args = Vec::new();
+    if batch_mode {
+        args.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
+    }
+    #[cfg(windows)]
+    args.extend([
+        "-o".to_string(),
+        r"IdentityAgent=\\.\pipe\openssh-ssh-agent".to_string(),
+    ]);
+    if interactive {
+        args.extend(["-o".to_string(), "AddKeysToAgent=yes".to_string()]);
+    }
+    args
+}
+
+fn push_ssh_common_options(command: &mut Command, interactive: bool, batch_mode: bool) {
+    for arg in ssh_common_options(interactive, batch_mode) {
+        command.arg(arg);
     }
 }
 
@@ -1613,9 +1527,6 @@ fn spawn_terminal_direct(
     for arg in args {
         cmd.arg(arg);
     }
-    if profile.kind == "ssh" {
-        apply_session_ssh_agent_to_pty(&mut cmd);
-    }
     if profile.kind == "windows" && !cwd.is_empty() {
         cmd.cwd(PathBuf::from(&cwd));
     } else if profile.kind == "wsl" || profile.kind == "ssh" {
@@ -1894,9 +1805,8 @@ fn start_port_forward_host(
         };
         let alias = profile.ssh_alias.unwrap_or_else(|| "default".to_string());
         let mut command = Command::new("ssh.exe");
+        push_ssh_common_options(&mut command, false, true);
         command
-            .arg("-o")
-            .arg("BatchMode=yes")
             .arg("-N")
             .arg("-L")
             .arg(format!("127.0.0.1:{actual_local}:127.0.0.1:{remote_port}"))
@@ -1905,7 +1815,6 @@ fn start_port_forward_host(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        apply_session_ssh_agent_to_command(&mut command);
         let child = hide_command_window(&mut command)
             .spawn()
             .map_err(|err| format!("failed to start ssh forward: {err}"))?;
@@ -2843,16 +2752,9 @@ fn terminal_command(
                     shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None))
                 )
             };
-            (
-                "ssh.exe".to_string(),
-                vec![
-                    "-o".to_string(),
-                    "AddKeysToAgent=yes".to_string(),
-                    "-tt".to_string(),
-                    alias,
-                    remote_command,
-                ],
-            )
+            let mut args = ssh_common_options(true, false);
+            args.extend(["-tt".to_string(), alias, remote_command]);
+            ("ssh.exe".to_string(), args)
         }
         _ => {
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
@@ -4398,14 +4300,12 @@ fn profile_shell_command(profile: &ConnectionProfile, script: &str) -> Result<Co
             let alias = profile.ssh_alias.as_deref().unwrap_or("default");
             let remote = format!("sh -lc {}", shell_quote(script));
             let mut command = Command::new("ssh.exe");
+            push_ssh_common_options(&mut command, false, true);
             command
                 .current_dir(windows_spawn_cwd())
-                .arg("-o")
-                .arg("BatchMode=yes")
                 .arg("-T")
                 .arg(alias)
                 .arg(remote);
-            apply_session_ssh_agent_to_command(&mut command);
             Ok(command)
         }
         _ => Err(format!("profile is not remote: {}", profile.kind)),
@@ -4733,14 +4633,12 @@ fn run_profile_shell(
             let alias = profile.ssh_alias.as_deref().unwrap_or("default");
             let remote = format!("sh -lc {}", shell_quote(script));
             let mut command = Command::new("ssh.exe");
+            push_ssh_common_options(&mut command, false, true);
             command
                 .current_dir(windows_spawn_cwd())
-                .arg("-o")
-                .arg("BatchMode=yes")
                 .arg("-T")
                 .arg(alias)
                 .arg(remote);
-            apply_session_ssh_agent_to_command(&mut command);
             command
         }
         _ => return Err(format!("profile is not remote: {}", profile.kind)),
@@ -6273,7 +6171,6 @@ pub fn run() {
             // process exits before the background worker finishes.
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 shutdown_runtime_sessions_background(app_handle.state::<IdeState>().inner());
-                shutdown_session_ssh_agent();
             }
         });
 }

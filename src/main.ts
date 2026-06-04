@@ -1994,7 +1994,9 @@ function setStatus(message: string, danger = false) {
   if (appStatusRenderSignature === signature) return;
   appStatusRenderSignature = signature;
   setTextContentIfChanged(el.status, message);
-  el.status.title = `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
+  el.status.title = message
+    ? `${message}\n${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`
+    : `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
   el.status.classList.toggle('danger', danger);
 }
 

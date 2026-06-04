@@ -63,15 +63,18 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   Explorer directory loading/watch refresh until that shell is ready, so a
   passphrase prompt remains interactive instead of being hidden behind a
   background file-list command.
-- SSH terminal processes now share an IDE-session `ssh-agent` environment and
+- SSH terminal processes now try to start the Windows OpenSSH Authentication
+  Agent service once, force `IdentityAgent=\\.\pipe\openssh-ssh-agent`, and
   pass `AddKeysToAgent=yes` to interactive `ssh.exe` sessions. After the user
-  enters a key passphrase once in the IDE terminal, later SSH terminals,
-  Explorer refreshes, and port forwards can reuse that decrypted key until the
-  IDE exits.
+  enters a key passphrase once, later SSH terminals, Explorer refreshes, and
+  port forwards can reuse the key through the Windows agent instead of asking
+  again.
 - Background SSH file operations and port forwards now use noninteractive
-  `BatchMode=yes`; they reuse the IDE-session agent when available and fail
-  fast instead of consuming or hanging on a passphrase prompt when no key has
-  been unlocked yet.
+  `BatchMode=yes`; they reuse the Windows agent when available and fail fast
+  instead of consuming or hanging on a passphrase prompt when no key has been
+  unlocked yet.
+- The bottom status text now keeps the full message in its tooltip so clipped
+  red errors such as permission/authentication failures can be inspected.
 
 #### Verified
 
