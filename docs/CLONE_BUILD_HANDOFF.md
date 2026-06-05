@@ -78,6 +78,9 @@ If `%TEMP%` is too small, use a spacious local path such as
   shell-ready gate is still correct for typing commands into terminals, but SSH
   Explorer reads should run directly through the askpass-capable background
   command path.
+- SSH/WSL Explorer and file commands must stay off the synchronous IPC path
+  because the askpass flow needs the WebView to remain responsive while the
+  background SSH process waits for an unlock answer.
 - For a local passphrase/agent regression check on Linux/WSL, run
   `scripts/ssh-agent-fixture-smoke.sh`. It starts a temporary localhost `sshd`,
   proves BatchMode SSH fails before unlock, proves direct `SSH_ASKPASS` works

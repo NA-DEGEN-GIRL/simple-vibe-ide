@@ -1503,6 +1503,16 @@ fn ssh_profiles() -> Vec<ConnectionProfile> {
     profiles
 }
 
+async fn run_blocking_command<T, F>(label: &'static str, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| format!("{label} worker failed: {error}"))?
+}
+
 #[tauri::command]
 fn resolve_profile_path(profile_id: String, path: String) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
@@ -1527,7 +1537,18 @@ fn resolve_profile_path(profile_id: String, path: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-fn list_directory(
+async fn list_directory(
+    profile_id: String,
+    path: String,
+    include_sizes: Option<bool>,
+) -> Result<Vec<FileEntry>, String> {
+    run_blocking_command("list directory", move || {
+        list_directory_blocking(profile_id, path, include_sizes)
+    })
+    .await
+}
+
+fn list_directory_blocking(
     profile_id: String,
     path: String,
     include_sizes: Option<bool>,
@@ -1550,7 +1571,18 @@ fn list_directory(
 }
 
 #[tauri::command]
-fn list_directories(
+async fn list_directories(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    run_blocking_command("list directories", move || {
+        list_directories_blocking(profile_id, paths, include_sizes)
+    })
+    .await
+}
+
+fn list_directories_blocking(
     profile_id: String,
     paths: Vec<String>,
     include_sizes: Option<bool>,
@@ -1572,7 +1604,18 @@ fn list_directories(
 }
 
 #[tauri::command]
-fn directory_signatures(
+async fn directory_signatures(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+) -> Result<Vec<DirectorySignatureResult>, String> {
+    run_blocking_command("directory signatures", move || {
+        directory_signatures_blocking(profile_id, paths, include_sizes)
+    })
+    .await
+}
+
+fn directory_signatures_blocking(
     profile_id: String,
     paths: Vec<String>,
     include_sizes: Option<bool>,
@@ -1598,7 +1641,14 @@ fn directory_signatures(
 }
 
 #[tauri::command]
-fn read_text_file(profile_id: String, path: String) -> Result<String, String> {
+async fn read_text_file(profile_id: String, path: String) -> Result<String, String> {
+    run_blocking_command("read text file", move || {
+        read_text_file_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn read_text_file_blocking(profile_id: String, path: String) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     match profile.kind.as_str() {
@@ -1625,7 +1675,14 @@ fn read_text_file(profile_id: String, path: String) -> Result<String, String> {
 /// externally modified files (terminal/LLM edits, vim, other processes) are never served
 /// as stale editor content. Much lighter than re-reading the whole file on every open.
 #[tauri::command]
-fn file_signature(profile_id: String, path: String) -> Result<String, String> {
+async fn file_signature(profile_id: String, path: String) -> Result<String, String> {
+    run_blocking_command("file signature", move || {
+        file_signature_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn file_signature_blocking(profile_id: String, path: String) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     match profile.kind.as_str() {
@@ -1669,7 +1726,14 @@ fn remote_file_signature(profile: &ConnectionProfile, path: &str) -> Result<Stri
 }
 
 #[tauri::command]
-fn read_file_data_url(profile_id: String, path: String) -> Result<String, String> {
+async fn read_file_data_url(profile_id: String, path: String) -> Result<String, String> {
+    run_blocking_command("read file data url", move || {
+        read_file_data_url_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn read_file_data_url_blocking(profile_id: String, path: String) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     let bytes = match profile.kind.as_str() {
@@ -1694,7 +1758,18 @@ fn read_file_data_url(profile_id: String, path: String) -> Result<String, String
 }
 
 #[tauri::command]
-fn write_text_file(profile_id: String, path: String, content: String) -> Result<(), String> {
+async fn write_text_file(profile_id: String, path: String, content: String) -> Result<(), String> {
+    run_blocking_command("write text file", move || {
+        write_text_file_blocking(profile_id, path, content)
+    })
+    .await
+}
+
+fn write_text_file_blocking(
+    profile_id: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     match profile.kind.as_str() {
@@ -1736,7 +1811,14 @@ fn write_text_file(profile_id: String, path: String, content: String) -> Result<
 }
 
 #[tauri::command]
-fn create_directory(profile_id: String, path: String) -> Result<(), String> {
+async fn create_directory(profile_id: String, path: String) -> Result<(), String> {
+    run_blocking_command("create directory", move || {
+        create_directory_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn create_directory_blocking(profile_id: String, path: String) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     match profile.kind.as_str() {
@@ -1760,7 +1842,14 @@ fn create_directory(profile_id: String, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn create_file(profile_id: String, path: String) -> Result<(), String> {
+async fn create_file(profile_id: String, path: String) -> Result<(), String> {
+    run_blocking_command("create file", move || {
+        create_file_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn create_file_blocking(profile_id: String, path: String) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     match profile.kind.as_str() {
@@ -1792,7 +1881,18 @@ fn create_file(profile_id: String, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn rename_path(profile_id: String, old_path: String, new_path: String) -> Result<(), String> {
+async fn rename_path(profile_id: String, old_path: String, new_path: String) -> Result<(), String> {
+    run_blocking_command("rename path", move || {
+        rename_path_blocking(profile_id, old_path, new_path)
+    })
+    .await
+}
+
+fn rename_path_blocking(
+    profile_id: String,
+    old_path: String,
+    new_path: String,
+) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let old_path = normalize_profile_path(&profile, &old_path);
     let new_path = normalize_profile_path(&profile, &new_path);
@@ -1829,7 +1929,20 @@ fn rename_path(profile_id: String, old_path: String, new_path: String) -> Result
 }
 
 #[tauri::command]
-fn delete_paths(profile_id: String, paths: Vec<String>) -> Result<Vec<DeletedPathItem>, String> {
+async fn delete_paths(
+    profile_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<DeletedPathItem>, String> {
+    run_blocking_command("delete paths", move || {
+        delete_paths_blocking(profile_id, paths)
+    })
+    .await
+}
+
+fn delete_paths_blocking(
+    profile_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<DeletedPathItem>, String> {
     let profile = profile_from_id(&profile_id);
     let mut deleted = Vec::new();
     let delete_id = Uuid::new_v4().to_string();
@@ -1849,7 +1962,20 @@ fn delete_paths(profile_id: String, paths: Vec<String>) -> Result<Vec<DeletedPat
 }
 
 #[tauri::command]
-fn restore_deleted_paths(profile_id: String, items: Vec<DeletedPathItem>) -> Result<(), String> {
+async fn restore_deleted_paths(
+    profile_id: String,
+    items: Vec<DeletedPathItem>,
+) -> Result<(), String> {
+    run_blocking_command("restore deleted paths", move || {
+        restore_deleted_paths_blocking(profile_id, items)
+    })
+    .await
+}
+
+fn restore_deleted_paths_blocking(
+    profile_id: String,
+    items: Vec<DeletedPathItem>,
+) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     for item in items {
         let original_path = normalize_profile_path(&profile, &item.original_path);

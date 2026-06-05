@@ -51,6 +51,28 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-06 - Run SSH file commands off the IPC thread
+
+#### Changed
+
+- Explorer/file commands that can run SSH or WSL subprocesses now execute in
+  blocking worker tasks instead of directly inside the Tauri IPC handler.
+- This prevents the IDE-local `SSH_ASKPASS` unlock flow from deadlocking the
+  WebView: while a background `ssh.exe` waits for the passphrase, the frontend
+  can still receive the askpass event, render the unlock modal, and submit the
+  answer.
+
+#### Verified
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `npm run check`
+- `npm run build`
+- `scripts/ssh-agent-fixture-smoke.sh`
+- `bash -n scripts/ssh-agent-fixture-smoke.sh`
+- `git diff --check`
+
 ### 2026-06-06 - SSH unlock Enter key submit
 
 #### Changed
