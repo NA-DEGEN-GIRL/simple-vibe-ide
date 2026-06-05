@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
@@ -21,6 +21,9 @@ use uuid::Uuid;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+#[cfg(not(windows))]
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 use windows::Win32::System::DataExchange::{
@@ -165,6 +168,7 @@ struct EdgeDevtoolsSessionState {
     port: u16,
 }
 
+#[cfg(not(windows))]
 #[derive(Clone)]
 struct SshAgentSession {
     vars: Vec<(String, String)>,
@@ -402,18 +406,23 @@ fn assign_child_to_cleanup_job(pid: u32) {
 
 static WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_SSH_AGENT_SERVICE_ELEVATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(windows))]
 static SSH_AGENT_SESSION: OnceLock<Mutex<Option<SshAgentSession>>> = OnceLock::new();
+#[cfg(not(windows))]
 static SSH_AGENT_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(windows))]
 fn ssh_agent_store() -> &'static Mutex<Option<SshAgentSession>> {
     SSH_AGENT_SESSION.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(windows)]
 fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
-    #[cfg(windows)]
-    if windows_ssh_agent_service_running() {
-        return Vec::new();
-    }
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
     if let Ok(guard) = ssh_agent_store().lock() {
         if let Some(session) = guard.as_ref() {
             return session.vars.clone();
@@ -432,6 +441,7 @@ fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
     vars
 }
 
+#[cfg(not(windows))]
 fn start_session_ssh_agent() -> Option<SshAgentSession> {
     let mut command = Command::new("ssh-agent.exe");
     command
@@ -462,6 +472,7 @@ fn start_session_ssh_agent() -> Option<SshAgentSession> {
     }
 }
 
+#[cfg(not(windows))]
 fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     let mut vars = Vec::new();
     for key in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
@@ -475,6 +486,7 @@ fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     vars
 }
 
+#[cfg(not(windows))]
 fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     for line in output.lines() {
@@ -496,8 +508,16 @@ fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
 }
 
 fn apply_session_ssh_agent_to_command(command: &mut Command) {
-    for (key, value) in ensure_session_ssh_agent_vars() {
-        Command::env(command, key, value);
+    #[cfg(windows)]
+    {
+        command.env_remove("SSH_AUTH_SOCK");
+        command.env_remove("SSH_AGENT_PID");
+    }
+    #[cfg(not(windows))]
+    {
+        for (key, value) in ensure_session_ssh_agent_vars() {
+            Command::env(command, key, value);
+        }
     }
 }
 
@@ -508,30 +528,37 @@ fn apply_session_ssh_agent_to_pty(command: &mut CommandBuilder) {
 }
 
 fn shutdown_session_ssh_agent() {
-    let session = ssh_agent_store()
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    let Some(session) = session else {
-        return;
-    };
-    let mut command = Command::new("ssh-agent.exe");
-    command
-        .arg("-k")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    for (key, value) in &session.vars {
-        Command::env(&mut command, key, value);
-    }
-    let _ = hide_command_window(&mut command).status();
-    if let Some(pid) = session
-        .vars
-        .iter()
-        .find(|(key, _)| key == "SSH_AGENT_PID")
-        .and_then(|(_, value)| value.parse::<u32>().ok())
+    #[cfg(windows)]
     {
-        kill_process_tree(pid);
+        return;
+    }
+    #[cfg(not(windows))]
+    {
+        let session = ssh_agent_store()
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(session) = session else {
+            return;
+        };
+        let mut command = Command::new("ssh-agent.exe");
+        command
+            .arg("-k")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in &session.vars {
+            Command::env(&mut command, key, value);
+        }
+        let _ = hide_command_window(&mut command).status();
+        if let Some(pid) = session
+            .vars
+            .iter()
+            .find(|(key, _)| key == "SSH_AGENT_PID")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+        {
+            kill_process_tree(pid);
+        }
     }
 }
 
@@ -714,6 +741,8 @@ $ssh = {ssh_path}
 $sshAdd = {ssh_add_path}
 $aliasName = {alias_quoted}
 $remoteCommand = {remote_quoted}
+Remove-Item Env:SSH_AUTH_SOCK -ErrorAction SilentlyContinue
+Remove-Item Env:SSH_AGENT_PID -ErrorAction SilentlyContinue
 try {{
   $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
   if ($svc -and $svc.Status -ne 'Running') {{

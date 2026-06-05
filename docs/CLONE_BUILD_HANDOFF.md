@@ -72,6 +72,10 @@ If `%TEMP%` is too small, use a spacious local path such as
   (`BatchMode=yes`). They should reuse the shared agent if a key is unlocked
   and fail fast instead of prompting from hidden Explorer jobs when no key is
   available.
+- For a local passphrase/agent regression check on Linux/WSL, run
+  `scripts/ssh-agent-fixture-smoke.sh`. It starts a temporary localhost `sshd`,
+  proves BatchMode SSH fails before `ssh-add`, unlocks a passphrase-protected
+  key into `ssh-agent`, then proves BatchMode SSH succeeds afterward.
 
 ## Release Portability
 

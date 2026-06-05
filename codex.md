@@ -51,6 +51,30 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - SSH agent env cleanup and local fixture smoke
+
+#### Changed
+
+- Windows SSH commands now clear inherited `SSH_AUTH_SOCK`/`SSH_AGENT_PID`
+  instead of injecting an IDE-started agent fallback. This avoids stale or
+  incompatible agent environment variables blocking the Windows OpenSSH named
+  pipe agent after the user approves the OpenSSH Authentication Agent service.
+- The visible SSH PowerShell bootstrap also removes inherited SSH agent
+  environment variables before running `ssh-add`, so `ssh-add` uses the Windows
+  OpenSSH agent pipe rather than a stale process-local socket.
+- Added `scripts/ssh-agent-fixture-smoke.sh`, a tiny localhost SSH fixture that
+  starts an unprivileged `sshd`, creates a passphrase-protected key, confirms
+  BatchMode SSH fails before `ssh-add`, then confirms BatchMode succeeds after
+  unlocking the key in `ssh-agent`.
+
+#### Verified
+
+- `scripts/ssh-agent-fixture-smoke.sh`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `npm run build`
+
 ### 2026-06-05 - Enable Windows OpenSSH agent for SSH reuse
 
 #### Changed
