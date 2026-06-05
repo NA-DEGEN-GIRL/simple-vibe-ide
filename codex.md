@@ -51,6 +51,23 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-06 - Align status with market ticker row
+
+#### Changed
+
+- Moved the main IDE status message into the workspace control bar, immediately
+  before the market ticker. The status now uses the empty left side of the
+  price/ticker line while the ticker remains on the right.
+- Removed the separate always-visible status row. Normal status messages are
+  single-line with ellipsis and a full tooltip; danger details can still expand
+  into the dedicated detail strip below when needed.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-06 - Run SSH file commands off the IPC thread
 
 #### Changed

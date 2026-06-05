@@ -1668,13 +1668,13 @@ app.innerHTML = `
       <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
       <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
       <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
+      <div class="workspace-status-slot"><div id="status" class="status">Ready</div></div>
       <div id="market-ticker" class="market-ticker" title="Binance USD-M Futures ticker">
         <div id="market-ticker-list" class="market-ticker-list" aria-live="polite"></div>
         <input id="market-symbol-input" spellcheck="false" placeholder="ETHUSDT" title="Add one Binance USD-M symbol" />
         <button id="market-add-symbol" title="Add ticker symbol">+</button>
       </div>
     </section>
-    <div class="status-row"><div id="status" class="status">Ready</div></div>
     <div id="status-detail" class="status-detail hidden" aria-live="polite"></div>
     <main class="main-grid">
       <aside class="explorer panel floating-panel hidden" data-panel="explorer">
