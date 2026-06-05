@@ -1646,7 +1646,6 @@ app.innerHTML = `
     <section class="workspace-bar">
       <div class="profile-control-stack">
         <label>Profile <select id="profile-select"></select></label>
-        <div id="status" class="status">Ready</div>
       </div>
       <label>Root <input id="root-input" spellcheck="false" placeholder="select a profile first" /></label>
       <button id="open-root">Open / Connect</button>
@@ -1675,6 +1674,7 @@ app.innerHTML = `
         <button id="market-add-symbol" title="Add ticker symbol">+</button>
       </div>
     </section>
+    <div class="status-row"><div id="status" class="status">Ready</div></div>
     <div id="status-detail" class="status-detail hidden" aria-live="polite"></div>
     <main class="main-grid">
       <aside class="explorer panel floating-panel hidden" data-panel="explorer">
@@ -9039,7 +9039,9 @@ async function switchWorkspace(path: string) {
     refreshTitle();
     deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
     setWorkspaceOpen(true, { deferExplorerWatch: true });
+    revealWorkspaceOpenSurface();
     const widget = await createTerminal(null, 'shell', { cwd: path });
+    if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
     const pane = widget ? activePaneForWidget(widget) : null;
     if (pane?.backendId) {
       queueWorkspaceDirectoryLoadAfterShellReady(pane, path, profile);
@@ -9051,7 +9053,9 @@ async function switchWorkspace(path: string) {
   }
   await openWorkspace(path);
   setWorkspaceOpen(true);
-  await createTerminal(null, 'shell', { cwd: path });
+  revealWorkspaceOpenSurface();
+  const widget = await createTerminal(null, 'shell', { cwd: path });
+  if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
 }
 
@@ -9583,6 +9587,24 @@ function setWorkspaceOpen(open: boolean, options: { preserveVisibility?: boolean
   if (!open) setKeyboardResizeTarget({ kind: 'ide' });
   if (open && !IS_TERMINAL_APP && !options.deferExplorerWatch) scheduleExplorerWatch(1200);
   else stopExplorerWatch();
+  renderShellTabs();
+}
+
+function revealWorkspaceOpenSurface(options: { showExplorer?: boolean; terminalWidget?: TerminalWidget | null } = {}) {
+  if (!state.activeWorkspaceId) return;
+  const showExplorer = options.showExplorer !== false;
+  if (showExplorer && !IS_TERMINAL_APP) {
+    setPanelVisible('explorer', true, { skipSave: true, skipFocus: true });
+  }
+  showTerminalWidgetsForWorkspace(state.activeWorkspaceId);
+  const widget = options.terminalWidget;
+  if (widget && widget.workspaceId === state.activeWorkspaceId) {
+    widget.element.classList.remove('hidden');
+    bringPanelToFront(widget.element);
+    syncTerminalWidgetActiveState(widget);
+    renderTerminalWidgetSplitLayout(widget);
+    scheduleFitTerminalWidget(widget, { activeOnly: true });
+  }
   renderShellTabs();
 }
 

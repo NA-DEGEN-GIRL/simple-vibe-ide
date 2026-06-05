@@ -51,6 +51,29 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - Workspace surface and status row regression fix
+
+#### Changed
+
+- Moved the compact status text out of the Profile control stack into its own
+  full-width row below the workspace toolbar, so Root input width can no longer
+  truncate messages such as remote shell-login waiting states.
+- Explicitly assigned the title, workspace tabs, workspace toolbar, status row,
+  status detail, and main workspace area to fixed CSS grid rows. This prevents
+  the hidden status-detail element from shifting `main-grid` into an auto-sized
+  row and making Explorer/Shell panels appear missing.
+- Open/Connect now explicitly reveals the workspace surface: Explorer is shown
+  for IDE workspaces and active shell widgets are shown/brought forward even
+  while SSH/WSL file loading is gated on shell login.
+
+#### Verified
+
+- `git diff --check`
+- `npm run check`
+- `npm run build`
+- Privacy grep over the diff found no obvious private values or local home
+  paths.
+
 ### 2026-06-05 - SSH prompt fallback and blank workspace connect
 
 #### Changed
