@@ -2059,9 +2059,13 @@ function showNextSshAuthPrompt() {
   submit.textContent = 'Unlock';
   buttons.append(cancel, submit);
 
+  let finished = false;
   const finish = async (secret: string | null) => {
+    if (finished) return;
+    finished = true;
     submit.disabled = true;
     cancel.disabled = true;
+    input.disabled = true;
     try {
       await api.answerSshAuthPrompt(request.id, secret);
     } catch {
@@ -2075,19 +2079,31 @@ function showNextSshAuthPrompt() {
     }
   };
 
+  const submitFromKeyboard = (event: KeyboardEvent) => {
+    if (event.isComposing || event.key !== 'Enter') return;
+    event.preventDefault();
+    event.stopPropagation();
+    void finish(input.value);
+  };
+
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     void finish(input.value);
   });
+  input.addEventListener('keydown', submitFromKeyboard);
   cancel.addEventListener('click', () => {
     void finish(null);
   });
   overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      submitFromKeyboard(event);
+      return;
+    }
     if (event.key === 'Escape') {
       event.preventDefault();
       void finish(null);
     }
-  });
+  }, true);
 
   form.append(title, summary, prompt, input, buttons);
   overlay.append(form);

@@ -51,6 +51,21 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-06 - SSH unlock Enter key submit
+
+#### Changed
+
+- The IDE SSH unlock dialog now treats `Enter` as the same action as clicking
+  `Unlock`, even if focus is on the overlay instead of the password field.
+- Added a one-shot guard so `Enter`, form submit, and button clicks cannot send
+  duplicate answers for the same SSH prompt.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-06 - VS Code-style SSH askpass broker
 
 #### Changed
