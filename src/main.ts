@@ -1674,8 +1674,8 @@ app.innerHTML = `
         <input id="market-symbol-input" spellcheck="false" placeholder="ETHUSDT" title="Add one Binance USD-M symbol" />
         <button id="market-add-symbol" title="Add ticker symbol">+</button>
       </div>
-      <div id="status-detail" class="status-detail hidden" aria-live="polite"></div>
     </section>
+    <div id="status-detail" class="status-detail hidden" aria-live="polite"></div>
     <main class="main-grid">
       <aside class="explorer panel floating-panel hidden" data-panel="explorer">
         <div class="panel-title panel-drag-handle">

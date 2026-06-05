@@ -63,19 +63,20 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   Explorer directory loading/watch refresh until that shell is ready, so a
   passphrase prompt remains interactive instead of being hidden behind a
   background file-list command.
-- SSH terminal processes now try to start the Windows OpenSSH Authentication
-  Agent service once, force `IdentityAgent=\\.\pipe\openssh-ssh-agent`, and
-  pass `AddKeysToAgent=yes` to interactive `ssh.exe` sessions. After the user
-  enters a key passphrase once, later SSH terminals, Explorer refreshes, and
-  port forwards can reuse the key through the Windows agent instead of asking
-  again.
+- SSH terminal processes now start an IDE-session `ssh-agent`, pass that agent
+  environment to SSH terminals/background jobs, and run `ssh-add` before the
+  first interactive `ssh.exe` connection. If the session agent cannot start,
+  the launcher falls back to the Windows OpenSSH Authentication Agent service.
+  After the user enters a key passphrase once, later SSH terminals, Explorer
+  refreshes, and port forwards can reuse the key through the available agent
+  instead of asking again.
 - Background SSH file operations and port forwards now use noninteractive
-  `BatchMode=yes`; they reuse the Windows agent when available and fail fast
+  `BatchMode=yes`; they reuse the shared agent when available and fail fast
   instead of consuming or hanging on a passphrase prompt when no key has been
   unlocked yet.
-- Red status errors now also render in a wrapped detail row under the workspace
-  toolbar, so permission/authentication failures are visible even when the
-  compact status chip truncates.
+- Red status errors now also render in a separate wrapped detail row below the
+  workspace toolbar, so permission/authentication failures are visible even when
+  the compact status chip truncates.
 
 #### Verified
 
