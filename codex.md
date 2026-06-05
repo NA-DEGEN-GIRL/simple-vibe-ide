@@ -81,6 +81,25 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 - `npm run build`
 - `git diff --check`
 
+### 2026-06-06 - Stop gating SSH Explorer on shell login
+
+#### Changed
+
+- SSH Explorer/File reads no longer wait for a terminal shell-ready prompt before
+  loading or refreshing. With the IDE-local `SSH_ASKPASS` broker, the hidden
+  background `ssh.exe` can request a visible unlock dialog directly, so waiting
+  for a shell login only blocked Explorer while LLM launcher terminals already
+  worked.
+- Kept the shell-ready gate for terminal input injection paths such as LLM
+  launch typing and Python venv restoration, where sending text before a prompt
+  can still corrupt an auth/login prompt.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-05 - Proper Windows SSH agent smoke and fallback
 
 #### Changed

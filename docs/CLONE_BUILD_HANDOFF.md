@@ -74,6 +74,10 @@ If `%TEMP%` is too small, use a spacious local path such as
   `NumberOfPasswordPrompts=1` plus the IDE askpass helper instead of
   `BatchMode=yes`, so a hidden Explorer job can request a visible unlock dialog
   rather than failing immediately.
+- Do not gate SSH Explorer loading/refresh on terminal shell-ready state. The
+  shell-ready gate is still correct for typing commands into terminals, but SSH
+  Explorer reads should run directly through the askpass-capable background
+  command path.
 - For a local passphrase/agent regression check on Linux/WSL, run
   `scripts/ssh-agent-fixture-smoke.sh`. It starts a temporary localhost `sshd`,
   proves BatchMode SSH fails before unlock, proves direct `SSH_ASKPASS` works

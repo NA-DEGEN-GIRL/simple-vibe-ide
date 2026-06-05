@@ -5462,7 +5462,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     updateExplorerFileSizeMode();
     await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
 
-    const deferExplorerUntilShellReady = profileNeedsShellReadyGate(profile);
+    const deferExplorerUntilShellReady = profileNeedsExplorerShellReadyGate(profile);
     setWorkspaceOpen(true, { preserveVisibility: true, deferExplorerWatch: deferExplorerUntilShellReady });
     restorePanelSnapshots(snapshot.panels);
     if (isPanelVisible('calculator')) renderCalculator();
@@ -9127,7 +9127,7 @@ async function switchWorkspace(path: string) {
   await closeTerminalsForWorkspace(state.activeWorkspaceId);
   discardWorkspacePreviewRuntime(state.activeWorkspaceId);
   clearWorkspacePanels();
-  if (profileNeedsShellReadyGate(profile) && !IS_TERMINAL_APP) {
+  if (profileNeedsExplorerShellReadyGate(profile) && !IS_TERMINAL_APP) {
     refreshTitle();
     deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
     setWorkspaceOpen(true, { deferExplorerWatch: true });
@@ -9374,6 +9374,14 @@ function profileNeedsShellReadyGate(profile: ConnectionProfile | null | undefine
   return profile?.kind === 'ssh' || profile?.kind === 'wsl';
 }
 
+function profileNeedsExplorerShellReadyGate(profile: ConnectionProfile | null | undefined) {
+  // SSH Explorer/File jobs now use the IDE-local SSH_ASKPASS broker, so they
+  // must not wait for a terminal shell prompt. Waiting here can deadlock the
+  // Explorer when the shell is still at an auth/login prompt, even though the
+  // background ssh.exe can show the IDE unlock dialog itself.
+  return profile?.kind === 'wsl';
+}
+
 function terminalShellReadyProfile(pane: TerminalPane) {
   return profileForIdWithWindowsFallback(pane.profileId) ?? state.activeProfile;
 }
@@ -9397,7 +9405,7 @@ function workspaceHasReadyShell(profile: ConnectionProfile | null | undefined, w
 
 function shouldDeferRemoteDirectoryRead(profileId: string, workspaceId = state.activeWorkspaceId) {
   const profile = profileForIdWithWindowsFallback(profileId);
-  return Boolean(profileNeedsShellReadyGate(profile) && !workspaceHasReadyShell(profile, workspaceId));
+  return Boolean(profileNeedsExplorerShellReadyGate(profile) && !workspaceHasReadyShell(profile, workspaceId));
 }
 
 function remoteDirectoryReadWaitMessage(profileId: string) {
@@ -9407,7 +9415,7 @@ function remoteDirectoryReadWaitMessage(profileId: string) {
 
 function shouldDeferRemoteWorkspaceDirectoryLoad(profile: ConnectionProfile | null | undefined = state.activeProfile) {
   return Boolean(
-    profileNeedsShellReadyGate(profile)
+    profileNeedsExplorerShellReadyGate(profile)
     && state.workspaceOpen
     && state.currentDir
     && !activeWorkspaceHasReadyShell(profile)
