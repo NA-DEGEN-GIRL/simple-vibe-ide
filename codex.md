@@ -51,6 +51,28 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - Enable Windows OpenSSH agent for SSH reuse
+
+#### Changed
+
+- When the Windows OpenSSH Authentication Agent service is unavailable, the IDE
+  now first tries to set it to Manual and start it normally, then launches an
+  elevated PowerShell `RunAs` request once so the user can approve enabling and
+  starting `ssh-agent`.
+- SSH terminal bootstrap now waits briefly for the agent to become available
+  after the UAC request before deciding that `ssh-add` cannot connect.
+- The visible SSH warning and Explorer publickey error now point to approving
+  the OpenSSH agent UAC prompt and reopening the SSH workspace once, instead of
+  implying that passphrase entry in a regular SSH login can be reused without a
+  working agent.
+
+#### Verified
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `npm run build`
+
 ### 2026-06-05 - Visible ssh-add unlock before SSH terminals
 
 #### Changed

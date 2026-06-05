@@ -401,7 +401,7 @@ fn assign_child_to_cleanup_job(pid: u32) {
 }
 
 static WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-static WINDOWS_SSH_AGENT_SERVICE_RUNNING: OnceLock<bool> = OnceLock::new();
+static WINDOWS_SSH_AGENT_SERVICE_ELEVATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SSH_AGENT_SESSION: OnceLock<Mutex<Option<SshAgentSession>>> = OnceLock::new();
 static SSH_AGENT_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
@@ -570,9 +570,10 @@ fn ssh_add_executable_string() -> String {
     ssh_add_executable().to_string_lossy().to_string()
 }
 
-fn ensure_windows_ssh_agent_service_started() {
-    if WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED.swap(true, Ordering::Relaxed) {
-        return;
+fn query_windows_ssh_agent_service_running() -> bool {
+    #[cfg(not(windows))]
+    {
+        false
     }
     #[cfg(windows)]
     {
@@ -586,8 +587,74 @@ fn ensure_windows_ssh_agent_service_started() {
             .arg("-Command")
             .arg(
                 "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
-                 if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name ssh-agent -ErrorAction SilentlyContinue } } catch {}",
+                 if ($svc -and $svc.Status -eq 'Running') { exit 0 } else { exit 1 } } catch { exit 1 }",
             )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_command_window(&mut command)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+fn ensure_windows_ssh_agent_service_started() {
+    #[cfg(windows)]
+    {
+        if query_windows_ssh_agent_service_running() {
+            return;
+        }
+        if !WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED.swap(true, Ordering::Relaxed) {
+            let mut command = Command::new("powershell.exe");
+            command
+                .arg("-NoLogo")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(
+                    "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
+                     if ($svc) { \
+                       Set-Service -Name ssh-agent -StartupType Manual -ErrorAction SilentlyContinue; \
+                       if ($svc.Status -ne 'Running') { Start-Service -Name ssh-agent -ErrorAction SilentlyContinue } \
+                     } } catch {}",
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let _ = hide_command_window(&mut command).status();
+        }
+        if !query_windows_ssh_agent_service_running()
+            && !WINDOWS_SSH_AGENT_SERVICE_ELEVATION_ATTEMPTED.swap(true, Ordering::Relaxed)
+        {
+            launch_elevated_windows_ssh_agent_service_enable();
+        }
+    }
+}
+
+fn launch_elevated_windows_ssh_agent_service_enable() {
+    #[cfg(windows)]
+    {
+        let admin_script = "try { \
+          Set-Service -Name ssh-agent -StartupType Manual -ErrorAction SilentlyContinue; \
+          Start-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
+        } catch {}";
+        let encoded_script = powershell_encoded_command(admin_script);
+        let launcher_script = format!(
+            "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{}') -Verb RunAs",
+            encoded_script
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(launcher_script)
+            .current_dir(windows_spawn_cwd())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -603,27 +670,7 @@ fn windows_ssh_agent_service_running() -> bool {
     #[cfg(windows)]
     {
         ensure_windows_ssh_agent_service_started();
-        *WINDOWS_SSH_AGENT_SERVICE_RUNNING.get_or_init(|| {
-            let mut command = Command::new("powershell.exe");
-            command
-                .arg("-NoLogo")
-                .arg("-NoProfile")
-                .arg("-NonInteractive")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-Command")
-                .arg(
-                    "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
-                     if ($svc -and $svc.Status -eq 'Running') { exit 0 } else { exit 1 } } catch { exit 1 }",
-                )
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            hide_command_window(&mut command)
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
+        query_windows_ssh_agent_service_running()
     }
 }
 
@@ -675,6 +722,11 @@ try {{
 }} catch {{}}
 & $sshAdd -l *> $null
 $agentStatus = $LASTEXITCODE
+for ($i = 0; $agentStatus -ne 0 -and $i -lt 20; $i++) {{
+  Start-Sleep -Milliseconds 500
+  & $sshAdd -l *> $null
+  $agentStatus = $LASTEXITCODE
+}}
 if ($agentStatus -eq 1) {{
   $identityFiles = @()
   try {{
@@ -706,7 +758,8 @@ if ($agentStatus -eq 1) {{
   }}
 }} elseif ($agentStatus -ne 0) {{
   Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; SSH may ask for the key passphrase for each separate Shell/Explorer/LLM connection.'
-  Write-Host '[simple-vibe-ide] Enable the OpenSSH Authentication Agent service or run ssh-add in a Windows shell for one-time reuse.'
+  Write-Host '[simple-vibe-ide] If Windows shows a UAC prompt for OpenSSH Authentication Agent, approve it, then reopen this SSH workspace once.'
+  Write-Host '[simple-vibe-ide] Otherwise run an elevated Windows PowerShell: Set-Service ssh-agent -StartupType Manual; Start-Service ssh-agent; ssh-add'
 }}
 $sshArgs = @({common_options})
 $sshArgs += @('-tt', $aliasName, $remoteCommand)
