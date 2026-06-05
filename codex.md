@@ -51,6 +51,40 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - Proper Windows SSH agent smoke and fallback
+
+#### Changed
+
+- Restored the Windows private `ssh-agent.exe -s` fallback for the case where
+  the Windows OpenSSH Authentication Agent service remains unavailable after
+  normal and elevated start attempts. Stale inherited agent env is still cleared
+  when the service agent is running, but IDE-owned private agent env is now
+  preserved and shared with SSH terminals, Explorer/File jobs, and LLM panes
+  when the service agent cannot be used.
+- The visible SSH bootstrap only clears `SSH_AUTH_SOCK`/`SSH_AGENT_PID` when it
+  is intentionally using the Windows service agent. This avoids deleting the
+  IDE private agent fallback before `ssh-add` runs.
+- Added `scripts/windows-ssh-agent-smoke.ps1`, a Windows-side smoke test that
+  uses the real Windows OpenSSH `ssh.exe`/`ssh-add.exe`/`ssh-agent.exe`, checks
+  the `ssh-agent` service, optionally requests UAC with `-AllowElevate`, falls
+  back to a private process agent, runs `ssh-add`, and verifies that
+  `ssh -o BatchMode=yes <alias> <command>` works afterward.
+- Extended the local SSH fixture to prove the unlocked agent also works from a
+  separate noninteractive process that only inherits the agent environment,
+  matching the Explorer/File/LLM job shape more closely.
+
+#### Verified
+
+- `scripts/ssh-agent-fixture-smoke.sh`
+- `bash -n scripts/ssh-agent-fixture-smoke.sh`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `npm run build`
+- Windows PowerShell execution for `scripts/windows-ssh-agent-smoke.ps1` is not
+  available in this WSL/Linux validation environment and must be run on the
+  affected Windows machine.
+
 ### 2026-06-05 - SSH agent env cleanup and local fixture smoke
 
 #### Changed

@@ -130,7 +130,7 @@ print("sshd did not become ready", file=sys.stderr)
 sys.exit(1)
 PY
 
-echo "[1/3] BatchMode before ssh-add should fail"
+echo "[1/4] BatchMode before ssh-add should fail"
 set +e
 env -u SSH_AUTH_SOCK -u SSH_AGENT_PID ssh -F "$SSH_CONFIG" -o BatchMode=yes svi-fixture true >"$WORKDIR/before.out" 2>&1
 BEFORE_STATUS=$?
@@ -140,7 +140,7 @@ if [ "$BEFORE_STATUS" = 0 ]; then
   exit 1
 fi
 
-echo "[2/3] Unlock key in a fresh ssh-agent"
+echo "[2/4] Unlock key in a fresh ssh-agent"
 eval "$(ssh-agent -s)" >/dev/null
 AGENT_STARTED=1
 cat > "$ASKPASS" <<EOF
@@ -155,12 +155,24 @@ ssh-add "$CLIENT_KEY" </dev/null >/dev/null
 
 ssh-add -l >/dev/null
 
-echo "[3/3] BatchMode after ssh-add should succeed"
+echo "[3/4] BatchMode after ssh-add should succeed"
 ssh -F "$SSH_CONFIG" -o BatchMode=yes svi-fixture 'printf fixture-ok' >"$WORKDIR/after.out"
 if ! grep -q 'fixture-ok' "$WORKDIR/after.out"; then
   echo "expected fixture-ok from remote command" >&2
   exit 1
 fi
 
-echo "ok: passphrase-protected key fails before ssh-add and succeeds after agent unlock"
+echo "[4/4] Separate noninteractive job with agent env should succeed"
+env -i \
+  "PATH=${PATH:-/usr/bin:/bin}" \
+  "HOME=${HOME:-}" \
+  "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" \
+  "SSH_AGENT_PID=${SSH_AGENT_PID:-}" \
+  "$(command -v ssh)" -F "$SSH_CONFIG" -o BatchMode=yes svi-fixture 'printf separate-job-ok' >"$WORKDIR/separate.out"
+if ! grep -q 'separate-job-ok' "$WORKDIR/separate.out"; then
+  echo "expected separate-job-ok from remote command" >&2
+  exit 1
+fi
+
+echo "ok: passphrase-protected key fails before ssh-add and succeeds in same-shell and separate noninteractive agent-env jobs"
 echo "fixture alias config: $SSH_CONFIG"

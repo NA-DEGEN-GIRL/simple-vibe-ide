@@ -75,7 +75,14 @@ If `%TEMP%` is too small, use a spacious local path such as
 - For a local passphrase/agent regression check on Linux/WSL, run
   `scripts/ssh-agent-fixture-smoke.sh`. It starts a temporary localhost `sshd`,
   proves BatchMode SSH fails before `ssh-add`, unlocks a passphrase-protected
-  key into `ssh-agent`, then proves BatchMode SSH succeeds afterward.
+  key into `ssh-agent`, then proves BatchMode SSH succeeds both in the current
+  shell and in a separate noninteractive job that only inherits the agent env.
+- For the real Windows OpenSSH agent path, run
+  `.\scripts\windows-ssh-agent-smoke.ps1 -Alias <ssh-config-alias> -AllowElevate`
+  from Windows PowerShell. This uses the Windows OpenSSH client binaries,
+  checks/starts the `ssh-agent` service, can request UAC, can fall back to a
+  private `ssh-agent.exe -s`, runs `ssh-add`, and verifies that noninteractive
+  `ssh -o BatchMode=yes` works after unlock.
 
 ## Release Portability
 
