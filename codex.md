@@ -51,6 +51,31 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - Visible ssh-add unlock before SSH terminals
+
+#### Changed
+
+- SSH terminal startup now uses a visible PowerShell bootstrap again, but only
+  to unlock the key in the same terminal before the remote `ssh.exe` session
+  starts. The bootstrap starts/checks the Windows OpenSSH agent, inspects
+  `ssh -G <alias>` for configured identity files, runs `ssh-add` for an
+  available identity when the agent has no keys, and then starts the normal
+  interactive SSH session.
+- This is intended to make the first SSH Shell show the key passphrase prompt
+  once via `ssh-add`, so later Explorer/File jobs and Codex/Claude/Grok SSH
+  panes can reuse the key through the Windows OpenSSH agent instead of asking
+  again.
+- Explorer publickey errors now direct the user to reopen an SSH shell and
+  answer the visible `ssh-add` prompt once, rather than relying only on
+  `AddKeysToAgent`.
+
+#### Verified
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `npm run build`
+
 ### 2026-06-05 - SSH agent reuse for Explorer jobs
 
 #### Changed

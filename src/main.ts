@@ -9936,7 +9936,7 @@ function explorerAuthErrorMessage(error: unknown, action: string) {
     state.activeProfile?.kind === 'ssh'
     && /permission denied.*publickey|publickey.*permission denied/i.test(message)
   ) {
-    return `SSH ${action} failed after shell login: ${message}. The Shell can be interactive, but Explorer/File jobs use a separate noninteractive ssh.exe and need the key in the Windows OpenSSH agent. If the shell just asked for the key passphrase, reconnect once with this build so AddKeysToAgent can store it; otherwise run ssh-add in a Windows shell or enable the Windows OpenSSH Authentication Agent service.`;
+    return `SSH ${action} failed after shell login: ${message}. The Shell can be interactive, but Explorer/File/LLM jobs use separate noninteractive ssh.exe processes and need the key in the Windows OpenSSH agent. Reopen an SSH shell with this build and enter the visible ssh-add passphrase prompt once; if no ssh-add prompt appears, run ssh-add in a Windows shell or enable the Windows OpenSSH Authentication Agent service.`;
   }
   return message;
 }

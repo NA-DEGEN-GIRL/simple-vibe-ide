@@ -165,7 +165,6 @@ struct EdgeDevtoolsSessionState {
     port: u16,
 }
 
-#[cfg(not(windows))]
 #[derive(Clone)]
 struct SshAgentSession {
     vars: Vec<(String, String)>,
@@ -403,23 +402,18 @@ fn assign_child_to_cleanup_job(pid: u32) {
 
 static WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_SSH_AGENT_SERVICE_RUNNING: OnceLock<bool> = OnceLock::new();
-#[cfg(not(windows))]
 static SSH_AGENT_SESSION: OnceLock<Mutex<Option<SshAgentSession>>> = OnceLock::new();
-#[cfg(not(windows))]
 static SSH_AGENT_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(windows))]
 fn ssh_agent_store() -> &'static Mutex<Option<SshAgentSession>> {
     SSH_AGENT_SESSION.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(windows)]
 fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
-    Vec::new()
-}
-
-#[cfg(not(windows))]
-fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    if windows_ssh_agent_service_running() {
+        return Vec::new();
+    }
     if let Ok(guard) = ssh_agent_store().lock() {
         if let Some(session) = guard.as_ref() {
             return session.vars.clone();
@@ -438,7 +432,6 @@ fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
     vars
 }
 
-#[cfg(not(windows))]
 fn start_session_ssh_agent() -> Option<SshAgentSession> {
     let mut command = Command::new("ssh-agent.exe");
     command
@@ -469,7 +462,6 @@ fn start_session_ssh_agent() -> Option<SshAgentSession> {
     }
 }
 
-#[cfg(not(windows))]
 fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     let mut vars = Vec::new();
     for key in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
@@ -483,7 +475,6 @@ fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     vars
 }
 
-#[cfg(not(windows))]
 fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     for line in output.lines() {
@@ -517,33 +508,30 @@ fn apply_session_ssh_agent_to_pty(command: &mut CommandBuilder) {
 }
 
 fn shutdown_session_ssh_agent() {
-    #[cfg(not(windows))]
+    let session = ssh_agent_store()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    let Some(session) = session else {
+        return;
+    };
+    let mut command = Command::new("ssh-agent.exe");
+    command
+        .arg("-k")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in &session.vars {
+        Command::env(&mut command, key, value);
+    }
+    let _ = hide_command_window(&mut command).status();
+    if let Some(pid) = session
+        .vars
+        .iter()
+        .find(|(key, _)| key == "SSH_AGENT_PID")
+        .and_then(|(_, value)| value.parse::<u32>().ok())
     {
-        let session = ssh_agent_store()
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        let Some(session) = session else {
-            return;
-        };
-        let mut command = Command::new("ssh-agent.exe");
-        command
-            .arg("-k")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        for (key, value) in &session.vars {
-            Command::env(&mut command, key, value);
-        }
-        let _ = hide_command_window(&mut command).status();
-        if let Some(pid) = session
-            .vars
-            .iter()
-            .find(|(key, _)| key == "SSH_AGENT_PID")
-            .and_then(|(_, value)| value.parse::<u32>().ok())
-        {
-            kill_process_tree(pid);
-        }
+        kill_process_tree(pid);
     }
 }
 
@@ -572,6 +560,14 @@ fn ssh_executable() -> PathBuf {
 
 fn ssh_executable_string() -> String {
     ssh_executable().to_string_lossy().to_string()
+}
+
+fn ssh_add_executable() -> PathBuf {
+    windows_openssh_executable("ssh-add.exe").unwrap_or_else(|| PathBuf::from("ssh-add.exe"))
+}
+
+fn ssh_add_executable_string() -> String {
+    ssh_add_executable().to_string_lossy().to_string()
 }
 
 fn ensure_windows_ssh_agent_service_started() {
@@ -653,6 +649,71 @@ fn push_ssh_common_options(command: &mut Command, interactive: bool, batch_mode:
     for arg in ssh_common_options(interactive, batch_mode) {
         command.arg(arg);
     }
+}
+
+fn ssh_terminal_bootstrap_script(alias: &str, remote_command: &str) -> String {
+    let ssh_path = powershell_single_quote(&ssh_executable_string());
+    let ssh_add_path = powershell_single_quote(&ssh_add_executable_string());
+    let alias_quoted = powershell_single_quote(alias);
+    let remote_quoted = powershell_single_quote(remote_command);
+    let common_options = ssh_common_options(true, false)
+        .into_iter()
+        .map(|arg| powershell_single_quote(&arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"$ErrorActionPreference = 'Continue'
+$ssh = {ssh_path}
+$sshAdd = {ssh_add_path}
+$aliasName = {alias_quoted}
+$remoteCommand = {remote_quoted}
+try {{
+  $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
+  if ($svc -and $svc.Status -ne 'Running') {{
+    Start-Service -Name ssh-agent -ErrorAction SilentlyContinue
+  }}
+}} catch {{}}
+& $sshAdd -l *> $null
+$agentStatus = $LASTEXITCODE
+if ($agentStatus -eq 1) {{
+  $identityFiles = @()
+  try {{
+    $identityFiles = & $ssh -G $aliasName 2>$null | ForEach-Object {{
+      if ($_ -match '^identityfile\s+(.+)$') {{ $Matches[1] }}
+    }}
+  }} catch {{}}
+  $addedIdentity = $false
+  foreach ($identityFile in $identityFiles) {{
+    if ([string]::IsNullOrWhiteSpace($identityFile)) {{ continue }}
+    if ($identityFile.Contains('%')) {{ continue }}
+    $expandedIdentity = $identityFile
+    if ($expandedIdentity -eq '~') {{
+      $expandedIdentity = $env:USERPROFILE
+    }} elseif ($expandedIdentity.StartsWith('~/') -or $expandedIdentity.StartsWith('~\')) {{
+      $expandedIdentity = Join-Path $env:USERPROFILE $expandedIdentity.Substring(2)
+    }}
+    if (Test-Path -LiteralPath $expandedIdentity) {{
+      & $sshAdd -- $expandedIdentity
+      & $sshAdd -l *> $null
+      if ($LASTEXITCODE -eq 0) {{
+        $addedIdentity = $true
+        break
+      }}
+    }}
+  }}
+  if (-not $addedIdentity) {{
+    & $sshAdd
+  }}
+}} elseif ($agentStatus -ne 0) {{
+  Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; SSH may ask for the key passphrase for each separate Shell/Explorer/LLM connection.'
+  Write-Host '[simple-vibe-ide] Enable the OpenSSH Authentication Agent service or run ssh-add in a Windows shell for one-time reuse.'
+}}
+$sshArgs = @({common_options})
+$sshArgs += @('-tt', $aliasName, $remoteCommand)
+& $ssh @sshArgs
+exit $LASTEXITCODE
+"#
+    )
 }
 
 /// Forcefully terminate a process *and its entire child tree* by PID.
@@ -2966,9 +3027,20 @@ fn terminal_command(
                     shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None))
                 )
             };
-            let mut args = ssh_common_options(true, false);
-            args.extend(["-tt".to_string(), alias, remote_command]);
-            (ssh_executable_string(), args)
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-EncodedCommand".to_string(),
+                    powershell_encoded_command(&ssh_terminal_bootstrap_script(
+                        &alias,
+                        &remote_command,
+                    )),
+                ],
+            )
         }
         _ => {
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
