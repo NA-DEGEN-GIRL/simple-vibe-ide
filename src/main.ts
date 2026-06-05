@@ -3829,6 +3829,25 @@ function workspaceSnapshotCanAcceptOpen(snapshot: WorkspaceSnapshot | null | und
   return Boolean(snapshot && !snapshot.workspaceOpen && !snapshot.profileId && !snapshot.root);
 }
 
+function ensureWorkspaceTabForOpen() {
+  if (state.activeWorkspaceId && workspaceSnapshotForId(state.activeWorkspaceId)) {
+    return state.activeWorkspaceId;
+  }
+  const reusable = state.workspaceSnapshots.find((snapshot) => workspaceSnapshotCanAcceptOpen(snapshot));
+  if (reusable) {
+    state.activeWorkspaceId = reusable.id;
+    renderWorkspaceTabs();
+    return reusable.id;
+  }
+  const id = crypto.randomUUID();
+  const snapshot = blankWorkspaceSnapshot(id);
+  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+  insertWorkspaceSnapshot(state.workspaceSnapshots.length, snapshot);
+  state.activeWorkspaceId = id;
+  renderWorkspaceTabs();
+  return id;
+}
+
 function pruneWorkspaceTabElementCache(seen: Set<string>) {
   for (const id of workspaceTabElementCache.keys()) {
     if (!seen.has(id)) workspaceTabElementCache.delete(id);
@@ -4390,7 +4409,9 @@ async function createBlankWorkspaceTab() {
   workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
   insertWorkspaceSnapshot(insertIndex, snapshot);
   state.activeWorkspaceId = id;
+  renderWorkspaceTabs();
   await closeWorkspace();
+  renderWorkspaceTabs();
   persistWorkspaceStore();
   setStatus('New empty workspace');
 }
@@ -9010,7 +9031,7 @@ async function switchWorkspace(path: string) {
   state.workspaceRoot = path;
   state.currentDir = path;
   el.rootInput.value = path;
-  if (!state.activeWorkspaceId) state.activeWorkspaceId = crypto.randomUUID();
+  ensureWorkspaceTabForOpen();
   await closeTerminalsForWorkspace(state.activeWorkspaceId);
   discardWorkspacePreviewRuntime(state.activeWorkspaceId);
   clearWorkspacePanels();

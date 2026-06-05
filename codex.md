@@ -51,6 +51,29 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - SSH prompt fallback and blank workspace connect
+
+#### Changed
+
+- SSH terminal startup now launches `ssh.exe` directly again instead of running
+  a blocking `ssh-add` preflight in a PowerShell wrapper. The IDE still starts
+  and passes an IDE-session `ssh-agent` environment when available, and
+  interactive SSH uses `AddKeysToAgent=yes`, but an unavailable agent no longer
+  prevents the normal key passphrase prompt from appearing in the terminal.
+- New empty workspace tabs are rendered active immediately, and Open/Connect
+  now fills the selected blank workspace tab instead of losing the selection and
+  creating another workspace slot.
+
+#### Verified
+
+- `git diff --check`
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- Privacy grep over the staged diff found no obvious private values or local
+  home paths.
+
 ### 2026-06-04 - SSH/WSL passphrase-safe shell startup
 
 #### Changed
@@ -63,13 +86,12 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   Explorer directory loading/watch refresh until that shell is ready, so a
   passphrase prompt remains interactive instead of being hidden behind a
   background file-list command.
-- SSH terminal processes now start an IDE-session `ssh-agent`, pass that agent
-  environment to SSH terminals/background jobs, and run `ssh-add` before the
-  first interactive `ssh.exe` connection. If the session agent cannot start,
-  the launcher falls back to the Windows OpenSSH Authentication Agent service.
-  After the user enters a key passphrase once, later SSH terminals, Explorer
-  refreshes, and port forwards can reuse the key through the available agent
-  instead of asking again.
+- SSH terminal processes now start an IDE-session `ssh-agent` when possible and
+  pass that agent environment to SSH terminals/background jobs. Interactive SSH
+  starts `ssh.exe` directly with `AddKeysToAgent=yes`, so the terminal can still
+  show the normal key passphrase prompt if no agent is usable, and later SSH
+  terminals, Explorer refreshes, and port forwards can reuse a key that was
+  added to the available agent.
 - Background SSH file operations and port forwards now use noninteractive
   `BatchMode=yes`; they reuse the shared agent when available and fail fast
   instead of consuming or hanging on a passphrase prompt when no key has been
