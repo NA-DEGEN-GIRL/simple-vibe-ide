@@ -165,6 +165,7 @@ struct EdgeDevtoolsSessionState {
     port: u16,
 }
 
+#[cfg(not(windows))]
 #[derive(Clone)]
 struct SshAgentSession {
     vars: Vec<(String, String)>,
@@ -401,13 +402,23 @@ fn assign_child_to_cleanup_job(pid: u32) {
 }
 
 static WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static WINDOWS_SSH_AGENT_SERVICE_RUNNING: OnceLock<bool> = OnceLock::new();
+#[cfg(not(windows))]
 static SSH_AGENT_SESSION: OnceLock<Mutex<Option<SshAgentSession>>> = OnceLock::new();
+#[cfg(not(windows))]
 static SSH_AGENT_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(windows))]
 fn ssh_agent_store() -> &'static Mutex<Option<SshAgentSession>> {
     SSH_AGENT_SESSION.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(windows)]
+fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
 fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
     if let Ok(guard) = ssh_agent_store().lock() {
         if let Some(session) = guard.as_ref() {
@@ -427,6 +438,7 @@ fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
     vars
 }
 
+#[cfg(not(windows))]
 fn start_session_ssh_agent() -> Option<SshAgentSession> {
     let mut command = Command::new("ssh-agent.exe");
     command
@@ -457,6 +469,7 @@ fn start_session_ssh_agent() -> Option<SshAgentSession> {
     }
 }
 
+#[cfg(not(windows))]
 fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     let mut vars = Vec::new();
     for key in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
@@ -470,6 +483,7 @@ fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     vars
 }
 
+#[cfg(not(windows))]
 fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     for line in output.lines() {
@@ -503,31 +517,61 @@ fn apply_session_ssh_agent_to_pty(command: &mut CommandBuilder) {
 }
 
 fn shutdown_session_ssh_agent() {
-    let session = ssh_agent_store()
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    let Some(session) = session else {
-        return;
-    };
-    let mut command = Command::new("ssh-agent.exe");
-    command
-        .arg("-k")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    for (key, value) in &session.vars {
-        Command::env(&mut command, key, value);
-    }
-    let _ = hide_command_window(&mut command).status();
-    if let Some(pid) = session
-        .vars
-        .iter()
-        .find(|(key, _)| key == "SSH_AGENT_PID")
-        .and_then(|(_, value)| value.parse::<u32>().ok())
+    #[cfg(not(windows))]
     {
-        kill_process_tree(pid);
+        let session = ssh_agent_store()
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(session) = session else {
+            return;
+        };
+        let mut command = Command::new("ssh-agent.exe");
+        command
+            .arg("-k")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in &session.vars {
+            Command::env(&mut command, key, value);
+        }
+        let _ = hide_command_window(&mut command).status();
+        if let Some(pid) = session
+            .vars
+            .iter()
+            .find(|(key, _)| key == "SSH_AGENT_PID")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+        {
+            kill_process_tree(pid);
+        }
     }
+}
+
+fn windows_openssh_executable(name: &str) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        None
+    }
+    #[cfg(windows)]
+    {
+        let windir = std::env::var("WINDIR")
+            .or_else(|_| std::env::var("SystemRoot"))
+            .unwrap_or_else(|_| "C:\\Windows".to_string());
+        let path = PathBuf::from(windir)
+            .join("System32")
+            .join("OpenSSH")
+            .join(name);
+        path.exists().then_some(path)
+    }
+}
+
+fn ssh_executable() -> PathBuf {
+    windows_openssh_executable("ssh.exe").unwrap_or_else(|| PathBuf::from("ssh.exe"))
+}
+
+fn ssh_executable_string() -> String {
+    ssh_executable().to_string_lossy().to_string()
 }
 
 fn ensure_windows_ssh_agent_service_started() {
@@ -555,6 +599,38 @@ fn ensure_windows_ssh_agent_service_started() {
     }
 }
 
+fn windows_ssh_agent_service_running() -> bool {
+    #[cfg(not(windows))]
+    {
+        false
+    }
+    #[cfg(windows)]
+    {
+        ensure_windows_ssh_agent_service_started();
+        *WINDOWS_SSH_AGENT_SERVICE_RUNNING.get_or_init(|| {
+            let mut command = Command::new("powershell.exe");
+            command
+                .arg("-NoLogo")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(
+                    "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
+                     if ($svc -and $svc.Status -eq 'Running') { exit 0 } else { exit 1 } } catch { exit 1 }",
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            hide_command_window(&mut command)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+    }
+}
+
 fn ssh_common_options(interactive: bool, batch_mode: bool) -> Vec<String> {
     ensure_windows_ssh_agent_service_started();
     let mut args = Vec::new();
@@ -563,6 +639,12 @@ fn ssh_common_options(interactive: bool, batch_mode: bool) -> Vec<String> {
     }
     if interactive {
         args.extend(["-o".to_string(), "AddKeysToAgent=yes".to_string()]);
+    }
+    if windows_ssh_agent_service_running() {
+        args.extend([
+            "-o".to_string(),
+            "IdentityAgent=\\\\.\\pipe\\openssh-ssh-agent".to_string(),
+        ]);
     }
     args
 }
@@ -1935,7 +2017,7 @@ fn start_port_forward_host(
             requested_local
         };
         let alias = profile.ssh_alias.unwrap_or_else(|| "default".to_string());
-        let mut command = Command::new("ssh.exe");
+        let mut command = Command::new(ssh_executable());
         push_ssh_common_options(&mut command, false, true);
         command
             .arg("-N")
@@ -2886,7 +2968,7 @@ fn terminal_command(
             };
             let mut args = ssh_common_options(true, false);
             args.extend(["-tt".to_string(), alias, remote_command]);
-            ("ssh.exe".to_string(), args)
+            (ssh_executable_string(), args)
         }
         _ => {
             if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
@@ -4431,7 +4513,7 @@ fn profile_shell_command(profile: &ConnectionProfile, script: &str) -> Result<Co
         "ssh" => {
             let alias = profile.ssh_alias.as_deref().unwrap_or("default");
             let remote = format!("sh -lc {}", shell_quote(script));
-            let mut command = Command::new("ssh.exe");
+            let mut command = Command::new(ssh_executable());
             push_ssh_common_options(&mut command, false, true);
             command
                 .current_dir(windows_spawn_cwd())
@@ -4765,7 +4847,7 @@ fn run_profile_shell(
         "ssh" => {
             let alias = profile.ssh_alias.as_deref().unwrap_or("default");
             let remote = format!("sh -lc {}", shell_quote(script));
-            let mut command = Command::new("ssh.exe");
+            let mut command = Command::new(ssh_executable());
             push_ssh_common_options(&mut command, false, true);
             command
                 .current_dir(windows_spawn_cwd())

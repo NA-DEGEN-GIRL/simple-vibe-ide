@@ -9926,8 +9926,19 @@ async function loadDirectory(path: string) {
     setStatus('Directory loaded');
     saveActiveWorkspaceSnapshot();
   } catch (error) {
-    setStatus(String(error), true);
+    setStatus(explorerAuthErrorMessage(error, 'load directory'), true);
   }
+}
+
+function explorerAuthErrorMessage(error: unknown, action: string) {
+  const message = String(error);
+  if (
+    state.activeProfile?.kind === 'ssh'
+    && /permission denied.*publickey|publickey.*permission denied/i.test(message)
+  ) {
+    return `SSH ${action} failed after shell login: ${message}. The Shell can be interactive, but Explorer/File jobs use a separate noninteractive ssh.exe and need the key in the Windows OpenSSH agent. If the shell just asked for the key passphrase, reconnect once with this build so AddKeysToAgent can store it; otherwise run ssh-add in a Windows shell or enable the Windows OpenSSH Authentication Agent service.`;
+  }
+  return message;
 }
 
 function shouldLoadExplorerDirectoryOnShow() {
@@ -11691,7 +11702,7 @@ async function refreshExplorerTree(options: { manual?: boolean; silent?: boolean
     if (options.manual && !options.silent) setStatus(changed ? 'Explorer refreshed' : 'Explorer already up to date');
     else if (changed && !options.silent) setStatus('Explorer updated');
   } catch (error) {
-    if (options.manual) setStatus(`Explorer refresh failed: ${String(error)}`, true);
+    if (options.manual) setStatus(explorerAuthErrorMessage(error, 'refresh Explorer'), true);
   } finally {
     if (options.manual) {
       el.refreshExplorer.textContent = previousLabel;

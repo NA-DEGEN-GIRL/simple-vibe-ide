@@ -51,6 +51,30 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-05 - SSH agent reuse for Explorer jobs
+
+#### Changed
+
+- Windows SSH commands now prefer the built-in Windows OpenSSH `ssh.exe` under
+  `System32\OpenSSH` when available, avoiding Git/OpenSSH PATH mismatches
+  between the interactive Shell and background Explorer/File jobs.
+- Windows no longer injects an IDE-started process-local `SSH_AUTH_SOCK` into
+  SSH terminal/background commands. Instead, when the Windows OpenSSH
+  Authentication Agent service is running, SSH commands explicitly use
+  `IdentityAgent=\\.\pipe\openssh-ssh-agent`; interactive Shell SSH still uses
+  `AddKeysToAgent=yes` so a key passphrase entered in the visible shell can be
+  reused by later noninteractive Explorer/File jobs.
+- Explorer load/refresh publickey failures now explain that the visible Shell
+  is interactive but Explorer/File jobs use separate noninteractive SSH
+  processes and need the key in the Windows OpenSSH agent.
+
+#### Verified
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `npm run build`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+
 ### 2026-06-05 - Workspace surface and status row regression fix
 
 #### Changed
