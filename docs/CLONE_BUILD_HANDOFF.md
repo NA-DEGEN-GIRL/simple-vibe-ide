@@ -63,26 +63,27 @@ If `%TEMP%` is too small, use a spacious local path such as
 - SSH/WSL startup injections must wait for the shell-ready OSC7 marker. Do not
   type LLM launcher calls, restored venv activation, or deferred workspace file
   loading into a login/passphrase prompt.
-- SSH terminals on Windows should show a visible `ssh-add` unlock step before
-  the remote SSH session if the Windows OpenSSH agent has no keys. This keeps
-  the first key passphrase prompt in a visible shell and lets later
-  noninteractive Explorer/File jobs and additional SSH LLM panes reuse the key
-  through the Windows OpenSSH agent.
-- Background SSH file operations are intentionally noninteractive
-  (`BatchMode=yes`). They should reuse the shared agent if a key is unlocked
-  and fail fast instead of prompting from hidden Explorer jobs when no key is
-  available.
+- SSH terminals and background Explorer/File/LLM jobs on Windows use the IDE's
+  own `SSH_ASKPASS` broker. The first encrypted-key prompt should appear as a
+  Simple Vibe IDE modal, and the passphrase is kept only in IDE process memory
+  until the app exits.
+- The Windows OpenSSH Authentication Agent service is optional now. If it is
+  already running, SSH can still use it; otherwise the IDE askpass path should
+  handle encrypted keys without requiring UAC, `ssh-add`, or service setup.
+- Background SSH file operations use public-key auth with
+  `NumberOfPasswordPrompts=1` plus the IDE askpass helper instead of
+  `BatchMode=yes`, so a hidden Explorer job can request a visible unlock dialog
+  rather than failing immediately.
 - For a local passphrase/agent regression check on Linux/WSL, run
   `scripts/ssh-agent-fixture-smoke.sh`. It starts a temporary localhost `sshd`,
-  proves BatchMode SSH fails before `ssh-add`, unlocks a passphrase-protected
-  key into `ssh-agent`, then proves BatchMode SSH succeeds both in the current
-  shell and in a separate noninteractive job that only inherits the agent env.
-- For the real Windows OpenSSH agent path, run
+  proves BatchMode SSH fails before unlock, proves direct `SSH_ASKPASS` works
+  without an agent, unlocks a passphrase-protected key into `ssh-agent`, then
+  proves BatchMode SSH succeeds both in the current shell and in a separate
+  noninteractive job that only inherits the agent env.
+- For the legacy Windows OpenSSH agent path, run
   `.\scripts\windows-ssh-agent-smoke.ps1 -Alias <ssh-config-alias> -AllowElevate`
-  from Windows PowerShell. This uses the Windows OpenSSH client binaries,
-  checks/starts the `ssh-agent` service, can request UAC, can fall back to a
-  private `ssh-agent.exe -s`, runs `ssh-add`, and verifies that noninteractive
-  `ssh -o BatchMode=yes` works after unlock.
+  from Windows PowerShell. This is no longer the primary app path, but remains
+  useful when diagnosing a machine-level OpenSSH agent/service problem.
 
 ## Release Portability
 

@@ -130,7 +130,13 @@ print("sshd did not become ready", file=sys.stderr)
 sys.exit(1)
 PY
 
-echo "[1/4] BatchMode before ssh-add should fail"
+cat > "$ASKPASS" <<EOF
+#!/usr/bin/env sh
+printf '%s\n' '$PASS'
+EOF
+chmod 700 "$ASKPASS"
+
+echo "[1/5] BatchMode before ssh-add should fail"
 set +e
 env -u SSH_AUTH_SOCK -u SSH_AGENT_PID ssh -F "$SSH_CONFIG" -o BatchMode=yes svi-fixture true >"$WORKDIR/before.out" 2>&1
 BEFORE_STATUS=$?
@@ -140,14 +146,23 @@ if [ "$BEFORE_STATUS" = 0 ]; then
   exit 1
 fi
 
-echo "[2/4] Unlock key in a fresh ssh-agent"
+echo "[2/5] Direct askpass without an agent should succeed"
+env -u SSH_AUTH_SOCK -u SSH_AGENT_PID \
+  "DISPLAY=${DISPLAY:-svi-fixture}" \
+  "SSH_ASKPASS=$ASKPASS" \
+  "SSH_ASKPASS_REQUIRE=force" \
+  ssh -F "$SSH_CONFIG" \
+    -o PreferredAuthentications=publickey \
+    -o NumberOfPasswordPrompts=1 \
+    svi-fixture 'printf askpass-ok' </dev/null >"$WORKDIR/askpass.out"
+if ! grep -q 'askpass-ok' "$WORKDIR/askpass.out"; then
+  echo "expected askpass-ok from remote command" >&2
+  exit 1
+fi
+
+echo "[3/5] Unlock key in a fresh ssh-agent"
 eval "$(ssh-agent -s)" >/dev/null
 AGENT_STARTED=1
-cat > "$ASKPASS" <<EOF
-#!/usr/bin/env sh
-printf '%s\n' '$PASS'
-EOF
-chmod 700 "$ASKPASS"
 DISPLAY="${DISPLAY:-svi-fixture}" \
 SSH_ASKPASS="$ASKPASS" \
 SSH_ASKPASS_REQUIRE=force \
@@ -155,14 +170,14 @@ ssh-add "$CLIENT_KEY" </dev/null >/dev/null
 
 ssh-add -l >/dev/null
 
-echo "[3/4] BatchMode after ssh-add should succeed"
+echo "[4/5] BatchMode after ssh-add should succeed"
 ssh -F "$SSH_CONFIG" -o BatchMode=yes svi-fixture 'printf fixture-ok' >"$WORKDIR/after.out"
 if ! grep -q 'fixture-ok' "$WORKDIR/after.out"; then
   echo "expected fixture-ok from remote command" >&2
   exit 1
 fi
 
-echo "[4/4] Separate noninteractive job with agent env should succeed"
+echo "[5/5] Separate noninteractive job with agent env should succeed"
 env -i \
   "PATH=${PATH:-/usr/bin:/bin}" \
   "HOME=${HOME:-}" \
@@ -174,5 +189,5 @@ if ! grep -q 'separate-job-ok' "$WORKDIR/separate.out"; then
   exit 1
 fi
 
-echo "ok: passphrase-protected key fails before ssh-add and succeeds in same-shell and separate noninteractive agent-env jobs"
+echo "ok: passphrase-protected key works via direct askpass and via same-shell/separate agent-env jobs"
 echo "fixture alias config: $SSH_CONFIG"

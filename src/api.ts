@@ -5,6 +5,8 @@ export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
   listWslProfiles: () => invoke<ConnectionProfile[]>('list_wsl_profiles'),
   windowsShellRoot: () => invoke<string>('windows_shell_root'),
+  answerSshAuthPrompt: (id: string, secret: string | null) =>
+    invoke<void>('answer_ssh_auth_prompt', { id, secret }),
   setCaptureProtection: (enabled: boolean) =>
     invoke<void>('set_capture_protection', { enabled }),
   resolveProfilePath: (profileId: string, path: string) =>

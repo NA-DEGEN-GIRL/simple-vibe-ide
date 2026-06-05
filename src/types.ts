@@ -84,6 +84,14 @@ export interface TerminalExitEvent {
   code?: number | null;
 }
 
+export interface SshAuthPromptEvent {
+  id: string;
+  prompt: string;
+  profileId: string;
+  alias: string;
+  cacheable: boolean;
+}
+
 export type ExportJobStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface ExportStartResult {

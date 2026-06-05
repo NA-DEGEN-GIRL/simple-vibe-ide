@@ -137,6 +137,7 @@ $privateAgentStarted = $false
 
 try {
   Write-Host "Simple Vibe IDE Windows SSH agent smoke"
+  Write-Host "Note: this checks the legacy machine-level OpenSSH agent path. The app now primarily uses its IDE-local SSH_ASKPASS broker."
   Write-Host "Alias: $Alias"
   Write-Host "ssh: $(Format-DisplayPath $ssh)"
   Write-Host "ssh-add: $(Format-DisplayPath $sshAdd)"

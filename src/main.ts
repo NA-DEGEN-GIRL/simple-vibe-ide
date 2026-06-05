@@ -9,7 +9,7 @@ import type { FitAddon as XTermFitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 declare const __SVIDE_BUILD_ID__: string;
@@ -2006,6 +2006,95 @@ function setStatus(message: string, danger = false) {
   el.statusDetail.classList.toggle('hidden', !detailVisible);
 }
 
+const sshAuthPromptQueue: SshAuthPromptEvent[] = [];
+let sshAuthPromptActive = false;
+
+function handleSshAuthPrompt(request: SshAuthPromptEvent) {
+  sshAuthPromptQueue.push(request);
+  showNextSshAuthPrompt();
+}
+
+function showNextSshAuthPrompt() {
+  if (sshAuthPromptActive) return;
+  const request = sshAuthPromptQueue.shift();
+  if (!request) return;
+  sshAuthPromptActive = true;
+  setStatus('SSH key unlock required');
+
+  const overlay = document.createElement('div');
+  overlay.className = 'ssh-auth-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', 'SSH key unlock');
+
+  const form = document.createElement('form');
+  form.className = 'ssh-auth-dialog';
+
+  const title = document.createElement('h2');
+  title.textContent = 'Unlock SSH key';
+
+  const summary = document.createElement('p');
+  const alias = request.alias || request.profileId || 'SSH profile';
+  summary.textContent = request.cacheable
+    ? `${alias} needs a key passphrase. It will be kept in IDE memory only until the app exits.`
+    : `${alias} needs SSH authentication for this command.`;
+
+  const prompt = document.createElement('code');
+  prompt.className = 'ssh-auth-prompt';
+  prompt.textContent = request.prompt || 'SSH authentication prompt';
+
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.autocomplete = 'current-password';
+  input.spellcheck = false;
+  input.placeholder = 'Passphrase';
+
+  const buttons = document.createElement('div');
+  buttons.className = 'ssh-auth-buttons';
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.textContent = 'Unlock';
+  buttons.append(cancel, submit);
+
+  const finish = async (secret: string | null) => {
+    submit.disabled = true;
+    cancel.disabled = true;
+    try {
+      await api.answerSshAuthPrompt(request.id, secret);
+    } catch {
+      // The SSH process may have timed out or exited while the dialog was open.
+    } finally {
+      overlay.remove();
+      sshAuthPromptActive = false;
+      if (secret === null) setStatus('SSH auth cancelled', true);
+      else setStatus('SSH auth submitted');
+      showNextSshAuthPrompt();
+    }
+  };
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void finish(input.value);
+  });
+  cancel.addEventListener('click', () => {
+    void finish(null);
+  });
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      void finish(null);
+    }
+  });
+
+  form.append(title, summary, prompt, input, buttons);
+  overlay.append(form);
+  document.body.append(overlay);
+  requestAnimationFrame(() => input.focus());
+}
+
 function setTextContentIfChanged(element: HTMLElement, text: string) {
   if (element.textContent !== text) element.textContent = text;
 }
@@ -2091,6 +2180,9 @@ async function init() {
       if (widget) renderTerminalWidgetTabs(widget);
       refreshWorkspaceLlmActivityAfterPaneChange(workspaceId);
     }
+  });
+  await listen<SshAuthPromptEvent>('ssh-auth-request', (event) => {
+    void handleSshAuthPrompt(event.payload);
   });
 
   await listen<TauriDragDropPayload>('tauri://drag-enter', (event) => {
@@ -9936,7 +10028,7 @@ function explorerAuthErrorMessage(error: unknown, action: string) {
     state.activeProfile?.kind === 'ssh'
     && /permission denied.*publickey|publickey.*permission denied/i.test(message)
   ) {
-    return `SSH ${action} failed after shell login: ${message}. Explorer/File/LLM jobs use separate noninteractive ssh.exe processes and need the key in the Windows OpenSSH agent. If Windows showed a UAC prompt for OpenSSH Authentication Agent, approve it and reopen this SSH workspace once. If no UAC/ssh-add prompt appears, run an elevated Windows PowerShell: Set-Service ssh-agent -StartupType Manual; Start-Service ssh-agent; ssh-add`;
+    return `SSH ${action} failed: ${message}. The IDE now uses its own SSH passphrase prompt for noninteractive Explorer/File/LLM jobs, so if no unlock dialog appeared, check that the SSH profile has an IdentityFile and retry.`;
   }
   return message;
 }

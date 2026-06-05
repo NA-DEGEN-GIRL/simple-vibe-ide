@@ -9,6 +9,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -165,9 +167,56 @@ struct EdgeDevtoolsSessionState {
     port: u16,
 }
 
+#[cfg(not(windows))]
 #[derive(Clone)]
 struct SshAgentSession {
     vars: Vec<(String, String)>,
+}
+
+#[cfg(windows)]
+struct SshAskpassServer {
+    #[cfg(windows)]
+    port: u16,
+    token: String,
+    app: AppHandle,
+    pending: Mutex<HashMap<String, Arc<SshAskpassPending>>>,
+    cache: Mutex<HashMap<String, String>>,
+}
+
+#[cfg(windows)]
+struct SshAskpassPending {
+    answer: Mutex<Option<Option<String>>>,
+    ready: Condvar,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshAuthPromptEvent {
+    id: String,
+    prompt: String,
+    profile_id: String,
+    alias: String,
+    cacheable: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SshAskpassHttpRequest {
+    token: String,
+    prompt: String,
+    profile_id: String,
+    alias: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshAskpassHttpRequestOut {
+    token: String,
+    prompt: String,
+    profile_id: String,
+    alias: String,
 }
 
 struct RuntimeShutdownBatch {
@@ -400,38 +449,349 @@ fn assign_child_to_cleanup_job(pid: u32) {
     let _ = pid;
 }
 
-static WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-static WINDOWS_SSH_AGENT_SERVICE_ELEVATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static SSH_ASKPASS_SERVER: OnceLock<Arc<SshAskpassServer>> = OnceLock::new();
+#[cfg(not(windows))]
 static SSH_AGENT_SESSION: OnceLock<Mutex<Option<SshAgentSession>>> = OnceLock::new();
+#[cfg(not(windows))]
 static SSH_AGENT_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(windows))]
 fn ssh_agent_store() -> &'static Mutex<Option<SshAgentSession>> {
     SSH_AGENT_SESSION.get_or_init(|| Mutex::new(None))
 }
 
-fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
-    #[cfg(windows)]
-    if windows_ssh_agent_service_running() {
-        return Vec::new();
-    }
-    if let Ok(guard) = ssh_agent_store().lock() {
-        if let Some(session) = guard.as_ref() {
-            return session.vars.clone();
-        }
-    }
-    if SSH_AGENT_START_ATTEMPTED.swap(true, Ordering::Relaxed) {
-        return Vec::new();
-    }
-    let Some(session) = start_session_ssh_agent() else {
-        return Vec::new();
-    };
-    let vars = session.vars.clone();
-    if let Ok(mut guard) = ssh_agent_store().lock() {
-        *guard = Some(session);
-    }
-    vars
+#[cfg(not(windows))]
+fn start_ssh_askpass_server(_app: AppHandle) {}
+
+#[cfg(windows)]
+fn start_ssh_askpass_server(app: AppHandle) {
+    let _ = SSH_ASKPASS_SERVER.get_or_init(|| {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local SSH askpass broker");
+        let port = listener
+            .local_addr()
+            .expect("local SSH askpass broker address")
+            .port();
+        let server = Arc::new(SshAskpassServer {
+            port,
+            token: Uuid::new_v4().to_string(),
+            app,
+            pending: Mutex::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+        });
+        let server_for_thread = server.clone();
+        let _ = thread::Builder::new()
+            .name("simple-vibe-ssh-askpass".to_string())
+            .spawn(move || {
+                for incoming in listener.incoming() {
+                    let Ok(stream) = incoming else {
+                        continue;
+                    };
+                    let server = server_for_thread.clone();
+                    let _ = thread::Builder::new()
+                        .name("simple-vibe-ssh-askpass-request".to_string())
+                        .spawn(move || {
+                            let _ = handle_ssh_askpass_http_request(server, stream);
+                        });
+                }
+            });
+        server
+    });
 }
 
+fn ssh_askpass_env_vars(profile: &ConnectionProfile) -> Vec<(String, String)> {
+    #[cfg(not(windows))]
+    {
+        let _ = profile;
+        Vec::new()
+    }
+    #[cfg(windows)]
+    {
+        let Some(server) = SSH_ASKPASS_SERVER.get() else {
+            return Vec::new();
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            return Vec::new();
+        };
+        vec![
+            ("SSH_ASKPASS".to_string(), exe.to_string_lossy().to_string()),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+            ("DISPLAY".to_string(), "simple-vibe-ide".to_string()),
+            ("SVIDE_ASKPASS_HELPER".to_string(), "1".to_string()),
+            ("SVIDE_ASKPASS_PORT".to_string(), server.port.to_string()),
+            ("SVIDE_ASKPASS_TOKEN".to_string(), server.token.clone()),
+            ("SVIDE_ASKPASS_PROFILE".to_string(), profile.id.clone()),
+            (
+                "SVIDE_ASKPASS_ALIAS".to_string(),
+                profile.ssh_alias.clone().unwrap_or_default(),
+            ),
+        ]
+    }
+}
+
+fn apply_ssh_askpass_to_command(command: &mut Command, profile: &ConnectionProfile) {
+    for (key, value) in ssh_askpass_env_vars(profile) {
+        Command::env(command, key, value);
+    }
+}
+
+fn apply_ssh_askpass_to_pty(command: &mut CommandBuilder, profile: &ConnectionProfile) {
+    for (key, value) in ssh_askpass_env_vars(profile) {
+        CommandBuilder::env(command, key, value);
+    }
+}
+
+#[cfg(windows)]
+fn handle_ssh_askpass_http_request(
+    server: Arc<SshAskpassServer>,
+    mut stream: TcpStream,
+) -> std::io::Result<()> {
+    let buffer = read_http_headers(&mut stream, 64 * 1024)?;
+    let Some(header_end) = find_http_header_end(&buffer) else {
+        return write_plain_http_response(&mut stream, 400, "Bad Request", "missing headers\n");
+    };
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let body_start = header_end + 4;
+    let mut body = buffer.get(body_start..).unwrap_or_default().to_vec();
+    if let Some(length) = http_content_length(&header_text) {
+        if body.len() < length {
+            let mut rest = vec![0_u8; length - body.len()];
+            stream.read_exact(&mut rest)?;
+            body.extend(rest);
+        }
+        body.truncate(length);
+    }
+    let request = match serde_json::from_slice::<SshAskpassHttpRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return write_plain_http_response(&mut stream, 400, "Bad Request", "invalid request\n")
+        }
+    };
+    if request.token != server.token {
+        return write_plain_http_response(&mut stream, 403, "Forbidden", "bad token\n");
+    }
+    let Some(secret) = server.request_secret(&request.prompt, &request.profile_id, &request.alias)
+    else {
+        return write_plain_http_response(&mut stream, 403, "Forbidden", "cancelled\n");
+    };
+    write_plain_http_response(&mut stream, 200, "OK", &format!("{secret}\n"))
+}
+
+#[cfg(windows)]
+fn write_plain_http_response(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
+    );
+    stream.write_all(response.as_bytes())
+}
+
+#[cfg(windows)]
+impl SshAskpassServer {
+    fn request_secret(&self, prompt: &str, profile_id: &str, alias: &str) -> Option<String> {
+        let cacheable = ssh_auth_prompt_cacheable(prompt);
+        let cache_key = ssh_auth_cache_key(prompt, profile_id, alias);
+        if cacheable {
+            if let Ok(cache) = self.cache.lock() {
+                if let Some(secret) = cache.get(&cache_key) {
+                    return Some(secret.clone());
+                }
+            }
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let pending = Arc::new(SshAskpassPending {
+            answer: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        if let Ok(mut pending_map) = self.pending.lock() {
+            pending_map.insert(id.clone(), pending.clone());
+        }
+
+        let event = SshAuthPromptEvent {
+            id: id.clone(),
+            prompt: prompt.to_string(),
+            profile_id: profile_id.to_string(),
+            alias: alias.to_string(),
+            cacheable,
+        };
+        let _ = self.app.emit("ssh-auth-request", event);
+        let answer = pending.wait_for_answer(Duration::from_secs(300));
+        if let Ok(mut pending_map) = self.pending.lock() {
+            pending_map.remove(&id);
+        }
+        if let Some(secret) = answer.as_ref() {
+            if cacheable && !secret.is_empty() {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(cache_key, secret.clone());
+                }
+            }
+        }
+        answer
+    }
+
+    fn answer_prompt(&self, id: &str, secret: Option<String>) -> bool {
+        let pending = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|pending_map| pending_map.get(id).cloned());
+        let Some(pending) = pending else {
+            return false;
+        };
+        let answered = if let Ok(mut answer) = pending.answer.lock() {
+            *answer = Some(secret);
+            pending.ready.notify_all();
+            true
+        } else {
+            false
+        };
+        answered
+    }
+
+    fn clear_cache_for_profile(&self, profile_id: &str, alias: &str) {
+        let profile_prefix = format!("profile:{profile_id}:");
+        let alias_prefix = format!("alias:{alias}:");
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|key, _| {
+                !key.starts_with(&profile_prefix)
+                    && (alias.is_empty() || !key.starts_with(&alias_prefix))
+            });
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SshAskpassPending {
+    fn wait_for_answer(&self, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        let mut answer = self.answer.lock().ok()?;
+        loop {
+            if let Some(value) = answer.take() {
+                return value;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_answer, wait_result) = self.ready.wait_timeout(answer, remaining).ok()?;
+            answer = next_answer;
+            if wait_result.timed_out() {
+                return answer.take().flatten();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn answer_ssh_askpass_prompt(id: &str, secret: Option<String>) -> bool {
+    SSH_ASKPASS_SERVER
+        .get()
+        .map(|server| server.answer_prompt(id, secret))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn answer_ssh_askpass_prompt(_id: &str, _secret: Option<String>) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn clear_ssh_askpass_cache_for_profile(profile: &ConnectionProfile) {
+    let alias = profile.ssh_alias.as_deref().unwrap_or("");
+    if let Some(server) = SSH_ASKPASS_SERVER.get() {
+        server.clear_cache_for_profile(&profile.id, alias);
+    }
+}
+
+#[cfg(not(windows))]
+fn clear_ssh_askpass_cache_for_profile(_profile: &ConnectionProfile) {}
+
+#[cfg(windows)]
+fn ssh_auth_prompt_cacheable(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("passphrase") && lower.contains("key")
+}
+
+#[cfg(windows)]
+fn ssh_auth_cache_key(prompt: &str, profile_id: &str, alias: &str) -> String {
+    if let Some(key) = ssh_auth_prompt_key_path(prompt) {
+        return format!("key:{key}");
+    }
+    if !alias.is_empty() {
+        return format!("alias:{alias}:{}", ssh_auth_prompt_shape(prompt));
+    }
+    format!("profile:{profile_id}:{}", ssh_auth_prompt_shape(prompt))
+}
+
+#[cfg(windows)]
+fn ssh_auth_prompt_key_path(prompt: &str) -> Option<String> {
+    let lower = prompt.to_ascii_lowercase();
+    let key_index = lower.find("key")?;
+    let after_key = prompt.get(key_index + 3..)?.trim_start();
+    for quote in ['\'', '"'] {
+        if let Some(rest) = after_key.strip_prefix(quote) {
+            if let Some(end) = rest.find(quote) {
+                let value = rest[..end].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn ssh_auth_prompt_shape(prompt: &str) -> String {
+    prompt
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ensure_session_ssh_agent_vars() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    {
+        return Vec::new();
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(guard) = ssh_agent_store().lock() {
+            if let Some(session) = guard.as_ref() {
+                return session.vars.clone();
+            }
+        }
+        if SSH_AGENT_START_ATTEMPTED.swap(true, Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let Some(session) = start_session_ssh_agent() else {
+            return Vec::new();
+        };
+        let vars = session.vars.clone();
+        if let Ok(mut guard) = ssh_agent_store().lock() {
+            *guard = Some(session);
+        }
+        vars
+    }
+}
+
+#[cfg(not(windows))]
 fn start_session_ssh_agent() -> Option<SshAgentSession> {
     let mut command = Command::new(ssh_agent_executable());
     command
@@ -439,8 +799,6 @@ fn start_session_ssh_agent() -> Option<SshAgentSession> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.current_dir(windows_spawn_cwd());
     let output = hide_command_window(&mut command).output().ok()?;
     if !output.status.success() {
         return None;
@@ -470,6 +828,7 @@ fn start_session_ssh_agent() -> Option<SshAgentSession> {
     }
 }
 
+#[cfg(not(windows))]
 fn session_ssh_agent_is_usable(session: &SshAgentSession) -> bool {
     let mut command = Command::new(ssh_add_executable());
     command
@@ -477,8 +836,6 @@ fn session_ssh_agent_is_usable(session: &SshAgentSession) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.current_dir(windows_spawn_cwd());
     for (key, value) in &session.vars {
         Command::env(&mut command, key, value);
     }
@@ -491,6 +848,7 @@ fn session_ssh_agent_is_usable(session: &SshAgentSession) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(windows))]
 fn shutdown_ssh_agent_session(session: SshAgentSession) {
     let mut command = Command::new(ssh_agent_executable());
     command
@@ -498,8 +856,6 @@ fn shutdown_ssh_agent_session(session: SshAgentSession) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.current_dir(windows_spawn_cwd());
     for (key, value) in &session.vars {
         Command::env(&mut command, key, value);
     }
@@ -514,6 +870,7 @@ fn shutdown_ssh_agent_session(session: SshAgentSession) {
     }
 }
 
+#[cfg(not(windows))]
 fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     let mut vars = Vec::new();
     for key in ["SSH_AUTH_SOCK", "SSH_AGENT_PID"] {
@@ -527,6 +884,7 @@ fn parse_ssh_agent_shell_vars(output: &str) -> Vec<(String, String)> {
     vars
 }
 
+#[cfg(not(windows))]
 fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     for line in output.lines() {
@@ -547,7 +905,8 @@ fn parse_shell_assignment(output: &str, key: &str) -> Option<String> {
     None
 }
 
-fn apply_session_ssh_agent_to_command(command: &mut Command) {
+fn apply_session_ssh_auth_to_command(command: &mut Command, profile: &ConnectionProfile) {
+    apply_ssh_askpass_to_command(command, profile);
     #[cfg(windows)]
     {
         if windows_ssh_agent_service_running() {
@@ -561,40 +920,41 @@ fn apply_session_ssh_agent_to_command(command: &mut Command) {
     }
 }
 
-fn apply_session_ssh_agent_to_pty(command: &mut CommandBuilder) {
+fn apply_session_ssh_auth_to_pty(command: &mut CommandBuilder, profile: &ConnectionProfile) {
+    apply_ssh_askpass_to_pty(command, profile);
     for (key, value) in ensure_session_ssh_agent_vars() {
         CommandBuilder::env(command, key, value);
     }
 }
 
 fn shutdown_session_ssh_agent() {
-    let session = ssh_agent_store()
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    let Some(session) = session else {
-        return;
-    };
-    shutdown_ssh_agent_session(session);
-}
-
-fn windows_openssh_executable(name: &str) -> Option<PathBuf> {
-    #[cfg(not(windows))]
-    {
-        let _ = name;
-        None
-    }
     #[cfg(windows)]
     {
-        let windir = std::env::var("WINDIR")
-            .or_else(|_| std::env::var("SystemRoot"))
-            .unwrap_or_else(|_| "C:\\Windows".to_string());
-        let path = PathBuf::from(windir)
-            .join("System32")
-            .join("OpenSSH")
-            .join(name);
-        path.exists().then_some(path)
+        return;
     }
+    #[cfg(not(windows))]
+    {
+        let session = ssh_agent_store()
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(session) = session else {
+            return;
+        };
+        shutdown_ssh_agent_session(session);
+    }
+}
+
+#[cfg(windows)]
+fn windows_openssh_executable(name: &str) -> Option<PathBuf> {
+    let windir = std::env::var("WINDIR")
+        .or_else(|_| std::env::var("SystemRoot"))
+        .unwrap_or_else(|_| "C:\\Windows".to_string());
+    let path = PathBuf::from(windir)
+        .join("System32")
+        .join("OpenSSH")
+        .join(name);
+    path.exists().then_some(path)
 }
 
 fn ssh_executable() -> PathBuf {
@@ -627,108 +987,32 @@ fn ssh_add_executable_string() -> String {
     ssh_add_executable().to_string_lossy().to_string()
 }
 
+#[cfg(not(windows))]
 fn ssh_agent_executable() -> PathBuf {
-    #[cfg(not(windows))]
-    {
-        PathBuf::from("ssh-agent")
-    }
-    #[cfg(windows)]
-    {
-        windows_openssh_executable("ssh-agent.exe")
-            .unwrap_or_else(|| PathBuf::from("ssh-agent.exe"))
-    }
+    PathBuf::from("ssh-agent")
 }
 
+#[cfg(windows)]
 fn query_windows_ssh_agent_service_running() -> bool {
-    #[cfg(not(windows))]
-    {
-        false
-    }
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("powershell.exe");
-        command
-            .arg("-NoLogo")
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-Command")
-            .arg(
-                "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
-                 if ($svc -and $svc.Status -eq 'Running') { exit 0 } else { exit 1 } } catch { exit 1 }",
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        hide_command_window(&mut command)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-}
-
-fn ensure_windows_ssh_agent_service_started() {
-    #[cfg(windows)]
-    {
-        if query_windows_ssh_agent_service_running() {
-            return;
-        }
-        if !WINDOWS_SSH_AGENT_SERVICE_ATTEMPTED.swap(true, Ordering::Relaxed) {
-            let mut command = Command::new("powershell.exe");
-            command
-                .arg("-NoLogo")
-                .arg("-NoProfile")
-                .arg("-NonInteractive")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-Command")
-                .arg(
-                    "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
-                     if ($svc) { \
-                       Set-Service -Name ssh-agent -StartupType Manual -ErrorAction SilentlyContinue; \
-                       if ($svc.Status -ne 'Running') { Start-Service -Name ssh-agent -ErrorAction SilentlyContinue } \
-                     } } catch {}",
-                )
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            let _ = hide_command_window(&mut command).status();
-        }
-        if !query_windows_ssh_agent_service_running()
-            && !WINDOWS_SSH_AGENT_SERVICE_ELEVATION_ATTEMPTED.swap(true, Ordering::Relaxed)
-        {
-            launch_elevated_windows_ssh_agent_service_enable();
-        }
-    }
-}
-
-fn launch_elevated_windows_ssh_agent_service_enable() {
-    #[cfg(windows)]
-    {
-        let admin_script = "try { \
-          Set-Service -Name ssh-agent -StartupType Manual -ErrorAction SilentlyContinue; \
-          Start-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
-        } catch {}";
-        let encoded_script = powershell_encoded_command(admin_script);
-        let launcher_script = format!(
-            "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{}') -Verb RunAs",
-            encoded_script
-        );
-        let mut command = Command::new("powershell.exe");
-        command
-            .arg("-NoLogo")
-            .arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-Command")
-            .arg(launcher_script)
-            .current_dir(windows_spawn_cwd())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = hide_command_window(&mut command).status();
-    }
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(
+            "try { $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue; \
+             if ($svc -and $svc.Status -eq 'Running') { exit 0 } else { exit 1 } } catch { exit 1 }",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn windows_ssh_agent_service_running() -> bool {
@@ -738,13 +1022,11 @@ fn windows_ssh_agent_service_running() -> bool {
     }
     #[cfg(windows)]
     {
-        ensure_windows_ssh_agent_service_started();
         query_windows_ssh_agent_service_running()
     }
 }
 
 fn ssh_common_options(interactive: bool, batch_mode: bool) -> Vec<String> {
-    ensure_windows_ssh_agent_service_started();
     let mut args = Vec::new();
     if batch_mode {
         args.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
@@ -761,10 +1043,15 @@ fn ssh_common_options(interactive: bool, batch_mode: bool) -> Vec<String> {
     args
 }
 
-fn push_ssh_common_options(command: &mut Command, interactive: bool, batch_mode: bool) {
-    for arg in ssh_common_options(interactive, batch_mode) {
+fn push_ssh_background_options(command: &mut Command) {
+    for arg in ssh_common_options(false, false) {
         command.arg(arg);
     }
+    command
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=1");
 }
 
 fn ssh_terminal_bootstrap_script(alias: &str, remote_command: &str) -> String {
@@ -789,19 +1076,8 @@ $sshAdd = {ssh_add_path}
 $aliasName = {alias_quoted}
 $remoteCommand = {remote_quoted}
 {clear_agent_env}
-try {{
-  $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
-  if ($svc -and $svc.Status -ne 'Running') {{
-    Start-Service -Name ssh-agent -ErrorAction SilentlyContinue
-  }}
-}} catch {{}}
 & $sshAdd -l *> $null
 $agentStatus = $LASTEXITCODE
-for ($i = 0; $agentStatus -ne 0 -and $i -lt 20; $i++) {{
-  Start-Sleep -Milliseconds 500
-  & $sshAdd -l *> $null
-  $agentStatus = $LASTEXITCODE
-}}
 if ($agentStatus -eq 1) {{
   $identityFiles = @()
   try {{
@@ -832,9 +1108,7 @@ if ($agentStatus -eq 1) {{
     & $sshAdd
   }}
 }} elseif ($agentStatus -ne 0) {{
-  Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; SSH may ask for the key passphrase for each separate Shell/Explorer/LLM connection.'
-  Write-Host '[simple-vibe-ide] If Windows shows a UAC prompt for OpenSSH Authentication Agent, approve it, then reopen this SSH workspace once.'
-  Write-Host '[simple-vibe-ide] Otherwise run an elevated Windows PowerShell: Set-Service ssh-agent -StartupType Manual; Start-Service ssh-agent; ssh-add'
+  Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; using the IDE SSH askpass prompt instead.'
 }}
 $sshArgs = @({common_options})
 $sshArgs += @('-tt', $aliasName, $remoteCommand)
@@ -1064,6 +1338,15 @@ fn list_wsl_profiles() -> Vec<ConnectionProfile> {
 #[tauri::command]
 fn windows_shell_root() -> String {
     windows_shell_cwd().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn answer_ssh_auth_prompt(id: String, secret: Option<String>) -> Result<(), String> {
+    if answer_ssh_askpass_prompt(&id, secret) {
+        Ok(())
+    } else {
+        Err("SSH auth prompt is no longer active".to_string())
+    }
 }
 
 #[tauri::command]
@@ -1927,7 +2210,7 @@ fn spawn_terminal_direct(
         cmd.arg(arg);
     }
     if profile.kind == "ssh" {
-        apply_session_ssh_agent_to_pty(&mut cmd);
+        apply_session_ssh_auth_to_pty(&mut cmd, &profile);
     }
     if profile.kind == "windows" && !cwd.is_empty() {
         cmd.cwd(PathBuf::from(&cwd));
@@ -2205,9 +2488,12 @@ fn start_port_forward_host(
         } else {
             requested_local
         };
-        let alias = profile.ssh_alias.unwrap_or_else(|| "default".to_string());
+        let alias = profile
+            .ssh_alias
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         let mut command = Command::new(ssh_executable());
-        push_ssh_common_options(&mut command, false, true);
+        push_ssh_background_options(&mut command);
         command
             .arg("-N")
             .arg("-L")
@@ -2217,7 +2503,7 @@ fn start_port_forward_host(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        apply_session_ssh_agent_to_command(&mut command);
+        apply_session_ssh_auth_to_command(&mut command, &profile);
         let child = hide_command_window(&mut command)
             .spawn()
             .map_err(|err| format!("failed to start ssh forward: {err}"))?;
@@ -4690,6 +4976,9 @@ fn stream_profile_shell_to_file(
         .wait_with_output()
         .map_err(|err| format!("failed to wait for export: {err}"))?;
     if !output.status.success() {
+        if profile.kind == "ssh" {
+            clear_ssh_askpass_cache_for_profile(profile);
+        }
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(())
@@ -4714,13 +5003,13 @@ fn profile_shell_command(profile: &ConnectionProfile, script: &str) -> Result<Co
             let alias = profile.ssh_alias.as_deref().unwrap_or("default");
             let remote = format!("sh -lc {}", shell_quote(script));
             let mut command = Command::new(ssh_executable());
-            push_ssh_common_options(&mut command, false, true);
+            push_ssh_background_options(&mut command);
             command
                 .current_dir(windows_spawn_cwd())
                 .arg("-T")
                 .arg(alias)
                 .arg(remote);
-            apply_session_ssh_agent_to_command(&mut command);
+            apply_session_ssh_auth_to_command(&mut command, profile);
             Ok(command)
         }
         _ => Err(format!("profile is not remote: {}", profile.kind)),
@@ -5048,13 +5337,13 @@ fn run_profile_shell(
             let alias = profile.ssh_alias.as_deref().unwrap_or("default");
             let remote = format!("sh -lc {}", shell_quote(script));
             let mut command = Command::new(ssh_executable());
-            push_ssh_common_options(&mut command, false, true);
+            push_ssh_background_options(&mut command);
             command
                 .current_dir(windows_spawn_cwd())
                 .arg("-T")
                 .arg(alias)
                 .arg(remote);
-            apply_session_ssh_agent_to_command(&mut command);
+            apply_session_ssh_auth_to_command(&mut command, profile);
             command
         }
         _ => return Err(format!("profile is not remote: {}", profile.kind)),
@@ -5075,6 +5364,9 @@ fn run_profile_shell(
         .wait_with_output()
         .map_err(|err| format!("failed to wait for remote shell: {err}"))?;
     if !output.status.success() {
+        if profile.kind == "ssh" {
+            clear_ssh_askpass_cache_for_profile(profile);
+        }
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(output.stdout)
@@ -6495,6 +6787,78 @@ fn show_window_on_primary_monitor<R: tauri::Runtime>(window: &tauri::WebviewWind
     bring_window_to_front(window);
 }
 
+pub fn run_ssh_askpass_helper() -> i32 {
+    let prompt = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let port = match std::env::var("SVIDE_ASKPASS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        Some(port) => port,
+        None => return 1,
+    };
+    let token = match std::env::var("SVIDE_ASKPASS_TOKEN") {
+        Ok(token) if !token.is_empty() => token,
+        _ => return 1,
+    };
+    let profile_id = std::env::var("SVIDE_ASKPASS_PROFILE").unwrap_or_default();
+    let alias = std::env::var("SVIDE_ASKPASS_ALIAS").unwrap_or_default();
+    match run_ssh_askpass_helper_request(port, token, prompt, profile_id, alias) {
+        Ok(secret) => {
+            print!("{secret}");
+            if !secret.ends_with('\n') {
+                println!();
+            }
+            let _ = std::io::stdout().flush();
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
+fn run_ssh_askpass_helper_request(
+    port: u16,
+    token: String,
+    prompt: String,
+    profile_id: String,
+    alias: String,
+) -> std::io::Result<String> {
+    let request = SshAskpassHttpRequestOut {
+        token,
+        prompt,
+        profile_id,
+        alias,
+    };
+    let body = serde_json::to_string(&request)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    let http_request = format!(
+        "POST /ssh-askpass HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
+    );
+    stream.write_all(http_request.as_bytes())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let Some(header_end) = find_http_header_end(&response) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing askpass response headers",
+        ));
+    };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let status_ok = headers
+        .lines()
+        .next()
+        .map(|line| line.contains(" 200 "))
+        .unwrap_or(false);
+    if !status_ok {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "askpass request rejected",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&response[header_end + 4..]).to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -6503,6 +6867,7 @@ pub fn run() {
             list_profiles,
             list_wsl_profiles,
             windows_shell_root,
+            answer_ssh_auth_prompt,
             set_capture_protection,
             resolve_profile_path,
             list_directory,
@@ -6547,6 +6912,7 @@ pub fn run() {
         .setup(|app| {
             let window = app.get_webview_window("main").expect("main window");
             let app_handle = app.handle().clone();
+            start_ssh_askpass_server(app_handle.clone());
             show_window_on_primary_monitor(&window);
             let app_for_events = app_handle.clone();
             let main_for_events = window.clone();

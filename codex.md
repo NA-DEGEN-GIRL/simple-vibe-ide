@@ -51,6 +51,36 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-06 - VS Code-style SSH askpass broker
+
+#### Changed
+
+- Replaced the agent-only SSH unlock strategy with an IDE-local
+  `SSH_ASKPASS` broker for Windows SSH profiles. The running IDE now starts a
+  loopback-only, token-protected askpass endpoint and points `ssh.exe` /
+  `ssh-add.exe` at the app executable as the askpass helper.
+- SSH key passphrase prompts now show as an IDE modal and are cached in process
+  memory until the app exits. This matches the VS Code-style flow better than
+  requiring the Windows OpenSSH Authentication Agent service to be enabled.
+- Background Explorer/File/LLM SSH jobs no longer use `BatchMode=yes`; they use
+  `PreferredAuthentications=publickey`, `NumberOfPasswordPrompts=1`, and the
+  IDE askpass helper so encrypted keys can be unlocked from the visible IDE UI.
+- Windows OpenSSH agent use is now opportunistic only: if the service is
+  already running, commands can still use its pipe, but the IDE no longer
+  launches UAC to enable/start it.
+- The local SSH fixture now proves both flows: direct askpass without any agent,
+  and ssh-agent reuse from a separate noninteractive process.
+
+#### Verified
+
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `npm run check`
+- `scripts/ssh-agent-fixture-smoke.sh`
+- `bash -n scripts/ssh-agent-fixture-smoke.sh`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-05 - Proper Windows SSH agent smoke and fallback
 
 #### Changed
