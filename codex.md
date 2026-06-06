@@ -51,6 +51,32 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-06 - Separate Simple Vibe Terminal taskbar identity
+
+#### Changed
+
+- Added a dedicated `Simple Vibe Terminal` icon with a terminal prompt mark and
+  wired the terminal Tauri config to use `icons/terminal.ico` instead of
+  inheriting the IDE icon.
+- Removed the hardcoded Rust startup title `Simple Vibe IDE - Windows / WSL /
+  SSH`; the native window title now comes from the active Tauri `productName`.
+- The frontend also sets the native Tauri window title to the current variant
+  product name, so taskbar hover text should show `Simple Vibe Terminal` for
+  the terminal build.
+- Windows smoke now checks built exe `ProductName` and `FileDescription` for
+  both `simple-vibe-ide.exe` and `simple-vibe-terminal.exe`.
+
+#### Verified
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `npm run tauri:terminal:build`
+- `git diff --check`
+
 ### 2026-06-06 - Align status with market ticker row
 
 #### Changed

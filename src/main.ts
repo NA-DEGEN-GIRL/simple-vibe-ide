@@ -1989,6 +1989,7 @@ const currentWindow = getCurrentWindow();
 let appStatusRenderSignature = '\0';
 let appClockRenderSignature = '\0';
 let appTitleRenderSignature = '\0';
+let nativeWindowTitleRenderSignature = '\0';
 let workspaceControlsRenderSignature = '\0';
 
 function setStatus(message: string, danger = false) {
@@ -2169,6 +2170,10 @@ function refreshTitle() {
   el.titleContext.title = `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
   const title = `${APP_PRODUCT_NAME} build ${APP_BUILD_ID}`;
   if (document.title !== title) document.title = title;
+  if (nativeWindowTitleRenderSignature !== APP_PRODUCT_NAME) {
+    nativeWindowTitleRenderSignature = APP_PRODUCT_NAME;
+    void currentWindow.setTitle(APP_PRODUCT_NAME).catch(() => undefined);
+  }
 }
 
 async function init() {

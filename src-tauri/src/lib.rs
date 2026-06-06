@@ -7038,6 +7038,11 @@ pub fn run() {
         .setup(|app| {
             let window = app.get_webview_window("main").expect("main window");
             let app_handle = app.handle().clone();
+            let product_name = app
+                .config()
+                .product_name
+                .clone()
+                .unwrap_or_else(|| "Simple Vibe IDE".to_string());
             start_ssh_askpass_server(app_handle.clone());
             show_window_on_primary_monitor(&window);
             let app_for_events = app_handle.clone();
@@ -7064,13 +7069,11 @@ pub fn run() {
                     show_window_on_primary_monitor(&focus_window);
                 });
             });
-            window
-                .set_title("Simple Vibe IDE - Windows / WSL / SSH")
-                .expect("set title");
+            window.set_title(&product_name).expect("set title");
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while running Simple Vibe IDE")
+        .expect("error while running Simple Vibe app")
         .run(|app_handle, event| {
             // Guarantee child processes (terminals, ssh/wsl, port forwards,
             // Edge devtools) are detached from app state on every exit path,

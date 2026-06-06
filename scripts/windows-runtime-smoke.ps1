@@ -102,6 +102,22 @@ function Save-BuiltExeSnapshot {
   return $snapshotExe
 }
 
+function Assert-ExeProductName {
+  param(
+    [Parameter(Mandatory = $true)][string]$ExePath,
+    [Parameter(Mandatory = $true)][string]$ExpectedName
+  )
+
+  $item = Get-Item -LiteralPath $ExePath
+  $info = $item.VersionInfo
+  $productName = $info.ProductName
+  $fileDescription = $info.FileDescription
+  if ($productName -ne $ExpectedName -or $fileDescription -ne $ExpectedName) {
+    throw "Unexpected Windows metadata for $(Format-DisplayPath $ExePath): ProductName='$productName', FileDescription='$fileDescription', expected '$ExpectedName'."
+  }
+  Write-Host "Windows metadata OK: $ExpectedName" -ForegroundColor Green
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $repoProviderPath = $repoRoot.ProviderPath
 
@@ -155,6 +171,7 @@ if (-not $ideExe) {
   throw "Could not find built simple-vibe-ide.exe after Tauri build."
 }
 $ideExe = Save-BuiltExeSnapshot -SourceExe $ideExe -BinaryName "simple-vibe-ide"
+Assert-ExeProductName -ExePath $ideExe -ExpectedName "Simple Vibe IDE"
 
 Remove-StaleBuiltExe "simple-vibe-terminal"
 Invoke-Step "Tauri Terminal release no-bundle build" { npm.cmd run tauri:terminal:build }
@@ -163,6 +180,7 @@ if (-not $terminalExe) {
   throw "Could not find built simple-vibe-terminal.exe after Tauri terminal build."
 }
 $terminalExe = Save-BuiltExeSnapshot -SourceExe $terminalExe -BinaryName "simple-vibe-terminal"
+Assert-ExeProductName -ExePath $terminalExe -ExpectedName "Simple Vibe Terminal"
 
 Write-Host ""
 Write-Host "Built IDE exe: $(Format-DisplayPath $ideExe)" -ForegroundColor Green
