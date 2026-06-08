@@ -1403,6 +1403,7 @@ const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
 const edgeDevtoolsSessions = new Map<string, EdgeDevtoolsSession>();
 const edgeDevtoolsSessionPromises = new Map<string, Promise<EdgeDevtoolsSession>>();
 let nativeBrowserWebviewTabId = '';
+let nativeBrowserWebviewLabel = '';
 let nativeBrowserWebviewUrl = '';
 let nativeBrowserWebviewVisible = false;
 let nativeBrowserWebviewSyncFrame = 0;
@@ -5291,12 +5292,8 @@ function saveActiveWorkspaceRuntimeCache() {
   clearExplorerBackgroundWork();
   if (hasBrowserFramesForWorkspace(workspaceId)) {
     hideBrowserFramesForWorkspace(workspaceId);
-    if (isBrowserPanelHidden() || document.hidden) {
+    if (document.hidden) {
       suspendBrowserFramesForWorkspace(workspaceId, { includeActive: true });
-    } else {
-      scheduleBrowserWorkspaceFrameSuspend(workspaceId, {
-        includeActive: true
-      });
     }
   }
   if (activeEdgeCdp && browserTabForId(activeEdgeCdp.tabId)) {
@@ -7242,8 +7239,12 @@ function normalizeBrowserTabForCurrentMode(
 }
 
 function showRestoredBrowserIdle(tab: BrowserTab) {
-  hideNativeBrowserWebview();
   disconnectActiveEdgeCdp();
+  if (USE_NATIVE_BROWSER_WEBVIEW) {
+    setEdgePreviewVisible(false);
+    if (!isBrowserPanelHidden()) void showNativeBrowserWebview(tab, { navigate: false });
+    return;
+  }
   if (!USE_EDGE_CDP_BROWSER) {
     setEdgePreviewVisible(false);
     if (browserTabFrameReady(tab)) showBrowserFrame(tab);
@@ -18415,11 +18416,26 @@ function nativeBrowserPreviewRect() {
 }
 
 function activeBrowserUsesNativeWebview() {
+  const active = browserTabForId(state.activeBrowserTabId);
   return USE_NATIVE_BROWSER_WEBVIEW
     && nativeBrowserWebviewVisible
-    && nativeBrowserWebviewTabId === state.activeBrowserTabId
+    && Boolean(active)
+    && nativeBrowserWebviewTabId === active?.id
+    && nativeBrowserWebviewLabel === (active ? nativeBrowserWebviewLabelForTab(active) : '')
     && !isBrowserPanelHidden()
     && !document.hidden;
+}
+
+function safeNativeBrowserWebviewLabelPart(value: string) {
+  return (value || 'item').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80) || 'item';
+}
+
+function nativeBrowserWebviewLabelForTab(tab: BrowserTab, workspaceId = state.activeWorkspaceId) {
+  return [
+    'browser-preview-webview',
+    safeNativeBrowserWebviewLabelPart(workspaceId || 'workspace'),
+    safeNativeBrowserWebviewLabelPart(tab.id)
+  ].join('-');
 }
 
 function hideNativeBrowserWebview() {
@@ -18428,11 +18444,13 @@ function hideNativeBrowserWebview() {
     window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
     nativeBrowserWebviewSyncFrame = 0;
   }
+  const label = nativeBrowserWebviewLabel;
   nativeBrowserWebviewTabId = '';
+  nativeBrowserWebviewLabel = '';
   nativeBrowserWebviewUrl = '';
-  if (!nativeBrowserWebviewVisible) return;
+  if (!nativeBrowserWebviewVisible && !label) return;
   nativeBrowserWebviewVisible = false;
-  void api.hideBrowserWebview().catch(() => undefined);
+  void api.hideBrowserWebview(label || undefined).catch(() => undefined);
 }
 
 function scheduleNativeBrowserWebviewSync() {
@@ -18448,17 +18466,23 @@ function scheduleNativeBrowserWebviewSync() {
   });
 }
 
-async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?: boolean; loadUrl?: string } = {}) {
+async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?: boolean; loadUrl?: string; navigate?: boolean } = {}) {
   if (!USE_NATIVE_BROWSER_WEBVIEW) return;
   if (isBrowserPanelHidden() || document.hidden) {
     hideNativeBrowserWebview();
     return;
   }
   const requestId = ++nativeBrowserWebviewRequestSeq;
+  const label = nativeBrowserWebviewLabelForTab(tab);
+  const previousLabel = nativeBrowserWebviewVisible ? nativeBrowserWebviewLabel : '';
   nativeBrowserWebviewTabId = tab.id;
+  nativeBrowserWebviewLabel = label;
   nativeBrowserWebviewUrl = tab.url;
   nativeBrowserWebviewVisible = true;
   hideAllBrowserFrames();
+  if (previousLabel && previousLabel !== label) {
+    void api.hideBrowserWebview(previousLabel).catch(() => undefined);
+  }
   disconnectActiveEdgeCdp();
   setEdgePreviewVisible(false);
   toggleClassIfChanged(el.browserShell, 'has-preview', true);
@@ -18467,18 +18491,26 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
   }
   const rect = nativeBrowserPreviewRect();
   if (!rect) {
-    await api.hideBrowserWebview().catch(() => undefined);
+    await api.hideBrowserWebview(label).catch(() => undefined);
+    if (requestId === nativeBrowserWebviewRequestSeq) {
+      nativeBrowserWebviewVisible = false;
+    }
     return;
   }
   const loadUrl = options.loadUrl ?? tab.url;
+  const navigate = options.navigate ?? Boolean(options.loadUrl);
   try {
-    await api.showBrowserWebview(loadUrl, rect.x, rect.y, rect.width, rect.height);
-    if (requestId !== nativeBrowserWebviewRequestSeq) return;
+    await api.showBrowserWebview(label, loadUrl, rect.x, rect.y, rect.width, rect.height, navigate);
+    if (requestId !== nativeBrowserWebviewRequestSeq) {
+      void api.hideBrowserWebview(label).catch(() => undefined);
+      return;
+    }
     nativeBrowserWebviewVisible = true;
   } catch (error) {
     if (requestId !== nativeBrowserWebviewRequestSeq) return;
     nativeBrowserWebviewVisible = false;
     nativeBrowserWebviewTabId = '';
+    nativeBrowserWebviewLabel = '';
     nativeBrowserWebviewUrl = '';
     logBrowserConsole('error', `Native WebView preview failed: ${String(error)}`);
     setStatus(`Native WebView preview failed: ${String(error)}`, true);
@@ -18488,6 +18520,7 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
 
 function handleBrowserWebviewPageLoad(payload: BrowserWebviewPageLoadEvent) {
   if (!activeBrowserUsesNativeWebview()) return;
+  if (payload.label && payload.label !== nativeBrowserWebviewLabel) return;
   if (payload.event === 'finished') {
     logBrowserConsole('info', `Loaded ${nativeBrowserWebviewUrl || payload.url}`);
     setStatus(`Loaded ${nativeBrowserWebviewUrl || payload.url}`);
@@ -20576,8 +20609,8 @@ function refreshPreview(hard: boolean) {
   if (USE_NATIVE_BROWSER_WEBVIEW) {
     if (activeBrowserUsesNativeWebview()) {
       const action = hard
-        ? showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url) })
-        : api.reloadBrowserWebview();
+        ? showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url), navigate: true })
+        : api.reloadBrowserWebview(nativeBrowserWebviewLabel);
       void action.then(() => {
         state.previewUrl = tab.url;
         setInputValueIfChanged(el.previewUrl, tab.url);
@@ -20620,7 +20653,7 @@ async function clearBrowserCacheAndReload() {
   }
 
   if (USE_NATIVE_BROWSER_WEBVIEW) {
-    await showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url) });
+    await showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url), navigate: true });
     state.previewUrl = tab.url;
     setInputValueIfChanged(el.previewUrl, tab.url);
     logBrowserConsole('info', `Cleared preview cache and reloaded ${tab.url}`);

@@ -66,6 +66,7 @@ export interface EdgeDevtoolsPage {
 }
 
 export interface BrowserWebviewPageLoadEvent {
+  label: string;
   url: string;
   event: 'started' | 'finished';
 }

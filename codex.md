@@ -51,6 +51,30 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-08 - Preserve Browser state across workspaces
+
+#### Changed
+
+- Native Browser child WebViews now use workspace/tab-scoped labels instead of
+  one shared `browser-preview-webview`, so switching to another workspace no
+  longer navigates/reloads the previous workspace's Browser page when returning.
+- Restoring a workspace shows the existing native Browser WebView without
+  forcing navigation unless the user explicitly reloads, hard-refreshes, or
+  clears cache.
+- The iframe fallback now only hides workspace frames during normal workspace
+  switches; it no longer replaces them with `about:blank` unless the app is
+  actually hidden/unloading.
+- Browser WebView load events include the scoped WebView label so stale hidden
+  workspaces cannot report load status for the active Browser tab.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+
 ### 2026-06-08 - Compact Explorer path controls
 
 #### Changed

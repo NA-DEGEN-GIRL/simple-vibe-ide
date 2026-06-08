@@ -117,7 +117,7 @@ const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
 const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
 const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
-const BROWSER_NATIVE_WEBVIEW_LABEL: &str = "browser-preview-webview";
+const BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX: &str = "browser-preview-webview";
 
 type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 
@@ -1208,6 +1208,7 @@ struct TerminalCursorQueryEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserWebviewPageLoadEvent {
+    label: String,
     url: String,
     event: String,
 }
@@ -2882,30 +2883,57 @@ fn shutdown_runtime_sessions_command(state: State<'_, IdeState>) -> Result<(), S
     Ok(())
 }
 
+fn normalize_browser_webview_label(label: Option<String>) -> Result<String, String> {
+    let label = label.unwrap_or_else(|| BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX.to_string());
+    let has_valid_prefix = label == BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX
+        || label
+            .strip_prefix(BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX)
+            .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1);
+    let has_valid_chars = label
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_');
+    if has_valid_prefix && has_valid_chars && label.len() <= 220 {
+        Ok(label)
+    } else {
+        Err("invalid browser preview label".to_string())
+    }
+}
+
+fn is_browser_webview_label(label: &str) -> bool {
+    label == BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX
+        || label
+            .strip_prefix(BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX)
+            .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+}
+
 #[tauri::command]
 async fn show_browser_webview(
     app: AppHandle,
+    label: Option<String>,
     url: String,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+    navigate: Option<bool>,
 ) -> Result<(), String> {
+    let label = normalize_browser_webview_label(label)?;
     let parsed_url: tauri::Url = url
         .parse()
         .map_err(|err| format!("invalid browser preview URL: {err}"))?;
     let position = LogicalPosition::new(x.max(0.0), y.max(0.0));
     let size = LogicalSize::new(width.max(1.0), height.max(1.0));
 
-    if let Some(webview) = app.get_webview(BROWSER_NATIVE_WEBVIEW_LABEL) {
+    if let Some(webview) = app.get_webview(&label) {
         webview
             .set_position(position)
             .map_err(|error| error.to_string())?;
         webview.set_size(size).map_err(|error| error.to_string())?;
-        let should_navigate = webview
-            .url()
-            .map(|current| current.as_str() != parsed_url.as_str())
-            .unwrap_or(true);
+        let should_navigate = navigate.unwrap_or(true)
+            && webview
+                .url()
+                .map(|current| current.as_str() != parsed_url.as_str())
+                .unwrap_or(true);
         if should_navigate {
             webview
                 .navigate(parsed_url)
@@ -2919,23 +2947,22 @@ async fn show_browser_webview(
         .get_window("main")
         .ok_or_else(|| "main window is not available".to_string())?;
     let app_for_load = app.clone();
-    let webview_builder = WebviewBuilder::new(
-        BROWSER_NATIVE_WEBVIEW_LABEL,
-        WebviewUrl::External(parsed_url),
-    )
-    .on_page_load(move |_webview, payload| {
-        let event = match payload.event() {
-            PageLoadEvent::Started => "started",
-            PageLoadEvent::Finished => "finished",
-        };
-        let _ = app_for_load.emit(
-            "browser-webview-page-load",
-            BrowserWebviewPageLoadEvent {
-                url: payload.url().to_string(),
-                event: event.to_string(),
-            },
-        );
-    });
+    let label_for_load = label.clone();
+    let webview_builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed_url))
+        .on_page_load(move |_webview, payload| {
+            let event = match payload.event() {
+                PageLoadEvent::Started => "started",
+                PageLoadEvent::Finished => "finished",
+            };
+            let _ = app_for_load.emit(
+                "browser-webview-page-load",
+                BrowserWebviewPageLoadEvent {
+                    label: label_for_load.clone(),
+                    url: payload.url().to_string(),
+                    event: event.to_string(),
+                },
+            );
+        });
     let webview = main
         .add_child(webview_builder, position, size)
         .map_err(|error| error.to_string())?;
@@ -2943,16 +2970,27 @@ async fn show_browser_webview(
 }
 
 #[tauri::command]
-fn hide_browser_webview(app: AppHandle) -> Result<(), String> {
-    if let Some(webview) = app.get_webview(BROWSER_NATIVE_WEBVIEW_LABEL) {
+fn hide_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), String> {
+    if let Some(label) = label {
+        let label = normalize_browser_webview_label(Some(label))?;
+        if let Some(webview) = app.get_webview(&label) {
+            webview.hide().map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    for (label, webview) in app.webviews() {
+        if !is_browser_webview_label(&label) {
+            continue;
+        }
         webview.hide().map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-fn reload_browser_webview(app: AppHandle) -> Result<(), String> {
-    if let Some(webview) = app.get_webview(BROWSER_NATIVE_WEBVIEW_LABEL) {
+fn reload_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), String> {
+    let label = normalize_browser_webview_label(label)?;
+    if let Some(webview) = app.get_webview(&label) {
         webview.reload().map_err(|error| error.to_string())?;
     }
     Ok(())

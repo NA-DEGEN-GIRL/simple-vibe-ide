@@ -91,10 +91,18 @@ export const api = {
     invoke<boolean>('probe_local_http_url', { targetUrl }),
   startPreviewProxy: (targetUrl: string) =>
     invoke<PreviewProxyResult>('start_preview_proxy', { targetUrl }),
-  showBrowserWebview: (url: string, x: number, y: number, width: number, height: number) =>
-    invoke<void>('show_browser_webview', { url, x, y, width, height }),
-  hideBrowserWebview: () => invoke<void>('hide_browser_webview'),
-  reloadBrowserWebview: () => invoke<void>('reload_browser_webview'),
+  showBrowserWebview: (
+    label: string,
+    url: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    navigate = true
+  ) =>
+    invoke<void>('show_browser_webview', { label, url, x, y, width, height, navigate }),
+  hideBrowserWebview: (label?: string) => invoke<void>('hide_browser_webview', { label }),
+  reloadBrowserWebview: (label?: string) => invoke<void>('reload_browser_webview', { label }),
   startEdgeDevtoolsSession: (workspaceId: string) =>
     invoke<EdgeDevtoolsSession>('start_edge_devtools_session', { workspaceId }),
   edgeDevtoolsNewPage: (sessionId: string, url: string) =>
