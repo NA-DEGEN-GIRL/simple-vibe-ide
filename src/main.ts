@@ -760,6 +760,7 @@ const TERMINAL_CURSOR_QUERY_FLUSH_LIMIT_CHARS = 64 * 1024;
 const TERMINAL_CURSOR_QUERY_DRAIN_TIMEOUT_MS = 160;
 const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
 const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
+const TERMINAL_FOCUS_REPORT_PATTERN = /\x1b\[(?:I|O)/g;
 const WORKSPACE_LLM_OUTPUT_ACTIVE_MS = 2500;
 const WORKSPACE_LLM_INPUT_ACTIVE_MS = 3500;
 const WORKSPACE_LLM_START_ACTIVE_MS = 4000;
@@ -9276,9 +9277,24 @@ function hideTerminalWidgetsForWorkspace(workspaceId: string) {
 }
 
 function filterTerminalInputData(pane: TerminalPane, data: string) {
+  let filtered = data;
   const suppressUntil = pane.suppressTerminalQueryResponsesUntil ?? 0;
-  if (!suppressUntil || performance.now() >= suppressUntil) return data;
-  return data.replace(TERMINAL_CPR_RESPONSE_PATTERN, '');
+  if (suppressUntil && performance.now() < suppressUntil) {
+    filtered = filtered.replace(TERMINAL_CPR_RESPONSE_PATTERN, '');
+  }
+  if (terminalShouldSuppressFocusReports(pane)) {
+    filtered = filtered.replace(TERMINAL_FOCUS_REPORT_PATTERN, '');
+  }
+  return filtered;
+}
+
+function terminalShouldSuppressFocusReports(pane: TerminalPane) {
+  // Codex/Claude-style fullscreen TUIs often enable DEC focus reporting and
+  // then repaint the whole alternate screen when xterm sends ESC[I/ESC[O while
+  // the user merely reselects the shell. That repaint makes the cursor visibly
+  // sweep from the top to the bottom. Suppress only launcher-owned panes so
+  // normal shells/editors keep their focus-report semantics.
+  return Boolean(pane.llmId);
 }
 
 async function respondToTerminalCursorQuery(pane: TerminalPane) {
@@ -17104,7 +17120,10 @@ function enqueueTerminalWrite(pane: TerminalPane, data: string) {
     window.cancelAnimationFrame(pane.writeFrame);
     pane.writeFrame = undefined;
   }
-  if (visibility === 'background' && pane.writeBuffer.length < TERMINAL_WRITE_FORCE_FLUSH_CHARS) return visibility;
+  // Keep hidden workspace terminals draining into xterm's offscreen buffer.
+  // Otherwise a Codex/Claude pane can accumulate a full TUI repaint while the
+  // user is in another workspace, then visibly replay cursor moves when the
+  // shell is selected again.
   if (pane.writeTimer) return visibility;
   const delay = visibility === 'inactive'
     ? TERMINAL_INACTIVE_WRITE_BATCH_MS

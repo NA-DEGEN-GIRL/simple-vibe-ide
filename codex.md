@@ -51,6 +51,24 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-09 - Reduce LLM terminal focus repaint sweeps
+
+#### Changed
+
+- LLM launcher panes now suppress xterm DEC focus-report input (`ESC[I` /
+  `ESC[O`) before it reaches Codex/Claude-style TUIs. This avoids the common
+  reselect-focus repaint where the cursor visibly sweeps from the top of the
+  terminal to the bottom.
+- Hidden workspace terminals now keep draining output into xterm's offscreen
+  buffer instead of waiting until the workspace becomes visible again, so a
+  background Codex/Claude repaint is less likely to replay on return.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-08 - Preserve Browser state across workspaces
 
 #### Changed
