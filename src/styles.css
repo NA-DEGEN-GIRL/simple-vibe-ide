@@ -821,13 +821,20 @@ body.terminal-app .terminal-title {
   border-color: #4d8dff;
   box-shadow: 0 0 0 2px rgba(77, 141, 255, 0.28), 0 14px 28px rgba(0, 0, 0, 0.28);
 }
-.path-row { padding: 8px; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #182132; }
-.explorer.widget-controls-wrap .path-row { flex-wrap: wrap; }
-.path-row button { flex: 0 0 auto; }
-.path-badge { flex: 1; min-width: 0; font-family: var(--mono-font); color: #b7c6d8; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.path-row {
+  padding: 6px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  border-bottom: 1px solid #182132;
+}
+.path-row button { min-width: 0; padding: 5px 8px; white-space: nowrap; }
+.path-row .use-folder-button { width: 48px; padding-inline: 7px; }
+.path-badge { min-width: 0; font-family: var(--mono-font); color: #b7c6d8; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .explorer.widget-controls-wrap .path-badge {
-  flex: 1 1 100%;
-  white-space: normal;
+  min-width: 0;
+  white-space: nowrap;
 }
 .export-list {
   display: grid;

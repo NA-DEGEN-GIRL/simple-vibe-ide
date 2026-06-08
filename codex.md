@@ -51,6 +51,24 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-08 - Compact Explorer path controls
+
+#### Changed
+
+- Explorer path controls now use a compact three-column row: parent directory,
+  current path, and a short `Use` button for the existing `Use This Folder`
+  action.
+- Removed the wrapping rule that forced the Explorer path badge onto its own
+  full-width line when widget controls wrapping was enabled.
+- The shortened `Use` button keeps the full `Use This Folder` action in its
+  tooltip and accessibility label.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-06 - Separate Simple Vibe Terminal taskbar identity
 
 #### Changed

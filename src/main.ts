@@ -10129,8 +10129,10 @@ function renderExplorerPathRow() {
   up.title = 'Parent directory';
   up.addEventListener('click', () => void goToParentDirectory());
   const useFolder = document.createElement('button');
-  useFolder.textContent = 'Use This Folder';
+  useFolder.className = 'use-folder-button';
+  useFolder.textContent = 'Use';
   useFolder.title = 'Restart workspace from this directory';
+  useFolder.setAttribute('aria-label', 'Use This Folder');
   useFolder.addEventListener('click', () => {
     const selected = findExplorerEntry(state.explorerSelectedPath);
     void switchWorkspace(selected?.kind === 'dir' ? selected.path : state.currentDir);
@@ -12538,6 +12540,7 @@ function pathBadge(path: string): HTMLElement {
   const span = document.createElement('span');
   span.className = 'path-badge';
   span.textContent = path;
+  span.title = path;
   return span;
 }
 
