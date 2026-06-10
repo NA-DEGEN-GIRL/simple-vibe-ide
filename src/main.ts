@@ -47,6 +47,7 @@ interface TerminalPane {
   imeComposing?: boolean;
   imeFallbackTimer?: number;
   imeReleaseTimer?: number;
+  imePendingCommits?: { data: string; sentAt: number }[];
   focusFrame?: number;
   focusRetryTimer?: number;
   lastUserInputAt?: number;
@@ -766,11 +767,18 @@ const WORKSPACE_LLM_INPUT_ACTIVE_MS = 3500;
 const WORKSPACE_LLM_START_ACTIVE_MS = 4000;
 const WORKSPACE_LLM_WAITING_BUFFER_CHARS = 6000;
 const WORKSPACE_LLM_WAITING_AFTER_INPUT_SUPPRESS_MS = 1800;
+// Snapshot replay arrives as one giant chunk whose scrollback can contain long-answered
+// prompts; only the tail (≈ the final screen) reflects what the CLI is showing now.
+const WORKSPACE_LLM_SNAPSHOT_DETECTION_TAIL_CHARS = 8000;
 const DEFAULT_TERMINAL_FOCUS_TARGET: TerminalDefaultFocusTarget = 'shell';
 // Defer post-composition repaint/refocus well past xterm's own setTimeout(0) finalize (which
 // re-reads the helper-textarea), so our DOM/focus churn can't clobber the committed Hangul tail.
 const TERMINAL_IME_RELEASE_DEFER_MS = 120;
 const TERMINAL_IME_COMPOSITION_FALLBACK_MS = 1800;
+// xterm's deferred composition send normally arrives on the next task (setTimeout(0));
+// the window only needs to absorb main-thread contention. Commits are multi-byte IME
+// strings that no keypress path can coincidentally equal, so a generous window is safe.
+const TERMINAL_IME_COMMIT_DEDUP_MS = 1000;
 const TERMINAL_FOCUS_RETRY_MS = 36;
 const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
 const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
@@ -4115,6 +4123,14 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
   const meaningful = normalized.trim();
   if (!meaningful) return workspaceLlmWaitingByPaneId.has(pane.paneId);
   if (llmWaitingDetectionSuppressedAfterInput(pane)) {
+    // Suppression keeps the echo of just-typed user text from reading as a prompt, but a
+    // chained dialog (answer prompt #1 -> prompt #2 inside the window) paints once and
+    // then sits static, so discarding it here would hide it forever. Structured choice
+    // menus cannot be faked by echoed prose, so they may still set waiting.
+    if (llmOutputLooksLikeStructuredChoiceMenu(meaningful)) {
+      markWorkspaceLlmWaitingForPane(pane);
+      return true;
+    }
     pane.llmWaitingDetectionBuffer = '';
     return false;
   }
@@ -4201,6 +4217,11 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
     // instead of a fixed verb list so model/status-name churn still reads as work.
     /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑]\s*[A-Za-z][A-Za-z -]{1,48}ing(?:…|\.{3})[^\n]*(?:tokens?|effort|\d+\s*(?:ms|s|m|h)|tool uses?)/i,
     /(?:^|\n)\s*(?:Running|Thinking|Working|Processing|Searching|Reading|Writing|Editing|Executing|Analyzing)(?:…|\.{3})/i,
+    // Claude and Codex both show this hint only while a turn is actually running
+    // ("esc to interrupt" / "Esc to interrupt"); waiting dialogs say "esc to cancel"
+    // instead. It survives status-verb churn, Codex's no-ellipsis "Working (3s ...)"
+    // shape, and early status lines that have no token/time counters yet.
+    /\besc to interrupt\b/i,
     /\bWaiting for \d+ (?:dynamic )?workflows? to finish\b/i,
     /(?:^|\n)\s*…\s*\+\d+\s+tool uses?\b/i,
     /\b\d+\s+tool uses?\s*\(ctrl\+o to expand\)/i,
@@ -4282,7 +4303,11 @@ function llmOutputLooksLikeStructuredChoiceMenu(text: string) {
 }
 
 function llmOutputLooksClearlyNotWaiting(text: string) {
-  return /\b(?:turn completed|worked for|model changed to|usage:|total cost|total duration|current session|current week|resets|nothing over|resume session|quit|connecting mcps|user prompt submit|thought for|stop\s+\[hooks|tip:)\b/i.test(text)
+  // No bare "quit" here: Codex's always-visible footer ("⌃C quit") repaints in its own
+  // chunk and would clear a waiting dialog that is still on screen. "usage:"/"tip:" were
+  // dead entries — \b after ":" never matches the real "Tip: ..." spacing — so dropping
+  // them changes nothing.
+  return /\b(?:turn completed|worked for|model changed to|total cost|total duration|current session|current week|resets|nothing over|resume session|connecting mcps|user prompt submit|thought for|stop\s+\[hooks)\b/i.test(text)
     || /\brequest_user_input\b[\s\S]{0,220}\b(?:unavailable|failed|error|not available)\b/i.test(text)
     || /\bunavailable in default mode\b/i.test(text)
     || /(?:작업|턴).{0,20}(?:완료|종료)/.test(text);
@@ -9449,9 +9474,22 @@ function terminalInputShouldSendImmediately(data: string) {
 async function sendTerminalInputNow(pane: TerminalPane, data: string) {
   if (!data) return;
   if (pane.inputWriteBuffer) await flushTerminalInput(pane);
-  if (pane.inputWritePromise) await pane.inputWritePromise.catch(() => undefined);
   if (!pane.backendId) return;
-  await api.writeTerminal(pane.backendId, data);
+  // Join the same write chain as batched input. Two awaited invokes are not ordered once
+  // both are in flight (sync Tauri commands run per-invoke on a thread pool), so an
+  // unchained immediate write could land after — or before — a neighbouring one.
+  const previousWrite = pane.inputWritePromise ?? Promise.resolve();
+  const currentWrite = previousWrite
+    .catch(() => undefined)
+    .then(() => {
+      if (!pane.backendId) return;
+      return api.writeTerminal(pane.backendId, data);
+    });
+  const trackedWrite = currentWrite.finally(() => {
+    if (pane.inputWritePromise === trackedWrite) pane.inputWritePromise = undefined;
+  });
+  pane.inputWritePromise = trackedWrite;
+  await trackedWrite;
 }
 
 function profileNeedsShellReadyGate(profile: ConnectionProfile | null | undefined) {
@@ -14761,6 +14799,7 @@ async function createTerminalTab(
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
+    if (consumeTerminalImeDuplicate(pane, data)) return;
     const inputData = filterTerminalInputData(pane, data);
     if (!inputData) return;
     markTerminalUserInput(pane);
@@ -15511,11 +15550,63 @@ function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
 
   textarea.addEventListener('compositionstart', () => beginTerminalImeCompositionGuard(pane));
   textarea.addEventListener('compositionupdate', () => beginTerminalImeCompositionGuard(pane));
-  textarea.addEventListener('compositionend', () => finishTerminalImeCompositionGuard(pane));
+  textarea.addEventListener('compositionend', (event) => {
+    interceptTerminalImeCommit(pane, event);
+    finishTerminalImeCompositionGuard(pane);
+  });
   // No 'blur' -> finish handler on purpose: a transient blur mid-composition would schedule a
   // refocus right across xterm's compositionend finalization window (it re-reads the textarea on a
   // setTimeout(0)) and drop the last Hangul syllable. The fallback timer already releases a stuck
   // composition, so blur-based release is both redundant and harmful.
+}
+
+// xterm 6.0.0's CompositionHelper commits IME text by re-reading its helper textarea on a
+// setTimeout(0) after compositionend, and finalizes synchronously from a stale range when a
+// non-229 key lands first. Both lose or reorder fast Hangul (same family as waveterm#3164,
+// vscode#267568). Own the commit instead: send compositionend's data straight to the PTY,
+// then strand xterm's deferred duplicate. Re-verify on any xterm upgrade — 6.1's #5698
+// changes the finalize bookkeeping.
+function interceptTerminalImeCommit(pane: TerminalPane, event: CompositionEvent) {
+  const committed = event.data ?? '';
+  const neutralized = neutralizeXtermPendingComposition(pane);
+  if (!committed) return;
+  if (!neutralized) {
+    const pending = pane.imePendingCommits ?? (pane.imePendingCommits = []);
+    pending.push({ data: committed, sentAt: performance.now() });
+  }
+  markTerminalUserInput(pane);
+  markWorkspaceLlmInputActivityForPane(pane, committed);
+  trackTerminalCwdFromInput(pane, committed);
+  void sendTerminalInputNow(pane, committed).catch((error) => {
+    setStatus(`Failed to write IME input: ${String(error)}`, true);
+  });
+}
+
+// Flip the helper's in-flight flag so its deferred setTimeout(0) send (and the synchronous
+// finalize path) sees no pending composition and emits nothing. Private state, but property
+// names survive the bundle and the dependency is pinned; returns false so the caller falls
+// back to onData dedup if an upgrade renames it.
+function neutralizeXtermPendingComposition(pane: TerminalPane) {
+  const helper = (pane.term as unknown as {
+    _core?: { _compositionHelper?: { _isSendingComposition?: boolean } };
+  })._core?._compositionHelper;
+  if (!helper || typeof helper._isSendingComposition !== 'boolean') return false;
+  helper._isSendingComposition = false;
+  return true;
+}
+
+// Backstop for when the private flag was not reachable: xterm's deferred composition send
+// surfaces through term.onData with exactly the committed string; swallow that one echo.
+function consumeTerminalImeDuplicate(pane: TerminalPane, data: string) {
+  const pending = pane.imePendingCommits;
+  if (!pending?.length) return false;
+  const now = performance.now();
+  while (pending.length && now - pending[0].sentAt > TERMINAL_IME_COMMIT_DEDUP_MS) pending.shift();
+  if (pending.length && pending[0].data === data) {
+    pending.shift();
+    return true;
+  }
+  return false;
 }
 
 function beginTerminalImeCompositionGuard(pane: TerminalPane) {
@@ -15715,7 +15806,15 @@ function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly
 
 function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
   if (event.isComposing || event.key === 'Process' || event.keyCode === 229) {
-    return true;
+    // Let the IME own composing keys. Suppressing the KEYDOWN (return false) keeps
+    // xterm's CompositionHelper from force-finalizing on a non-229 key — Windows
+    // Korean IME delivers Space/Enter mid-composition (isComposing=true), and that
+    // synchronous finalize reads a stale textarea slice and drops the syllable tail.
+    // The committed text is sent by the compositionend interceptor instead.
+    // Keypress/keyup still go to xterm: the commit key's own character (space, CR)
+    // arrives through the keypress path after compositionend, and keyup resets
+    // xterm's internal key tracking.
+    return event.type !== 'keydown';
   }
   setTerminalTextTarget('shell');
 
@@ -17110,10 +17209,10 @@ async function canUseDirectLocalPreview(url: string) {
   }
 }
 
-function handleTerminalData(pane: TerminalPane, data: string) {
+function handleTerminalData(pane: TerminalPane, data: string, llmDetectionData = data) {
   pane.backendOutputChars += data.length;
-  const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, data);
-  if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, data, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, llmDetectionData);
+  if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, llmDetectionData, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
   const visibility = enqueueTerminalWrite(pane, data);
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
@@ -17133,12 +17232,17 @@ function handleTerminalData(pane: TerminalPane, data: string) {
 function handleTerminalSnapshotData(pane: TerminalPane, output: string) {
   if (!output) return;
   const alreadyWritten = pane.backendOutputChars;
+  // Replayed backlog scrollback can still contain prompts that were answered long ago;
+  // judge the LLM waiting/working state only from the tail, which approximates the
+  // screen the CLI is actually showing.
+  const replay = (chunk: string) =>
+    handleTerminalData(pane, chunk, chunk.slice(-WORKSPACE_LLM_SNAPSHOT_DETECTION_TAIL_CHARS));
   if (alreadyWritten > 0) {
     if (output.length <= alreadyWritten) return;
-    handleTerminalData(pane, output.slice(alreadyWritten));
+    replay(output.slice(alreadyWritten));
     return;
   }
-  handleTerminalData(pane, output);
+  replay(output);
 }
 
 function enqueueTerminalWrite(pane: TerminalPane, data: string) {

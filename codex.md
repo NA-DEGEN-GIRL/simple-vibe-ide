@@ -51,6 +51,84 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-10 - Send IME commits directly to the PTY
+
+#### Changed
+
+- Composing keydowns (`isComposing`/keyCode 229/`Process`) are now suppressed from
+  xterm via the custom key handler. xterm 6.0.0's CompositionHelper otherwise
+  force-finalizes the composition synchronously when a non-229 key arrives
+  mid-composition (Windows Korean IME delivers Space/Enter that way) and sends a
+  stale helper-textarea slice, dropping the syllable tail. Keypress/keyup still
+  reach xterm, so commit keys (space, CR) keep flowing through the keypress path.
+- A `compositionend` interceptor now writes the IME-committed string straight to
+  the PTY and flips xterm's private `_isSendingComposition` flag so its deferred
+  `setTimeout(0)` re-read sends nothing. If a future xterm upgrade renames that
+  private state, an onData dedup queue (exact-match, 1s window) swallows the
+  duplicate echo instead. Same family of fixes as Wave Terminal PR #2938/#3264
+  for the identical Hangul drop/reorder in Electron+xterm.
+- `sendTerminalInputNow` immediate writes now join the same per-pane write chain
+  as batched input. Two in-flight Tauri invokes are not order-guaranteed (sync
+  commands run per-invoke on a thread pool), so an unchained immediate write —
+  e.g. a Hangul commit followed by Enter — could previously reorder under load.
+- IME commits mark user input/LLM activity and feed cwd tracking exactly like
+  typed input did before.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Bundled xterm 6.0.0 source inspection: `_core` delegation, `_compositionHelper`
+  and `_isSendingComposition` names survive in both `lib/xterm.js` and the Vite
+  ESM bundle; `_inputEvent` ignores composition inputTypes (no double-send path).
+
+#### Known limits
+
+- Needs a real Windows smoke: fast Hangul typing into Claude/Codex panes with the
+  interceptor active (watch for drops, duplicates, and ordering around Space and
+  Enter), plus Japanese/Chinese candidate-window flows.
+- Any residual drop inside the CLI's own raw-mode stdin handling (Ink) is not
+  reachable from the terminal layer; the typing pad remains the guaranteed path.
+
+### 2026-06-10 - Harden LLM working/waiting detection
+
+#### Changed
+
+- `esc to interrupt` now counts as active work. It is shown by Claude and Codex
+  only while a turn is running (waiting dialogs say `esc to cancel`), so it
+  covers Codex's `Working (3s • Esc to interrupt)` shape (no ellipsis, `•`
+  glyph) and early Claude status lines that have no token/time counters yet —
+  both previously undetectable, which could leave a workspace idle-looking for
+  the rest of a turn after one 2.5s output gap.
+- Removed bare `quit` from the clearly-not-waiting list: Codex's always-visible
+  footer (`⌃C quit`) could repaint in its own chunk and clear a waiting dialog
+  that was still on screen. Dropped `usage:`/`tip:` too — the trailing `\b`
+  after `:` never matched real `Tip: ...` spacing, so they were dead entries.
+- Chained dialogs are no longer lost to the post-input suppression window:
+  structured choice menus (option lists like `› 1. ...`) may set waiting even
+  while echo suppression is active, since echoed prose cannot fake that shape.
+  A second permission prompt arriving right after answering the first now turns
+  the tab red instead of being discarded forever.
+- Workspace snapshot replay now judges LLM waiting/working state only from the
+  replay tail (last 8000 chars ≈ the final screen), so an old answered prompt in
+  restored scrollback no longer shows a stale red indicator after restore.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Regex regression sweep over 18 sampled status/prompt/footer lines (Claude,
+  Codex, Grok shapes, Korean completion text, echo false-positive guards).
+
+#### Known limits
+
+- Inside a single chunk the prompt patterns still win over later completion
+  text at the pure-function level; the replay-site tail slice mitigates the
+  practical case (restore). Real Codex/Claude status line samples from the
+  Windows app should still be captured during the next smoke to confirm shapes.
+
 ### 2026-06-10 - Detect dynamic workflow agent progress
 
 #### Changed
