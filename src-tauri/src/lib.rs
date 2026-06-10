@@ -1111,7 +1111,13 @@ if ($agentStatus -eq 1) {{
   Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; using the IDE SSH askpass prompt instead.'
 }}
 $sshArgs = @({common_options})
-$sshArgs += @('-tt', $aliasName, $remoteCommand)
+# Windows PowerShell 5.1 hands native args to ssh.exe inside auto-added quotes WITHOUT
+# escaping embedded double quotes, and ssh.exe's MSVCRT argv parser then strips them.
+# That corrupted the remote bash bootstrap (its rcfile heredoc lost every double quote,
+# so bash aborted at `case ;...;` and never ran the launcher command). Pre-escape each
+# quote, doubling any backslash run in front of it, so the argv round-trip is lossless.
+$remoteCommandArg = $remoteCommand -replace '(\\*)"', '$1$1\"'
+$sshArgs += @('-tt', $aliasName, $remoteCommandArg)
 & $ssh @sshArgs
 exit $LASTEXITCODE
 "#

@@ -51,6 +51,48 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-10 - Fix SSH bash bootstrap quote loss and venv tracking misses
+
+#### Changed
+
+- SSH terminals: Windows PowerShell 5.1 hands native args to `ssh.exe` inside
+  auto-added quotes without escaping embedded double quotes, and ssh.exe's
+  MSVCRT argv parser strips them. The remote bash bootstrap therefore lost
+  every `"` (visible as `bash: /dev/fd/63: line 3: syntax error near
+  unexpected token ';'` on `case ;${PROMPT_COMMAND:-};`), bash aborted the
+  rcfile there, and the codex/claude launcher command queued after that line
+  never ran. The PS bootstrap now pre-escapes each quote (doubling any
+  backslash run in front of it) so the argv round-trip is lossless. This also
+  un-breaks OSC7 shell-ready/cwd reporting on SSH, which the same corruption
+  silently disabled. WSL terminals were never affected.
+- Python venv tracking: detection previously parsed only literally typed
+  characters, so Tab completion (`source .v<TAB>`) and history recall (arrow
+  keys) — the common ways to type the command — never registered an
+  activation, which is why `source .venv/bin/activate` did not survive
+  restarts in practice. On Enter the tracker now also reads the echoed
+  logical prompt line from the xterm buffer (wrap-aware, prompt prefix
+  stripped, alternate-screen and LLM/command panes excluded) and feeds it
+  through the same activation/deactivation parser. The existing
+  snapshot-restore path then re-sources the venv as designed.
+
+#### Verified
+
+- `npm run check`, `npm run build`, `git diff --check`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- Python simulation of PS `-replace` + MSVCRT argv parsing: old path reproduces
+  the exact reported corruption; escaped path round-trips losslessly.
+- Node regression sweep over 9 echoed-prompt-line shapes (bash/starship/venv
+  prompts, chained commands, dot-source, redirects, quoted-mention and plain
+  command false-positive guards).
+
+#### Known limits
+
+- Real SSH smoke still needed on Windows: spawn an SSH terminal, confirm no
+  `/dev/fd/63` syntax error, codex/claude launch, and OSC7 cwd updates.
+- Venv lines pasted together with their own newline (no typed Enter) are still
+  not tracked; activation typed or recalled interactively now is.
+
 ### 2026-06-10 - Send IME commits directly to the PTY
 
 #### Changed

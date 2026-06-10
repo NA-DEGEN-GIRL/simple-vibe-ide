@@ -17508,6 +17508,7 @@ function trackTerminalCwdFromInput(pane: TerminalPane, data: string) {
     if (char === '\r' || char === '\n') {
       updateTerminalCwdFromCommand(pane, pane.inputBuffer);
       updateTerminalPythonEnvFromCommand(pane, pane.inputBuffer);
+      updateTerminalPythonEnvFromScreenLine(pane);
       pane.inputBuffer = '';
     } else if (char === '\u007f' || char === '\b') {
       pane.inputBuffer = pane.inputBuffer.slice(0, -1);
@@ -17522,6 +17523,38 @@ function updateTerminalCwdFromCommand(pane: TerminalPane, command: string) {
   if (target === null) return;
   const next = resolveTerminalCdTarget(pane, target);
   if (next) updateTerminalCwd(pane, next);
+}
+
+// Tab completion and history recall reach the shell as control bytes (TAB, arrows), so the
+// typed-input buffer rarely holds the full "source .venv/bin/activate" text — which is why
+// venv tracking used to miss most real activations. The shell has already echoed the
+// completed command onto the prompt line, so read that logical line when Enter is pressed.
+function updateTerminalPythonEnvFromScreenLine(pane: TerminalPane) {
+  if (pane.command || pane.llmId) return;
+  if (terminalUsesAlternateBuffer(pane)) return;
+  const line = terminalLogicalLineAtCursor(pane);
+  if (!line) return;
+  // Drop the prompt prefix (user@host:~/dir$ , PS C:\>, ❯ ...) so the activation pattern's
+  // start-of-command anchor can match; lines without a prompt marker pass through as-is.
+  updateTerminalPythonEnvFromCommand(pane, line.replace(/^.*?[$#%>❯]\s+/, ''));
+}
+
+function terminalLogicalLineAtCursor(pane: TerminalPane) {
+  try {
+    const buffer = pane.term.buffer.active;
+    const cursorRow = buffer.baseY + buffer.cursorY;
+    let row = cursorRow;
+    while (row > 0 && buffer.getLine(row)?.isWrapped) row -= 1;
+    let text = '';
+    for (let y = row; y <= cursorRow && text.length <= 4000; y += 1) {
+      const line = buffer.getLine(y);
+      if (!line) break;
+      text += line.translateToString(true);
+    }
+    return text.trim();
+  } catch {
+    return '';
+  }
 }
 
 function updateTerminalPythonEnvFromCommand(pane: TerminalPane, command: string) {
