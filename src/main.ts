@@ -3981,10 +3981,15 @@ function markWorkspaceLlmUserActivityForPane(pane: TerminalPane, durationMs = WO
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
 
-function markWorkspaceLlmOutputActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS) {
-  // Resize/focus on workspace activation can make some PTYs repaint a prompt. Treat output as
-  // "working" only if the launcher/input path already put the pane into an active window.
-  if (!pane.llmId || !workspaceLlmActivityIsActive(pane.workspaceId)) return;
+function markWorkspaceLlmOutputActivityForPane(
+  pane: TerminalPane,
+  data: string,
+  durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS
+) {
+  if (!pane.llmId || !pane.workspaceId) return;
+  // Resize/focus on workspace activation can make some PTYs repaint a prompt. Generic output only
+  // extends an already-working window, but explicit Claude/Codex progress status text can start one.
+  if (!workspaceLlmActivityIsActive(pane.workspaceId) && !llmOutputLooksLikeActiveWork(pane.llmId, data)) return;
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
 
@@ -4120,6 +4125,10 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
     markWorkspaceLlmWaitingForPane(pane);
     return true;
   }
+  if (llmOutputLooksLikeActiveWork(pane.llmId, meaningful)) {
+    clearWorkspaceLlmWaitingForPane(pane);
+    return false;
+  }
   if (llmOutputLooksClearlyNotWaiting(meaningful)) {
     clearWorkspaceLlmWaitingForPane(pane);
     return false;
@@ -4179,6 +4188,28 @@ function normalizeTerminalOutputForLlmWaitingDetection(data: string) {
     .replace(/\r/g, '\n')
     .replace(/[^\S\n]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n');
+}
+
+function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
+  if (!workspaceLlmSupportsWaitingDetection(llmId)) return false;
+  const text = normalizeTerminalOutputForLlmWaitingDetection(data).trim();
+  if (!text) return false;
+  const activeProgressPatterns = [
+    // Claude's newer status line is intentionally whimsical: "Simmering…",
+    // "Shimmying…", etc. Match the spinner/glyph + arbitrary -ing verb shape
+    // instead of a fixed verb list so model/status-name churn still reads as work.
+    /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑]\s*[A-Za-z][A-Za-z -]{1,48}ing(?:…|\.{3})[^\n]*(?:tokens?|effort|\d+\s*(?:ms|s|m|h)|tool uses?)/i,
+    /(?:^|\n)\s*(?:Running|Thinking|Working|Processing|Searching|Reading|Writing|Editing|Executing|Analyzing)(?:…|\.{3})/i,
+    /(?:^|\n)\s*…\s*\+\d+\s+tool uses?\b/i,
+    /\b\d+\s+tool uses?\s*\(ctrl\+o to expand\)/i,
+    /\(ctrl\+b to run in background\)/i
+  ];
+  if (activeProgressPatterns.some((pattern) => pattern.test(text))) return true;
+  if (llmId === 'claude') {
+    return /\b(?:thinking more with|xhigh effort|high effort)\b/i.test(text)
+      || /\bAgent\([^\n)]{1,160}\)[\s\S]{0,900}\bRunning(?:…|\.{3})/i.test(text);
+  }
+  return false;
 }
 
 function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
@@ -17067,7 +17098,7 @@ async function canUseDirectLocalPreview(url: string) {
 function handleTerminalData(pane: TerminalPane, data: string) {
   pane.backendOutputChars += data.length;
   const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, data);
-  if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, data, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
   const visibility = enqueueTerminalWrite(pane, data);
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);

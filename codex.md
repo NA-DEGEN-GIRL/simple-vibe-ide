@@ -51,6 +51,24 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-10 - Detect Claude active progress status
+
+#### Changed
+
+- Workspace LLM activity now recognizes Claude's newer progress/status lines
+  such as `Simmering…`, `Shimmying…`, `Running…`, token counters, and expanded
+  agent/tool-use summaries as active work.
+- Generic terminal output still only extends an already-working state, preserving
+  the focus/repaint false-positive guard from the previous terminal patch.
+- Active progress text now clears stale waiting/red state so a Claude agent that
+  resumes work switches back to the working indicator.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-09 - Reduce LLM terminal focus repaint sweeps
 
 #### Changed
