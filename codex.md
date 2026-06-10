@@ -51,6 +51,23 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-10 - Detect dynamic workflow agent progress
+
+#### Changed
+
+- LLM activity detection now treats `Waiting for N dynamic workflow(s) to
+  finish` as active background work instead of an idle/waiting-looking status.
+- Agent progress summaries such as `0/3 agents done ... tokens` now keep the
+  workspace in the working state while the done count is still below the total.
+- This covers Ultracode/Claude-style dynamic workflow panes where tokens keep
+  increasing while subagents are still running.
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-10 - Detect Claude active progress status
 
 #### Changed

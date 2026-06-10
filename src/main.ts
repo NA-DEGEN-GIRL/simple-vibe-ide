@@ -4194,12 +4194,14 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
   if (!workspaceLlmSupportsWaitingDetection(llmId)) return false;
   const text = normalizeTerminalOutputForLlmWaitingDetection(data).trim();
   if (!text) return false;
+  if (llmOutputHasIncompleteAgentProgress(text)) return true;
   const activeProgressPatterns = [
     // Claude's newer status line is intentionally whimsical: "Simmering…",
     // "Shimmying…", etc. Match the spinner/glyph + arbitrary -ing verb shape
     // instead of a fixed verb list so model/status-name churn still reads as work.
     /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑]\s*[A-Za-z][A-Za-z -]{1,48}ing(?:…|\.{3})[^\n]*(?:tokens?|effort|\d+\s*(?:ms|s|m|h)|tool uses?)/i,
     /(?:^|\n)\s*(?:Running|Thinking|Working|Processing|Searching|Reading|Writing|Editing|Executing|Analyzing)(?:…|\.{3})/i,
+    /\bWaiting for \d+ (?:dynamic )?workflows? to finish\b/i,
     /(?:^|\n)\s*…\s*\+\d+\s+tool uses?\b/i,
     /\b\d+\s+tool uses?\s*\(ctrl\+o to expand\)/i,
     /\(ctrl\+b to run in background\)/i
@@ -4208,6 +4210,19 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
   if (llmId === 'claude') {
     return /\b(?:thinking more with|xhigh effort|high effort)\b/i.test(text)
       || /\bAgent\([^\n)]{1,160}\)[\s\S]{0,900}\bRunning(?:…|\.{3})/i.test(text);
+  }
+  return false;
+}
+
+function llmOutputHasIncompleteAgentProgress(text: string) {
+  const pattern = /\b(\d+)\s*\/\s*(\d+)\s+agents?\s+done\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const done = Number(match[1]);
+    const total = Number(match[2]);
+    if (Number.isFinite(done) && Number.isFinite(total) && total > 0 && done < total) {
+      return true;
+    }
   }
   return false;
 }
