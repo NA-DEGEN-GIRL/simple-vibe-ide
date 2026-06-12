@@ -51,6 +51,41 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-12 - Detect non-English Claude status lines as active work
+
+#### Changed
+
+- LLM working indicator: Claude Code's spinner status text can be
+  model-authored in any language (real sample: `✢ Phase B 구현 중 (…)…
+  (16m 24s)`), and newer builds cycle the `esc to interrupt` hint out of the
+  parenthetical, so a long turn could run with neither the Latin `-ing` verb
+  shape nor the interrupt hint ever matching — the workspace dot stayed idle
+  for the whole turn. `llmOutputLooksLikeActiveWork` now also accepts the
+  language-agnostic structural shape: spinner glyph at line start + ellipsis
+  + parenthesized elapsed-time counter (`(3s)`, `(16m 24s)`, `(1h 4m)`).
+  Completion summaries ("Worked for 16m 24s") and persisted todo trees have
+  no trailing ellipsis-plus-timer, so they stay inert.
+- Confirmed the session-feedback survey ("How is Claude doing this session?"
+  with `1: Bad 2: Fine 3: Good`) does not trip waiting detection: it has no
+  cursor-marked menu rows and no approval keywords.
+
+#### Verified
+
+- Node regression harness extracting the real functions from `src/main.ts`
+  (18 cases incl. the user's exact frame, English/Codex regressions,
+  completion/todo/survey false-positive guards): all pass.
+- `npm run check`, `npm run build`.
+
+#### Known limits
+
+- Working state still needs a frame that actually contains the status line;
+  if a TUI repaints only the timer cell without the spinner glyph in the same
+  chunk, that frame alone does not start a window (the next full repaint
+  does).
+- Spinner glyph classes include `*` and `·`; a prose bullet ending in `…`
+  with a parenthesized digit+`h/m/s` token could briefly read as working.
+  Judged acceptable vs. missing whole turns.
+
 ### 2026-06-10 - Fix SSH bash bootstrap quote loss and venv tracking misses
 
 #### Changed

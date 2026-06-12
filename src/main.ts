@@ -4216,6 +4216,13 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
     // "Shimmying…", etc. Match the spinner/glyph + arbitrary -ing verb shape
     // instead of a fixed verb list so model/status-name churn still reads as work.
     /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑]\s*[A-Za-z][A-Za-z -]{1,48}ing(?:…|\.{3})[^\n]*(?:tokens?|effort|\d+\s*(?:ms|s|m|h)|tool uses?)/i,
+    // Claude's status text can also be model-authored in any language ("✢ Phase B 구현 중
+    // (서비스 작성)… (16m 24s)"), so the Latin "-ing" shape above misses it, and the
+    // "esc to interrupt" hint cycles out of the parenthetical on newer builds. A spinner
+    // glyph at line start + an ellipsis + a parenthesized elapsed-time counter is still
+    // unique to the live status line: completion summaries ("Worked for 16m 24s") and
+    // persisted todo trees carry no trailing ellipsis-plus-timer.
+    /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴·*]\s*\S[^\n]{0,200}?(?:…|\.{3})[^\n]{0,80}?\(\s*[^()\n]{0,60}?\d+\s*[hms]\b/i,
     /(?:^|\n)\s*(?:Running|Thinking|Working|Processing|Searching|Reading|Writing|Editing|Executing|Analyzing)(?:…|\.{3})/i,
     // Claude and Codex both show this hint only while a turn is actually running
     // ("esc to interrupt" / "Esc to interrupt"); waiting dialogs say "esc to cancel"
