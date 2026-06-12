@@ -4222,8 +4222,14 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
     // glyph at line start + an ellipsis + a parenthesized elapsed-time counter is still
     // unique to the live status line: completion summaries ("Worked for 16m 24s") and
     // persisted todo trees carry no trailing ellipsis-plus-timer.
-    /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴·*]\s*\S[^\n]{0,200}?(?:…|\.{3})[^\n]{0,80}?\(\s*[^()\n]{0,60}?\d+\s*[hms]\b/i,
-    /(?:^|\n)\s*(?:Running|Thinking|Working|Processing|Searching|Reading|Writing|Editing|Executing|Analyzing)(?:…|\.{3})/i,
+    /(?:^|\n)\s*[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑•·*⠁-⣿]\s*\S[^\n]{0,200}?(?:…|\.{3})[^\n]{0,80}?\(\s*[^()\n]{0,60}?\d+\s*[hms]\b/i,
+    // Bare status verbs may carry a spinner frame before them ("⠼ Thinking…", "✻ Running…");
+    // braille frames (grok-style CLIs) would otherwise break the line-start anchor.
+    /(?:^|\n)\s*(?:[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑•·*⠁-⣿]\s*)?(?:Running|Thinking|Working|Processing|Searching|Reading|Writing|Editing|Executing|Analyzing|Loading|Connecting|Generating|Compiling|Building|Installing|Fetching|Planning)(?:…|\.{3})/i,
+    // Codex cycles its parenthetical hint, so frames can read "• Working (3s)" with neither
+    // an ellipsis nor "Esc to interrupt". A status verb immediately followed by a
+    // parenthesized elapsed counter is still unique to a live turn.
+    /(?:^|\n)\s*(?:[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑•·*⠁-⣿]\s*)?(?:Running|Thinking|Working|Processing|Loading|Connecting)\s*\(\s*[^()\n]{0,60}?\d+\s*[hms]\b/i,
     // Claude and Codex both show this hint only while a turn is actually running
     // ("esc to interrupt" / "Esc to interrupt"); waiting dialogs say "esc to cancel"
     // instead. It survives status-verb churn, Codex's no-ellipsis "Working (3s ...)"
@@ -4259,7 +4265,11 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
   if (!text.trim()) return false;
   if (llmOutputLooksLikeStructuredChoiceMenu(text)) return true;
   const lower = text.toLowerCase();
-  if (!/(amend|approval|approve|confirm|continue|permission|proceed|project|requesting permission|trust|yolo|승인|확인)/.test(lower)) {
+  // Cheap pre-filter only — the shape patterns below still decide. "allow", "apply",
+  // "execute", and "reject" were missing, which silently killed the claude
+  // "allow …?" branch, grok's "no, reject" / "execute … (●) yes" branches, and the
+  // generic "allow?/apply?" prompts whose dialog text has no other gate word.
+  if (!/(amend|approval|approve|allow|apply|confirm|continue|execute|permission|proceed|project|reject|requesting permission|trust|yolo|승인|확인)/.test(lower)) {
     return false;
   }
   const genericPromptPatterns = [
@@ -4303,8 +4313,15 @@ function llmOutputLooksLikeStructuredChoiceMenu(text: string) {
   if (/\brequest_user_input\b[\s\S]{0,220}\b(?:unavailable|failed|error|not available)\b/i.test(text)) return false;
   const structuredChoicePatterns = [
     /\brequest_user_input\b[\s\S]{0,900}\b(?:questions?|options?|choices?|recommended|label)\b/i,
-    /(?:^|\n)\s*[›>]\s*(?:\d+[.)]|\d+\s*\([●○]\)|[●○])[\s\S]{0,100}\b(?:yes|no|continue|proceed|allow|approve|trust|recommended)\b/i,
-    /(?:^|\n)\s*[›>]\s*\d+[.)]\s+.{1,100}\n\s*(?:\d+[.)]|[›>]\s*\d+[.)])/i
+    // Selected-row cursor + option marker + a decision keyword nearby. Claude's cursor is
+    // ❯ (U+276F) — [›>] never matched it — and dialogs are drawn inside box borders
+    // ("│ ❯ 1. Yes"), so allow one border glyph before the cursor. [●○◉◻◼☐☑□■] covers
+    // radio/checkbox markers (AskUserQuestion multi-select rows are "❯ ◻ 1. …").
+    /(?:^|\n)\s*(?:[│┃|]\s*)?[›>❯▶▸]\s*(?:\d+[.)]|\d+\s*\([●○]\)|[●○◉◻◼☐☑□■])[\s\S]{0,100}\b(?:yes|no|continue|proceed|allow|approve|trust|recommended)\b/i,
+    // Keyword-free menus (AskUserQuestion with arbitrary option labels): a cursor-marked
+    // numbered row followed by another numbered row. The follow-up row must NOT carry a
+    // cursor glyph itself, so markdown blockquotes ("> 1. …" / "> 2. …") stay inert.
+    /(?:^|\n)\s*(?:[│┃|]\s*)?[›>❯▶▸]\s*(?:[●○◉◻◼☐☑□■]\s*)?\d+[.)]\s+.{1,100}\n\s*(?:[│┃|]\s*)?(?:[●○◉◻◼☐☑□■]\s*)?\d+[.)]/i
   ];
   return structuredChoicePatterns.some((pattern) => pattern.test(text));
 }

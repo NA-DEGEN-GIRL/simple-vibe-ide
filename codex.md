@@ -51,6 +51,51 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-12 - Close working/waiting detection gaps across all LLM CLIs
+
+#### Changed
+
+- Waiting (structured menus): Claude Code's selection cursor is `❯` (U+276F),
+  which the cursor class `[›>]` never matched, and dialogs render inside box
+  borders (`│ ❯ 1. Yes │`) that broke the line-start anchor. Menu patterns now
+  accept `❯▶▸`, one leading border glyph, and radio/checkbox option markers
+  (`❯ ◻ 1. …` multi-select rows). This is what makes Claude permission
+  dialogs, AskUserQuestion menus (including keyword-free option labels), and
+  chained dialogs inside the post-input suppression window actually
+  detectable.
+- Waiting (keyword gate): `allow`, `apply`, `execute`, `reject` were missing
+  from the cheap pre-filter, which silently killed the claude `allow …?`
+  branch, grok's `no, reject` and `execute … (●) yes` branches, and generic
+  `apply?/allow?` prompts whose dialog text has no other gate word.
+- Waiting (false-positive guard): the keyword-free consecutive-numbered-rows
+  menu pattern no longer accepts a cursor glyph on the follow-up row, so
+  markdown blockquotes (`> 1. …` / `> 2. …`) stay inert.
+- Working: status verbs may carry a spinner frame prefix including braille
+  (`⠼ Thinking…`, grok-style CLIs) which previously broke the line anchor;
+  added common verbs (Loading/Connecting/Generating/Compiling/Building/
+  Installing/Fetching/Planning); added a verb + parenthesized elapsed counter
+  shape (`• Working (3s)`) for Codex frames where the hint has cycled out;
+  extended the spinner-glyph class of the language-agnostic ellipsis+timer
+  pattern with braille and bullet/geometric frames.
+
+#### Verified
+
+- Node regression harness extracting the real functions from `src/main.ts`:
+  32 cases pass (bordered Claude permission dialog, keyword-free Korean
+  AskUserQuestion, edit-permission menu, multi-select, grok execute/reject
+  dialogs, braille spinner, hint-churned Codex line, blockquote/table/
+  turn-end-prose false-positive guards, plus all prior cases).
+- `npm run check`, `npm run build`.
+
+#### Known limits
+
+- Dialog shapes for grok/antigravity are modeled from their documented flag
+  surfaces and generic TUI conventions, not captured frames; a real sample
+  that still misses should be added to the harness.
+- A turn-ending plain-prose question (no menu) still cannot stay marked as
+  waiting: the completion footer that follows it is a clearly-not-waiting
+  marker by design.
+
 ### 2026-06-12 - Detect non-English Claude status lines as active work
 
 #### Changed
