@@ -93,6 +93,59 @@ export interface SshAuthPromptEvent {
   cacheable: boolean;
 }
 
+export interface RendererRecoveryNotice {
+  kind: string;
+  attempts: number;
+  message: string;
+}
+
+export interface RendererHeartbeatResponse {
+  recovery?: RendererRecoveryNotice | null;
+}
+
+export interface AgentAlertPayload {
+  title: string;
+  body: string;
+  showBanner: boolean;
+  playSound: boolean;
+}
+
+export interface LlmTmuxSession {
+  name: string;
+  attached: boolean;
+  windows: number;
+  createdAt?: number | null;
+  activityAt?: number | null;
+  legacy: boolean;
+}
+
+export interface LlmTmuxSessionListResult {
+  available: boolean;
+  baseName: string;
+  sessions: LlmTmuxSession[];
+  message?: string | null;
+}
+
+export interface SnippetItem {
+  id: string;
+  content: string;
+  description?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SnippetTab {
+  id: string;
+  title: string;
+  items: SnippetItem[];
+}
+
+export interface SnippetsStore {
+  version: 1;
+  activeTabId: string;
+  tabs: SnippetTab[];
+}
+
 export type ExportJobStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface ExportStartResult {

@@ -51,6 +51,786 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-06-28 - Polish LLM toolbar and alert diagnostics
+
+#### Context
+- Reported: in LLM terminal widgets, the `Tmux` button and `+` button had
+  visibly different sizing.
+- Reported: active workspace highlighting was too subtle compared with active
+  widget title highlighting.
+- Reported: native alert test sound plays, but Windows banner output still is
+  not visible; the Settings panel needed a clear diagnostic trail.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Matched the LLM widget `Tmux` and `+` button height, padding, alignment, and
+  tab-shaped radius.
+- Strengthened active workspace blue border/title highlighting. The title
+  highlight now uses the same blue as active widget title bars, while protected
+  workspace title highlights keep stronger amber/green variants.
+- Added an inline `Agent alerts` debug log below the `Test native path`
+  buttons. Test clicks now record permission checks, backend
+  `send_agent_alert` OK/FAILED results, elapsed time, and a warning when the OS
+  may have hidden or blocked the banner despite a successful backend call.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Add numbered LLM tmux sessions and picker
+
+#### Context
+- Requested: LLM launcher buttons should usually create a new tmux-backed
+  session instead of attaching to the one saved workspace+agent tmux session.
+- Requested: still make it easy to open or kill a specific existing tmux
+  session from the LLM widget.
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src/types.ts`, `src-tauri/src/lib.rs`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- WSL/SSH LLM launcher buttons now allocate numbered workspace+agent tmux
+  sessions such as `svi_<workspace>_codex_1`, `_2`, `_3`.
+- LLM terminal widgets now show a `Tmux` button beside `+`; it lists existing
+  sessions for that agent, can attach one as an additional tab, and can kill a
+  session after confirmation.
+- The LLM widget `+` button now opens a new numbered tmux session for the same
+  agent. Plain shell widgets keep the old plain-shell `+` behavior.
+- Terminal tab `x` still closes only the IDE tab/PTY; tmux session kill is
+  explicit from the `Tmux` menu.
+- Workspace snapshots now persist the tmux session name for LLM panes so restore
+  reattaches the same session; older snapshots still attach the legacy
+  workspace+agent session name.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+
+### 2026-06-28 - Polish workspace dock detail indicators
+
+#### Context
+- Reported: when a left/right workspace dock detail row is expanded, the LLM
+  status dot is vertically centered against the full expanded card instead of
+  staying beside the workspace title row.
+- Requested: make the active workspace selection indicator configurable like
+  active widget indicators.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- In side workspace docks, the LLM status dot is now anchored to the first
+  30px title row, so it stays beside the workspace name when detail is open.
+- Added `Set` -> `Active workspace indicator`:
+  - `Blue outer border`
+  - `Highlight tab title`
+- The two active-workspace indicators are independent and persisted in IDE
+  settings.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Route agent alerts through native backend
+
+#### Context
+- Reported: agent notification banners and light sound alerts did not fire
+  while another program had focus; clicking back into the IDE later could play
+  a delayed short sound.
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src/types.ts`, `src-tauri/*`, `docs/USER_GUIDE.ko.md`)
+- Added a backend `send_agent_alert` command that emits Tauri desktop
+  notifications and plays the light alert from native Rust/Windows code.
+- Removed the WebAudio oscillator alert path, so background alerts no longer
+  wait for the next WebView user activation/focus click.
+- Added `Set` -> `Agent alerts` -> `Test native path` buttons for `Banner`,
+  `Sound`, and `Both`. These bypass LLM status detection and call the same
+  backend alert command directly.
+- Frontend alert throttling, privacy-capped alert text, and independent
+  banner/sound toggles are preserved.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Confirm the banner appears while another app is focused.
+- Confirm the native beep plays immediately on `waiting`, `error`, and
+  completion transitions.
+- Use the `Test native path` buttons first to distinguish native Windows/Tauri
+  alert delivery from LLM status-detection failures.
+- If banners still do not appear, check Windows notification/Do Not Disturb
+  settings for the app.
+
+### 2026-06-27 - Stabilize workspace agent detail and tmux launchers
+
+#### Context
+- Requested: fix false `대기` after workspace resume, make side-dock agent
+  detail expandable per workspace, reduce detail flicker, and keep LLM button
+  sessions alive through app rebuilds when `tmux` is available.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Snapshot/replay terminal output no longer drives LLM `waiting`/`working`
+  detection, so old approval prompts restored from scrollback do not mark a
+  workspace as waiting.
+- Live title/output/input detection still drives actual `waiting`, including
+  live choice/question prompts.
+- Side workspace dock detail now renders inline under each workspace row.
+- Each workspace has an independent runtime detail toggle, and the dock `Detail`
+  button now expands/collapses all workspace details.
+- Agent detail rendering is throttled and title-spinner activity is normalized
+  to reduce flickering text while a CLI is working.
+- POSIX LLM launchers now use `tmux new-session -A` with a workspace+agent
+  session name when `tmux` exists, and fall back to direct launch otherwise.
+  Windows profiles keep the existing direct launcher path.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `git diff --check`
+
+#### Needs real Windows/WSL smoke
+- Confirm resume no longer shows stale `대기` from old scrollback.
+- Confirm live request/choice prompts still switch to `대기`.
+- Confirm WSL/SSH LLM buttons attach/reuse the expected tmux session, and no-tmux
+  shells fall back to direct launch.
+
+### 2026-06-27 - Add opt-in agent notification alerts
+
+#### Context
+- Requested: add configurable Windows notification banners for LLM sessions that
+  appear to need user input or have finished, and add a separate lightweight
+  sound alert toggle.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src-tauri/*`, `package.json`, `package-lock.json`, `docs/USER_GUIDE.ko.md`)
+- Added Tauri notification plugin wiring and `notification:default`
+  capability.
+- Added `Set` -> `Agent alerts` toggles:
+  - `Windows notification banners`
+  - `Light sound alert`
+- Agent progress transitions now trigger alerts for `waiting`, `error`, and
+  `working -> idle/exited` completion.
+- Banner and sound toggles are independent. The first implementation used a
+  short WebAudio beep; this is superseded by the 2026-06-28 native backend
+  alert path above.
+- Alert text is based on capped/sanitized agent progress summaries and does not
+  persist raw transcript content.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Superseded by the 2026-06-28 native backend alert smoke items above.
+
+### 2026-06-25 - Add frontend workspace agent activity dock
+
+#### Context
+- Requested: implement the prepared Helm-inspired workspace activity plan so
+  side workspace docks can show which LLM sessions are working, waiting, idle,
+  errored, or exited without storing raw transcripts.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`, `docs/designs/workspace-agent-activity-dock.md`)
+- Added runtime-only `AgentSessionProgress` tracking per terminal pane.
+- Existing launcher, terminal title, terminal output, prompt input, cwd/title
+  rename, and backend-exit paths now update normalized agent state.
+- LLM shell startup failures mark that agent session as `error` instead of
+  looking idle.
+- Workspace tab aggregate priority now uses session progress first:
+  waiting, error, working, idle, exited, then none.
+- Left/right workspace dock `Detail` now shows active-workspace agent cards with
+  agent badge, status chip, shell title, cwd/source, recent activity, and click
+  to focus the matching shell.
+- Detail data is capped/sanitized and kept in memory only; structured
+  todo/tool/context sources remain a future backend watcher task.
+- High-volume LLM output keeps extending the working window with a short
+  fast-path throttle so the xterm write path does not rebuild/sanitize/render
+  agent progress for every output chunk.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Confirm the side dock cards update from real Claude/Codex/Grok title changes
+  while another workspace is active.
+- Confirm click-to-focus returns to the correct shell after workspace switching.
+
+### 2026-06-24 - Normalize widget titlebars and show terminal renderer state
+
+#### Context
+- Requested: show the terminal renderer status directly in the shell titlebar
+  after the WebGL/DOM renderer investigation.
+- Requested: make titlebar controls such as `Op`, `Hist`, `Type`, and
+  `Focus: ...` use consistent font/button sizing, and make one-line widget
+  titlebar heights consistent across Editor, Image Preview, shell, and other
+  widgets.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Shell titlebars now show a small renderer badge: `GL`, `DOM`, `GL?`, or
+  `GL!` for WebGL active, DOM selected/fallback, startup pending, or WebGL
+  context-loss fallback.
+- Terminal WebGL context loss now updates the visible badge immediately.
+- Widget titlebar height and titlebar control sizes now share CSS variables,
+  so titlebar buttons/selects/checkbox labels align to the same one-line
+  baseline.
+- Floating-panel and terminal widget grid rows now use the same titlebar height
+  variable; wrap mode can still grow titlebars when enabled.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-24 - Add configurable workspace tab dock
+
+#### Context
+- Requested: prepare the workspace tab UI for future Helm-like LLM activity
+  details by allowing workspace tabs to move to top, bottom, left, or right.
+- Left/right should reserve real layout space, be resizable, and keep widgets
+  from being hidden underneath the dock.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- IDE Settings now stores global workspace tab placement, side dock width, and
+  side dock detail visibility.
+- Top remains the default and keeps the previous compact tab bar layout.
+- Bottom uses the same compact tab bar at the lower edge of the IDE chrome.
+- Left/right use a true side dock that pushes the main workspace area instead
+  of overlaying it.
+- Side dock resizing updates a CSS variable during drag and persists on release.
+- Vertical workspace reorder now uses the pointer Y midpoint; horizontal tabs
+  keep the existing X midpoint behavior.
+- Added a placeholder detail panel and render hook for later LLM progress UI
+  without implementing log/hook-based LLM status details yet.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Confirm native Browser WebView bounds do not overlap the side dock while
+  switching dock positions or resizing left/right docks.
+- Confirm terminal fit/IME behavior remains stable after dock changes.
+
+### 2026-06-23 - Keep new workspace tabs truly blank
+
+#### Context
+- Reported: clicking workspace `+` could create a tab that partially inherited
+  the previous workspace. Choosing a profile/path from that tab then made the
+  clicked tab disappear and opened a different new workspace.
+- Reported: long workspace tab names correctly ellipsized visually, but
+  hovering the visible label showed the generic "Open workspace..." tooltip
+  instead of the full workspace name.
+- Reported: workspace LLM status dots could disappear for older/manual
+  Codex/Claude panes, and working/waiting state could fail to propagate while
+  viewing a different workspace.
+
+#### Changed (`src/main.ts`)
+- `createBlankWorkspaceTab()` now inserts the blank snapshot but keeps the
+  previous workspace active until `closeWorkspace()` finishes tearing down the
+  previous live UI.
+- This prevents `closeWorkspace()` snapshot flushing from writing the old
+  profile/root/panels into the new blank workspace id, and avoids clearing the
+  previous workspace's capture-protection flag during that flush.
+- The blank tab is activated only after teardown, so the next profile/path
+  selection can fill that same tab.
+- Workspace tab label tooltips now mirror the full workspace tab tooltip, so
+  ellipsized labels reveal the full name/root/status on hover.
+- Terminal panes now have a runtime-only detected LLM id for manual/older
+  Codex/Claude/Grok/Antigravity sessions. This drives indicators and
+  waiting/working detection without saving inferred sessions as launcher-owned
+  restore state.
+- Raw terminal OSC 0/2 title updates are parsed before xterm write flush, so
+  background workspace LLM title changes can update the workspace tab dot even
+  when that workspace's terminal widget is hidden.
+- Follow-up: raw title parsing now also accepts C1 OSC/ST sequences, and
+  background known-LLM panes can mark activity from meaningful non-idle output
+  even when a CLI version does not expose a recognizable title/progress pattern.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-22 - Fix widget bottom-edge resize consistency
+
+#### Context
+- Reported: Explorer, shell widgets, and notes could stop short of the visible
+  workspace bottom while Editor/Image Preview could resize to the bottom edge.
+
+#### Changed (`src/styles.css`)
+- Removed the fixed `16px`/responsive inset from floating-panel and terminal
+  widget `max-height` / `max-width` caps. The existing JavaScript resize clamp
+  remains responsible for keeping widgets inside the workspace, so widgets that
+  start near the top can now expand down to the same bottom edge as other
+  widgets.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-22 - Add per-widget opacity controls
+
+#### Context
+- Requested: make it easier to notice widgets behind the active widget by
+  letting each widget become partially transparent, without adding runtime
+  overhead or losing the value on restart.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Floating panels and terminal widgets now get an `Op` titlebar button.
+- `Op` opens a single body-level popover with a `45%`-`100%` slider and `100%`
+  reset button. The popover is outside the widget so it does not inherit the
+  widget opacity.
+- Widget opacity is applied through a CSS variable on the widget container; no
+  widget body rerender is needed while dragging the slider.
+- Floating panel opacity is saved in each panel snapshot. Terminal widget
+  opacity is saved per terminal widget in the workspace snapshot.
+- Dragging/resizing keeps widgets at a readable opacity while preserving the
+  saved value afterward.
+- Browser widgets can use the control for DOM chrome/iframe/canvas content, but
+  native child WebView content may remain opaque because it is an OS-level child
+  surface.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Confirm per-widget opacity persists across app restart and workspace restore.
+- Confirm Browser native WebView opacity limitations are understandable and do
+  not break preview positioning.
+
+### 2026-06-22 - Add terminal scrollback controls and session history overlay
+
+#### Context
+- Requested: if terminal scrollback contributes to lag/RAM usage, expose a
+  setting to shorten it, but still allow older terminal output to be viewed via
+  a cache-like flow.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Settings now includes `Terminal scrollback rows`. The default remains
+  xterm's previous behavior (`1000` rows); `0` means no terminal scrollback /
+  fastest, not unlimited history.
+- Settings now includes `Terminal history cache` with `Off`, `Balanced`, and
+  `Deep` session-memory modes.
+- Terminal output is copied into a per-pane, session-only plain-text history
+  cache. It is not saved to workspace snapshots or disk.
+- Shell widgets gained a `Hist` button. The History overlay can copy visible
+  history, copy all cached history, page older/newer, or clear the cache.
+- When a normal terminal is already scrolled to the top, scrolling upward again
+  opens the History overlay near the older cached output. Alternate-screen TUI
+  buffers do not auto-open the overlay.
+- Terminal scrollbars were made more visible.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Confirm the built app applies scrollback settings to new and existing
+  terminals.
+- Generate long output, scroll to the terminal top, and confirm `Hist` opens
+  older plain-text history without interfering with Claude/Codex/Grok TUI
+  screens.
+
+### 2026-06-22 - Prioritize capture protection and reduce workspace memory pressure
+
+#### Context
+- Reported: after restarting the IDE, opening a workspace that was still marked
+  capture-protected could briefly show real content in OBS until workspace
+  loading finished.
+- Reported: many workspaces increased lag/RAM, and terminal left columns could
+  show rendering artifacts during resize/scroll.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `package.json`, `docs/USER_GUIDE.ko.md`)
+- Protected workspace selection now auto-arms the persisted marker for the
+  current session and awaits native capture protection before restoring that
+  workspace's content.
+- If native protection fails while opening a protected workspace, the app fails
+  closed by keeping the protection guidance frame visible instead of revealing
+  the workspace.
+- Terminal renderer setting added: `Auto` loads `@xterm/addon-webgl` with a DOM
+  fallback/context-loss recovery; `DOM compatibility` keeps the old renderer.
+- Workspace Memory Saver setting added. The default `Balanced` mode can sleep
+  old inactive workspace shells while keeping their tabs/layout snapshots.
+- Workspace tab context menu gained `Keep live` for long-running servers/jobs.
+- Hidden native browser WebView cleanup delay was reduced from 45s to 12s.
+- Settings gained live widget appearance controls: corner radius, active widget
+  outer-border indicator, and active title-bar highlight.
+- Settings now also shows the current IDE scale and provides a `Reset 100%`
+  button, so terminal rendering artifacts can be compared at exact 100% scale.
+- Claude review found Memory Saver could treat output-producing non-LLM shells
+  as idle. Memory Saver now tracks terminal output activity, re-checks sleep
+  eligibility immediately before killing panes, and shows a status notice when
+  a workspace is slept.
+- Claude review also recommended a post-await active-workspace guard in the
+  capture-protection restore barrier; that guard was added before content
+  restore begins.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- `npm audit --omit=dev`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+
+#### Needs real Windows + OBS smoke
+- Restart the built app, click a capture-protected workspace, and confirm OBS
+  never shows real content before protection is active.
+- Test terminal resize/scroll with Korean output using the default renderer.
+- Open 7+ workspaces and confirm Memory Saver sleeps only inactive unpinned
+  workspaces.
+
+### 2026-06-22 - Support terminal OSC 52 clipboard copies
+
+#### Context
+- Reported: while using Claude/Codex-style terminal TUIs, dragging/copying an
+  address could show a message like `sent N chars via OSC 52`, but the text was
+  not actually available in the desktop clipboard.
+
+#### Changed (`src/main.ts`)
+- Added an xterm OSC 52 handler for terminal panes. When a TUI emits
+  `OSC 52 ; c ; <base64>`, the app now decodes the UTF-8 payload and writes it
+  to the native clipboard through the existing Tauri clipboard plugin.
+- Clipboard writes are capped at 1 MiB and clipboard queries / non-clipboard
+  selections are ignored.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+
+#### Notes
+- This makes terminal-app copy paths that rely on OSC 52 work as expected.
+- For normal xterm text selection while a full-screen TUI has mouse reporting
+  enabled, hold `Shift` while dragging to force terminal selection.
+
+### 2026-06-21 - Fix active workspace capture-block toggles
+
+#### Context
+- Reported: capture block works when toggled from another workspace, but the
+  protected active workspace could fail to toggle with `current webview is not a
+  WebviewWindow` or stay on an `Applying capture block...` status.
+- Reported: when OBS respects the native block it can keep the last real frame,
+  so the user wanted the broadcast-protection guidance frame to be the frozen
+  frame instead, without leaving that card over the local IDE.
+
+#### Changed (`src-tauri/src/lib.rs`, `src/main.ts`)
+- `set_capture_protection` no longer depends on Tauri injecting the caller as a
+  `WebviewWindow`. The command now uses the app handle plus the cached main HWND
+  first, then falls back to locating the main webview window.
+- Active capture re-apply paths use the same app-level helper, so Browser child
+  WebView page-load refreshes do not require a currently focused webview window.
+- Enabling capture block briefly paints the existing "방송 송출 보호 중" DOM
+  frame before applying the native Windows display-affinity flag, then hides the
+  frame locally within about one second. OBS Window Capture should therefore
+  retain the safe guidance frame instead of the last real workspace frame.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+
+#### Needs real Windows + OBS smoke
+- Rebuild the Windows app, enable capture block inside the active protected
+  workspace, then disable it from the same workspace. The status should not hang.
+- In OBS Window Capture, enable capture block and confirm the short protection
+  guidance frame is what remains visible while the local IDE returns to normal.
+
+### 2026-06-21 - Add global Snippets cheat-sheet panel
+
+#### Context
+- Requested: a global, app-wide cheat sheet for frequently copied commands,
+  flags, and short paste-ready snippets. This should not be tied to a single
+  workspace like Notes.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src/api.ts`, `src/types.ts`, `src-tauri/src/lib.rs`)
+- Added a `Snip` toolbar toggle and a global `Snippets` floating panel.
+- Snippets are grouped by category tabs; `+` creates a new tab/category.
+- Each snippet stores paste content plus an optional description, and each row
+  has one-click `Copy`, `Edit`, and `Del` actions.
+- Snippet row actions use a compact right-side action column with `Copy`
+  visually emphasized, so short snippets do not waste a separate footer row.
+- Search filters the current tab by both content and description.
+- Snippets are saved through Tauri into a plaintext app config JSON file instead
+  of workspace snapshots.
+- The panel copy path never auto-runs commands; it only writes the selected
+  snippet content to the clipboard.
+
+#### Safety note
+- Snippets are plaintext local convenience entries, not a secret manager. Do not
+  store passwords, tokens, private keys, or other secrets.
+
+#### Needs real Windows smoke
+- Open `Snip`, create/rename/delete tabs, add/edit/delete snippets, copy a
+  snippet into a terminal, restart the app, and confirm global persistence.
+
+### 2026-06-21 - Add renderer white-screen recovery watchdog
+
+#### Context
+- Reported: under memory pressure WebView2 can degrade to a plain white page,
+  consistent with the renderer process becoming unresponsive or being killed.
+- Direct WebView2 `ProcessFailed` hooks are not exposed cleanly through the
+  current Tauri/wry surface, so the low-risk recovery path is an app-level
+  heartbeat plus backend watchdog.
+
+#### Changed (`src-tauri/src/lib.rs`, `src/main.ts`, `src/api.ts`, `src/types.ts`)
+- Frontend sends a lightweight `renderer_heartbeat` IPC every 5 seconds and
+  listens for `renderer-recovery` notices.
+- Backend watchdog waits through startup grace, then reloads the main WebView if
+  heartbeats stop for the timeout window.
+- Watchdog has a reload cooldown and keeps the recovery notice available for
+  the next renderer, so a white-screen recovery does not immediately loop or
+  lose the user-visible status message.
+- Watchdog-triggered reload deliberately closes native Browser WebViews and
+  drains in-process runtime sessions before reloading. The app does not support
+  reattaching those JS/runtime objects after a renderer crash, and draining is
+  safer than leaving orphaned shells or child WebView2 surfaces.
+- `beforeunload` now flushes workspace/editor/cwd state without marking a
+  full app shutdown, so a watchdog UI reload does not take the normal close
+  path. Explicit window close still uses the Rust/JS shutdown paths.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Stress/kill the renderer or force a severe UI hang and confirm the app returns
+  from a white page after the watchdog timeout.
+- Confirm the recovery status appears after reload and that terminal/browser
+  runtime sessions are restarted cleanly rather than orphaned.
+
+### 2026-06-19 - Make broadcast capture protection reliable (Window Capture)
+
+#### Context
+- Reported: with block enabled, OBS still shows the real workspace. User
+  verified on a fresh build and captures the app with OBS **Window Capture**.
+- Key fact: Window Capture grabs exactly one window's rendered surface, so the
+  separate `capture-cover` decoy window can NEVER appear in it (it only helps
+  monitor/Display Capture). The only protection Window Capture respects is the
+  main window actually carrying `WDA_EXCLUDEFROMCAPTURE` — which then shows
+  **black** in OBS, not the branded cover. "Real content shows" therefore means
+  the affinity was not effectively applied.
+
+#### Changed (`src-tauri/src/lib.rs`, `src/main.ts`)
+- `set_capture_protection` now applies `set_window_capture_protection` FIRST and
+  unconditionally; the decoy cover became best-effort (`if let Err … eprintln`).
+  Previously `show_capture_cover(...)?` could fail and skip the affinity entirely
+  via `?` — the most likely reason the rebuild still leaked.
+- `set_window_capture_protection` now also propagates the affinity to every
+  descendant HWND via `EnumChildWindows`, because WebView2 renders into child
+  windows (`Chrome_WidgetWin` / GPU surface) that Window Capture can latch onto
+  even when the top-level is excluded.
+- Frontend `applyWorkspaceCaptureProtection` no longer `await`s the ~600ms
+  freeze-frame overlay before calling `setCaptureProtection`, and dropped the
+  first no-redispatch bail, so the OS exclusion is applied immediately on toggle.
+- Cover decoy (for Display Capture users) restored + hardened in the same file:
+  kept strictly behind main via `SetWindowPos(SWP_NOACTIVATE | SWP_SHOWWINDOW)`
+  (no `set_focus` z-order fighting), `focused(false)` + click-through, hidden
+  while moving/resizing (debounced re-align) and while minimized — so it never
+  leaks onto the user's own display (the bug that got it removed before).
+
+#### Verified (repo-side only)
+- `cargo fmt --check`, `cargo check --target x86_64-pc-windows-msvc`,
+  `npm run check`, `npm run build`: all OK (pre-existing GNU-target warning only).
+
+#### Needs real Windows + OBS smoke
+- Window Capture: enable block → OBS should go **black** (not branded), user
+  still sees the real workspace. This is the user's setup and the primary test.
+- If a branded "방송 송출 보호 중" screen is wanted in OBS, that requires
+  **Display Capture**; then the restored decoy cover shows. Confirm the cover
+  never appears on the user's own monitor during drag/resize/minimize/toggle.
+- If Window Capture still shows real content after this, the next suspect is the
+  OBS capture method (BitBlt ignores `WDA_EXCLUDEFROMCAPTURE`; only the WGC
+  "Windows 10 1903+" method respects it).
+
+### 2026-06-14 - Split native Browser WebView hide/close and harden shell restore
+
+#### Changed
+
+- Native Browser preview lifecycle is now split by intent:
+  - workspace tab switching hides Browser child WebViews so returning to a
+    workspace can re-show the same preview without reloading;
+  - closing the Web panel, closing/deleting a workspace, changing workspace
+    root, or app exit closes/destroys the relevant Browser child WebViews so
+    hidden audio and OS-level click interception cannot linger.
+- Added a dedicated `close_browser_webview` backend command instead of using
+  `hide_browser_webview` for both preserve and destroy paths.
+- Terminal startup now runs through a blocking worker instead of the Tauri
+  command thread, reducing the chance that slow WSL/SSH PTY startup makes the UI
+  feel frozen.
+- Terminal output/cursor/exit events that arrive before the frontend receives
+  the spawned backend id are buffered briefly and replayed after the pane maps
+  the id. This prevents fast startup/failure output from being dropped and
+  leaving an apparently blank shell.
+- WSL/SSH shell-ready waiters now have a short fallback so workspace restore and
+  Explorer loading cannot wait forever for an OSC7 prompt marker when shell
+  startup is still warming up or a user rcfile blocks the prompt hook.
+- Terminal startup has a timeout; if a backend id arrives after the timeout, the
+  late process is killed so orphan WSL/SSH processes do not accumulate.
+- Terminal startup timeouts are split by profile kind: Windows keeps a short
+  timeout, while WSL and SSH get longer cold-start windows.
+- If a terminal pane is closed while startup is still pending, any backend id
+  that arrives later is killed instead of being attached to a disposed pane.
+- WSL terminal panes are no longer gated on a fake "shell login" state. Once the
+  backend PTY exists, WSL is considered ready and LLM launcher input can be sent
+  immediately.
+- Explorer/file reads no longer wait for terminal shell-ready. They use their
+  own backend timeout and SSH askpass path so one stuck shell cannot block
+  unrelated workspace tabs.
+- Pending shell-ready actions now have their own fallback timer and are cleared
+  if the pane closes, exits, or the workspace restore becomes stale.
+- Switching workspace roots now detaches/kills old terminals in the background,
+  and backend terminal kill removes the session map entry immediately before
+  process-tree cleanup waits in a worker thread.
+- The bash rcfile bootstrap emits the IDE OSC7 ready marker before and after
+  sourcing user `.bashrc`, so slow or noisy rcfiles do not leave the IDE stuck
+  at "Waiting for ... shell login".
+- WSL Linux paths no longer use `\\wsl.localhost\...` for Explorer/file reads.
+  They go through timeout-controlled `wsl.exe` shell commands instead, avoiding
+  Windows filesystem calls that can hang after a distro is restarted or killed.
+- WSL/SSH workspace restore now starts the workspace shell independently and
+  loads Explorer in the background, so file listing delays do not leave the
+  workspace stuck at "shells starting".
+
+#### Verified
+
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target
+  x86_64-pc-windows-msvc`
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch`
+- `git diff --check`
+
+#### Needs real Windows smoke
+
+- Switch away from a workspace with an active native Browser preview and return:
+  the preview should be preserved/re-shown without reload.
+- Close the Web panel or workspace while preview audio is playing: audio should
+  stop and the native WebView should not intercept titlebar/tabs/close clicks.
+- Open WSL `[USER]` workspaces including `simple-vibe-ide` and
+  `[WORKSPACE]`; shell panes should either start or show a startup failure
+  instead of remaining blank.
+- Open SSH `ubuntu-dev` and launch Codex/Claude; `Loading ./useful-skills...`
+  may still be a CLI-side startup step, but the workspace UI should remain
+  interactive and shell output should not be dropped.
+
+### 2026-06-14 - Keep SSH workspace open/close responsive
+
+#### Changed
+
+- SSH Explorer startup now follows the same visible-shell-first path as WSL:
+  workspace activation renders the workspace and starts the terminal first, then
+  loads Explorer after shell-ready/fallback. A stuck background `ssh.exe` directory
+  read should no longer make workspace tabs or the window close button feel dead.
+- Remote Explorer/listing/signature probes now have a short backend timeout and
+  frontend timeout. Timed-out SSH reads clear auth cache and kill the spawned
+  process tree instead of lingering indefinitely.
+- General remote file operations keep a longer timeout so normal larger file
+  reads/writes are not cut off by the Explorer probe timeout.
+- Terminal backend close now kills first instead of waiting for pending input
+  flushes, and the backend `kill_terminal` command runs on a blocking worker so
+  closing a stuck SSH PTY does not tie up the Tauri command thread.
+
+#### Verified
+
+- `ssh ubuntu-dev` noninteractive smoke for a basic command, `sh -lc`, and the
+  base64 bootstrap loader all returned successfully.
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target
+  x86_64-pc-windows-msvc`
+- `git diff --check`
+
+#### Follow-up smoke
+
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch` completed after
+  the WSL/SSH startup-timeout follow-up and produced both Windows release exes.
+
+### 2026-06-14 - Harden WSL root-account workspace resolve
+
+#### Changed
+
+- WSL home detection is now cached per distro for the IDE process lifetime.
+  Root-account distros such as `coding` no longer spawn a fresh WSL probe every
+  time profile/root resolution runs.
+- WSL home probes now have a hard timeout and kill the probe process tree on
+  timeout. If the primary home probe fails, the IDE falls back to `id -un` and
+  maps root users to `/root`.
+- `resolve_profile_path` now runs on a blocking worker instead of a synchronous
+  command path, and the frontend wraps root resolution in a longer timeout. A
+  stuck WSL resolve should show an error and leave the window close path
+  responsive.
+- The Open / Connect button now catches resolve failures instead of continuing
+  into a half-open workspace after a timeout.
+- During this investigation, a stuck Simple Vibe IDE process tree was terminated:
+  the app process plus child WebView2, WSL, WSL host, and console host processes.
+
+#### Verified
+
+- `coding` direct home probe returned `/root`.
+- `coding` `--cd /root` shell smoke returned `/root`.
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target
+  x86_64-pc-windows-msvc`
+- `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch`
+- `git diff --check`
+
+### 2026-06-13 - Harden SSH bootstrap and stop hidden preview audio
+
+#### Changed
+
+- SSH terminals: the previous PowerShell quote pre-escape was not sufficient on
+  every Windows OpenSSH path; a real SSH launch could still strip double quotes
+  from the remote bash rcfile and fail at `case ;${PROMPT_COMMAND:-};`. SSH
+  terminal launches now pass a quote-free base64 loader through `ssh.exe`, decode
+  the full bash bootstrap on the remote host, and source it inside remote bash
+  before `exec bash --rcfile ... -i`. This keeps `codex`/`claude` launcher
+  commands and OSC7 cwd bootstrap out of the fragile Windows argv quote path.
+- Browser preview: native child WebViews keep playing media after `hide()`.
+  Closing the Web panel, closing/switching workspace preview state, or removing
+  preview tabs now destroys the child WebView via the existing hide command path,
+  so background music stops instead of continuing invisibly.
+
+#### Verified
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `npm run check`
+- `npm run build`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target
+  x86_64-pc-windows-msvc`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+
+#### Known limits
+
+- Real Windows smoke is still required: SSH launch should no longer show the
+  `/dev/fd/63` quote-loss syntax error, and a local preview page with audio
+  should stop when Web/workspace is closed.
+
 ### 2026-06-12 - Close working/waiting detection gaps across all LLM CLIs
 
 #### Changed
@@ -8180,6 +8960,22 @@ as historical context for why the pty-host path was removed.
   for multi-selection.
 - Export rows now include Clear actions, and multi-export completion reports a
   compact item-count summary instead of a long per-file message stream.
+- Capture lock now survives restart via the saved workspace flag while OS-level
+  capture protection is applied asynchronously, so workspace loading, shell
+  startup, and app close are not blocked by capture-protection work.
+- Removed the persistent native capture-cover window from capture lock. The app
+  now uses the main window capture affinity directly and closes any stale cover,
+  avoiding input/focus issues where the IDE looked alive but tabs and close
+  controls stopped responding.
+- Claude launcher now checks the effective uid again at launch time and runs
+  plain `claude` as root, preventing stale `__svi_args` from passing
+  `--dangerously-skip-permissions` in root WSL/SSH shells.
+- WSL workspace and terminal startup now treat `Wsl/Service/E_UNEXPECTED` as a
+  transient WSL service error: terminal spawn warms the distro with a short
+  probe, and WSL shell/file commands retry briefly before surfacing the error.
+- WSL warmup is now cached per distro and guarded while in flight, preventing a
+  workspace restore with multiple terminals from launching duplicate warmup
+  probes that can slow WSL cold start.
 
 #### Verification
 

@@ -4,12 +4,14 @@ import { Image as TauriImage } from '@tauri-apps/api/image';
 import type { Extension } from '@codemirror/state';
 import type { EditorView as CodeMirrorView } from '@codemirror/view';
 import { readImage, readText, writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
 import type { IBufferLine, ILink as XTermLink, Terminal as XTermTerminal } from '@xterm/xterm';
 import type { FitAddon as XTermFitAddon } from '@xterm/addon-fit';
+import type { WebglAddon as XTermWebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, PortForwardResult, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, LlmTmuxSession, PortForwardResult, RendererHeartbeatResponse, RendererRecoveryNotice, SnippetItem, SnippetsStore, SnippetTab, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 declare const __SVIDE_BUILD_ID__: string;
@@ -26,14 +28,23 @@ interface TerminalPane {
   // Set when opened via an LLM launcher button (codex/claude/grok/antigravity). On workspace restore this is
   // used to re-launch the CLI (typed at the prompt) instead of restoring a plain shell.
   llmId?: string;
+  llmTmuxSessionName?: string;
+  // Runtime-only fallback for LLM sessions that were started manually or restored
+  // from older snapshots without llmId metadata. This drives indicators/detection
+  // but is not saved as launcher-owned state.
+  detectedLlmId?: string;
   profileId: string;
   cwd: string;
   term: XTermTerminal;
   fit: XTermFitAddon;
+  webgl?: XTermWebglAddon;
+  webglContextLost?: boolean;
+  webglContextLossDisposable?: { dispose: () => void };
   element: HTMLElement;
   host: HTMLElement;
   outputBuffer: string;
   writeBuffer: string;
+  historyCache?: TerminalHistoryCache;
   backendOutputChars: number;
   cwdOutputBuffer: string;
   inputBuffer: string;
@@ -42,6 +53,9 @@ interface TerminalPane {
   inputWritePromise?: Promise<void>;
   shellReadyAt?: number;
   pendingShellReadyActions?: TerminalShellReadyAction[];
+  startupNoticeTimer?: number;
+  startupStallTimer?: number;
+  closed?: boolean;
   typingPadOpen?: boolean;
   typingPadDraft?: string;
   imeComposing?: boolean;
@@ -53,6 +67,12 @@ interface TerminalPane {
   lastUserInputAt?: number;
   llmWaitingDetectionBuffer?: string;
   llmWaitingSuppressUntil?: number;
+  llmTitleOscBuffer?: string;
+  llmTitleSignalTimer?: number;
+  llmTitlePendingSignal?: WorkspaceLlmTitleSignal;
+  llmTitlePendingActivity?: string;
+  llmTitleDetectionSuppressUntil?: number;
+  llmTitleDisposable?: { dispose: () => void };
   activePythonEnv?: TerminalPythonEnvSnapshot;
   pendingTerminalWrites?: number;
   writeDrainPromise?: Promise<void>;
@@ -63,11 +83,19 @@ interface TerminalPane {
   fitFrame?: number;
   writeFrame?: number;
   writeTimer?: number;
+  shellReadyFallbackTimer?: number;
   portScanTimer?: number;
   cwdScanTimer?: number;
   lastRows?: number;
   lastCols?: number;
   resizeObserver?: ResizeObserver;
+}
+
+interface TerminalHistoryCache {
+  lines: string[];
+  currentLine: string;
+  charCount: number;
+  escapeCarry: string;
 }
 
 type TerminalSplitDirection = 'row' | 'column';
@@ -97,8 +125,25 @@ interface TerminalWidget {
   element: HTMLElement;
   title: HTMLElement;
   cwd: HTMLElement;
+  rendererBadge: HTMLElement;
   tabList: HTMLElement;
   hostStack: HTMLElement;
+  llmSessionsButton: HTMLButtonElement;
+  opacityButton: HTMLButtonElement;
+  historyButton: HTMLButtonElement;
+  historyOverlay: HTMLElement;
+  historyMeta: HTMLElement;
+  historyContent: HTMLTextAreaElement;
+  historyOlder: HTMLButtonElement;
+  historyNewer: HTMLButtonElement;
+  historyCopyVisible: HTMLButtonElement;
+  historyCopyAll: HTMLButtonElement;
+  historyClear: HTMLButtonElement;
+  historyClose: HTMLButtonElement;
+  historyOverlayPaneId?: string;
+  historyOverlayEndLine?: number;
+  historyOverlayPageStart?: number;
+  historyOverlayPageEnd?: number;
   typePadToggle: HTMLButtonElement;
   typePadFocusToggle: HTMLButtonElement;
   typePad: HTMLElement;
@@ -238,6 +283,20 @@ interface IdeSettings {
   uiFont: string;
   monoFont: string;
   editorTheme: EditorThemeId;
+  terminalRenderer: TerminalRendererSetting;
+  terminalScrollbackRows: number;
+  terminalHistoryCache: TerminalHistoryCacheMode;
+  memorySaver: WorkspaceMemorySaverMode;
+  workspaceDockPosition: WorkspaceDockPosition;
+  workspaceDockSize: number;
+  workspaceDockDetailOpen: boolean;
+  workspaceFocusBorder: boolean;
+  workspaceFocusTitle: boolean;
+  agentNotificationBanners: boolean;
+  agentAlertSound: boolean;
+  widgetRadius: number;
+  widgetFocusBorder: boolean;
+  widgetFocusTitle: boolean;
   extraMaskPatterns: string[];
   widgetWrap: WidgetWrapSettings;
 }
@@ -330,6 +389,7 @@ interface LayoutRatio {
 interface WorkspacePanelSnapshot {
   visible: boolean;
   rect?: LayoutRatio;
+  opacity?: number;
 }
 
 interface WorkspaceTerminalSnapshot {
@@ -338,6 +398,7 @@ interface WorkspaceTerminalSnapshot {
   customTitle?: string;
   command: string | null;
   llmId?: string;
+  llmTmuxSessionName?: string;
   backendId?: string;
   widgetId?: string;
   groupId?: string;
@@ -404,9 +465,11 @@ interface WorkspaceSnapshot {
   currentDir: string;
   workspaceOpen: boolean;
   captureProtected: boolean;
+  keepLive?: boolean;
   updatedAt: string;
   panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>>;
   terminalSpawnRect?: LayoutRatio;
+  terminalWidgetOpacity?: Record<string, number>;
   terminals: WorkspaceTerminalSnapshot[];
   terminalGroups?: WorkspaceTerminalGroupSnapshot[];
   activeTerminalIndex: number;
@@ -527,9 +590,10 @@ interface TerminalRuntime {
   Terminal: typeof import('@xterm/xterm').Terminal;
   FitAddon: typeof import('@xterm/addon-fit').FitAddon;
   Unicode11Addon: typeof import('@xterm/addon-unicode11').Unicode11Addon;
+  WebglAddon?: typeof import('@xterm/addon-webgl').WebglAddon;
 }
 
-type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'calculator' | 'settings';
+type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'snippets' | 'calculator' | 'settings';
 type PanelRect = { left: number; top: number; width: number; height: number };
 type ExplorerOpenMode = 'single' | 'double';
 type BrowserOrientation = 'portrait' | 'landscape';
@@ -539,6 +603,12 @@ type WidgetWrapTargetId = FloatingPanelId | 'terminal';
 type WidgetWrapPart = 'title' | 'controls';
 type WidgetWrapState = Record<WidgetWrapPart, boolean>;
 type WidgetWrapSettings = Partial<Record<WidgetWrapTargetId, Partial<WidgetWrapState>>>;
+type TerminalRendererSetting = 'auto' | 'dom';
+type TerminalHistoryCacheMode = 'off' | 'balanced' | 'deep';
+type WorkspaceMemorySaverMode = 'balanced' | 'off' | 'aggressive';
+type WidgetOpacityTarget =
+  | { kind: 'panel'; id: FloatingPanelId; element: HTMLElement }
+  | { kind: 'terminal'; widgetId: string; element: HTMLElement };
 type ForwardRenderKind = 'detected' | 'forward' | 'empty';
 type WorkspaceSnapshotPersistMode = 'flush' | 'defer' | 'none';
 type TerminalVisibility = 'visible' | 'inactive' | 'background';
@@ -552,11 +622,19 @@ type TerminalDefaultFocusTarget = 'shell' | 'typing-pad';
 type TerminalShellReadyAction = {
   label: string;
   run: () => void | Promise<void>;
+  timer?: number;
 };
 type TerminalPythonEnvShell = 'posix' | 'powershell';
 type ImageTagPasteTarget = TerminalTextTarget | 'none';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
+type WorkspaceDockPosition = 'top' | 'bottom' | 'left' | 'right';
+type AgentSessionStatus = 'idle' | 'working' | 'waiting' | 'error' | 'exited';
+type AgentSessionSource = 'launcher' | 'title' | 'output' | 'heuristic';
+type AgentAlertKind = 'waiting' | 'done' | 'error';
+type TerminalDataHandlingOptions = {
+  detectLlmState?: boolean;
+};
 type BrowserDevicePreset = {
   id: string;
   label: string;
@@ -576,6 +654,21 @@ type ContextMenuItem = {
   separator?: boolean;
 };
 type WorkspaceDropTarget = { targetId: string; position: 'before' | 'after' };
+
+interface AgentSessionProgress {
+  paneId: string;
+  workspaceId: string;
+  backendId?: string;
+  agentId: string;
+  status: AgentSessionStatus;
+  title: string;
+  cwd: string;
+  activity: string;
+  source: AgentSessionSource;
+  updatedAt: number;
+  expiresAt?: number;
+  redacted?: boolean;
+}
 type WorkspaceDragState = {
   id: string;
   pointerId: number;
@@ -596,6 +689,8 @@ type CreateTerminalOptions = {
   splitDirection?: TerminalSplitDirection;
   defaultFocusTarget?: TerminalDefaultFocusTarget;
   pythonEnv?: TerminalPythonEnvSnapshot;
+  llmId?: string;
+  llmTmuxSessionName?: string;
 };
 
 interface TerminalPythonEnvSnapshot {
@@ -685,7 +780,7 @@ const APP_BUILD_ID = typeof __SVIDE_BUILD_ID__ === 'string' && __SVIDE_BUILD_ID_
   ? __SVIDE_BUILD_ID__
   : 'dev';
 const APP_STORAGE_PREFIX = IS_TERMINAL_APP ? 'simple-vibe-terminal' : 'simple-vibe-ide';
-const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'calculator', 'settings'];
+const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'snippets', 'calculator', 'settings'];
 const WIDGET_WRAP_TARGETS: Array<{ id: WidgetWrapTargetId; label: string }> = [
   { id: 'terminal', label: 'Shell widgets' },
   { id: 'explorer', label: 'Explorer' },
@@ -693,6 +788,7 @@ const WIDGET_WRAP_TARGETS: Array<{ id: WidgetWrapTargetId; label: string }> = [
   { id: 'image', label: 'Image Preview' },
   { id: 'browser', label: 'Browser' },
   { id: 'notes', label: 'Notes' },
+  { id: 'snippets', label: 'Snippets' },
   { id: 'calculator', label: 'Calculator' },
   { id: 'settings', label: 'Settings' }
 ];
@@ -702,6 +798,7 @@ const IDE_DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   image: true,
   browser: true,
   notes: false,
+  snippets: false,
   calculator: false,
   settings: false
 };
@@ -711,6 +808,7 @@ const TERMINAL_DEFAULT_PANEL_VISIBILITY: Record<FloatingPanelId, boolean> = {
   image: false,
   browser: false,
   notes: false,
+  snippets: false,
   calculator: false,
   settings: false
 };
@@ -727,6 +825,10 @@ const BROWSER_ADDRESS_SUGGESTION_LIMIT = 8;
 const WORKSPACE_IMAGE_STORE_KEY = `${APP_STORAGE_PREFIX}.workspaceImages.v1`;
 const WORKSPACE_IMAGE_REF_PREFIX = 'simple-vibe-image:';
 const WORKSPACE_IMAGE_REF_CACHE_LIMIT = 512;
+const IMAGE_HISTORY_LIMIT = 24;
+const WORKSPACE_IMAGE_HISTORY_PERSIST_LIMIT = 12;
+const WORKSPACE_IMAGE_DATA_URL_PERSIST_MAX_CHARS = 6 * 1024 * 1024;
+const WORKSPACE_IMAGE_STORE_MAX_CHARS = 16 * 1024 * 1024;
 const MARKET_TICKER_STORE_KEY = `${APP_STORAGE_PREFIX}.marketTicker.v1`;
 const IDE_SETTINGS_KEY = `${APP_STORAGE_PREFIX}.settings.v1`;
 const NOTES_DIR = '.vibe-ide-temp/notes';
@@ -741,6 +843,13 @@ const NOTE_THEMES: Array<{ id: NoteThemeId; label: string }> = [
   { id: 'rose', label: 'Rose' },
   { id: 'paper', label: 'Paper' }
 ];
+const DEFAULT_SNIPPETS_TAB_ID = 'general';
+const DEFAULT_SNIPPETS_TAB_TITLE = 'General';
+const SNIPPETS_MAX_TABS = 32;
+const SNIPPETS_MAX_ITEMS_PER_TAB = 500;
+const SNIPPETS_MAX_TITLE_CHARS = 48;
+const SNIPPETS_MAX_CONTENT_CHARS = 4000;
+const SNIPPETS_MAX_DESCRIPTION_CHARS = 500;
 const PANEL_SNAP_DISTANCE = 14;
 const WIDGET_KEYBOARD_SCALE = 1.1;
 const TERMINAL_PORT_SCAN_LIMIT = 4000;
@@ -751,15 +860,44 @@ const TERMINAL_INACTIVE_WRITE_BATCH_MS = 240;
 const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
 const TERMINAL_INPUT_BATCH_MS = 4;
 const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
+const TERMINAL_START_TIMEOUT_WINDOWS_MS = 15000;
+const TERMINAL_START_TIMEOUT_WSL_MS = 60000;
+const TERMINAL_START_TIMEOUT_SSH_MS = 45000;
+const TERMINAL_STARTUP_NOTICE_MS = 900;
+const TERMINAL_STARTUP_STALL_MS = 10000;
+const TERMINAL_CLOSE_BACKEND_TIMEOUT_MS = 2500;
+const TERMINAL_SHELL_READY_FALLBACK_MS = 4500;
+const TERMINAL_SHELL_READY_ACTION_FALLBACK_MS = 6500;
+const TERMINAL_PENDING_BACKEND_EVENT_LIMIT = 64;
+const TERMINAL_PENDING_BACKEND_DATA_CHARS = 128 * 1024;
 const TERMINAL_BACKGROUND_SCAN_BATCH_MS = 900;
 const TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS = 1200;
 const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 64 * 1024;
 const TERMINAL_VISIBLE_WRITE_CHUNK_CHARS = 16 * 1024;
 const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 8 * 1024;
 const TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS = 2 * 1024;
+const TERMINAL_OSC52_CLIPBOARD_MAX_BYTES = 1024 * 1024;
+const TERMINAL_OSC52_CLIPBOARD_MAX_BASE64_CHARS = Math.ceil(TERMINAL_OSC52_CLIPBOARD_MAX_BYTES / 3) * 4 + 16;
 const TERMINAL_CURSOR_QUERY_FLUSH_LIMIT_CHARS = 64 * 1024;
 const TERMINAL_CURSOR_QUERY_DRAIN_TIMEOUT_MS = 160;
 const TERMINAL_CWD_CONTINUATION_TAIL_LIMIT = 512;
+const TERMINAL_SCROLLBACK_DEFAULT_ROWS = 1000;
+const TERMINAL_SCROLLBACK_MAX_ROWS = 10000;
+const WORKSPACE_DOCK_DEFAULT_SIZE = 260;
+const WORKSPACE_DOCK_MIN_SIZE = 180;
+const WORKSPACE_DOCK_MAX_SIZE = 420;
+const WORKSPACE_DOCK_MAX_VIEWPORT_FRACTION = 0.4;
+const TERMINAL_HISTORY_BALANCED_MAX_LINES = 20_000;
+const TERMINAL_HISTORY_BALANCED_MAX_CHARS = 4 * 1024 * 1024;
+const TERMINAL_HISTORY_DEEP_MAX_LINES = 100_000;
+const TERMINAL_HISTORY_DEEP_MAX_CHARS = 16 * 1024 * 1024;
+const TERMINAL_HISTORY_VISIBLE_PAGE_LINES = 2500;
+const TERMINAL_HISTORY_VISIBLE_PAGE_CHARS = 768 * 1024;
+const TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES = 40;
+const WIDGET_OPACITY_DEFAULT = 100;
+const WIDGET_OPACITY_MIN = 45;
+const WIDGET_OPACITY_MAX = 100;
+const WIDGET_OPACITY_STEP = 5;
 const TERMINAL_RECENT_INPUT_WINDOW_MS = 900;
 const TERMINAL_FOCUS_REPORT_PATTERN = /\x1b\[(?:I|O)/g;
 const WORKSPACE_LLM_OUTPUT_ACTIVE_MS = 2500;
@@ -767,6 +905,18 @@ const WORKSPACE_LLM_INPUT_ACTIVE_MS = 3500;
 const WORKSPACE_LLM_START_ACTIVE_MS = 4000;
 const WORKSPACE_LLM_WAITING_BUFFER_CHARS = 6000;
 const WORKSPACE_LLM_WAITING_AFTER_INPUT_SUPPRESS_MS = 1800;
+const WORKSPACE_LLM_TITLE_ACTIVE_MS = 1800;
+const WORKSPACE_LLM_TITLE_WORKING_DEBOUNCE_MS = 150;
+const WORKSPACE_LLM_TITLE_IDLE_DEBOUNCE_MS = 500;
+const WORKSPACE_LLM_TITLE_OSC_BUFFER_CHARS = 4096;
+const LLM_TMUX_SESSION_MAX_LEN = 48;
+const AGENT_SESSION_ACTIVITY_MAX_CHARS = 160;
+const AGENT_SESSION_TITLE_MAX_CHARS = 80;
+const AGENT_SESSION_CWD_MAX_CHARS = 90;
+const AGENT_SESSION_OUTPUT_ACTIVITY_THROTTLE_MS = 350;
+const AGENT_ALERT_MIN_INTERVAL_MS = 4500;
+const WORKSPACE_DOCK_DETAIL_RENDER_THROTTLE_MS = 450;
+const TERMINAL_SNAPSHOT_LLM_TITLE_SUPPRESS_MS = 5000;
 // Snapshot replay arrives as one giant chunk whose scrollback can contain long-answered
 // prompts; only the tail (≈ the final screen) reflects what the CLI is showing now.
 const WORKSPACE_LLM_SNAPSHOT_DETECTION_TAIL_CHARS = 8000;
@@ -806,6 +956,8 @@ const EXPLORER_DIRECTORY_CACHE_BUSY_LIMIT = EXPLORER_DIRECTORY_CACHE_LIMIT + EXP
 const EXPLORER_DIRECTORY_CACHE_TTL_LOCAL_MS = 3000;
 const EXPLORER_DIRECTORY_CACHE_TTL_WSL_MS = 6000;
 const EXPLORER_DIRECTORY_CACHE_TTL_SSH_MS = 9000;
+const EXPLORER_REMOTE_DIRECTORY_LOAD_TIMEOUT_MS = 7000;
+const RESOLVE_PROFILE_PATH_TIMEOUT_MS = 30000;
 const NOTES_AUTOSAVE_DELAY_MS = 1800;
 const TEXT_FILE_CACHE_LIMIT = 128;
 const TEXT_FILE_PREFETCH_MAX_BYTES = 512 * 1024;
@@ -845,7 +997,15 @@ const BROWSER_CONSOLE_LOCAL_URL_PORT_PATTERN = /\b(?:https?|wss?):\/\/(?:127\.0\
 const BROWSER_INACTIVE_FRAME_SUSPEND_DELAY_MS = 3500;
 const BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS = 350;
 const BROWSER_FRAME_SUSPEND_IDLE_MS = 250;
+const BROWSER_NATIVE_HIDDEN_CLOSE_DELAY_MS = 12_000;
 const WORKSPACE_RESTORE_BACKGROUND_DELAY_MS = 1800;
+const WORKSPACE_MEMORY_SAVER_CHECK_DELAY_MS = 3000;
+const WORKSPACE_MEMORY_SAVER_BALANCED_LIVE_LIMIT = 3;
+const WORKSPACE_MEMORY_SAVER_BALANCED_MIN_WORKSPACES = 6;
+const WORKSPACE_MEMORY_SAVER_BALANCED_IDLE_MS = 10 * 60_000;
+const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_LIVE_LIMIT = 1;
+const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_MIN_WORKSPACES = 3;
+const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_IDLE_MS = 2 * 60_000;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const BROWSER_ZOOM_LEVELS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const IMAGE_PREVIEW_MIN_ZOOM = 0.1;
@@ -855,6 +1015,7 @@ const IMAGE_PREVIEW_WHEEL_FACTOR = 1.12;
 // separate headless Edge + CDP screencast proved brittle on Windows because the
 // launcher can exit before the remote-debugging endpoint ever binds.
 const USE_NATIVE_BROWSER_WEBVIEW = true;
+const BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX = 'browser-preview-webview';
 const USE_EDGE_CDP_BROWSER = false;
 const USE_PREVIEW_PROXY_BROWSER = false;
 const EDGE_SCREENCAST_QUALITY = 66;
@@ -890,6 +1051,7 @@ const MARKET_TICKER_BOOT_DELAY_MS = 2200;
 const MARKET_TICKER_VISIBLE_RESUME_DELAY_MS = 900;
 const MARKET_TICKER_IDLE_TIMEOUT_MS = 2500;
 const MARKET_TICKER_RENDER_MIN_MS = 1000;
+const RENDERER_HEARTBEAT_INTERVAL_MS = 5000;
 const MARKET_TICKER_FETCH_TIMEOUT_MS = 8000;
 const MARKET_TICKER_FALLBACK_MS = 30000;
 const MARKET_TICKER_STALE_MS = 45000;
@@ -1249,9 +1411,43 @@ const DEFAULT_IDE_SETTINGS: IdeSettings = {
   uiFont: 'system',
   monoFont: 'cascadia',
   editorTheme: 'simple-dark',
+  terminalRenderer: 'auto',
+  terminalScrollbackRows: TERMINAL_SCROLLBACK_DEFAULT_ROWS,
+  terminalHistoryCache: 'balanced',
+  memorySaver: 'balanced',
+  workspaceDockPosition: 'top',
+  workspaceDockSize: WORKSPACE_DOCK_DEFAULT_SIZE,
+  workspaceDockDetailOpen: false,
+  workspaceFocusBorder: true,
+  workspaceFocusTitle: false,
+  agentNotificationBanners: false,
+  agentAlertSound: false,
+  widgetRadius: 8,
+  widgetFocusBorder: true,
+  widgetFocusTitle: false,
   extraMaskPatterns: ['*.env', '*.env.*', '*.secret', '*.private', '*.credentials'],
   widgetWrap: defaultWidgetWrapSettings()
 };
+const TERMINAL_RENDERER_CHOICES: Array<{ id: TerminalRendererSetting; label: string }> = [
+  { id: 'auto', label: 'Auto (WebGL, fallback)' },
+  { id: 'dom', label: 'DOM compatibility' }
+];
+const TERMINAL_HISTORY_CACHE_CHOICES: Array<{ id: TerminalHistoryCacheMode; label: string }> = [
+  { id: 'balanced', label: 'Balanced (session memory)' },
+  { id: 'off', label: 'Off' },
+  { id: 'deep', label: 'Deep (session memory)' }
+];
+const WORKSPACE_MEMORY_SAVER_CHOICES: Array<{ id: WorkspaceMemorySaverMode; label: string }> = [
+  { id: 'balanced', label: 'Balanced' },
+  { id: 'off', label: 'Off' },
+  { id: 'aggressive', label: 'Aggressive' }
+];
+const WORKSPACE_DOCK_POSITION_CHOICES: Array<{ id: WorkspaceDockPosition; label: string }> = [
+  { id: 'top', label: 'Top' },
+  { id: 'bottom', label: 'Bottom' },
+  { id: 'left', label: 'Left side dock' },
+  { id: 'right', label: 'Right side dock' }
+];
 const PANEL_RESIZE_DIRECTIONS: WindowResizeDirection[] = ['North', 'East', 'South', 'West', 'NorthEast', 'NorthWest', 'SouthEast', 'SouthWest'];
 
 const state = {
@@ -1302,6 +1498,8 @@ const state = {
   activeNoteTabId: '',
   notePinned: false,
   noteOpacity: 100,
+  snippets: defaultSnippetsStore(),
+  snippetSearch: '',
   forwards: [] as PortForwardResult[],
   previewProxies: [] as PortForwardResult[],
   detectedPorts: [] as DetectedPortItem[],
@@ -1337,6 +1535,8 @@ let terminalRuntimePromise: Promise<TerminalRuntime> | null = null;
 let panelZ = 20;
 let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
 let keyboardResizeTargetElement: HTMLElement | null = null;
+let widgetOpacityPopoverTarget: WidgetOpacityTarget | null = null;
+let widgetOpacityPopoverDirty = false;
 let terminalTextTarget: TerminalTextTarget = 'shell';
 let ideScale = 1;
 let editorFontSize = 13;
@@ -1357,6 +1557,9 @@ const stringFingerprintCache = new Map<string, string>();
 const profileById = new Map<string, ConnectionProfile>();
 const terminalPaneById = new Map<string, TerminalPane>();
 const terminalPaneByBackendId = new Map<string, TerminalPane>();
+const pendingTerminalDataByBackendId = new Map<string, string>();
+const pendingTerminalCursorQueriesByBackendId = new Map<string, number>();
+const pendingTerminalExitByBackendId = new Map<string, TerminalExitEvent>();
 const terminalPanesByWidgetId = new Map<string, TerminalPane[]>();
 const terminalWidgetById = new Map<string, TerminalWidget>();
 const terminalWidgetByElement = new WeakMap<HTMLElement, TerminalWidget>();
@@ -1371,6 +1574,8 @@ const workspaceTabElementCache = new Map<string, HTMLElement>();
 const workspaceTabPartCache = new WeakMap<HTMLElement, {
   label: HTMLButtonElement;
   input: HTMLInputElement;
+  detailToggle: HTMLButtonElement;
+  detail: HTMLDivElement;
   security: HTMLButtonElement;
   copy: HTMLButtonElement;
   close: HTMLButtonElement;
@@ -1402,6 +1607,7 @@ const imageTabElementCache = new Map<string, HTMLElement>();
 const noteTabById = new Map<string, NoteTabState>();
 const noteTabIndexByIdLookup = new Map<string, number>();
 const noteTabElementCache = new Map<string, HTMLElement>();
+const snippetTabElementCache = new Map<string, HTMLElement>();
 const calculatorHistoryElementCache = new Map<string, HTMLElement>();
 const explorerDirectorySignatureCache = new WeakMap<FileEntry[], string>();
 const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
@@ -1426,6 +1632,7 @@ const previewProxyLocalPortMisses = new Set<number>();
 const browserFrameByTabId = new Map<string, HTMLIFrameElement>();
 const browserFramesByWorkspaceId = new Map<string, Set<HTMLIFrameElement>>();
 const browserWorkspaceSuspendTimers = new Map<string, number>();
+const nativeBrowserWebviewCloseTimers = new Map<string, number>();
 const browserLoadRequestByTabId = new Map<string, number>();
 const browserAssetRecoveryByTabId = new Map<string, { url: string; count: number; at: number }>();
 const browserAssetRecoveryTimers = new Map<string, number>();
@@ -1535,9 +1742,25 @@ let workspaceImageStore: Record<string, string> = {};
 let workspaceImageStoreDirty = false;
 const workspaceImageRefCache = new Map<string, { dataUrl: string; key: string }>();
 const workspaceSnapshotSignatures = new Map<string, string>();
+const captureProtectionSessionWorkspaceIds = new Set<string>();
+const workspaceLastActiveAt = new Map<string, number>();
+const workspaceLastOutputAt = new Map<string, number>();
+const workspaceMemorySleepingIds = new Set<string>();
+let workspaceMemorySaverTimer = 0;
 const workspaceLlmActivityExpiresAt = new Map<string, number>();
 const workspaceLlmActivityTimers = new Map<string, number>();
 const workspaceLlmWaitingByPaneId = new Map<string, { workspaceId: string; llmId: string; detectedAt: number }>();
+const workspaceLlmTitleActivityByPaneId = new Map<string, { workspaceId: string; llmId: string; expiresAt: number }>();
+const workspaceLlmTitleActivityTimers = new Map<string, number>();
+const agentSessionProgressByPaneId = new Map<string, AgentSessionProgress>();
+const agentSessionProgressTimers = new Map<string, number>();
+const agentAlertLastByPaneId = new Map<string, { kind: AgentAlertKind; at: number }>();
+const AGENT_ALERT_DEBUG_LOG_MAX = 12;
+const agentAlertDebugLogEntries: string[] = [];
+const workspaceDockDetailOpenWorkspaceIds = new Set<string>();
+const workspaceDockDetailClosedWorkspaceIds = new Set<string>();
+const workspaceDockDetailRenderTimers = new Map<string, number>();
+let agentNotificationPermissionPromise: Promise<boolean> | null = null;
 let noteStatusRenderSignature = '\0';
 let workspaceTabsRenderSignature = '\0';
 let workspaceTabsOrderRenderSignature = '\0';
@@ -1546,6 +1769,10 @@ let editorTabsRenderSignature = '\0';
 let editorTabsOrderRenderSignature = '\0';
 let noteTabsRenderSignature = '\0';
 let noteTabsOrderRenderSignature = '\0';
+let snippetTabsRenderSignature = '\0';
+let snippetTabsOrderRenderSignature = '\0';
+let snippetsRenderSignature = '\0';
+let snippetEditingItemId = '';
 let browserTabsRenderSignature = '\0';
 let browserTabsOrderRenderSignature = '\0';
 let browserAddressSuggestionSignature = '\0';
@@ -1578,7 +1805,11 @@ let workspaceTerminalRestoreToken = 0;
 let inactiveEditorHydrationToken = 0;
 let noteHydrationToken = 0;
 let explorerVisiblePrefetchToken = 0;
+let appShutdownStarted = false;
+let appCloseFallbackTimer = 0;
 let terminalCwdSaveTimer = 0;
+let rendererHeartbeatTimer = 0;
+let rendererRecoveryNotice: RendererRecoveryNotice | null = null;
 let marketTickerSocket: WebSocket | null = null;
 let marketTickerStarted = false;
 let marketTickerStartTimer = 0;
@@ -1596,6 +1827,10 @@ let wslProfilesLoadTimer = 0;
 let wslProfilesLoadInFlight = false;
 let wslProfilesLoaded = false;
 let workspaceDragState: WorkspaceDragState | null = null;
+let workspaceDockResizeDragging = false;
+let workspaceDockLayoutFrame = 0;
+let workspaceDockDetailRenderSignature = '\0';
+let workspaceDockAppliedSignature = '\0';
 let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
 let editorLoadingTimer = 0;
@@ -1649,9 +1884,15 @@ app.innerHTML = `
       </div>
       <div id="app-clock" class="app-clock" data-window-drag-region></div>
     </header>
-    <section class="workspace-tabs-bar">
+    <section id="workspace-dock" class="workspace-tabs-bar">
+      <div class="workspace-dock-header">
+        <span>Workspaces</span>
+        <button id="workspace-dock-detail-toggle" class="workspace-dock-detail-toggle" type="button" aria-pressed="false" title="Toggle workspace detail dock">Detail</button>
+      </div>
       <div id="workspace-tabs" class="workspace-tabs" aria-label="Workspaces"></div>
       <button id="new-workspace-tab" class="tab-add" title="New workspace">+</button>
+      <div id="workspace-dock-detail" class="workspace-dock-detail" aria-live="polite"></div>
+      <div id="workspace-dock-resizer" class="workspace-dock-resizer" role="separator" aria-orientation="vertical" title="Resize workspace dock"></div>
     </section>
     <section class="workspace-bar">
       <div class="profile-control-stack">
@@ -1675,6 +1916,7 @@ app.innerHTML = `
       <button class="panel-toggle" data-toggle-panel="image" title="Toggle Image Preview" aria-pressed="false">Img</button>
       <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
       <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
+      <button class="panel-toggle" data-toggle-panel="snippets" title="Toggle Snippets" aria-pressed="false">Snip</button>
       <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
       <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
       <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
@@ -1740,6 +1982,29 @@ app.innerHTML = `
         <div id="notes-tabs" class="widget-tabs"></div>
         <textarea id="notes-body" class="notes-body" spellcheck="true" placeholder="Quick notes for this workspace..."></textarea>
         <div id="notes-path" class="notes-path"></div>
+      </section>
+      <section class="panel snippets-panel floating-panel hidden" data-panel="snippets">
+        <div class="panel-title panel-drag-handle">
+          <span>Snippets</span>
+          <span id="snippets-status" class="muted snippets-status">Plaintext local</span>
+          <span class="spacer"></span>
+          <button id="snippets-new-tab" class="panel-mode" title="New snippet category">+</button>
+          <button class="panel-close" data-close-panel="snippets" title="Close Snippets" aria-label="Close Snippets">x</button>
+        </div>
+        <div id="snippets-tabs" class="widget-tabs"></div>
+        <div class="snippets-search-row">
+          <input id="snippets-search" spellcheck="false" placeholder="Search content or description..." />
+        </div>
+        <div id="snippets-list" class="snippets-list" aria-live="polite"></div>
+        <form id="snippets-form" class="snippets-form">
+          <textarea id="snippets-content" rows="2" spellcheck="false" placeholder="Command, flag, or paste-ready text"></textarea>
+          <input id="snippets-description" spellcheck="true" placeholder="Description (optional)" />
+          <div class="snippets-form-actions">
+            <button id="snippets-save" type="submit">Add</button>
+            <button id="snippets-cancel" type="button" class="hidden">Cancel</button>
+          </div>
+        </form>
+        <div class="snippets-warning">Plaintext local snippets. Do not store tokens, passwords, or secrets. Copy only; never auto-run.</div>
       </section>
       <section class="panel image-panel floating-panel hidden" data-panel="image">
         <div class="panel-title panel-drag-handle">
@@ -1852,6 +2117,51 @@ app.innerHTML = `
           <label>UI font <select id="settings-ui-font"></select></label>
           <label>Mono font <select id="settings-mono-font"></select></label>
           <label>Editor theme <select id="settings-editor-theme"></select></label>
+          <label>Terminal renderer <select id="settings-terminal-renderer"></select></label>
+          <label class="settings-number-label">
+            Terminal scrollback rows
+            <input id="settings-terminal-scrollback" type="number" min="0" max="10000" step="100" value="1000" />
+          </label>
+          <label>Terminal history cache <select id="settings-terminal-history-cache"></select></label>
+          <label>Workspace memory saver <select id="settings-memory-saver"></select></label>
+          <label>Workspace tabs <select id="settings-workspace-dock-position"></select></label>
+          <label class="settings-range-label">
+            <span>Side dock width <output id="settings-workspace-dock-size-value">260px</output></span>
+            <input id="settings-workspace-dock-size" type="range" min="180" max="420" step="10" value="260" />
+          </label>
+          <label class="settings-inline-check"><input id="settings-workspace-dock-detail" type="checkbox" /> Show side dock detail</label>
+          <fieldset class="settings-widget-focus-section">
+            <legend>Active workspace indicator</legend>
+            <label class="settings-inline-check"><input id="settings-workspace-focus-border" type="checkbox" /> Blue outer border</label>
+            <label class="settings-inline-check"><input id="settings-workspace-focus-title" type="checkbox" /> Highlight tab title</label>
+          </fieldset>
+          <fieldset class="settings-widget-focus-section settings-agent-alert-section">
+            <legend>Agent alerts</legend>
+            <label class="settings-inline-check"><input id="settings-agent-notification-banners" type="checkbox" /> Windows notification banners</label>
+            <label class="settings-inline-check"><input id="settings-agent-alert-sound" type="checkbox" /> Light sound alert</label>
+            <div class="settings-alert-test-row" aria-label="Native alert tests">
+              <span>Test native path</span>
+              <button id="settings-agent-alert-test-banner" type="button">Banner</button>
+              <button id="settings-agent-alert-test-sound" type="button">Sound</button>
+              <button id="settings-agent-alert-test-both" type="button">Both</button>
+            </div>
+            <div id="settings-agent-alert-test-status" class="settings-alert-test-status" aria-live="polite"></div>
+            <pre id="settings-agent-alert-debug-log" class="settings-alert-debug-log" aria-live="polite"></pre>
+            <p class="hint">Alerts fire when an LLM session appears to need input, errors, or finishes a working turn. Banner and sound toggles are independent.</p>
+          </fieldset>
+          <label class="settings-range-label">
+            <span>Widget corner radius <output id="settings-widget-radius-value">8px</output></span>
+            <input id="settings-widget-radius" type="range" min="0" max="24" step="1" value="8" />
+          </label>
+          <div class="settings-inline-row">
+            <span>IDE scale <output id="settings-ide-scale-value">100%</output></span>
+            <button id="settings-ide-scale-reset" type="button">Reset 100%</button>
+          </div>
+          <fieldset class="settings-widget-focus-section">
+            <legend>Active widget indicator</legend>
+            <label class="settings-inline-check"><input id="settings-widget-focus-border" type="checkbox" /> Blue outer border</label>
+            <label class="settings-inline-check"><input id="settings-widget-focus-title" type="checkbox" /> Highlight title bar</label>
+          </fieldset>
           <label class="settings-textarea-label">
             Mask file patterns
             <textarea id="settings-mask-patterns" spellcheck="false" placeholder="*.env&#10;*.secret"></textarea>
@@ -1861,6 +2171,8 @@ app.innerHTML = `
             <p class="hint">Default is on. Title wrap affects the widget title bar; controls wrap affects menus/toolbars inside each widget.</p>
             <div id="settings-widget-wraps" class="settings-widget-wraps"></div>
           </fieldset>
+          <p class="hint">Scrollback 0 means no terminal scrollback/fastest, not unlimited. History cache is session-only and shows older plain-text output in the Hist overlay.</p>
+          <p class="hint">Memory Saver sleeps old inactive workspace shells. Use workspace tab menu &quot;Keep live&quot; for servers or long-running jobs.</p>
           <p class="hint">Patterns are app-wide. Example/sample files stay excluded from default masking.</p>
         </div>
       </section>
@@ -1871,10 +2183,20 @@ app.innerHTML = `
     <button id="window-maximize" class="window-control" type="button" title="Maximize or restore" aria-label="Maximize or restore" data-window-action="toggle-maximize"><span class="window-control-icon maximize" aria-hidden="true"></span></button>
     <button id="window-close" class="window-control close" type="button" title="Close" aria-label="Close" data-window-action="close"><span class="window-control-icon close" aria-hidden="true"></span></button>
   </div>
+  <div id="widget-opacity-popover" class="widget-opacity-popover hidden" data-no-window-drag role="dialog" aria-label="Widget opacity">
+    <div class="widget-opacity-popover-header">
+      <span id="widget-opacity-popover-label">Opacity 100%</span>
+      <button id="widget-opacity-reset" type="button">100%</button>
+      <button id="widget-opacity-close" type="button" aria-label="Close widget opacity">Close</button>
+    </div>
+    <input id="widget-opacity-range" type="range" min="45" max="100" step="5" value="100" />
+    <div id="widget-opacity-note" class="widget-opacity-note">Widget opacity is saved with the current workspace.</div>
+  </div>
   <div id="context-menu" class="context-menu hidden" role="menu" aria-hidden="true"></div>
 `;
 
 const el = {
+  shell: document.querySelector<HTMLElement>('.shell')!,
   titlebar: document.querySelector<HTMLElement>('.titlebar')!,
   windowControlButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-window-action]')),
   windowResizeZones: Array.from(document.querySelectorAll<HTMLElement>('[data-window-resize-direction]')),
@@ -1886,6 +2208,10 @@ const el = {
   statusDetail: document.querySelector<HTMLDivElement>('#status-detail')!,
   appClock: document.querySelector<HTMLDivElement>('#app-clock')!,
   captureFreezeFrame: document.querySelector<HTMLDivElement>('#capture-freeze-frame')!,
+  workspaceDock: document.querySelector<HTMLElement>('#workspace-dock')!,
+  workspaceDockDetailToggle: document.querySelector<HTMLButtonElement>('#workspace-dock-detail-toggle')!,
+  workspaceDockDetail: document.querySelector<HTMLDivElement>('#workspace-dock-detail')!,
+  workspaceDockResizer: document.querySelector<HTMLDivElement>('#workspace-dock-resizer')!,
   workspaceTabs: document.querySelector<HTMLDivElement>('#workspace-tabs')!,
   newWorkspaceTab: document.querySelector<HTMLButtonElement>('#new-workspace-tab')!,
   profileSelect: document.querySelector<HTMLSelectElement>('#profile-select')!,
@@ -1934,6 +2260,16 @@ const el = {
   notesBody: document.querySelector<HTMLTextAreaElement>('#notes-body')!,
   notesStatus: document.querySelector<HTMLSpanElement>('#notes-status')!,
   notesPath: document.querySelector<HTMLDivElement>('#notes-path')!,
+  snippetsStatus: document.querySelector<HTMLSpanElement>('#snippets-status')!,
+  snippetsTabs: document.querySelector<HTMLDivElement>('#snippets-tabs')!,
+  snippetsNewTab: document.querySelector<HTMLButtonElement>('#snippets-new-tab')!,
+  snippetsSearch: document.querySelector<HTMLInputElement>('#snippets-search')!,
+  snippetsList: document.querySelector<HTMLDivElement>('#snippets-list')!,
+  snippetsForm: document.querySelector<HTMLFormElement>('#snippets-form')!,
+  snippetsContent: document.querySelector<HTMLTextAreaElement>('#snippets-content')!,
+  snippetsDescription: document.querySelector<HTMLInputElement>('#snippets-description')!,
+  snippetsSave: document.querySelector<HTMLButtonElement>('#snippets-save')!,
+  snippetsCancel: document.querySelector<HTMLButtonElement>('#snippets-cancel')!,
   imageTabs: document.querySelector<HTMLDivElement>('#image-tabs')!,
   imageNewTab: document.querySelector<HTMLButtonElement>('#image-new-tab')!,
   imageOpenNewTab: document.querySelector<HTMLInputElement>('#image-open-new-tab')!,
@@ -1989,9 +2325,38 @@ const el = {
   settingsUiFont: document.querySelector<HTMLSelectElement>('#settings-ui-font')!,
   settingsMonoFont: document.querySelector<HTMLSelectElement>('#settings-mono-font')!,
   settingsEditorTheme: document.querySelector<HTMLSelectElement>('#settings-editor-theme')!,
+  settingsTerminalRenderer: document.querySelector<HTMLSelectElement>('#settings-terminal-renderer')!,
+  settingsTerminalScrollback: document.querySelector<HTMLInputElement>('#settings-terminal-scrollback')!,
+  settingsTerminalHistoryCache: document.querySelector<HTMLSelectElement>('#settings-terminal-history-cache')!,
+  settingsMemorySaver: document.querySelector<HTMLSelectElement>('#settings-memory-saver')!,
+  settingsWorkspaceDockPosition: document.querySelector<HTMLSelectElement>('#settings-workspace-dock-position')!,
+  settingsWorkspaceDockSize: document.querySelector<HTMLInputElement>('#settings-workspace-dock-size')!,
+  settingsWorkspaceDockSizeValue: document.querySelector<HTMLOutputElement>('#settings-workspace-dock-size-value')!,
+  settingsWorkspaceDockDetail: document.querySelector<HTMLInputElement>('#settings-workspace-dock-detail')!,
+  settingsWorkspaceFocusBorder: document.querySelector<HTMLInputElement>('#settings-workspace-focus-border')!,
+  settingsWorkspaceFocusTitle: document.querySelector<HTMLInputElement>('#settings-workspace-focus-title')!,
+  settingsAgentNotificationBanners: document.querySelector<HTMLInputElement>('#settings-agent-notification-banners')!,
+  settingsAgentAlertSound: document.querySelector<HTMLInputElement>('#settings-agent-alert-sound')!,
+  settingsAgentAlertTestBanner: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-banner')!,
+  settingsAgentAlertTestSound: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-sound')!,
+  settingsAgentAlertTestBoth: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-both')!,
+  settingsAgentAlertTestStatus: document.querySelector<HTMLDivElement>('#settings-agent-alert-test-status')!,
+  settingsAgentAlertDebugLog: document.querySelector<HTMLPreElement>('#settings-agent-alert-debug-log')!,
+  settingsWidgetRadius: document.querySelector<HTMLInputElement>('#settings-widget-radius')!,
+  settingsWidgetRadiusValue: document.querySelector<HTMLOutputElement>('#settings-widget-radius-value')!,
+  settingsIdeScaleValue: document.querySelector<HTMLOutputElement>('#settings-ide-scale-value')!,
+  settingsIdeScaleReset: document.querySelector<HTMLButtonElement>('#settings-ide-scale-reset')!,
+  settingsWidgetFocusBorder: document.querySelector<HTMLInputElement>('#settings-widget-focus-border')!,
+  settingsWidgetFocusTitle: document.querySelector<HTMLInputElement>('#settings-widget-focus-title')!,
   settingsMaskPatterns: document.querySelector<HTMLTextAreaElement>('#settings-mask-patterns')!,
   settingsWidgetWraps: document.querySelector<HTMLDivElement>('#settings-widget-wraps')!,
   settingsSave: document.querySelector<HTMLButtonElement>('#settings-save')!,
+  widgetOpacityPopover: document.querySelector<HTMLDivElement>('#widget-opacity-popover')!,
+  widgetOpacityLabel: document.querySelector<HTMLSpanElement>('#widget-opacity-popover-label')!,
+  widgetOpacityRange: document.querySelector<HTMLInputElement>('#widget-opacity-range')!,
+  widgetOpacityReset: document.querySelector<HTMLButtonElement>('#widget-opacity-reset')!,
+  widgetOpacityClose: document.querySelector<HTMLButtonElement>('#widget-opacity-close')!,
+  widgetOpacityNote: document.querySelector<HTMLDivElement>('#widget-opacity-note')!,
   contextMenu: document.querySelector<HTMLDivElement>('#context-menu')!
 };
 
@@ -2172,6 +2537,26 @@ function renderAppClock() {
   setTextContentIfChanged(el.appClock, value);
 }
 
+function startRendererHeartbeat() {
+  if (rendererHeartbeatTimer) return;
+  const ping = () => {
+    void api.rendererHeartbeat()
+      .then(handleRendererHeartbeatResponse)
+      .catch(() => undefined);
+  };
+  ping();
+  rendererHeartbeatTimer = window.setInterval(ping, RENDERER_HEARTBEAT_INTERVAL_MS);
+}
+
+function handleRendererHeartbeatResponse(response: RendererHeartbeatResponse) {
+  if (response.recovery) handleRendererRecoveryNotice(response.recovery);
+}
+
+function handleRendererRecoveryNotice(notice: RendererRecoveryNotice) {
+  rendererRecoveryNotice = notice;
+  setStatus(notice.message, notice.kind === 'repeated-reload');
+}
+
 function refreshTitle() {
   const context = state.workspaceOpen ? 'workspace connected' : state.activeProfile ? 'profile selected' : 'no profile';
   if (appTitleRenderSignature === context) return;
@@ -2189,12 +2574,18 @@ function refreshTitle() {
 async function init() {
   await listen<TerminalDataEvent>('terminal-data', (event) => {
     const pane = terminalPaneByBackendId.get(event.payload.id);
-    if (!pane) return;
+    if (!pane) {
+      bufferPendingTerminalData(event.payload.id, event.payload.data);
+      return;
+    }
     handleTerminalData(pane, event.payload.data);
   });
   await listen<TerminalCursorQueryEvent>('terminal-cursor-query', (event) => {
     const pane = terminalPaneByBackendId.get(event.payload.id);
-    if (!pane) return;
+    if (!pane) {
+      bufferPendingTerminalCursorQuery(event.payload.id);
+      return;
+    }
     void respondToTerminalCursorQuery(pane);
   });
   await listen<BrowserWebviewPageLoadEvent>('browser-webview-page-load', (event) => {
@@ -2202,19 +2593,19 @@ async function init() {
   });
   await listen<TerminalExitEvent>('terminal-exit', (event) => {
     const pane = terminalPaneByBackendId.get(event.payload.id);
-    if (pane) {
-      const workspaceId = pane.workspaceId;
-      flushTerminalWriteBuffer(pane);
-      setTerminalBackendId(pane, undefined);
-      pane.title = `${pane.title} (exited)`;
-      const widget = terminalWidgetForPane(pane);
-      if (widget) renderTerminalWidgetTabs(widget);
-      refreshWorkspaceLlmActivityAfterPaneChange(workspaceId);
+    if (!pane) {
+      bufferPendingTerminalExit(event.payload);
+      return;
     }
+    handleTerminalExitEvent(pane);
   });
   await listen<SshAuthPromptEvent>('ssh-auth-request', (event) => {
     void handleSshAuthPrompt(event.payload);
   });
+  await listen<RendererRecoveryNotice>('renderer-recovery', (event) => {
+    handleRendererRecoveryNotice(event.payload);
+  });
+  startRendererHeartbeat();
 
   await listen<TauriDragDropPayload>('tauri://drag-enter', (event) => {
     updateExplorerDropTarget(event.payload.position);
@@ -2242,6 +2633,7 @@ async function init() {
 
   setProfiles(await api.listProfiles());
   loadIdeSettings();
+  await loadSnippetsStore();
   loadWorkspaceStore();
   if (!IS_TERMINAL_APP) loadMarketTickerConfig();
   ensureEditorTab();
@@ -2255,6 +2647,8 @@ async function init() {
   renderNoteTabs();
   renderNotes();
   renderNotePin();
+  renderSnippetTabs();
+  renderSnippets();
   renderShellTabs();
   renderBrowserDeviceOptions();
   if (isPanelVisible('calculator')) renderCalculator();
@@ -2274,7 +2668,7 @@ async function init() {
   startAppClock();
   selectProfile('');
   setWorkspaceOpen(false);
-  setStatus(`Ready · build ${APP_BUILD_ID}`);
+  setStatus(rendererRecoveryNotice?.message ?? `Ready · build ${APP_BUILD_ID}`, rendererRecoveryNotice?.kind === 'repeated-reload');
   if (!IS_TERMINAL_APP) scheduleMarketTickerStart(MARKET_TICKER_BOOT_DELAY_MS);
   scheduleWslProfilesBackgroundLoad();
 }
@@ -2451,23 +2845,36 @@ function normalizeSavedWorkspaceName(value: string, snapshot?: WorkspaceSnapshot
 function loadWorkspaceImageStore() {
   try {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACE_IMAGE_STORE_KEY) ?? '{}') as unknown;
-    workspaceImageStore = workspaceImageStoreFromParsed(parsed);
+    const loaded = workspaceImageStoreFromParsed(parsed);
+    workspaceImageStore = loaded.store;
+    workspaceImageStoreDirty = loaded.truncated;
   } catch {
     workspaceImageStore = {};
+    workspaceImageStoreDirty = false;
   }
-  workspaceImageStoreDirty = false;
 }
 
 function workspaceImageStoreFromParsed(parsed: unknown) {
   const store: Record<string, string> = {};
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return store;
+  let total = 0;
+  let truncated = false;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { store, truncated };
   const record = parsed as Record<string, unknown>;
   for (const key in record) {
     if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
     const value = record[key];
-    if (typeof value === 'string') store[key] = value;
+    if (typeof value !== 'string') continue;
+    if (
+      value.length > WORKSPACE_IMAGE_DATA_URL_PERSIST_MAX_CHARS
+      || total + value.length > WORKSPACE_IMAGE_STORE_MAX_CHARS
+    ) {
+      truncated = true;
+      continue;
+    }
+    store[key] = value;
+    total += value.length;
   }
-  return store;
+  return { store, truncated };
 }
 
 function persistWorkspaceStore() {
@@ -2479,7 +2886,20 @@ function persistWorkspaceStore() {
   const signature = workspaceStoreSignature(workspacesSignature);
   if (signature === workspaceStorePersistSignature) return;
   workspaceStorePersistSignature = signature;
-  localStorage.setItem(WORKSPACE_STORE_KEY, workspaceStoreJsonPayload(workspacesSignature));
+  try {
+    localStorage.setItem(WORKSPACE_STORE_KEY, workspaceStoreJsonPayload(workspacesSignature));
+  } catch (error) {
+    workspaceStorePersistSignature = '\0';
+    workspaceImageStore = {};
+    workspaceImageStoreDirty = false;
+    try {
+      localStorage.removeItem(WORKSPACE_IMAGE_STORE_KEY);
+      localStorage.setItem(WORKSPACE_STORE_KEY, workspaceStoreJsonPayload(workspacesSignature));
+      setStatus('Workspace image preview cache was cleared because browser storage was full', true);
+    } catch {
+      setStatus(`Workspace state could not be saved: ${String(error)}`, true);
+    }
+  }
   if (workspaceTabsRenderNeeded()) renderWorkspaceTabs();
 }
 
@@ -2499,8 +2919,8 @@ function workspaceSnapshotsForStorePersist(snapshots = state.workspaceSnapshots)
 
 function workspaceStoreWorkspacesJsonForPersist(snapshots: WorkspaceSnapshot[]) {
   const compactJson = JSON.stringify(compactWorkspaceSnapshotsForStore(snapshots));
-  if (persistWorkspaceImageStoreIfNeeded()) return compactJson;
-  return JSON.stringify(snapshots);
+  persistWorkspaceImageStoreIfNeeded();
+  return compactJson;
 }
 
 function compactWorkspaceSnapshotsForStore(snapshots: WorkspaceSnapshot[]) {
@@ -2532,7 +2952,10 @@ function compactImageTabsForStore(snapshot: WorkspaceSnapshot, usedImageRefs: Se
 
 function compactImageHistoryForStore(workspaceId: string, tab: ImageTabSnapshot, usedImageRefs: Set<string>) {
   const history: PastedImageItem[] = [];
-  for (const item of tab.history ?? []) {
+  const source = tab.history ?? [];
+  const limit = Math.min(source.length, WORKSPACE_IMAGE_HISTORY_PERSIST_LIMIT);
+  for (let index = 0; index < limit; index += 1) {
+    const item = source[index];
     history.push({
       ...item,
       dataUrl: imageDataRefForStore(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl, usedImageRefs)
@@ -2548,6 +2971,7 @@ function imageDataRefForStore(workspaceId: string, scope: string, dataUrl: strin
     return dataUrl;
   }
   if (!dataUrl.startsWith('data:image/')) return dataUrl;
+  if (dataUrl.length > WORKSPACE_IMAGE_DATA_URL_PERSIST_MAX_CHARS) return '';
   const key = imageRefKeyForDataUrl(workspaceId, scope, dataUrl);
   usedImageRefs.add(key);
   if (workspaceImageStore[key] !== dataUrl) {
@@ -2637,14 +3061,42 @@ function pruneWorkspaceImageRefCache() {
 
 function persistWorkspaceImageStoreIfNeeded() {
   if (!workspaceImageStoreDirty) return true;
+  trimWorkspaceImageStoreToBudget();
   try {
     localStorage.setItem(WORKSPACE_IMAGE_STORE_KEY, JSON.stringify(workspaceImageStore));
     workspaceImageStoreDirty = false;
     return true;
   } catch {
-    // If the split image store cannot be written, fall back to full data URLs
-    // in the main workspace payload for this persist attempt.
-    return false;
+    // Do not fall back to putting large data URLs back into the main workspace
+    // payload. That can make WebView2 start with a huge localStorage parse and
+    // surface as a plain white/OOM renderer page. Attachments are still on disk;
+    // only cached preview thumbnails are sacrificed here.
+    workspaceImageStore = {};
+    workspaceImageStoreDirty = false;
+    try {
+      localStorage.removeItem(WORKSPACE_IMAGE_STORE_KEY);
+    } catch {
+      // Ignore storage failures; the main workspace payload remains compact.
+    }
+    return true;
+  }
+}
+
+function trimWorkspaceImageStoreToBudget() {
+  let total = 0;
+  const entries = Object.keys(workspaceImageStore).map((key) => {
+    const size = workspaceImageStore[key]?.length ?? 0;
+    total += size;
+    return { key, size };
+  });
+  if (total <= WORKSPACE_IMAGE_STORE_MAX_CHARS) return;
+  entries.sort((a, b) => b.size - a.size);
+  for (const entry of entries) {
+    if (total <= WORKSPACE_IMAGE_STORE_MAX_CHARS) break;
+    if (!Object.prototype.hasOwnProperty.call(workspaceImageStore, entry.key)) continue;
+    delete workspaceImageStore[entry.key];
+    total -= entry.size;
+    workspaceImageStoreDirty = true;
   }
 }
 
@@ -2699,6 +3151,7 @@ function workspacePersistenceBusyDelayMs() {
   const scrollPause = explorerScrollingUntil - Date.now();
   if (scrollPause > 0) return scrollPause + EXPLORER_SCROLL_IDLE_MS;
   if (workspaceDragState?.dragging) return 240;
+  if (workspaceDockResizeDragging) return 120;
   if (uiInputPending()) return 80;
   return 0;
 }
@@ -2740,6 +3193,62 @@ function normalizeWidgetWrapSettings(value: unknown): WidgetWrapSettings {
   return settings;
 }
 
+function terminalRendererSetting(value: unknown): TerminalRendererSetting {
+  return value === 'dom' ? 'dom' : 'auto';
+}
+
+function normalizeTerminalScrollbackRows(value: unknown) {
+  const rows = Number(value);
+  return clamp(
+    Number.isFinite(rows) ? Math.round(rows) : TERMINAL_SCROLLBACK_DEFAULT_ROWS,
+    0,
+    TERMINAL_SCROLLBACK_MAX_ROWS
+  );
+}
+
+function terminalHistoryCacheMode(value: unknown): TerminalHistoryCacheMode {
+  return value === 'off' || value === 'deep' ? value : 'balanced';
+}
+
+function workspaceMemorySaverMode(value: unknown): WorkspaceMemorySaverMode {
+  return value === 'off' || value === 'aggressive' ? value : 'balanced';
+}
+
+function workspaceDockPosition(value: unknown): WorkspaceDockPosition {
+  return value === 'bottom' || value === 'left' || value === 'right' ? value : 'top';
+}
+
+function workspaceDockIsSide(position = state.ideSettings.workspaceDockPosition) {
+  const normalized = workspaceDockPosition(position);
+  return normalized === 'left' || normalized === 'right';
+}
+
+function normalizeWorkspaceDockSize(value: unknown) {
+  const size = Number(value);
+  return clamp(
+    Number.isFinite(size) ? Math.round(size) : WORKSPACE_DOCK_DEFAULT_SIZE,
+    WORKSPACE_DOCK_MIN_SIZE,
+    WORKSPACE_DOCK_MAX_SIZE
+  );
+}
+
+function workspaceDockMaxSizeForViewport() {
+  const width = el.shell.clientWidth || Math.round(window.innerWidth / Math.max(ideScale, 0.1)) || WORKSPACE_DOCK_DEFAULT_SIZE;
+  return Math.max(
+    WORKSPACE_DOCK_MIN_SIZE,
+    Math.min(WORKSPACE_DOCK_MAX_SIZE, Math.floor(width * WORKSPACE_DOCK_MAX_VIEWPORT_FRACTION))
+  );
+}
+
+function workspaceDockAppliedSize(value = state.ideSettings.workspaceDockSize) {
+  return clamp(normalizeWorkspaceDockSize(value), WORKSPACE_DOCK_MIN_SIZE, workspaceDockMaxSizeForViewport());
+}
+
+function normalizeWidgetRadius(value: unknown) {
+  const radius = Number(value);
+  return clamp(Number.isFinite(radius) ? radius : DEFAULT_IDE_SETTINGS.widgetRadius, 0, 24);
+}
+
 function widgetWrapState(target: WidgetWrapTargetId): WidgetWrapState {
   const settings = normalizeWidgetWrapSettings(state.ideSettings.widgetWrap);
   const item = settings[target] ?? { title: true, controls: true };
@@ -2756,6 +3265,20 @@ function loadIdeSettings() {
       ...DEFAULT_IDE_SETTINGS,
       ...parsed,
       editorTheme: isEditorThemeId(parsed.editorTheme) ? parsed.editorTheme : DEFAULT_IDE_SETTINGS.editorTheme,
+      terminalRenderer: terminalRendererSetting(parsed.terminalRenderer),
+      terminalScrollbackRows: normalizeTerminalScrollbackRows(parsed.terminalScrollbackRows),
+      terminalHistoryCache: terminalHistoryCacheMode(parsed.terminalHistoryCache),
+      memorySaver: workspaceMemorySaverMode(parsed.memorySaver),
+      workspaceDockPosition: workspaceDockPosition(parsed.workspaceDockPosition),
+      workspaceDockSize: normalizeWorkspaceDockSize(parsed.workspaceDockSize),
+      workspaceDockDetailOpen: parsed.workspaceDockDetailOpen === true,
+      workspaceFocusBorder: parsed.workspaceFocusBorder !== false,
+      workspaceFocusTitle: parsed.workspaceFocusTitle === true,
+      agentNotificationBanners: parsed.agentNotificationBanners === true,
+      agentAlertSound: parsed.agentAlertSound === true,
+      widgetRadius: normalizeWidgetRadius(parsed.widgetRadius),
+      widgetFocusBorder: parsed.widgetFocusBorder !== false,
+      widgetFocusTitle: parsed.widgetFocusTitle === true,
       extraMaskPatterns: Array.isArray(parsed.extraMaskPatterns)
         ? parsed.extraMaskPatterns.map(String).filter(Boolean)
         : DEFAULT_IDE_SETTINGS.extraMaskPatterns,
@@ -2775,9 +3298,38 @@ function renderSettings() {
   renderFontOptions(el.settingsUiFont, UI_FONT_CHOICES, state.ideSettings.uiFont);
   renderFontOptions(el.settingsMonoFont, MONO_FONT_CHOICES, state.ideSettings.monoFont);
   renderChoiceOptions(el.settingsEditorTheme, EDITOR_THEME_CHOICES, state.ideSettings.editorTheme);
+  renderChoiceOptions(el.settingsTerminalRenderer, TERMINAL_RENDERER_CHOICES, state.ideSettings.terminalRenderer);
+  renderChoiceOptions(el.settingsTerminalHistoryCache, TERMINAL_HISTORY_CACHE_CHOICES, state.ideSettings.terminalHistoryCache);
+  renderChoiceOptions(el.settingsMemorySaver, WORKSPACE_MEMORY_SAVER_CHOICES, state.ideSettings.memorySaver);
+  renderChoiceOptions(el.settingsWorkspaceDockPosition, WORKSPACE_DOCK_POSITION_CHOICES, workspaceDockPosition(state.ideSettings.workspaceDockPosition));
+  syncWorkspaceDockSettingsForm();
+  setCheckedIfChanged(el.settingsWorkspaceFocusBorder, state.ideSettings.workspaceFocusBorder !== false);
+  setCheckedIfChanged(el.settingsWorkspaceFocusTitle, state.ideSettings.workspaceFocusTitle === true);
+  setCheckedIfChanged(el.settingsAgentNotificationBanners, state.ideSettings.agentNotificationBanners === true);
+  setCheckedIfChanged(el.settingsAgentAlertSound, state.ideSettings.agentAlertSound === true);
+  const scrollbackRows = normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows);
+  if (el.settingsTerminalScrollback.value !== String(scrollbackRows)) el.settingsTerminalScrollback.value = String(scrollbackRows);
+  const widgetRadius = normalizeWidgetRadius(state.ideSettings.widgetRadius);
+  if (el.settingsWidgetRadius.value !== String(widgetRadius)) el.settingsWidgetRadius.value = String(widgetRadius);
+  setTextContentIfChanged(el.settingsWidgetRadiusValue, `${widgetRadius}px`);
+  syncIdeScaleSettings();
+  setCheckedIfChanged(el.settingsWidgetFocusBorder, state.ideSettings.widgetFocusBorder !== false);
+  setCheckedIfChanged(el.settingsWidgetFocusTitle, state.ideSettings.widgetFocusTitle === true);
   const maskPatterns = state.ideSettings.extraMaskPatterns.join('\n');
   if (el.settingsMaskPatterns.value !== maskPatterns) el.settingsMaskPatterns.value = maskPatterns;
   renderWidgetWrapSettings();
+}
+
+function syncWorkspaceDockSettingsForm() {
+  const position = workspaceDockPosition(state.ideSettings.workspaceDockPosition);
+  if (el.settingsWorkspaceDockPosition.value !== position) el.settingsWorkspaceDockPosition.value = position;
+  const size = normalizeWorkspaceDockSize(state.ideSettings.workspaceDockSize);
+  if (el.settingsWorkspaceDockSize.value !== String(size)) el.settingsWorkspaceDockSize.value = String(size);
+  setTextContentIfChanged(el.settingsWorkspaceDockSizeValue, `${size}px`);
+  setCheckedIfChanged(el.settingsWorkspaceDockDetail, state.ideSettings.workspaceDockDetailOpen === true);
+  const side = workspaceDockIsSide(position);
+  setDisabledIfChanged(el.settingsWorkspaceDockSize, !side);
+  setDisabledIfChanged(el.settingsWorkspaceDockDetail, !side);
 }
 
 function renderWidgetWrapSettings() {
@@ -2859,13 +3411,84 @@ function saveSettingsFromForm() {
     uiFont: el.settingsUiFont.value,
     monoFont: el.settingsMonoFont.value,
     editorTheme: editorThemeId(el.settingsEditorTheme.value),
+    terminalRenderer: terminalRendererSetting(el.settingsTerminalRenderer.value),
+    terminalScrollbackRows: normalizeTerminalScrollbackRows(el.settingsTerminalScrollback.value),
+    terminalHistoryCache: terminalHistoryCacheMode(el.settingsTerminalHistoryCache.value),
+    memorySaver: workspaceMemorySaverMode(el.settingsMemorySaver.value),
+    workspaceDockPosition: workspaceDockPosition(el.settingsWorkspaceDockPosition.value),
+    workspaceDockSize: normalizeWorkspaceDockSize(el.settingsWorkspaceDockSize.value),
+    workspaceDockDetailOpen: el.settingsWorkspaceDockDetail.checked,
+    workspaceFocusBorder: el.settingsWorkspaceFocusBorder.checked,
+    workspaceFocusTitle: el.settingsWorkspaceFocusTitle.checked,
+    agentNotificationBanners: el.settingsAgentNotificationBanners.checked,
+    agentAlertSound: el.settingsAgentAlertSound.checked,
+    widgetRadius: normalizeWidgetRadius(el.settingsWidgetRadius.value),
+    widgetFocusBorder: el.settingsWidgetFocusBorder.checked,
+    widgetFocusTitle: el.settingsWidgetFocusTitle.checked,
     extraMaskPatterns: el.settingsMaskPatterns.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
     widgetWrap: widgetWrapSettingsFromForm()
   };
   persistIdeSettings();
   applyIdeSettings();
+  scheduleWorkspaceDockLayoutRefresh();
   renderSettings();
+  if (state.ideSettings.agentNotificationBanners) void ensureAgentNotificationPermission();
   setStatus('Settings saved');
+}
+
+function updateWidgetAppearanceSettingsFromForm(options: { persist?: boolean } = {}) {
+  state.ideSettings.widgetRadius = normalizeWidgetRadius(el.settingsWidgetRadius.value);
+  state.ideSettings.widgetFocusBorder = el.settingsWidgetFocusBorder.checked;
+  state.ideSettings.widgetFocusTitle = el.settingsWidgetFocusTitle.checked;
+  applyIdeSettings();
+  setTextContentIfChanged(el.settingsWidgetRadiusValue, `${state.ideSettings.widgetRadius}px`);
+  if (options.persist) persistIdeSettings();
+}
+
+function updateWorkspaceDockSettingsFromForm(options: { persist?: boolean } = {}) {
+  const nextDetailOpen = el.settingsWorkspaceDockDetail.checked;
+  if (nextDetailOpen !== state.ideSettings.workspaceDockDetailOpen) {
+    workspaceDockDetailOpenWorkspaceIds.clear();
+    workspaceDockDetailClosedWorkspaceIds.clear();
+  }
+  state.ideSettings.workspaceDockPosition = workspaceDockPosition(el.settingsWorkspaceDockPosition.value);
+  state.ideSettings.workspaceDockSize = normalizeWorkspaceDockSize(el.settingsWorkspaceDockSize.value);
+  state.ideSettings.workspaceDockDetailOpen = nextDetailOpen;
+  applyWorkspaceDockSettings();
+  syncWorkspaceDockSettingsForm();
+  renderWorkspaceTabs();
+  if (options.persist) persistIdeSettings();
+}
+
+function updateWorkspaceFocusSettingsFromForm(options: { persist?: boolean } = {}) {
+  state.ideSettings.workspaceFocusBorder = el.settingsWorkspaceFocusBorder.checked;
+  state.ideSettings.workspaceFocusTitle = el.settingsWorkspaceFocusTitle.checked;
+  applyWorkspaceFocusSettings();
+  if (options.persist) persistIdeSettings();
+}
+
+function updateAgentAlertSettingsFromForm(options: { persist?: boolean } = {}) {
+  state.ideSettings.agentNotificationBanners = el.settingsAgentNotificationBanners.checked;
+  state.ideSettings.agentAlertSound = el.settingsAgentAlertSound.checked;
+  if (options.persist) persistIdeSettings();
+  if (state.ideSettings.agentNotificationBanners) {
+    void ensureAgentNotificationPermission().then((granted) => {
+      if (granted || !state.ideSettings.agentNotificationBanners) return;
+      state.ideSettings.agentNotificationBanners = false;
+      setCheckedIfChanged(el.settingsAgentNotificationBanners, false);
+      persistIdeSettings();
+      setStatus('Windows notification permission was not granted', true);
+    });
+  }
+}
+
+function ideScaleLabel() {
+  return `${Math.round(ideScale * 100)}%`;
+}
+
+function syncIdeScaleSettings() {
+  setTextContentIfChanged(el.settingsIdeScaleValue, ideScaleLabel());
+  setDisabledIfChanged(el.settingsIdeScaleReset, Math.abs(ideScale - 1) < 0.001);
 }
 
 function applyIdeSettings() {
@@ -2873,13 +3496,27 @@ function applyIdeSettings() {
   const monoFont = fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack;
   setRootStyleProperty('--ui-font', uiFont);
   setRootStyleProperty('--mono-font', monoFont);
+  setRootStyleProperty('--widget-radius', `${normalizeWidgetRadius(state.ideSettings.widgetRadius)}px`);
+  document.body.classList.toggle('widget-focus-border-off', state.ideSettings.widgetFocusBorder === false);
+  document.body.classList.toggle('widget-focus-title-on', state.ideSettings.widgetFocusTitle === true);
+  applyWorkspaceFocusSettings();
+  applyWorkspaceDockSettings({ skipLayoutRefresh: true });
   applyEditorTheme(state.ideSettings.editorTheme);
   configurePrivacyPolicy(state.ideSettings.extraMaskPatterns);
   applyWidgetWrapSettings();
+  scheduleWorkspaceMemorySaver();
+  const terminalScrollbackRows = normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows);
   for (const pane of state.terminals) {
     pane.term.options.fontFamily = monoFont;
+    pane.term.options.scrollback = terminalScrollbackRows;
+    trimTerminalHistoryCache(pane);
+    syncTerminalHistoryControlsForPane(pane);
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
+  }
+  for (const widget of state.terminalWidgets) updateTerminalWidgetRendererBadge(widget);
+  if (state.ideSettings.terminalHistoryCache === 'off') {
+    for (const widget of state.terminalWidgets) closeTerminalHistoryOverlay(widget);
   }
   requestCodeEditorMeasure();
 }
@@ -2931,6 +3568,66 @@ function setRootStyleProperty(name: string, value: string) {
   if (style.getPropertyValue(name) === value) return false;
   style.setProperty(name, value);
   return true;
+}
+
+function applyWorkspaceDockSettings(options: { skipLayoutRefresh?: boolean } = {}) {
+  const position = workspaceDockPosition(state.ideSettings.workspaceDockPosition);
+  const savedSize = normalizeWorkspaceDockSize(state.ideSettings.workspaceDockSize);
+  const appliedSize = workspaceDockAppliedSize(savedSize);
+  state.ideSettings.workspaceDockPosition = position;
+  state.ideSettings.workspaceDockSize = savedSize;
+
+  const previousSignature = workspaceDockAppliedSignature;
+  const detailOpen = workspaceDockIsSide(position) && workspaceDockDetailsAreAllOpen();
+  const signature = `${position}\t${appliedSize}\t${detailOpen ? '1' : '0'}`;
+  workspaceDockAppliedSignature = signature;
+
+  for (const choice of WORKSPACE_DOCK_POSITION_CHOICES) {
+    el.shell.classList.toggle(`workspace-dock-${choice.id}`, choice.id === position);
+  }
+  el.shell.classList.toggle('workspace-dock-side', workspaceDockIsSide(position));
+  el.workspaceDock.classList.toggle('detail-open', detailOpen);
+  syncWorkspaceDockDetailToggle();
+  setRootStyleProperty('--workspace-dock-size', `${appliedSize}px`);
+  renderWorkspaceDockDetail();
+
+  if (!options.skipLayoutRefresh && signature !== previousSignature) {
+    scheduleWorkspaceDockLayoutRefresh();
+  }
+}
+
+function applyWorkspaceFocusSettings() {
+  toggleClassIfChanged(el.shell, 'workspace-focus-border', state.ideSettings.workspaceFocusBorder !== false);
+  toggleClassIfChanged(el.shell, 'workspace-focus-title', state.ideSettings.workspaceFocusTitle === true);
+}
+
+function scheduleWorkspaceDockLayoutRefresh(options: { clampWidgets?: boolean; fitTerminals?: boolean; syncBrowser?: boolean } = {}) {
+  if (workspaceDockLayoutFrame) return;
+  const clampWidgets = options.clampWidgets !== false;
+  const fitTerminals = options.fitTerminals !== false;
+  const syncBrowser = options.syncBrowser !== false;
+  workspaceDockLayoutFrame = window.requestAnimationFrame(() => {
+    workspaceDockLayoutFrame = 0;
+    if (clampWidgets) {
+      FLOATING_PANELS.forEach((id) => {
+        const panel = getPanel(id);
+        if (!panel.classList.contains('hidden')) applyStoredLayoutRatio(panel);
+      });
+      state.terminalWidgets.forEach((widget) => {
+        if (widget.element.classList.contains('hidden')) return;
+        applyStoredLayoutRatio(widget.element);
+        if (fitTerminals) scheduleFitTerminalWidget(widget);
+      });
+    } else if (fitTerminals) {
+      state.terminalWidgets.forEach((widget) => {
+        if (!widget.element.classList.contains('hidden')) scheduleFitTerminalWidget(widget, { activeOnly: true });
+      });
+    }
+    scheduleExplorerVirtualRender();
+    requestCodeEditorMeasure();
+    scheduleConfigureEdgeViewport();
+    if (syncBrowser) scheduleNativeBrowserWebviewSync();
+  });
 }
 
 function loadMarketTickerConfig() {
@@ -3485,7 +4182,10 @@ function refreshWorkspaceSnapshotIndexLookup(startIndex = 0) {
 
 function renderWorkspaceTabs() {
   const signature = workspaceTabsSignature();
-  if (workspaceTabsRenderSignature === signature) return;
+  if (workspaceTabsRenderSignature === signature) {
+    renderWorkspaceDockDetail();
+    return;
+  }
   const orderSignature = workspaceTabsOrderSignature();
   const sameOrder = workspaceTabsOrderRenderSignature === orderSignature
     && el.workspaceTabs.childElementCount === state.workspaceSnapshots.length;
@@ -3495,6 +4195,7 @@ function renderWorkspaceTabs() {
     for (const workspace of state.workspaceSnapshots) {
       updateWorkspaceTabElement(workspaceTabElement(workspace.id), workspace);
     }
+    renderWorkspaceDockDetail();
     return;
   }
 
@@ -3509,6 +4210,7 @@ function renderWorkspaceTabs() {
   }
   el.workspaceTabs.replaceChildren(fragment);
   pruneWorkspaceTabElementCache(seen);
+  renderWorkspaceDockDetail();
 }
 
 function renderWorkspaceTabActivation(previousActiveId: string, activeWorkspace: WorkspaceSnapshot) {
@@ -3531,6 +4233,128 @@ function renderWorkspaceTabActivation(previousActiveId: string, activeWorkspace:
   if (previousWorkspace && previousTab) updateWorkspaceTabElement(previousTab, previousWorkspace);
   updateWorkspaceTabElement(activeTab, activeWorkspace);
   workspaceTabsRenderSignature = workspaceTabsSignature();
+  renderWorkspaceDockDetail();
+}
+
+function renderWorkspaceDockDetail() {
+  const position = workspaceDockPosition(state.ideSettings.workspaceDockPosition);
+  const signature = `${position}\t${workspaceDockDetailOpenSignature()}`;
+  if (workspaceDockDetailRenderSignature === signature) return;
+  workspaceDockDetailRenderSignature = signature;
+  el.workspaceDockDetail.replaceChildren();
+  syncWorkspaceDockDetailToggle();
+}
+
+function workspaceDockDetailOpenSignature() {
+  let signature = state.ideSettings.workspaceDockDetailOpen ? 'all' : 'some';
+  for (const workspace of state.workspaceSnapshots) {
+    signature += `\n${workspace.id}:${workspaceDockDetailIsOpen(workspace.id) ? '1' : '0'}`;
+  }
+  return signature;
+}
+
+function workspaceDockDetailIsOpen(workspaceId: string) {
+  if (!workspaceId) return false;
+  if (state.ideSettings.workspaceDockDetailOpen) return !workspaceDockDetailClosedWorkspaceIds.has(workspaceId);
+  return workspaceDockDetailOpenWorkspaceIds.has(workspaceId);
+}
+
+function workspaceDockDetailsAreAllOpen() {
+  if (!state.workspaceSnapshots.length) return false;
+  return state.workspaceSnapshots.every((workspace) => workspaceDockDetailIsOpen(workspace.id));
+}
+
+function syncWorkspaceDockDetailToggle() {
+  const side = workspaceDockIsSide();
+  const allOpen = side && workspaceDockDetailsAreAllOpen();
+  el.workspaceDockDetailToggle.classList.toggle('active', allOpen);
+  setAttributeIfChanged(el.workspaceDockDetailToggle, 'aria-pressed', String(allOpen));
+  el.workspaceDockDetailToggle.textContent = allOpen ? 'Hide' : 'Detail';
+  el.workspaceDockDetailToggle.title = allOpen ? 'Collapse all workspace details' : 'Expand all workspace details';
+}
+
+function renderWorkspaceTabDetail(tab: HTMLElement, workspace: WorkspaceSnapshot, open: boolean) {
+  const detail = workspaceTabParts(tab).detail;
+  if (!workspaceDockIsSide() || !open) {
+    detail.dataset.renderSignature = '';
+    detail.replaceChildren();
+    return;
+  }
+  const progressSignature = workspaceAgentProgressSignature(workspace.id);
+  const signature = `${workspace.id}\t${workspaceDisplayLabel(workspace)}\t${progressSignature}`;
+  if (detail.dataset.renderSignature === signature) return;
+  detail.dataset.renderSignature = signature;
+  const list = document.createElement('div');
+  list.className = 'workspace-agent-list';
+  const sessions = agentSessionProgressForWorkspace(workspace.id);
+  if (!sessions.length) {
+    const empty = document.createElement('p');
+    empty.className = 'workspace-agent-empty';
+    empty.textContent = 'No active agent sessions';
+    list.append(empty);
+  } else {
+    for (const session of sessions) {
+      list.append(workspaceAgentSessionElement(session));
+    }
+  }
+  detail.replaceChildren(list);
+}
+
+function workspaceAgentSessionElement(session: AgentSessionProgress) {
+  const status = effectiveAgentSessionStatus(session);
+  const item = document.createElement('button');
+  item.className = `workspace-agent-card status-${status}`;
+  item.type = 'button';
+  item.title = `${session.agentId} · ${status} · ${session.cwd}`;
+  item.addEventListener('click', () => {
+    void focusWorkspaceAgentSession(session);
+  });
+
+  const header = document.createElement('span');
+  header.className = 'workspace-agent-card-header';
+  const badge = document.createElement('span');
+  badge.className = `workspace-agent-badge agent-${session.agentId}`;
+  badge.textContent = agentSessionLabel(session.agentId);
+  const title = document.createElement('span');
+  title.className = 'workspace-agent-title';
+  title.textContent = session.title;
+  const statusChip = document.createElement('span');
+  statusChip.className = `workspace-agent-status status-${status}`;
+  statusChip.textContent = agentStatusLabel(status);
+  header.append(badge, title, statusChip);
+
+  const activity = document.createElement('span');
+  activity.className = 'workspace-agent-activity';
+  activity.textContent = session.activity || defaultAgentActivityForStatus(status);
+  const meta = document.createElement('span');
+  meta.className = 'workspace-agent-meta';
+  meta.textContent = `${session.cwd || 'cwd unknown'} · ${session.source}`;
+  item.append(header, activity, meta);
+  return item;
+}
+
+function agentSessionLabel(agentId: string) {
+  if (agentId === 'antigravity') return 'AGY';
+  return agentId.slice(0, 2).toUpperCase();
+}
+
+function agentStatusLabel(status: AgentSessionStatus) {
+  if (status === 'waiting') return '대기';
+  if (status === 'working') return '작업';
+  if (status === 'error') return '오류';
+  if (status === 'exited') return '종료';
+  return 'idle';
+}
+
+async function focusWorkspaceAgentSession(session: AgentSessionProgress) {
+  if (session.workspaceId !== state.activeWorkspaceId || !state.workspaceOpen) {
+    await activateWorkspaceTab(session.workspaceId);
+  }
+  const pane = terminalPaneById.get(session.paneId);
+  if (!pane || pane.workspaceId !== state.activeWorkspaceId) return;
+  setActivePane(pane.paneId);
+  const widget = terminalWidgetForPane(pane);
+  if (widget) bringPanelToFront(widget.element);
 }
 
 function connectedWorkspaceTabElement(id: string) {
@@ -3554,6 +4378,12 @@ function workspaceTabElement(id: string) {
   input.maxLength = 64;
   input.spellcheck = false;
   input.setAttribute('aria-label', 'Workspace name');
+  const detailToggle = document.createElement('button');
+  detailToggle.className = 'workspace-tab-detail-toggle';
+  detailToggle.type = 'button';
+  detailToggle.title = 'Toggle workspace agent detail';
+  detailToggle.setAttribute('aria-label', 'Toggle workspace agent detail');
+  detailToggle.textContent = '▸';
   const security = document.createElement('button');
   security.className = 'workspace-tab-security';
   security.type = 'button';
@@ -3576,11 +4406,15 @@ function workspaceTabElement(id: string) {
   close.title = 'Close workspace';
   close.setAttribute('aria-label', 'Close workspace');
   close.textContent = 'x';
-  tab.append(label, security, copy, close, input);
-  const parts = { label, input, security, copy, close };
+  const detail = document.createElement('div');
+  detail.className = 'workspace-tab-detail';
+  tab.append(label, detailToggle, security, copy, close, input, detail);
+  const parts = { label, input, detailToggle, detail, security, copy, close };
   workspaceTabPartCache.set(tab, parts);
   parts.label.draggable = false;
   parts.input.draggable = false;
+  parts.detailToggle.draggable = false;
+  parts.detail.draggable = false;
   parts.security.draggable = false;
   parts.copy.draggable = false;
   parts.close.draggable = false;
@@ -3618,6 +4452,13 @@ function workspaceTabElement(id: string) {
   parts.input.addEventListener('blur', () => finishWorkspaceTabRename(tab, true));
   parts.input.addEventListener('pointerdown', (event) => event.stopPropagation());
   parts.input.addEventListener('click', (event) => event.stopPropagation());
+  parts.detailToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const workspaceId = workspaceIdForTabElement(tab);
+    if (workspaceId) toggleWorkspaceTabDetail(workspaceId);
+  });
+  parts.detail.addEventListener('pointerdown', (event) => event.stopPropagation());
+  parts.detail.addEventListener('click', (event) => event.stopPropagation());
   parts.security.addEventListener('click', (event) => {
     event.stopPropagation();
     const workspaceId = workspaceIdForTabElement(tab);
@@ -3662,6 +4503,8 @@ function workspaceTabParts(tab: HTMLElement) {
   const parts = {
     label: tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!,
     input: tab.querySelector<HTMLInputElement>('.workspace-tab-name-input')!,
+    detailToggle: tab.querySelector<HTMLButtonElement>('.workspace-tab-detail-toggle')!,
+    detail: tab.querySelector<HTMLDivElement>('.workspace-tab-detail')!,
     security: tab.querySelector<HTMLButtonElement>('.workspace-tab-security')!,
     copy: tab.querySelector<HTMLButtonElement>('.workspace-tab-copy')!,
     close: tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!
@@ -3672,28 +4515,59 @@ function workspaceTabParts(tab: HTMLElement) {
 
 function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapshot) {
   const protectedWorkspace = Boolean(workspace.captureProtected);
+  const keepLive = Boolean(workspace.keepLive);
+  const sleeping = workspaceMemorySleepingIds.has(workspace.id);
+  const sessionEnabled = workspaceCaptureProtectionSessionEnabled(workspace.id);
+  const appliedWorkspace = workspaceCaptureProtectionAppliedForWorkspace(workspace.id);
   const active = workspace.id === state.activeWorkspaceId;
   const llmState = workspaceLlmIndicatorState(workspace.id);
   const displayLabel = workspaceDisplayLabel(workspace);
-  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}\t${llmState}`;
+  const detailOpen = workspaceDockDetailIsOpen(workspace.id);
+  const detailSignature = detailOpen ? workspaceAgentProgressSignature(workspace.id) : '';
+  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}\t${sessionEnabled ? '1' : '0'}\t${appliedWorkspace ? '1' : '0'}\t${llmState}\t${keepLive ? '1' : '0'}\t${sleeping ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
   tab.dataset.workspaceId = workspace.id;
   if (tab.dataset.renderSignature === signature) return;
   tab.dataset.renderSignature = signature;
-  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${llmState !== 'none' ? ' llm-present' : ''}${llmState === 'working' ? ' llm-working' : ''}${llmState === 'waiting' ? ' llm-waiting' : ''}`;
+  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${appliedWorkspace ? ' capture-applied' : ''}${keepLive ? ' keep-live' : ''}${sleeping ? ' memory-slept' : ''}${detailOpen ? ' detail-open' : ''}${llmState !== 'none' ? ' llm-present' : ''}${llmState === 'working' ? ' llm-working' : ''}${llmState === 'waiting' ? ' llm-waiting' : ''}${llmState === 'error' ? ' llm-error' : ''}${llmState === 'exited' ? ' llm-exited' : ''}`;
   const llmTitle = llmState === 'waiting'
     ? ' - LLM waiting for your response'
-    : llmState === 'working'
-      ? ' - LLM working'
-      : llmState === 'idle'
-        ? ' - LLM session present'
+    : llmState === 'error'
+      ? ' - LLM session error'
+      : llmState === 'working'
+        ? ' - LLM working'
+        : llmState === 'exited'
+          ? ' - LLM session exited'
+          : llmState === 'idle'
+            ? ' - LLM session present'
+            : '';
+  const captureTitle = appliedWorkspace
+    ? ' - capture block active now'
+    : protectedWorkspace && sessionEnabled
+      ? ' - capture block armed for this session'
+      : protectedWorkspace
+        ? ' - capture block marked; opening auto-applies'
         : '';
-  tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${protectedWorkspace ? ' - capture blocked when active' : ''}${llmTitle}`;
+  const keepLiveTitle = keepLive ? ' - kept live' : '';
+  const memoryTitle = sleeping ? ' - memory saver slept shells' : '';
+  tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${captureTitle}${keepLiveTitle}${memoryTitle}${llmTitle}`;
   const parts = workspaceTabParts(tab);
   const label = parts.label;
   setTextContentIfChanged(label, displayLabel);
+  if (label.title !== tab.title) label.title = tab.title;
+  setAttributeIfChanged(label, 'aria-label', `Open workspace: ${displayLabel}`);
+  parts.detailToggle.textContent = detailOpen ? '▾' : '▸';
+  setAttributeIfChanged(parts.detailToggle, 'aria-expanded', String(detailOpen));
+  renderWorkspaceTabDetail(tab, workspace, detailOpen);
   const security = parts.security;
-  const securityTitle = protectedWorkspace ? 'Disable capture block' : 'Block capture while this workspace is active';
+  const securityTitle = appliedWorkspace
+    ? 'Disable capture block'
+    : protectedWorkspace && sessionEnabled
+      ? 'Disable capture block'
+      : protectedWorkspace
+        ? 'Disable capture block'
+        : 'Block capture while this workspace is active';
   toggleClassIfChanged(security, 'active', protectedWorkspace);
+  toggleClassIfChanged(security, 'applied', appliedWorkspace);
   if (security.title !== securityTitle) security.title = securityTitle;
   setAttributeIfChanged(security, 'aria-label', securityTitle);
   setAttributeIfChanged(security, 'aria-pressed', String(protectedWorkspace));
@@ -3706,6 +4580,32 @@ function workspaceIdForTabElement(tab: HTMLElement) {
 function workspaceDisplayLabel(workspace: WorkspaceSnapshot) {
   const custom = normalizeWorkspaceCustomLabel(workspace.customLabel ?? '');
   return custom || workspace.label || 'Workspace';
+}
+
+function workspaceCaptureProtectionSessionEnabled(workspaceId: string) {
+  return Boolean(workspaceId && captureProtectionSessionWorkspaceIds.has(workspaceId));
+}
+
+function workspaceCaptureProtectionShouldApply(workspaceId: string, captureProtected?: boolean) {
+  const marked = captureProtected ?? Boolean(workspaceSnapshotForId(workspaceId)?.captureProtected);
+  return Boolean(workspaceId && marked && workspaceCaptureProtectionSessionEnabled(workspaceId));
+}
+
+function activeWorkspaceCaptureProtectionShouldApply() {
+  return workspaceCaptureProtectionShouldApply(state.activeWorkspaceId, state.workspaceCaptureProtected);
+}
+
+function workspaceCaptureProtectionAppliedForWorkspace(workspaceId: string) {
+  return Boolean(
+    workspaceId
+    && workspaceId === state.activeWorkspaceId
+    && state.captureProtectionApplied
+    && workspaceCaptureProtectionSessionEnabled(workspaceId)
+  );
+}
+
+function applyActiveWorkspaceCaptureProtectionSoon(options: { quiet?: boolean } = {}) {
+  applyWorkspaceCaptureProtectionSoon(activeWorkspaceCaptureProtectionShouldApply(), options);
 }
 
 function savedWorkspaceSelectSignature() {
@@ -3864,6 +4764,7 @@ async function loadSelectedSavedWorkspace() {
     if (activeIndex >= 0) replaceWorkspaceSnapshot(activeIndex, snapshot);
     else insertWorkspaceSnapshot(state.workspaceSnapshots.length, snapshot);
     state.activeWorkspaceId = snapshot.id;
+    markWorkspaceActive(snapshot.id);
     renderWorkspaceTabs();
     persistWorkspaceStore();
     await restoreWorkspaceSnapshot(snapshot);
@@ -3875,6 +4776,7 @@ async function loadSelectedSavedWorkspace() {
   insertWorkspaceSnapshot(activeIndex >= 0 ? activeIndex + 1 : state.workspaceSnapshots.length, snapshot);
   const previousActiveId = state.activeWorkspaceId;
   state.activeWorkspaceId = snapshot.id;
+  markWorkspaceActive(snapshot.id);
   renderWorkspaceTabActivation(previousActiveId, snapshot);
   persistWorkspaceStore();
   await restoreWorkspaceSnapshot(snapshot);
@@ -3897,6 +4799,7 @@ function cloneWorkspaceSnapshotForSavedStore(source: WorkspaceSnapshot): Workspa
     updatedAt: new Date().toISOString(),
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
+    terminalWidgetOpacity: cloneTerminalWidgetOpacityMap(source.terminalWidgetOpacity),
     terminals: cloneTerminalSnapshotsForSavedWorkspace(source.terminals),
     terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
@@ -3959,6 +4862,7 @@ function ensureWorkspaceTabForOpen() {
   const reusable = state.workspaceSnapshots.find((snapshot) => workspaceSnapshotCanAcceptOpen(snapshot));
   if (reusable) {
     state.activeWorkspaceId = reusable.id;
+    markWorkspaceActive(reusable.id);
     renderWorkspaceTabs();
     return reusable.id;
   }
@@ -3967,6 +4871,7 @@ function ensureWorkspaceTabForOpen() {
   workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
   insertWorkspaceSnapshot(state.workspaceSnapshots.length, snapshot);
   state.activeWorkspaceId = id;
+  markWorkspaceActive(id);
   renderWorkspaceTabs();
   return id;
 }
@@ -3975,17 +4880,40 @@ function pruneWorkspaceTabElementCache(seen: Set<string>) {
   for (const id of workspaceTabElementCache.keys()) {
     if (!seen.has(id)) workspaceTabElementCache.delete(id);
   }
+  for (const id of workspaceDockDetailOpenWorkspaceIds) {
+    if (!seen.has(id)) workspaceDockDetailOpenWorkspaceIds.delete(id);
+  }
+  for (const id of workspaceDockDetailClosedWorkspaceIds) {
+    if (!seen.has(id)) workspaceDockDetailClosedWorkspaceIds.delete(id);
+  }
+  for (const [id, timer] of workspaceDockDetailRenderTimers) {
+    if (seen.has(id)) continue;
+    window.clearTimeout(timer);
+    workspaceDockDetailRenderTimers.delete(id);
+  }
 }
 
 function markWorkspaceLlmActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS) {
-  if (!pane.llmId || !pane.workspaceId) return;
+  if (!terminalPaneLlmId(pane) || !pane.workspaceId) return;
+  updateAgentSessionProgressForPane(pane, {
+    status: 'working',
+    source: pane.llmId ? 'launcher' : 'heuristic',
+    activity: 'Working',
+    expiresAt: Date.now() + durationMs
+  });
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
 
 function markWorkspaceLlmUserActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_INPUT_ACTIVE_MS) {
-  if (!pane.llmId || !pane.workspaceId) return;
+  if (!terminalPaneLlmId(pane) || !pane.workspaceId) return;
   pane.llmWaitingSuppressUntil = performance.now() + WORKSPACE_LLM_WAITING_AFTER_INPUT_SUPPRESS_MS;
   clearWorkspaceLlmWaitingForPane(pane);
+  updateAgentSessionProgressForPane(pane, {
+    status: 'working',
+    source: 'heuristic',
+    activity: 'Prompt sent',
+    expiresAt: Date.now() + durationMs
+  });
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
 
@@ -3994,10 +4922,42 @@ function markWorkspaceLlmOutputActivityForPane(
   data: string,
   durationMs = WORKSPACE_LLM_OUTPUT_ACTIVE_MS
 ) {
-  if (!pane.llmId || !pane.workspaceId) return;
+  const llmId = terminalPaneLlmId(pane)
+    ?? setDetectedTerminalLlmId(pane, llmIdFromTerminalOutputText(data));
+  if (!llmId || !pane.workspaceId) return;
   // Resize/focus on workspace activation can make some PTYs repaint a prompt. Generic output only
   // extends an already-working window, but explicit Claude/Codex progress status text can start one.
-  if (!workspaceLlmActivityIsActive(pane.workspaceId) && !llmOutputLooksLikeActiveWork(pane.llmId, data)) return;
+  if (!workspaceLlmActivityIsActive(pane.workspaceId) && !llmOutputLooksLikeActiveWork(llmId, data)) {
+    const meaningful = normalizeTerminalOutputForLlmWaitingDetection(data).trim();
+    if (
+      terminalPaneVisibility(pane) !== 'background'
+      || !meaningful
+      || llmOutputLooksClearlyNotWaiting(meaningful)
+    ) {
+      return;
+    }
+  }
+  const now = Date.now();
+  const expiresAt = now + durationMs;
+  const previousProgress = agentSessionProgressByPaneId.get(pane.paneId);
+  if (
+    previousProgress?.agentId === llmId
+    && previousProgress.status === 'working'
+    && previousProgress.source === 'output'
+    && (previousProgress.expiresAt ?? 0) > now
+    && now - previousProgress.updatedAt < AGENT_SESSION_OUTPUT_ACTIVITY_THROTTLE_MS
+  ) {
+    previousProgress.expiresAt = Math.max(previousProgress.expiresAt ?? 0, expiresAt);
+    markWorkspaceLlmActivity(pane.workspaceId, durationMs);
+    return;
+  }
+  updateAgentSessionProgressForPane(pane, {
+    agentId: llmId,
+    status: 'working',
+    source: 'output',
+    activity: agentActivityFromTerminalText(data, 'Working'),
+    expiresAt
+  });
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
 
@@ -4048,24 +5008,442 @@ function clearWorkspaceLlmActivity(workspaceId: string) {
 function refreshWorkspaceLlmActivityAfterPaneChange(workspaceId: string) {
   if (!workspaceId) return;
   const hadWaiting = clearStaleWorkspaceLlmWaiting(workspaceId);
+  const hadTitleActivity = clearStaleWorkspaceLlmTitleActivity(workspaceId);
   if (!workspaceHasRunningLlmPane(workspaceId)) {
     clearWorkspaceLlmActivity(workspaceId);
     clearWorkspaceLlmWaitingForWorkspace(workspaceId);
+    clearWorkspaceLlmTitleActivityForWorkspace(workspaceId);
     return;
   }
-  if (hadWaiting) renderWorkspaceLlmActivityTab(workspaceId);
+  if (hadWaiting || hadTitleActivity) renderWorkspaceLlmActivityTab(workspaceId);
 }
 
 function workspaceLlmActivityIsActive(workspaceId: string) {
   return workspaceLlmIndicatorState(workspaceId) === 'working';
 }
 
-type WorkspaceLlmIndicatorState = 'none' | 'idle' | 'working' | 'waiting';
+type WorkspaceLlmIndicatorState = 'none' | AgentSessionStatus;
+type WorkspaceLlmTitleSignal = 'working' | 'waiting' | 'idle' | 'unknown';
+
+function agentProgressSignature(progress: AgentSessionProgress) {
+  const status = effectiveAgentSessionStatus(progress);
+  return [
+    progress.paneId,
+    progress.workspaceId,
+    progress.backendId ?? '',
+    progress.agentId,
+    status,
+    progress.title,
+    progress.cwd,
+    progress.activity,
+    progress.source,
+    progress.redacted ? '1' : '0'
+  ].join('\t');
+}
+
+function agentProgressPatchSignature(progress: AgentSessionProgress | null | undefined) {
+  return progress ? agentProgressSignature(progress) : '';
+}
+
+function effectiveAgentSessionStatus(progress: AgentSessionProgress): AgentSessionStatus {
+  if (progress.status === 'working' && progress.expiresAt && progress.expiresAt <= Date.now()) {
+    return 'idle';
+  }
+  return progress.status;
+}
+
+function updateAgentSessionProgressForPane(
+  pane: TerminalPane,
+  patch: {
+    agentId?: string | null;
+    status?: AgentSessionStatus;
+    title?: string;
+    cwd?: string;
+    activity?: string;
+    source?: AgentSessionSource;
+    expiresAt?: number;
+    redacted?: boolean;
+  } = {}
+) {
+  const agentId = normalizeTerminalLlmId(patch.agentId) ?? terminalPaneLlmId(pane);
+  if (!agentId || !pane.workspaceId) return null;
+  const previous = agentSessionProgressByPaneId.get(pane.paneId);
+  const previousSignature = agentProgressPatchSignature(previous);
+  const status = patch.status ?? previous?.status ?? (pane.backendId ? 'idle' : 'exited');
+  const next: AgentSessionProgress = {
+    paneId: pane.paneId,
+    workspaceId: pane.workspaceId,
+    backendId: pane.backendId,
+    agentId,
+    status,
+    title: sanitizeAgentProgressText(patch.title ?? previous?.title ?? terminalPaneLabel(pane), AGENT_SESSION_TITLE_MAX_CHARS),
+    cwd: sanitizeAgentProgressText(patch.cwd ?? previous?.cwd ?? pane.cwd, AGENT_SESSION_CWD_MAX_CHARS),
+    activity: sanitizeAgentProgressText(patch.activity ?? previous?.activity ?? defaultAgentActivityForStatus(status), AGENT_SESSION_ACTIVITY_MAX_CHARS),
+    source: patch.source ?? previous?.source ?? 'heuristic',
+    updatedAt: Date.now(),
+    redacted: patch.redacted ?? previous?.redacted
+  };
+  if (status === 'working') {
+    next.expiresAt = patch.expiresAt ?? previous?.expiresAt ?? Date.now() + WORKSPACE_LLM_OUTPUT_ACTIVE_MS;
+  }
+  agentSessionProgressByPaneId.set(pane.paneId, next);
+  scheduleAgentSessionProgressExpiry(next);
+  if (agentProgressSignature(next) !== previousSignature) {
+    renderWorkspaceLlmActivityTab(pane.workspaceId);
+    maybeSendAgentProgressAlert(pane, previous, next);
+  }
+  return next;
+}
+
+function defaultAgentActivityForStatus(status: AgentSessionStatus) {
+  if (status === 'waiting') return 'Waiting for your response';
+  if (status === 'working') return 'Working';
+  if (status === 'error') return 'Error';
+  if (status === 'exited') return 'Exited';
+  return 'Idle';
+}
+
+function maybeSendAgentProgressAlert(
+  pane: TerminalPane,
+  previous: AgentSessionProgress | null | undefined,
+  next: AgentSessionProgress
+) {
+  if (!state.ideSettings.agentNotificationBanners && !state.ideSettings.agentAlertSound) return;
+  const previousStatus = previous ? effectiveAgentSessionStatus(previous) : 'none';
+  const nextStatus = effectiveAgentSessionStatus(next);
+  let kind: AgentAlertKind | null = null;
+  if (nextStatus === 'waiting' && previousStatus !== 'waiting') kind = 'waiting';
+  else if (nextStatus === 'error' && previousStatus !== 'error') kind = 'error';
+  else if ((nextStatus === 'idle' || nextStatus === 'exited') && previousStatus === 'working') kind = 'done';
+  if (!kind) return;
+  const now = Date.now();
+  const last = agentAlertLastByPaneId.get(pane.paneId);
+  if (last?.kind === kind && now - last.at < AGENT_ALERT_MIN_INTERVAL_MS) return;
+  agentAlertLastByPaneId.set(pane.paneId, { kind, at: now });
+  const payload = agentAlertPayload(kind, next);
+  void sendAgentSystemAlert(payload.title, payload.body, {
+    showBanner: state.ideSettings.agentNotificationBanners,
+    playSound: state.ideSettings.agentAlertSound
+  });
+}
+
+function agentAlertPayload(kind: AgentAlertKind, progress: AgentSessionProgress) {
+  const agent = agentAlertAgentLabel(progress.agentId);
+  const workspace = workspaceSnapshotForId(progress.workspaceId);
+  const workspaceName = workspace ? workspaceDisplayLabel(workspace) : 'Workspace';
+  const title = kind === 'waiting'
+    ? `${agent} needs input`
+    : kind === 'error'
+      ? `${agent} needs attention`
+      : `${agent} finished`;
+  const activity = progress.activity && progress.activity !== '—'
+    ? ` · ${progress.activity}`
+    : '';
+  return {
+    title,
+    body: truncateAgentProgressText(`${workspaceName} · ${progress.title}${activity}`, AGENT_SESSION_ACTIVITY_MAX_CHARS)
+  };
+}
+
+function agentAlertAgentLabel(agentId: string) {
+  if (agentId === 'claude') return 'Claude';
+  if (agentId === 'codex') return 'Codex';
+  if (agentId === 'grok') return 'Grok';
+  if (agentId === 'antigravity') return 'Agy';
+  return agentSessionLabel(agentId);
+}
+
+async function ensureAgentNotificationPermission() {
+  if (agentNotificationPermissionPromise) return agentNotificationPermissionPromise;
+  agentNotificationPermissionPromise = (async () => {
+    try {
+      if (await isPermissionGranted()) return true;
+      return (await requestPermission()) === 'granted';
+    } catch (error) {
+      console.warn('Failed to request notification permission', error);
+      return false;
+    } finally {
+      agentNotificationPermissionPromise = null;
+    }
+  })();
+  return agentNotificationPermissionPromise;
+}
+
+async function sendAgentSystemAlert(
+  title: string,
+  body: string,
+  options: { showBanner: boolean; playSound: boolean }
+) {
+  if (!options.showBanner && !options.playSound) return;
+  try {
+    await api.sendAgentAlert({
+      title,
+      body,
+      showBanner: options.showBanner,
+      playSound: options.playSound
+    });
+  } catch (error) {
+    console.warn('Failed to send agent alert', error);
+  }
+}
+
+function appendAgentAlertDebugLog(message: string, severity: 'info' | 'warn' = 'info') {
+  const timestamp = new Date().toLocaleTimeString();
+  const line = `[${timestamp}] ${message}`;
+  agentAlertDebugLogEntries.unshift(line);
+  if (agentAlertDebugLogEntries.length > AGENT_ALERT_DEBUG_LOG_MAX) {
+    agentAlertDebugLogEntries.length = AGENT_ALERT_DEBUG_LOG_MAX;
+  }
+  setTextContentIfChanged(el.settingsAgentAlertDebugLog, agentAlertDebugLogEntries.join('\n'));
+  if (severity === 'warn') console.warn(`[agent-alert-test] ${message}`);
+  else console.info(`[agent-alert-test] ${message}`);
+}
+
+async function sendAgentAlertTest(kind: 'banner' | 'sound' | 'both') {
+  const showBanner = kind === 'banner' || kind === 'both';
+  const playSound = kind === 'sound' || kind === 'both';
+  const label = kind === 'both' ? 'banner + sound' : kind;
+  const now = new Date().toLocaleTimeString();
+  const requestId = Date.now().toString(36).slice(-5);
+  appendAgentAlertDebugLog(`#${requestId} click: ${label} test (banner=${showBanner}, sound=${playSound})`);
+  setTextContentIfChanged(el.settingsAgentAlertTestStatus, `Sending ${label} test...`);
+  if (showBanner) {
+    appendAgentAlertDebugLog(`#${requestId} checking frontend notification permission`);
+    const permissionGranted = await ensureAgentNotificationPermission();
+    appendAgentAlertDebugLog(`#${requestId} frontend notification permission: ${permissionGranted ? 'granted' : 'not granted'}`, permissionGranted ? 'info' : 'warn');
+  }
+  try {
+    const startedAt = performance.now();
+    await api.sendAgentAlert({
+      title: `Simple Vibe IDE ${label} test`,
+      body: `Native alert path test sent at ${now}.`,
+      showBanner,
+      playSound
+    });
+    const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
+    appendAgentAlertDebugLog(`#${requestId} backend send_agent_alert OK (${elapsed}ms)`);
+    if (showBanner) {
+      appendAgentAlertDebugLog(`#${requestId} if no banner appeared, Windows/Tauri notification surface likely hid or blocked it`, 'warn');
+    }
+    const message = `Native alert test sent: ${label}`;
+    setTextContentIfChanged(el.settingsAgentAlertTestStatus, message);
+    setStatus(message);
+  } catch (error) {
+    const message = `Native alert test failed: ${String(error)}`;
+    appendAgentAlertDebugLog(`#${requestId} backend send_agent_alert FAILED: ${String(error)}`, 'warn');
+    setTextContentIfChanged(el.settingsAgentAlertTestStatus, message);
+    setStatus(message, true);
+  }
+}
+
+function scheduleAgentSessionProgressExpiry(progress: AgentSessionProgress) {
+  const existing = agentSessionProgressTimers.get(progress.paneId);
+  if (existing) {
+    window.clearTimeout(existing);
+    agentSessionProgressTimers.delete(progress.paneId);
+  }
+  if (progress.status !== 'working' || !progress.expiresAt) return;
+  const delay = Math.max(80, progress.expiresAt - Date.now() + 40);
+  const timer = window.setTimeout(() => {
+    agentSessionProgressTimers.delete(progress.paneId);
+    expireAgentSessionProgress(progress.paneId);
+  }, delay);
+  agentSessionProgressTimers.set(progress.paneId, timer);
+}
+
+function expireAgentSessionProgress(paneId: string) {
+  const progress = agentSessionProgressByPaneId.get(paneId);
+  if (!progress || progress.status !== 'working') return;
+  if (progress.expiresAt && progress.expiresAt > Date.now()) {
+    scheduleAgentSessionProgressExpiry(progress);
+    return;
+  }
+  const pane = terminalPaneById.get(paneId);
+  if (!pane?.backendId || pane.workspaceId !== progress.workspaceId) return;
+  const next: AgentSessionProgress = {
+    ...progress,
+    status: 'idle',
+    activity: 'Idle',
+    updatedAt: Date.now(),
+    expiresAt: undefined
+  };
+  agentSessionProgressByPaneId.set(paneId, next);
+  renderWorkspaceLlmActivityTab(progress.workspaceId);
+  maybeSendAgentProgressAlert(pane, progress, next);
+}
+
+function deleteAgentSessionProgressForPane(pane: TerminalPane) {
+  const progress = agentSessionProgressByPaneId.get(pane.paneId);
+  const timer = agentSessionProgressTimers.get(pane.paneId);
+  if (timer) window.clearTimeout(timer);
+  agentSessionProgressTimers.delete(pane.paneId);
+  agentSessionProgressByPaneId.delete(pane.paneId);
+  agentAlertLastByPaneId.delete(pane.paneId);
+  if (progress) renderWorkspaceLlmActivityTab(progress.workspaceId);
+}
+
+function agentSessionProgressForWorkspace(workspaceId: string) {
+  const sessions: AgentSessionProgress[] = [];
+  for (const progress of agentSessionProgressByPaneId.values()) {
+    if (progress.workspaceId === workspaceId) sessions.push(progress);
+  }
+  return sessions.sort((left, right) => (
+    agentStatusPriority(effectiveAgentSessionStatus(left)) - agentStatusPriority(effectiveAgentSessionStatus(right))
+    || right.updatedAt - left.updatedAt
+  ));
+}
+
+function workspaceAgentAggregateState(workspaceId: string): WorkspaceLlmIndicatorState {
+  const sessions = agentSessionProgressForWorkspace(workspaceId);
+  if (!sessions.length) return 'none';
+  let best: WorkspaceLlmIndicatorState = 'none';
+  let bestPriority = Number.POSITIVE_INFINITY;
+  for (const progress of sessions) {
+    const status = effectiveAgentSessionStatus(progress);
+    const priority = agentStatusPriority(status);
+    if (priority < bestPriority) {
+      bestPriority = priority;
+      best = status;
+    }
+  }
+  return best;
+}
+
+function agentStatusPriority(status: AgentSessionStatus) {
+  if (status === 'waiting') return 0;
+  if (status === 'error') return 1;
+  if (status === 'working') return 2;
+  if (status === 'idle') return 3;
+  return 4;
+}
+
+function workspaceAgentProgressSignature(workspaceId: string) {
+  return agentSessionProgressForWorkspace(workspaceId).map(agentProgressSignature).join('\n') || 'empty';
+}
+
+function sanitizeAgentProgressText(value: string, maxChars: number) {
+  const normalized = normalizeTerminalOutputForLlmWaitingDetection(String(value ?? ''))
+    .replace(/\s+/g, ' ')
+    .trim();
+  const redacted = normalized
+    .replace(/\b(?:token|secret|password|passwd|api[_-]?key|authorization)\s*[:=]\s*["']?[^\s"']+/gi, (match) => {
+      const key = match.split(/[:=]/)[0]?.trim() || 'secret';
+      return `${key}=[redacted]`;
+    })
+    .replace(/\b[A-Za-z0-9_=-]{32,}\b/g, '[redacted]');
+  return truncateAgentProgressText(redacted || '—', maxChars);
+}
+
+function truncateAgentProgressText(value: string, maxChars: number) {
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 16) return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
+  const head = Math.ceil((maxChars - 1) * 0.62);
+  const tail = Math.max(4, maxChars - 1 - head);
+  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+}
+
+function agentActivityFromTerminalText(data: string, fallback: string) {
+  const text = normalizeTerminalOutputForLlmWaitingDetection(data);
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  return lines.length ? lines[lines.length - 1] : fallback;
+}
+
+function normalizeTerminalLlmId(value: string | null | undefined) {
+  const normalized = (value ?? '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === 'agy') return 'antigravity';
+  return Object.prototype.hasOwnProperty.call(LLM_LAUNCHERS, normalized) ? normalized : null;
+}
+
+function terminalPaneLlmId(pane: TerminalPane | null | undefined) {
+  return normalizeTerminalLlmId(pane?.llmId) ?? normalizeTerminalLlmId(pane?.detectedLlmId);
+}
+
+function setDetectedTerminalLlmId(pane: TerminalPane, llmId: string | null | undefined) {
+  const normalized = normalizeTerminalLlmId(llmId);
+  if (!normalized || pane.llmId) return terminalPaneLlmId(pane);
+  if (pane.detectedLlmId === normalized) return normalized;
+  const previousState = workspaceLlmIndicatorState(pane.workspaceId);
+  pane.detectedLlmId = normalized;
+  updateAgentSessionProgressForPane(pane, {
+    agentId: normalized,
+    status: pane.backendId ? 'idle' : 'idle',
+    source: 'heuristic',
+    activity: 'Agent detected'
+  });
+  if (workspaceLlmIndicatorState(pane.workspaceId) !== previousState) renderWorkspaceLlmActivityTab(pane.workspaceId);
+  return normalized;
+}
+
+function llmIdFromLauncherCommandText(text: string | null | undefined) {
+  if (!text) return null;
+  const normalized = text.replace(/\r/g, '\n');
+  const commandPattern = /(?:^|[\n;&|(){}]\s*|\s+)(?:exec\s+|command\s+|builtin\s+|nohup\s+|env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?(codex|claude|grok|agy|antigravity)(?=$|[\s;&|)])/i;
+  const match = normalized.match(commandPattern);
+  return normalizeTerminalLlmId(match?.[1]);
+}
+
+function llmIdFromTerminalTitleText(title: string | null | undefined) {
+  const normalized = normalizeWorkspaceLlmTerminalTitle(title ?? '');
+  if (!normalized) return null;
+  const direct = normalizeTerminalLlmId(normalized);
+  if (direct) return direct;
+  if (/^(?:Claude|Claude\s+Code)(?:\b|[:\-—·|])/i.test(normalized)) return 'claude';
+  if (/^(?:Codex|OpenAI\s+Codex|Codex\s+CLI)(?:\b|[:\-—·|])/i.test(normalized)) return 'codex';
+  if (/^(?:Grok|Grok\s+(?:Build|Code))(?:\b|[:\-—·|])/i.test(normalized)) return 'grok';
+  if (/^(?:Antigravity|Google\s+Antigravity|AGY)(?:\b|[:\-—·|])/i.test(normalized)) return 'antigravity';
+  return null;
+}
+
+function llmIdFromTerminalOutputText(text: string | null | undefined) {
+  if (!text) return null;
+  const normalized = normalizeTerminalOutputForLlmWaitingDetection(text);
+  if (/\bClaude\s+Code\b|\bWelcome\s+to\s+Claude\b|claude\.ai\/code/i.test(normalized)) return 'claude';
+  if (/\bOpenAI\s+Codex\b|\bCodex\s+CLI\b|\bWelcome\s+to\s+Codex\b/i.test(normalized)) return 'codex';
+  if (/\bGrok\s+(?:Build|Code)\b|\bWelcome\s+to\s+Grok\b/i.test(normalized)) return 'grok';
+  if (/\bGoogle\s+Antigravity\b|\bWelcome\s+to\s+Antigravity\b/i.test(normalized)) return 'antigravity';
+  return null;
+}
+
+function llmIdFromTerminalInputText(data: string | null | undefined) {
+  if (!data || !/[\r\n]/.test(data)) return null;
+  const normalized = normalizeTerminalOutputForLlmWaitingDetection(data);
+  return llmIdFromLauncherCommandText(normalized);
+}
+
+function detectTerminalPaneLlmFromMetadata(pane: TerminalPane) {
+  const existing = terminalPaneLlmId(pane);
+  if (existing) {
+    updateAgentSessionProgressForPane(pane, {
+      agentId: existing,
+      status: pane.backendId ? 'idle' : 'idle',
+      source: pane.llmId ? 'launcher' : 'heuristic',
+      activity: 'Agent session present'
+    });
+    return existing;
+  }
+  return setDetectedTerminalLlmId(
+    pane,
+    llmIdFromTerminalTitleText(pane.customTitle)
+      ?? llmIdFromTerminalTitleText(pane.title)
+      ?? llmIdFromLauncherCommandText(pane.command)
+  );
+}
+
+function terminalSnapshotLlmId(terminal: WorkspaceTerminalSnapshot | null | undefined) {
+  return normalizeTerminalLlmId(terminal?.llmId)
+    ?? llmIdFromTerminalTitleText(terminal?.customTitle)
+    ?? llmIdFromTerminalTitleText(terminal?.title)
+    ?? llmIdFromLauncherCommandText(terminal?.command);
+}
 
 function workspaceLlmIndicatorState(workspaceId: string): WorkspaceLlmIndicatorState {
+  const progressState = workspaceAgentAggregateState(workspaceId);
+  if (progressState !== 'none') return progressState;
   if (!workspaceHasLlmPane(workspaceId)) return 'none';
   if (workspaceHasWaitingLlmPane(workspaceId)) return 'waiting';
-  return workspaceHasRunningLlmPane(workspaceId) && (workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0) > Date.now()
+  return workspaceHasRunningLlmPane(workspaceId)
+    && ((workspaceLlmActivityExpiresAt.get(workspaceId) ?? 0) > Date.now() || workspaceHasTitleActiveLlmPane(workspaceId))
     ? 'working'
     : 'idle';
 }
@@ -4073,18 +5451,28 @@ function workspaceLlmIndicatorState(workspaceId: string): WorkspaceLlmIndicatorS
 function workspaceHasLlmPane(workspaceId: string) {
   if (workspaceHasRunningLlmPane(workspaceId)) return true;
   const snapshot = workspaceSnapshotForId(workspaceId);
-  return Boolean(snapshot?.terminals.some((terminal) => terminal.llmId));
+  return Boolean(snapshot?.terminals.some((terminal) => terminalSnapshotLlmId(terminal)));
 }
 
 function workspaceHasRunningLlmPane(workspaceId: string) {
-  return state.terminals.some((pane) => pane.workspaceId === workspaceId && Boolean(pane.llmId && pane.backendId));
+  return state.terminals.some((pane) => pane.workspaceId === workspaceId && Boolean(terminalPaneLlmId(pane) && pane.backendId));
 }
 
 function workspaceHasWaitingLlmPane(workspaceId: string) {
   for (const [paneId, waiting] of workspaceLlmWaitingByPaneId) {
     if (waiting.workspaceId !== workspaceId) continue;
     const pane = terminalPaneById.get(paneId);
-    if (pane?.workspaceId === workspaceId && pane.llmId && pane.backendId) return true;
+    if (pane?.workspaceId === workspaceId && terminalPaneLlmId(pane) && pane.backendId) return true;
+  }
+  return false;
+}
+
+function workspaceHasTitleActiveLlmPane(workspaceId: string) {
+  const now = Date.now();
+  for (const [paneId, active] of workspaceLlmTitleActivityByPaneId) {
+    if (active.workspaceId !== workspaceId || active.expiresAt <= now) continue;
+    const pane = terminalPaneById.get(paneId);
+    if (pane?.workspaceId === workspaceId && terminalPaneLlmId(pane) && pane.backendId) return true;
   }
   return false;
 }
@@ -4092,6 +5480,14 @@ function workspaceHasWaitingLlmPane(workspaceId: string) {
 function clearWorkspaceLlmWaitingForPane(pane: TerminalPane) {
   const hadWaiting = workspaceLlmWaitingByPaneId.delete(pane.paneId);
   pane.llmWaitingDetectionBuffer = '';
+  const progress = agentSessionProgressByPaneId.get(pane.paneId);
+  if (hadWaiting && progress && effectiveAgentSessionStatus(progress) === 'waiting') {
+    updateAgentSessionProgressForPane(pane, {
+      status: pane.backendId ? 'idle' : 'exited',
+      source: progress.source,
+      activity: pane.backendId ? 'Idle' : 'Exited'
+    });
+  }
   if (hadWaiting) renderWorkspaceLlmActivityTab(pane.workspaceId);
 }
 
@@ -4100,6 +5496,17 @@ function clearWorkspaceLlmWaitingForWorkspace(workspaceId: string) {
   for (const [paneId, waiting] of workspaceLlmWaitingByPaneId) {
     if (waiting.workspaceId !== workspaceId) continue;
     workspaceLlmWaitingByPaneId.delete(paneId);
+    const pane = terminalPaneById.get(paneId);
+    if (pane) {
+      const progress = agentSessionProgressByPaneId.get(paneId);
+      if (progress && effectiveAgentSessionStatus(progress) === 'waiting') {
+        updateAgentSessionProgressForPane(pane, {
+          status: pane.backendId ? 'idle' : 'exited',
+          source: progress.source,
+          activity: pane.backendId ? 'Idle' : 'Exited'
+        });
+      }
+    }
     changed = true;
   }
   if (changed) renderWorkspaceLlmActivityTab(workspaceId);
@@ -4110,16 +5517,275 @@ function clearStaleWorkspaceLlmWaiting(workspaceId: string) {
   for (const [paneId, waiting] of workspaceLlmWaitingByPaneId) {
     if (waiting.workspaceId !== workspaceId) continue;
     const pane = terminalPaneById.get(paneId);
-    if (pane?.workspaceId === workspaceId && pane.llmId && pane.backendId) continue;
+    if (pane?.workspaceId === workspaceId && terminalPaneLlmId(pane) && pane.backendId) continue;
     workspaceLlmWaitingByPaneId.delete(paneId);
+    if (pane) {
+      const progress = agentSessionProgressByPaneId.get(paneId);
+      if (progress && effectiveAgentSessionStatus(progress) === 'waiting') {
+        updateAgentSessionProgressForPane(pane, {
+          status: pane.backendId ? 'idle' : 'exited',
+          source: progress.source,
+          activity: pane.backendId ? 'Idle' : 'Exited'
+        });
+      }
+    }
     changed = true;
   }
   return changed;
 }
 
+function markWorkspaceLlmTitleActivityForPane(
+  pane: TerminalPane,
+  durationMs = WORKSPACE_LLM_TITLE_ACTIVE_MS,
+  activity = 'Working'
+) {
+  const llmId = terminalPaneLlmId(pane);
+  if (!llmId || !pane.workspaceId || !pane.backendId) return;
+  const previousState = workspaceLlmIndicatorState(pane.workspaceId);
+  updateAgentSessionProgressForPane(pane, {
+    agentId: llmId,
+    status: 'working',
+    source: 'title',
+    activity,
+    expiresAt: Date.now() + durationMs
+  });
+  workspaceLlmTitleActivityByPaneId.set(pane.paneId, {
+    workspaceId: pane.workspaceId,
+    llmId,
+    expiresAt: Date.now() + durationMs
+  });
+  scheduleWorkspaceLlmTitleActivityExpiry(pane.paneId);
+  if (workspaceLlmIndicatorState(pane.workspaceId) !== previousState) renderWorkspaceLlmActivityTab(pane.workspaceId);
+}
+
+function scheduleWorkspaceLlmTitleActivityExpiry(paneId: string) {
+  if (workspaceLlmTitleActivityTimers.has(paneId)) return;
+  const active = workspaceLlmTitleActivityByPaneId.get(paneId);
+  const delay = Math.max(80, (active?.expiresAt ?? Date.now()) - Date.now() + 40);
+  const timer = window.setTimeout(() => {
+    workspaceLlmTitleActivityTimers.delete(paneId);
+    expireWorkspaceLlmTitleActivity(paneId);
+  }, delay);
+  workspaceLlmTitleActivityTimers.set(paneId, timer);
+}
+
+function expireWorkspaceLlmTitleActivity(paneId: string) {
+  const active = workspaceLlmTitleActivityByPaneId.get(paneId);
+  if (!active) return;
+  const pane = terminalPaneById.get(paneId);
+  if (active.expiresAt > Date.now() && terminalPaneLlmId(pane) && pane?.backendId && pane.workspaceId === active.workspaceId) {
+    scheduleWorkspaceLlmTitleActivityExpiry(paneId);
+    return;
+  }
+  const previousState = workspaceLlmIndicatorState(active.workspaceId);
+  workspaceLlmTitleActivityByPaneId.delete(paneId);
+  const timer = workspaceLlmTitleActivityTimers.get(paneId);
+  if (timer) window.clearTimeout(timer);
+  workspaceLlmTitleActivityTimers.delete(paneId);
+  if (workspaceLlmIndicatorState(active.workspaceId) !== previousState) renderWorkspaceLlmActivityTab(active.workspaceId);
+}
+
+function clearWorkspaceLlmTitleActivityForPane(pane: TerminalPane) {
+  const active = workspaceLlmTitleActivityByPaneId.get(pane.paneId);
+  const previousState = active ? workspaceLlmIndicatorState(active.workspaceId) : null;
+  workspaceLlmTitleActivityByPaneId.delete(pane.paneId);
+  const timer = workspaceLlmTitleActivityTimers.get(pane.paneId);
+  if (timer) window.clearTimeout(timer);
+  workspaceLlmTitleActivityTimers.delete(pane.paneId);
+  const progress = agentSessionProgressByPaneId.get(pane.paneId);
+  if (active && progress && effectiveAgentSessionStatus(progress) === 'working' && progress.source === 'title') {
+    updateAgentSessionProgressForPane(pane, {
+      status: pane.backendId ? 'idle' : 'exited',
+      source: 'title',
+      activity: pane.backendId ? 'Idle' : 'Exited'
+    });
+  }
+  if (active && workspaceLlmIndicatorState(active.workspaceId) !== previousState) {
+    renderWorkspaceLlmActivityTab(active.workspaceId);
+  }
+}
+
+function clearWorkspaceLlmTitleActivityForWorkspace(workspaceId: string) {
+  let changed = false;
+  const previousState = workspaceLlmIndicatorState(workspaceId);
+  for (const [paneId, active] of workspaceLlmTitleActivityByPaneId) {
+    if (active.workspaceId !== workspaceId) continue;
+    workspaceLlmTitleActivityByPaneId.delete(paneId);
+    const timer = workspaceLlmTitleActivityTimers.get(paneId);
+    if (timer) window.clearTimeout(timer);
+    workspaceLlmTitleActivityTimers.delete(paneId);
+    const pane = terminalPaneById.get(paneId);
+    const progress = agentSessionProgressByPaneId.get(paneId);
+    if (pane && progress && effectiveAgentSessionStatus(progress) === 'working' && progress.source === 'title') {
+      updateAgentSessionProgressForPane(pane, {
+        status: pane.backendId ? 'idle' : 'exited',
+        source: 'title',
+        activity: pane.backendId ? 'Idle' : 'Exited'
+      });
+    }
+    changed = true;
+  }
+  if (changed && workspaceLlmIndicatorState(workspaceId) !== previousState) renderWorkspaceLlmActivityTab(workspaceId);
+}
+
+function clearStaleWorkspaceLlmTitleActivity(workspaceId: string) {
+  let changed = false;
+  for (const [paneId, active] of workspaceLlmTitleActivityByPaneId) {
+    if (active.workspaceId !== workspaceId) continue;
+    const pane = terminalPaneById.get(paneId);
+    if (pane?.workspaceId === workspaceId && terminalPaneLlmId(pane) && pane.backendId && active.expiresAt > Date.now()) continue;
+    workspaceLlmTitleActivityByPaneId.delete(paneId);
+    const timer = workspaceLlmTitleActivityTimers.get(paneId);
+    if (timer) window.clearTimeout(timer);
+    workspaceLlmTitleActivityTimers.delete(paneId);
+    const progress = agentSessionProgressByPaneId.get(paneId);
+    if (pane && progress && effectiveAgentSessionStatus(progress) === 'working' && progress.source === 'title') {
+      updateAgentSessionProgressForPane(pane, {
+        status: pane.backendId ? 'idle' : 'exited',
+        source: 'title',
+        activity: pane.backendId ? 'Idle' : 'Exited'
+      });
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+function clearWorkspaceLlmTitleSignalTimer(pane: TerminalPane) {
+  if (pane.llmTitleSignalTimer) window.clearTimeout(pane.llmTitleSignalTimer);
+  pane.llmTitleSignalTimer = undefined;
+  pane.llmTitlePendingSignal = undefined;
+  pane.llmTitlePendingActivity = undefined;
+}
+
+function cleanupWorkspaceLlmTitleDetectionForPane(pane: TerminalPane) {
+  clearWorkspaceLlmTitleSignalTimer(pane);
+  pane.llmTitleDisposable?.dispose();
+  pane.llmTitleDisposable = undefined;
+  pane.llmTitleOscBuffer = undefined;
+  clearWorkspaceLlmTitleActivityForPane(pane);
+}
+
+function updateWorkspaceLlmTitleFromTerminalData(pane: TerminalPane, data: string) {
+  if (!data && !pane.llmTitleOscBuffer) return;
+  const combined = `${pane.llmTitleOscBuffer ?? ''}${data}`;
+  pane.llmTitleOscBuffer = undefined;
+  const titlePattern = /(?:\x1b\]|\x9d)(?:0|2);([\s\S]*?)(?:\x07|\x1b\\|\x9c)/g;
+  let match: RegExpExecArray | null;
+  let lastCompleteIndex = 0;
+  while ((match = titlePattern.exec(combined))) {
+    lastCompleteIndex = titlePattern.lastIndex;
+    updateWorkspaceLlmTitleFromTerminalTitle(pane, match[1]);
+  }
+  const tailStart = Math.max(combined.lastIndexOf('\x1b]'), combined.lastIndexOf('\x9d'));
+  if (tailStart >= lastCompleteIndex) {
+    const tail = combined.slice(tailStart);
+    if (
+      tail.length <= WORKSPACE_LLM_TITLE_OSC_BUFFER_CHARS
+      && /^(?:\x1b\]|\x9d)(?:0|2);/.test(tail)
+      && !tail.includes('\x07')
+      && !tail.includes('\x1b\\')
+      && !tail.includes('\x9c')
+    ) {
+      pane.llmTitleOscBuffer = tail;
+    }
+  }
+}
+
+function updateWorkspaceLlmTitleFromTerminalTitle(pane: TerminalPane, title: string) {
+  if ((pane.llmTitleDetectionSuppressUntil ?? 0) > performance.now()) return;
+  pane.llmTitleDetectionSuppressUntil = undefined;
+  const llmId = terminalPaneLlmId(pane)
+    ?? setDetectedTerminalLlmId(pane, llmIdFromTerminalTitleText(title));
+  if (!llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(llmId)) return;
+  const signal = classifyWorkspaceLlmTerminalTitle(llmId, title);
+  if (signal === 'unknown') return;
+  scheduleWorkspaceLlmTitleSignal(pane, signal, agentActivityForTitleSignal(signal));
+}
+
+function agentActivityForTitleSignal(signal: Exclude<WorkspaceLlmTitleSignal, 'unknown'>) {
+  if (signal === 'waiting') return 'Waiting for your response';
+  if (signal === 'idle') return 'Idle';
+  return 'Working';
+}
+
+function scheduleWorkspaceLlmTitleSignal(
+  pane: TerminalPane,
+  signal: Exclude<WorkspaceLlmTitleSignal, 'unknown'>,
+  activity = ''
+) {
+  if (!terminalPaneLlmId(pane) || !pane.workspaceId) return;
+  if (signal === 'waiting') {
+    clearWorkspaceLlmTitleSignalTimer(pane);
+    markWorkspaceLlmWaitingForPane(pane, { source: 'title', activity: activity || 'Waiting for your response' });
+    return;
+  }
+  if (pane.llmTitlePendingSignal === signal && pane.llmTitleSignalTimer) return;
+  clearWorkspaceLlmTitleSignalTimer(pane);
+  pane.llmTitlePendingSignal = signal;
+  pane.llmTitlePendingActivity = activity;
+  const delay = signal === 'working' ? WORKSPACE_LLM_TITLE_WORKING_DEBOUNCE_MS : WORKSPACE_LLM_TITLE_IDLE_DEBOUNCE_MS;
+  pane.llmTitleSignalTimer = window.setTimeout(() => {
+    pane.llmTitleSignalTimer = undefined;
+    const pending = pane.llmTitlePendingSignal;
+    const pendingActivity = pane.llmTitlePendingActivity;
+    pane.llmTitlePendingSignal = undefined;
+    pane.llmTitlePendingActivity = undefined;
+    if (!pending || !isTerminalPaneAlive(pane) || !terminalPaneLlmId(pane) || !pane.backendId) return;
+    if (pending === 'working') {
+      markWorkspaceLlmTitleActivityForPane(pane, WORKSPACE_LLM_TITLE_ACTIVE_MS, pendingActivity);
+    } else if (pending === 'idle') {
+      clearWorkspaceLlmTitleActivityForPane(pane);
+      updateAgentSessionProgressForPane(pane, {
+        status: 'idle',
+        source: 'title',
+        activity: pendingActivity || 'Idle'
+      });
+    }
+  }, delay);
+}
+
+function classifyWorkspaceLlmTerminalTitle(llmId: string, title: string): WorkspaceLlmTitleSignal {
+  const normalized = normalizeWorkspaceLlmTerminalTitle(title);
+  if (!normalized) return 'unknown';
+  if (llmId === 'codex') return classifyCodexTerminalTitle(normalized);
+  if (llmId === 'claude') return classifyClaudeTerminalTitle(normalized);
+  if (llmId === 'grok') return classifyGrokTerminalTitle(normalized);
+  return 'unknown';
+}
+
+function normalizeWorkspaceLlmTerminalTitle(title: string) {
+  return title.replace(/\s+/g, ' ').trim();
+}
+
+function workspaceLlmTitleHasBrailleSpinner(title: string) {
+  return /[\u2800-\u28ff]/u.test(title);
+}
+
+function classifyCodexTerminalTitle(title: string): WorkspaceLlmTitleSignal {
+  if (/\[\s*[!.]\s*\]\s*Action Required/i.test(title)) return 'waiting';
+  if (/\bReady\b/i.test(title)) return 'idle';
+  if (workspaceLlmTitleHasBrailleSpinner(title)) return 'working';
+  if (/\b(?:Starting|Working|Thinking|Waiting)\b/i.test(title)) return 'working';
+  return 'unknown';
+}
+
+function classifyClaudeTerminalTitle(title: string): WorkspaceLlmTitleSignal {
+  return workspaceLlmTitleHasBrailleSpinner(title) ? 'working' : 'unknown';
+}
+
+function classifyGrokTerminalTitle(title: string): WorkspaceLlmTitleSignal {
+  if (/\bRunning:\s*Ask\s+\d+\s+questions?\b/i.test(title)) return 'waiting';
+  if (/\b(?:Thinking|Running:)\b/i.test(title)) return 'working';
+  if (/\bWaiting\b/i.test(title)) return 'idle';
+  return 'unknown';
+}
+
 function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
-  if (!pane.llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(pane.llmId)) return false;
   const normalized = normalizeTerminalOutputForLlmWaitingDetection(data);
+  const llmId = terminalPaneLlmId(pane)
+    ?? setDetectedTerminalLlmId(pane, llmIdFromTerminalOutputText(normalized));
+  if (!llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(llmId)) return false;
   const meaningful = normalized.trim();
   if (!meaningful) return workspaceLlmWaitingByPaneId.has(pane.paneId);
   if (llmWaitingDetectionSuppressedAfterInput(pane)) {
@@ -4128,7 +5794,10 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
     // then sits static, so discarding it here would hide it forever. Structured choice
     // menus cannot be faked by echoed prose, so they may still set waiting.
     if (llmOutputLooksLikeStructuredChoiceMenu(meaningful)) {
-      markWorkspaceLlmWaitingForPane(pane);
+      markWorkspaceLlmWaitingForPane(pane, {
+        source: 'output',
+        activity: agentActivityFromTerminalText(meaningful, 'Waiting for your response')
+      });
       return true;
     }
     pane.llmWaitingDetectionBuffer = '';
@@ -4136,12 +5805,15 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
   }
   pane.llmWaitingDetectionBuffer = trimLlmWaitingDetectionBuffer(`${pane.llmWaitingDetectionBuffer ?? ''}\n${meaningful}`);
   const wasWaiting = workspaceLlmWaitingByPaneId.has(pane.paneId);
-  const looksWaiting = llmOutputLooksLikeUserPrompt(pane.llmId, wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer);
+  const looksWaiting = llmOutputLooksLikeUserPrompt(llmId, wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer);
   if (looksWaiting) {
-    markWorkspaceLlmWaitingForPane(pane);
+    markWorkspaceLlmWaitingForPane(pane, {
+      source: 'output',
+      activity: agentActivityFromTerminalText(wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer, 'Waiting for your response')
+    });
     return true;
   }
-  if (llmOutputLooksLikeActiveWork(pane.llmId, meaningful)) {
+  if (llmOutputLooksLikeActiveWork(llmId, meaningful)) {
     clearWorkspaceLlmWaitingForPane(pane);
     return false;
   }
@@ -4173,12 +5845,22 @@ function clearTerminalPaneScreen(pane: TerminalPane | null | undefined) {
   clearWorkspaceLlmWaitingForPane(pane);
 }
 
-function markWorkspaceLlmWaitingForPane(pane: TerminalPane) {
-  if (!pane.llmId || !pane.workspaceId) return;
+function markWorkspaceLlmWaitingForPane(
+  pane: TerminalPane,
+  options: { source?: AgentSessionSource; activity?: string } = {}
+) {
+  const llmId = terminalPaneLlmId(pane);
+  if (!llmId || !pane.workspaceId) return;
   const previousState = workspaceLlmIndicatorState(pane.workspaceId);
+  updateAgentSessionProgressForPane(pane, {
+    agentId: llmId,
+    status: 'waiting',
+    source: options.source ?? 'heuristic',
+    activity: options.activity ?? 'Waiting for your response'
+  });
   workspaceLlmWaitingByPaneId.set(pane.paneId, {
     workspaceId: pane.workspaceId,
-    llmId: pane.llmId,
+    llmId,
     detectedAt: Date.now()
   });
   if (workspaceLlmIndicatorState(pane.workspaceId) !== previousState) renderWorkspaceLlmActivityTab(pane.workspaceId);
@@ -4238,12 +5920,17 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
     /\bWaiting for \d+ (?:dynamic )?workflows? to finish\b/i,
     /(?:^|\n)\s*…\s*\+\d+\s+tool uses?\b/i,
     /\b\d+\s+tool uses?\s*\(ctrl\+o to expand\)/i,
-    /\(ctrl\+b to run in background\)/i
+    /\(ctrl\+b to run in background\)/i,
+    /(?:^|\n)\s*(?:[✶✽✢✳✻✼✺✹✸✷✴●◆◇○◐◓◒◑•·*⠁-⣿]\s*)?(?:실행|처리|생성|분석|생각|작성|검색|읽기|쓰기|편집|로딩|연결|빌드|컴파일)\s*(?:중|하는 중|…|\.{3})/i
   ];
   if (activeProgressPatterns.some((pattern) => pattern.test(text))) return true;
   if (llmId === 'claude') {
     return /\b(?:thinking more with|xhigh effort|high effort)\b/i.test(text)
       || /\bAgent\([^\n)]{1,160}\)[\s\S]{0,900}\bRunning(?:…|\.{3})/i.test(text);
+  }
+  if (llmId === 'antigravity') {
+    return /\b(?:Analyzing the Request|Running|Generating|Thinking|Working|Processing)\b/i.test(text)
+      || /(?:요청|작업|파일|도구).{0,40}(?:분석|실행|생성|처리)\s*중/i.test(text);
   }
   return false;
 }
@@ -4269,7 +5956,7 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
   // "execute", and "reject" were missing, which silently killed the claude
   // "allow …?" branch, grok's "no, reject" / "execute … (●) yes" branches, and the
   // generic "allow?/apply?" prompts whose dialog text has no other gate word.
-  if (!/(amend|approval|approve|allow|apply|confirm|continue|execute|permission|proceed|project|reject|requesting permission|trust|yolo|승인|확인)/.test(lower)) {
+  if (!/(action required|amend|approval|approve|allow|apply|confirm|continue|execute|permission|proceed|project|reject|requesting permission|trust|yolo|승인|확인|권한|허용|거부|계속|진행|선택|질문|취소|예|아니오|네)/.test(lower)) {
     return false;
   }
   const genericPromptPatterns = [
@@ -4280,13 +5967,19 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
     />\s*1\.\s*yes\b/i,
     /\b\d+\s*\([●○]\)\s*yes,\s*(?:proceed|and don't ask again)/i,
     /\bno,\s*reject\b/i,
+    /\baction required\b/i,
     /\b(?:confirmation|approval|permission) required\b/i,
     /\brequesting permission for:/i,
     /\bwould you like to run the following command\b/i,
     /\b(?:do you want|would you like|should i) .*\b(?:continue|proceed|apply|approve|allow|run)\b/i,
     /\bdo you want to proceed\?/i,
     /\b(?:continue|proceed|apply|approve|allow|run)\?\b/i,
-    /(?:승인|확인).{0,24}(?:필요|요청|하세요|하십시오)/
+    /\b(?:ask|answer)\s+\d+\s+questions?\b/i,
+    /\b(?:choose|select) (?:one|an option|from the options)\b/i,
+    /(?:승인|확인|권한|허용).{0,32}(?:필요|요청|하세요|하십시오|하시겠습니까|\?)/,
+    /(?:계속|진행).{0,24}(?:할까요|하시겠습니까|하겠습니까|하려면|할지|선택|\?)/,
+    /(?:선택|질문).{0,32}(?:하세요|하십시오|응답|답변|옵션|항목)/,
+    /(?:예|네|아니오|거부|취소).{0,24}(?:선택|입력|누르|진행)/
   ];
   if (genericPromptPatterns.some((pattern) => pattern.test(text))) return true;
   if (llmId === 'codex') {
@@ -4298,13 +5991,16 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
   }
   if (llmId === 'grok') {
     return /\b(?:ctrl\+o:yolo|yes,\s*proceed|no,\s*reject)\b/i.test(text)
-      || /\bexecute .*\b(?:command|tool)\b[\s\S]{0,420}\b\d+\s*\([●○]\)\s*yes\b/i.test(text);
+      || /\bexecute .*\b(?:command|tool)\b[\s\S]{0,420}\b\d+\s*\([●○]\)\s*yes\b/i.test(text)
+      || /\b(?:ask|answer)\s+\d+\s+questions?\b/i.test(text)
+      || /\bplan:\s*submit\b[\s\S]{0,360}\b(?:accept|approve|proceed|yes|no|reject)\b/i.test(text);
   }
   if (llmId === 'antigravity') {
     return /\bantigravity cli requires permission\b/i.test(text)
       || /\brequesting permission for:/i.test(text)
       || /\bdo you want to proceed\?/i.test(text)
-      || /\byes,\s*i trust this folder\b/i.test(text);
+      || /\byes,\s*i trust this folder\b/i.test(text)
+      || /(?:권한|허용).{0,32}(?:필요|요청|진행|\?)/.test(text);
   }
   return false;
 }
@@ -4317,7 +6013,7 @@ function llmOutputLooksLikeStructuredChoiceMenu(text: string) {
     // ❯ (U+276F) — [›>] never matched it — and dialogs are drawn inside box borders
     // ("│ ❯ 1. Yes"), so allow one border glyph before the cursor. [●○◉◻◼☐☑□■] covers
     // radio/checkbox markers (AskUserQuestion multi-select rows are "❯ ◻ 1. …").
-    /(?:^|\n)\s*(?:[│┃|]\s*)?[›>❯▶▸]\s*(?:\d+[.)]|\d+\s*\([●○]\)|[●○◉◻◼☐☑□■])[\s\S]{0,100}\b(?:yes|no|continue|proceed|allow|approve|trust|recommended)\b/i,
+    /(?:^|\n)\s*(?:[│┃|]\s*)?[›>❯▶▸]\s*(?:\d+[.)]|\d+\s*\([●○]\)|[●○◉◻◼☐☑□■])[\s\S]{0,100}(?:\b(?:yes|no|continue|proceed|allow|approve|trust|recommended)\b|(?:예|네|아니오|계속|진행|허용|승인|거부|선택|추천))/i,
     // Keyword-free menus (AskUserQuestion with arbitrary option labels): a cursor-marked
     // numbered row followed by another numbered row. The follow-up row must NOT carry a
     // cursor glyph itself, so markdown blockquotes ("> 1. …" / "> 2. …") stay inert.
@@ -4338,6 +6034,19 @@ function llmOutputLooksClearlyNotWaiting(text: string) {
 }
 
 function renderWorkspaceLlmActivityTab(workspaceId: string) {
+  if (workspaceDockDetailIsOpen(workspaceId)) {
+    if (workspaceDockDetailRenderTimers.has(workspaceId)) return;
+    const timer = window.setTimeout(() => {
+      workspaceDockDetailRenderTimers.delete(workspaceId);
+      renderWorkspaceLlmActivityTabNow(workspaceId);
+    }, WORKSPACE_DOCK_DETAIL_RENDER_THROTTLE_MS);
+    workspaceDockDetailRenderTimers.set(workspaceId, timer);
+    return;
+  }
+  renderWorkspaceLlmActivityTabNow(workspaceId);
+}
+
+function renderWorkspaceLlmActivityTabNow(workspaceId: string) {
   const workspace = workspaceSnapshotForId(workspaceId);
   const tab = connectedWorkspaceTabElement(workspaceId);
   if (!workspace || !tab) {
@@ -4346,6 +6055,7 @@ function renderWorkspaceLlmActivityTab(workspaceId: string) {
   }
   updateWorkspaceTabElement(tab, workspace);
   workspaceTabsRenderSignature = workspaceTabsSignature();
+  if (workspaceId === state.activeWorkspaceId) renderWorkspaceDockDetail();
 }
 
 function workspaceTabsSignature() {
@@ -4353,7 +6063,8 @@ function workspaceTabsSignature() {
   for (let index = 0; index < state.workspaceSnapshots.length; index += 1) {
     const workspace = state.workspaceSnapshots[index];
     if (index) signature += '\n';
-    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}`;
+    const detailOpen = workspaceDockDetailIsOpen(workspace.id);
+    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceCaptureProtectionSessionEnabled(workspace.id) ? '1' : '0'}\t${workspaceCaptureProtectionAppliedForWorkspace(workspace.id) ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}\t${workspace.keepLive ? '1' : '0'}\t${workspaceMemorySleepingIds.has(workspace.id) ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailOpen ? workspaceAgentProgressSignature(workspace.id) : ''}`;
   }
   return signature;
 }
@@ -4418,7 +6129,7 @@ function startWorkspaceTabPointerDrag(event: PointerEvent, id: string, tab: HTML
   if (event.button !== 0) return;
   const target = event.target instanceof Element ? event.target : null;
   if (tab.classList.contains('renaming')) return;
-  if (target?.closest('.workspace-tab-security, .workspace-tab-copy, .workspace-tab-close, .workspace-tab-name-input')) return;
+  if (target?.closest('.workspace-tab-security, .workspace-tab-copy, .workspace-tab-close, .workspace-tab-name-input, .workspace-tab-detail-toggle, .workspace-tab-detail')) return;
   workspaceDragState = {
     id,
     pointerId: event.pointerId,
@@ -4465,9 +6176,10 @@ function finishWorkspaceTabPointerDrag(event: PointerEvent, tab: HTMLElement, co
 function workspaceDropTargetAt(x: number, y: number, sourceId: string): WorkspaceDropTarget | null {
   const direct = document.elementFromPoint(x, y)?.closest<HTMLElement>('.workspace-tab');
   if (direct?.dataset.workspaceId && direct.dataset.workspaceId !== sourceId) {
-    return { targetId: direct.dataset.workspaceId, position: workspaceDropPosition(x, direct) };
+    return { targetId: direct.dataset.workspaceId, position: workspaceDropPosition(x, y, direct) };
   }
 
+  const vertical = workspaceDockIsSide();
   let best: { tab: HTMLElement; score: number } | null = null;
   for (const child of el.workspaceTabs.children) {
     if (!(child instanceof HTMLElement) || !child.classList.contains('workspace-tab')) continue;
@@ -4477,15 +6189,18 @@ function workspaceDropTargetAt(x: number, y: number, sourceId: string): Workspac
     const rect = tab.getBoundingClientRect();
     const verticalPenalty = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
     const horizontalPenalty = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
-    const score = verticalPenalty * 3 + horizontalPenalty;
+    const score = vertical
+      ? horizontalPenalty * 3 + verticalPenalty
+      : verticalPenalty * 3 + horizontalPenalty;
     if (!best || score < best.score) best = { tab, score };
   }
   if (!best?.tab.dataset.workspaceId) return null;
-  return { targetId: best.tab.dataset.workspaceId, position: workspaceDropPosition(x, best.tab) };
+  return { targetId: best.tab.dataset.workspaceId, position: workspaceDropPosition(x, y, best.tab) };
 }
 
-function workspaceDropPosition(clientX: number, tab: HTMLElement): 'before' | 'after' {
+function workspaceDropPosition(clientX: number, clientY: number, tab: HTMLElement): 'before' | 'after' {
   const rect = tab.getBoundingClientRect();
+  if (workspaceDockIsSide()) return clientY < rect.top + rect.height / 2 ? 'before' : 'after';
   return clientX < rect.left + rect.width / 2 ? 'before' : 'after';
 }
 
@@ -4526,51 +6241,277 @@ function reorderWorkspaceTab(sourceId: string, targetId: string, position: 'befo
   persistWorkspaceStore();
 }
 
+function toggleWorkspaceDockDetail() {
+  if (!workspaceDockIsSide()) return;
+  const nextOpen = !workspaceDockDetailsAreAllOpen();
+  state.ideSettings.workspaceDockDetailOpen = nextOpen;
+  workspaceDockDetailOpenWorkspaceIds.clear();
+  workspaceDockDetailClosedWorkspaceIds.clear();
+  applyWorkspaceDockSettings();
+  syncWorkspaceDockSettingsForm();
+  renderWorkspaceTabs();
+  persistIdeSettings();
+}
+
+function toggleWorkspaceTabDetail(workspaceId: string) {
+  setWorkspaceTabDetailOpen(workspaceId, !workspaceDockDetailIsOpen(workspaceId));
+}
+
+function setWorkspaceTabDetailOpen(workspaceId: string, open: boolean) {
+  if (!workspaceId) return;
+  if (state.ideSettings.workspaceDockDetailOpen) {
+    if (open) workspaceDockDetailClosedWorkspaceIds.delete(workspaceId);
+    else workspaceDockDetailClosedWorkspaceIds.add(workspaceId);
+  } else if (open) {
+    workspaceDockDetailOpenWorkspaceIds.add(workspaceId);
+  } else {
+    workspaceDockDetailOpenWorkspaceIds.delete(workspaceId);
+  }
+  renderWorkspaceLlmActivityTabNow(workspaceId);
+  renderWorkspaceDockDetail();
+}
+
+function startWorkspaceDockResize(event: PointerEvent) {
+  if (event.button !== 0 || !workspaceDockIsSide()) return;
+  event.preventDefault();
+  event.stopPropagation();
+
+  const position = workspaceDockPosition(state.ideSettings.workspaceDockPosition);
+  const startSize = workspaceDockAppliedSize();
+  const startX = event.clientX;
+  workspaceDockResizeDragging = true;
+  document.body.classList.add('workspace-dock-resizing');
+  el.workspaceDockResizer.setPointerCapture(event.pointerId);
+
+  const applySize = (rawSize: number) => {
+    const size = clamp(Math.round(rawSize), WORKSPACE_DOCK_MIN_SIZE, workspaceDockMaxSizeForViewport());
+    state.ideSettings.workspaceDockSize = normalizeWorkspaceDockSize(size);
+    setRootStyleProperty('--workspace-dock-size', `${size}px`);
+    syncWorkspaceDockSettingsForm();
+    scheduleWorkspaceDockLayoutRefresh({ clampWidgets: false, fitTerminals: false, syncBrowser: false });
+  };
+
+  const move = (moveEvent: PointerEvent) => {
+    if (moveEvent.pointerId !== event.pointerId) return;
+    const delta = position === 'left'
+      ? moveEvent.clientX - startX
+      : startX - moveEvent.clientX;
+    applySize(startSize + delta);
+  };
+
+  const up = (upEvent: PointerEvent) => {
+    if (upEvent.pointerId !== event.pointerId) return;
+    if (el.workspaceDockResizer.hasPointerCapture(event.pointerId)) {
+      el.workspaceDockResizer.releasePointerCapture(event.pointerId);
+    }
+    workspaceDockResizeDragging = false;
+    document.body.classList.remove('workspace-dock-resizing');
+    el.workspaceDockResizer.removeEventListener('pointermove', move);
+    el.workspaceDockResizer.removeEventListener('pointerup', up);
+    el.workspaceDockResizer.removeEventListener('pointercancel', up);
+    applyWorkspaceDockSettings();
+    scheduleWorkspaceDockLayoutRefresh();
+    persistIdeSettings();
+  };
+
+  el.workspaceDockResizer.addEventListener('pointermove', move);
+  el.workspaceDockResizer.addEventListener('pointerup', up);
+  el.workspaceDockResizer.addEventListener('pointercancel', up);
+}
+
+function toggleWorkspaceKeepLive(id: string) {
+  const snapshot = workspaceSnapshotForId(id);
+  if (!snapshot) return;
+  snapshot.keepLive = !snapshot.keepLive;
+  snapshot.updatedAt = new Date().toISOString();
+  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+  if (snapshot.keepLive) workspaceMemorySleepingIds.delete(id);
+  renderWorkspaceTabs();
+  persistWorkspaceStore();
+  scheduleWorkspaceMemorySaver();
+  setStatus(snapshot.keepLive
+    ? 'Workspace will stay live'
+    : 'Workspace can be slept by Memory Saver');
+}
+
 async function toggleWorkspaceCaptureProtection(id: string) {
   const snapshot = workspaceSnapshotForId(id);
   if (!snapshot) return;
 
-  const enabled = !snapshot.captureProtected;
+  const wasMarked = Boolean(snapshot.captureProtected);
+  const shouldApplyToCurrentWindow = id === state.activeWorkspaceId || !state.activeWorkspaceId;
+  const wasSessionEnabled = workspaceCaptureProtectionSessionEnabled(id);
+  const enabled = !wasMarked;
+
   snapshot.captureProtected = enabled;
-  // Apply the OS block immediately for the window the user is looking at — including before any
-  // workspace is connected (activeWorkspaceId is '' at startup) — so there is no unprotected gap
-  // between toggling and connecting. A non-active background tab only updates its stored flag.
-  if (id === state.activeWorkspaceId || !state.activeWorkspaceId) {
-    state.workspaceCaptureProtected = enabled;
-    await applyWorkspaceCaptureProtection(enabled);
+  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+  if (enabled) captureProtectionSessionWorkspaceIds.add(id);
+  else captureProtectionSessionWorkspaceIds.delete(id);
+
+  if (shouldApplyToCurrentWindow) {
+    state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
   }
+  renderWorkspaceTabs();
   persistWorkspaceStore();
-  setStatus(enabled
+  if (shouldApplyToCurrentWindow) {
+    const shouldApply = workspaceCaptureProtectionShouldApply(id, snapshot.captureProtected);
+    setStatus(shouldApply ? 'Applying capture block...' : 'Disabling capture block...');
+    const applied = await applyWorkspaceCaptureProtection(shouldApply);
+    if (!applied) {
+      snapshot.captureProtected = wasMarked;
+      if (wasSessionEnabled) captureProtectionSessionWorkspaceIds.add(id);
+      else captureProtectionSessionWorkspaceIds.delete(id);
+      state.workspaceCaptureProtected = wasMarked;
+      workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+      renderWorkspaceTabs();
+      persistWorkspaceStore();
+      return;
+    }
+  }
+  const sessionArmed = workspaceCaptureProtectionShouldApply(id, snapshot.captureProtected);
+  if (!shouldApplyToCurrentWindow) {
+    setStatus(sessionArmed
+      ? 'Capture block will apply when this workspace is active'
+      : 'Capture block disabled for this workspace');
+    return;
+  }
+  setStatus(sessionArmed
     ? 'Capture blocked while this workspace is active'
     : 'Capture block disabled for this workspace');
 }
 
-async function applyWorkspaceCaptureProtection(enabled: boolean, options: { quiet?: boolean } = {}) {
+let captureProtectionApplyToken = 0;
+let captureProtectionDesired = false;
+const CAPTURE_PROTECTION_IPC_TIMEOUT_MS = 4500;
+
+async function applyWorkspaceCaptureProtection(
+  enabled: boolean,
+  options: { quiet?: boolean; holdFreezeFrame?: boolean; failClosed?: boolean } = {}
+) {
+  const token = ++captureProtectionApplyToken;
+  captureProtectionDesired = enabled;
   document.body.classList.toggle('capture-protected', enabled);
-  if (state.captureProtectionApplied === enabled) return;
+  // Clear any stale overlay first. When enabling, briefly paint the protection
+  // card before the native WDA flag so OBS keeps that frame instead of the last
+  // real workspace frame. It is hidden locally right after protection applies.
+  hideCaptureFreezeFrame();
 
   try {
-    if (enabled) await primeCaptureFreezeFrame();
-    await api.setCaptureProtection(enabled);
+    if (enabled) {
+      try {
+        switchBrowserPreviewToCaptureSafeFrame();
+      } catch (error) {
+        console.warn('Capture-safe browser preview switch failed; continuing OS capture protection.', error);
+      }
+      await primeCaptureFreezeFrame();
+      if (token !== captureProtectionApplyToken || captureProtectionDesired !== enabled) {
+        hideCaptureFreezeFrame();
+        return false;
+      }
+    }
+    await setCaptureProtectionWithTimeout(enabled);
+    if (token !== captureProtectionApplyToken || captureProtectionDesired !== enabled) {
+      applyWorkspaceCaptureProtectionSoon(captureProtectionDesired, { quiet: true });
+      return false;
+    }
     state.captureProtectionApplied = enabled;
-    if (enabled) hideCaptureFreezeFrameSoon();
-    else hideCaptureFreezeFrame();
+    if (enabled) {
+      if (!options.holdFreezeFrame) hideCaptureFreezeFrameSoon();
+    } else {
+      hideCaptureFreezeFrame();
+    }
+    renderWorkspaceTabs();
+    return true;
   } catch (error) {
+    if (token !== captureProtectionApplyToken || captureProtectionDesired !== enabled) return false;
+    if (enabled && options.failClosed) {
+      captureProtectionDesired = true;
+      document.body.classList.add('capture-protected');
+      holdCaptureFreezeFrameVisible();
+      renderWorkspaceTabs();
+      if (!options.quiet) setStatus(`Capture protection failed: ${String(error)}`, true);
+      return false;
+    }
+    captureProtectionDesired = state.captureProtectionApplied;
     document.body.classList.toggle('capture-protected', state.captureProtectionApplied);
     hideCaptureFreezeFrame();
+    renderWorkspaceTabs();
     if (!options.quiet) setStatus(`Capture protection failed: ${String(error)}`, true);
+    return false;
   }
 }
 
-const CAPTURE_FREEZE_MAX_MS = 4000;
+async function setCaptureProtectionWithTimeout(enabled: boolean) {
+  let timeoutId = 0;
+  try {
+    await Promise.race([
+      api.setCaptureProtection(enabled),
+      new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(() => {
+          reject(new Error(`native capture protection did not respond within ${CAPTURE_PROTECTION_IPC_TIMEOUT_MS}ms`));
+        }, CAPTURE_PROTECTION_IPC_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
+}
+
+function applyWorkspaceCaptureProtectionSoon(enabled: boolean, options: { quiet?: boolean } = {}) {
+  void applyWorkspaceCaptureProtection(enabled, options).catch(() => undefined);
+}
+
+function armWorkspaceCaptureProtectionForOpen(snapshot: WorkspaceSnapshot) {
+  if (snapshot.captureProtected) captureProtectionSessionWorkspaceIds.add(snapshot.id);
+}
+
+async function ensureWorkspaceCaptureProtectionBeforeReveal(snapshot: WorkspaceSnapshot) {
+  armWorkspaceCaptureProtectionForOpen(snapshot);
+  const shouldProtect = workspaceCaptureProtectionShouldApply(snapshot.id, snapshot.captureProtected);
+  if (!shouldProtect) return true;
+  state.workspaceCaptureProtected = true;
+  setStatus('Applying capture block before loading workspace...');
+  const applied = await applyWorkspaceCaptureProtection(true, {
+    quiet: true,
+    holdFreezeFrame: true,
+    failClosed: true
+  });
+  if (applied) return true;
+  setStatus('Capture protection is not active; protected workspace is hidden', true);
+  return false;
+}
+
+function finishWorkspaceCaptureProtectionAfterReveal(snapshot: WorkspaceSnapshot) {
+  if (state.activeWorkspaceId !== snapshot.id) return;
+  const shouldProtect = workspaceCaptureProtectionShouldApply(snapshot.id, state.workspaceCaptureProtected);
+  if (shouldProtect) {
+    hideCaptureFreezeFrameSoon();
+    return;
+  }
+  if (state.captureProtectionApplied || captureProtectionDesired) {
+    applyWorkspaceCaptureProtectionSoon(false, { quiet: true });
+  }
+}
+
+function disableCaptureProtectionForShutdown() {
+  captureProtectionSessionWorkspaceIds.clear();
+  captureProtectionDesired = false;
+  captureProtectionApplyToken += 1;
+  document.body.classList.remove('capture-protected');
+  hideCaptureFreezeFrame();
+  state.captureProtectionApplied = false;
+  void api.setCaptureProtection(false).catch(() => undefined);
+}
+
+const CAPTURE_FREEZE_PRIME_MS = 520;
+const CAPTURE_FREEZE_MAX_MS = 1000;
 let captureFreezeFailsafe = 0;
 
 async function primeCaptureFreezeFrame() {
   document.body.classList.add('capture-freeze-visible');
   el.captureFreezeFrame.setAttribute('aria-hidden', 'false');
-  // Failsafe: the freeze overlay must NEVER get stuck on screen (that forces an app restart).
-  // Arm a hard cap the moment it's shown so it comes down even if the backend call below hangs.
   if (captureFreezeFailsafe) window.clearTimeout(captureFreezeFailsafe);
+  // Failsafe: the freeze overlay must NEVER get stuck on screen (that forces an app restart).
   captureFreezeFailsafe = window.setTimeout(hideCaptureFreezeFrame, CAPTURE_FREEZE_MAX_MS);
   // Let the overlay paint, but never block on requestAnimationFrame — rAF pauses while the
   // window is hidden/backgrounded, which would otherwise hang the whole apply. Cap with a timer.
@@ -4578,14 +6519,23 @@ async function primeCaptureFreezeFrame() {
     (async () => {
       await nextAnimationFrame();
       await nextAnimationFrame();
-      await delay(520);
+      await delay(CAPTURE_FREEZE_PRIME_MS);
     })(),
-    delay(650)
+    delay(CAPTURE_FREEZE_PRIME_MS + 200)
   ]);
 }
 
 function hideCaptureFreezeFrameSoon() {
   window.setTimeout(hideCaptureFreezeFrame, 260);
+}
+
+function holdCaptureFreezeFrameVisible() {
+  if (captureFreezeFailsafe) {
+    window.clearTimeout(captureFreezeFailsafe);
+    captureFreezeFailsafe = 0;
+  }
+  document.body.classList.add('capture-freeze-visible');
+  el.captureFreezeFrame.setAttribute('aria-hidden', 'false');
 }
 
 function hideCaptureFreezeFrame() {
@@ -4595,6 +6545,21 @@ function hideCaptureFreezeFrame() {
   }
   document.body.classList.remove('capture-freeze-visible');
   el.captureFreezeFrame.setAttribute('aria-hidden', 'true');
+}
+
+function nativeBrowserWebviewAllowedForActiveWorkspace() {
+  return USE_NATIVE_BROWSER_WEBVIEW
+    && !state.workspaceCaptureProtected
+    && !state.captureProtectionApplied
+    && !captureProtectionDesired;
+}
+
+function switchBrowserPreviewToCaptureSafeFrame() {
+  if (!nativeBrowserWebviewVisible) return;
+  const active = browserTabForId(state.activeBrowserTabId);
+  hideNativeBrowserWebview();
+  if (!active || isBrowserPanelHidden()) return;
+  loadBrowserTabFallback(active);
 }
 
 function nextAnimationFrame() {
@@ -4614,13 +6579,20 @@ async function createBlankWorkspaceTab() {
   const insertIndex = previousId
     ? workspaceSnapshotIndexById(previousId) + 1
     : state.workspaceSnapshots.length;
-  state.workspaceCaptureProtected = false;
   const snapshot = blankWorkspaceSnapshot(id);
   workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
   insertWorkspaceSnapshot(insertIndex, snapshot);
-  state.activeWorkspaceId = id;
+  // Keep the previous workspace active while closing its live UI. closeWorkspace()
+  // may flush the current workspace state, and switching activeWorkspaceId or
+  // capture flags to the new blank tab too early would write old UI into the
+  // blank snapshot or clear the previous workspace's capture setting.
   renderWorkspaceTabs();
-  await closeWorkspace();
+  const preserveProtectionUntilBlank = state.captureProtectionApplied || captureProtectionDesired;
+  await closeWorkspace({ preserveCaptureProtection: preserveProtectionUntilBlank });
+  state.activeWorkspaceId = id;
+  state.workspaceCaptureProtected = false;
+  markWorkspaceActive(id);
+  if (preserveProtectionUntilBlank) applyWorkspaceCaptureProtectionSoon(false, { quiet: true });
   renderWorkspaceTabs();
   persistWorkspaceStore();
   setStatus('New empty workspace');
@@ -4638,11 +6610,14 @@ async function copyWorkspaceTab(id: string) {
   workspaceSnapshotSignatures.set(clone.id, workspaceSnapshotSignature(clone));
   insertWorkspaceSnapshot(sourceIndex + 1, clone);
   state.activeWorkspaceId = clone.id;
+  markWorkspaceActive(clone.id);
   persistWorkspaceStore();
   if (!clone.profileId) {
-    await closeWorkspace();
+    if (clone.captureProtected) captureProtectionSessionWorkspaceIds.add(clone.id);
+    const preserveProtectionUntilBlank = state.captureProtectionApplied || captureProtectionDesired;
+    await closeWorkspace({ preserveCaptureProtection: preserveProtectionUntilBlank });
     state.workspaceCaptureProtected = Boolean(clone.captureProtected);
-    await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+    applyWorkspaceCaptureProtectionSoon(activeWorkspaceCaptureProtectionShouldApply(), { quiet: true });
     renderWorkspaceTabs();
   } else {
     await restoreWorkspaceSnapshot(clone);
@@ -4660,6 +6635,7 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
     updatedAt: new Date().toISOString(),
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
+    terminalWidgetOpacity: cloneTerminalWidgetOpacityMap(source.terminalWidgetOpacity),
     terminals: cloneTerminalSnapshots(source.terminals),
     terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
@@ -4681,6 +6657,16 @@ function cloneTerminalSnapshots(terminals: WorkspaceTerminalSnapshot[]) {
     });
   }
   return cloned;
+}
+
+function cloneTerminalWidgetOpacityMap(opacity?: Record<string, number>) {
+  if (!opacity) return undefined;
+  const cloned: Record<string, number> = {};
+  for (const [widgetId, value] of Object.entries(opacity)) {
+    const normalized = normalizeWidgetOpacity(value);
+    if (normalized !== WIDGET_OPACITY_DEFAULT) cloned[widgetId] = normalized;
+  }
+  return Object.keys(cloned).length ? cloned : undefined;
 }
 
 function cloneTerminalPythonEnvSnapshot(env: TerminalPythonEnvSnapshot | null | undefined): TerminalPythonEnvSnapshot | undefined {
@@ -4762,6 +6748,12 @@ function cloneJson<T>(value: T): T {
 
 async function closeWorkspaceTab(id: string) {
   const wasActive = state.activeWorkspaceId === id;
+  const snapshot = workspaceSnapshotForId(id);
+  const runtime = restoreWorkspaceRuntimeCache(id);
+  closeNativeBrowserWebviewsForWorkspace(id, [
+    ...(snapshot?.browserTabs ?? []),
+    ...(runtime?.browserTabs ?? [])
+  ]);
   if (wasActive) {
     saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
     saveActiveWorkspaceRuntimeCache();
@@ -4773,16 +6765,24 @@ async function closeWorkspaceTab(id: string) {
   });
   removeWorkspaceRuntimeCache(id);
   workspaceSnapshotSignatures.delete(id);
+  captureProtectionSessionWorkspaceIds.delete(id);
+  workspaceLastActiveAt.delete(id);
+  workspaceLastOutputAt.delete(id);
+  workspaceMemorySleepingIds.delete(id);
   removeWorkspaceSnapshotById(id);
   if (wasActive) {
     const next = state.workspaceSnapshots[0];
     if (next) {
       state.activeWorkspaceId = next.id;
+      markWorkspaceActive(next.id);
       renderWorkspaceTabs();
       if (!next.profileId) {
-        await closeWorkspace();
-        state.workspaceCaptureProtected = Boolean(next.captureProtected);
-        await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+        const nextCaptureProtected = Boolean(next.captureProtected);
+        if (nextCaptureProtected) captureProtectionSessionWorkspaceIds.add(next.id);
+        const nextCaptureShouldApply = workspaceCaptureProtectionShouldApply(next.id, nextCaptureProtected);
+        await closeWorkspace({ preserveCaptureProtection: state.captureProtectionApplied || captureProtectionDesired || nextCaptureShouldApply });
+        state.workspaceCaptureProtected = nextCaptureProtected;
+        applyWorkspaceCaptureProtectionSoon(nextCaptureShouldApply, { quiet: true });
         renderWorkspaceTabs();
         scheduleWorkspaceStorePersist();
         return;
@@ -4798,18 +6798,23 @@ async function closeWorkspaceTab(id: string) {
 
 async function activateWorkspaceTab(id: string) {
   if (id === state.activeWorkspaceId && state.workspaceOpen) return;
+  const snapshot = workspaceSnapshotForId(id);
+  if (!snapshot) return;
+  const nextCaptureProtected = Boolean(snapshot.captureProtected);
+  if (nextCaptureProtected) captureProtectionSessionWorkspaceIds.add(id);
   const previousActiveId = state.activeWorkspaceId;
   await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
-  const snapshot = workspaceSnapshotForId(id);
-  if (!snapshot) return;
   state.activeWorkspaceId = id;
+  markWorkspaceActive(id);
+  state.workspaceCaptureProtected = nextCaptureProtected;
+  const nextCaptureShouldApply = workspaceCaptureProtectionShouldApply(id, nextCaptureProtected);
   renderWorkspaceTabActivation(previousActiveId, snapshot);
   if (!snapshot.profileId) {
-    await closeWorkspace();
-    state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
-    await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
+    await closeWorkspace({ preserveCaptureProtection: state.captureProtectionApplied || captureProtectionDesired || nextCaptureShouldApply });
+    state.workspaceCaptureProtected = nextCaptureProtected;
+    applyWorkspaceCaptureProtectionSoon(nextCaptureShouldApply, { quiet: true });
     renderWorkspaceTabs();
     scheduleWorkspaceStorePersist();
     setStatus('Empty workspace');
@@ -4828,9 +6833,11 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     currentDir: '',
     workspaceOpen: false,
     captureProtected: false,
+    keepLive: false,
     updatedAt: new Date().toISOString(),
     panels: {},
     terminalSpawnRect: undefined,
+    terminalWidgetOpacity: {},
     terminals: [],
     terminalGroups: [],
     activeTerminalIndex: 0,
@@ -4943,9 +6950,11 @@ function createCurrentWorkspaceSnapshot(
     currentDir: state.currentDir || state.workspaceRoot,
     workspaceOpen: state.workspaceOpen,
     captureProtected: state.workspaceCaptureProtected,
+    keepLive: Boolean(previousSnapshot?.keepLive),
     updatedAt,
     panels: snapshotPanels(),
     terminalSpawnRect: terminalSnapshotState.terminalSpawnRect,
+    terminalWidgetOpacity: terminalSnapshotState.terminalWidgetOpacity,
     terminals: terminalSnapshotState.terminals,
     terminalGroups: terminalSnapshotState.terminalGroups,
     activeTerminalIndex: terminalSnapshotState.activeTerminalIndex,
@@ -5017,7 +7026,7 @@ function currentImageTabSnapshots() {
 
 function currentImageHistorySnapshot(history: PastedImageItem[]) {
   const snapshot: PastedImageItem[] = [];
-  const limit = Math.min(history.length, 24);
+  const limit = Math.min(history.length, IMAGE_HISTORY_LIMIT);
   for (let index = 0; index < limit; index += 1) snapshot.push(history[index]);
   return snapshot;
 }
@@ -5071,8 +7080,10 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${workspaceSignaturePart(snapshot.currentDir)}`;
   signature += `|${snapshot.workspaceOpen ? '1' : '0'}`;
   signature += `|${snapshot.captureProtected ? '1' : '0'}`;
+  signature += `|${snapshot.keepLive ? '1' : '0'}`;
   signature += `|${workspacePanelsSignature(snapshot.panels)}`;
   signature += `|${layoutRatioSignature(snapshot.terminalSpawnRect)}`;
+  signature += `|${terminalWidgetOpacitySignature(snapshot.terminalWidgetOpacity)}`;
   signature += `|${terminalSnapshotsSignature(snapshot.terminals)}`;
   signature += `|${terminalGroupsSignature(snapshot.terminalGroups)}`;
   signature += `|${String(snapshot.activeTerminalIndex)}`;
@@ -5115,9 +7126,18 @@ function workspacePanelsSignature(panels: WorkspaceSnapshot['panels']) {
     const id = FLOATING_PANELS[index];
     const panel = panels?.[id];
     if (index) signature += ';';
-    signature += `${id}:${panel?.visible ? '1' : '0'}:${layoutRatioSignature(panel?.rect)}`;
+    signature += `${id}:${panel?.visible ? '1' : '0'}:${layoutRatioSignature(panel?.rect)}:${normalizeWidgetOpacity(panel?.opacity)}`;
   }
   return signature;
+}
+
+function terminalWidgetOpacitySignature(opacity?: Record<string, number>) {
+  if (!opacity) return '';
+  return Object.entries(opacity)
+    .filter(([, value]) => normalizeWidgetOpacity(value) !== WIDGET_OPACITY_DEFAULT)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([widgetId, value]) => `${workspaceSignaturePart(widgetId)}:${normalizeWidgetOpacity(value)}`)
+    .join(';');
 }
 
 function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
@@ -5130,7 +7150,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.llmTmuxSessionName ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function terminalPythonEnvSignature(env: TerminalPythonEnvSnapshot | null | undefined) {
@@ -5269,31 +7289,36 @@ function snapshotPanels() {
   const panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>> = {};
   for (const id of FLOATING_PANELS) {
     const panel = getPanel(id);
+    const opacity = widgetOpacityForElement(panel);
     panels[id] = {
       visible: !panel.classList.contains('hidden'),
-      rect: elementLayoutRatio(panel, { preferCache: true })
+      rect: elementLayoutRatio(panel, { preferCache: true }),
+      opacity: opacity === WIDGET_OPACITY_DEFAULT ? undefined : opacity
     };
   }
   return panels;
 }
 
-function currentWorkspaceTerminalSnapshotState(): Pick<
+function currentWorkspaceTerminalSnapshotState(workspaceId = state.activeWorkspaceId): Pick<
   WorkspaceSnapshot,
-  'terminals' | 'terminalGroups' | 'activeTerminalIndex' | 'terminalSpawnRect'
+  'terminals' | 'terminalGroups' | 'activeTerminalIndex' | 'terminalSpawnRect' | 'terminalWidgetOpacity'
 > {
   const terminals: WorkspaceSnapshot['terminals'] = [];
   const terminalGroups: WorkspaceTerminalGroupSnapshot[] = [];
+  const terminalWidgetOpacity: Record<string, number> = {};
   let activeTerminalIndex = -1;
   let firstWidget: TerminalWidget | null = null;
   let activeWidget: TerminalWidget | null = null;
   for (const widget of state.terminalWidgets) {
-    if (widget.workspaceId !== state.activeWorkspaceId) continue;
+    if (widget.workspaceId !== workspaceId) continue;
     if (!firstWidget) firstWidget = widget;
+    const opacity = widgetOpacityForElement(widget.element);
+    if (opacity !== WIDGET_OPACITY_DEFAULT) terminalWidgetOpacity[widget.widgetId] = opacity;
     for (const group of terminalGroupsForWidget(widget)) {
       const groupPaneIds = terminalGroupPaneIds(group);
       const groupHasPanes = groupPaneIds.some((paneId) => {
         const pane = terminalPaneById.get(paneId);
-        return pane?.workspaceId === state.activeWorkspaceId;
+        return pane?.workspaceId === workspaceId;
       });
       if (groupHasPanes) {
         const groupSnapshotRoot = workspaceTerminalSplitSnapshotForGroup(group);
@@ -5311,8 +7336,8 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
       }
       for (const paneId of groupPaneIds) {
         const pane = terminalPaneById.get(paneId);
-        if (!pane || pane.workspaceId !== state.activeWorkspaceId) continue;
-        if (pane.paneId === state.activePaneId) {
+        if (!pane || pane.workspaceId !== workspaceId) continue;
+        if (pane.paneId === state.activePaneId || (workspaceId !== state.activeWorkspaceId && pane.paneId === widget.activePaneId)) {
           activeTerminalIndex = terminals.length;
           activeWidget = widget;
         }
@@ -5322,6 +7347,7 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
           customTitle: pane.customTitle,
           command: pane.command,
           llmId: pane.llmId,
+          llmTmuxSessionName: pane.llmTmuxSessionName,
           widgetId: pane.widgetId,
           groupId: group.groupId,
           profileId: pane.profileId,
@@ -5334,14 +7360,15 @@ function currentWorkspaceTerminalSnapshotState(): Pick<
       }
     }
   }
-  const spawnWidget = activeWidget ?? firstWidget ?? firstActiveWorkspaceTerminalWidget();
+  const spawnWidget = activeWidget ?? firstWidget ?? (workspaceId === state.activeWorkspaceId ? firstActiveWorkspaceTerminalWidget() : null);
   return {
     terminals,
     terminalGroups,
+    terminalWidgetOpacity,
     activeTerminalIndex: Math.max(0, activeTerminalIndex),
     terminalSpawnRect: spawnWidget
       ? elementLayoutRatio(spawnWidget.element, { preferCache: true })
-      : activeWorkspaceSnapshot()?.terminalSpawnRect
+      : workspaceSnapshotForId(workspaceId)?.terminalSpawnRect
   };
 }
 
@@ -5396,7 +7423,19 @@ function saveActiveWorkspaceRuntimeCache() {
     disconnectActiveEdgeCdp();
     setEdgePreviewVisible(false);
   }
-  hideNativeBrowserWebview();
+  hideNativeBrowserWebview({ all: true });
+}
+
+function closeNativeBrowserWebviewsForWorkspace(workspaceId: string, tabs = state.browserTabs) {
+  if (!workspaceId) return;
+  const labels = new Set<string>();
+  for (const tab of tabs) {
+    if (tab?.id) labels.add(nativeBrowserWebviewLabelForTab(tab, workspaceId));
+  }
+  const workspaceLabelPart = safeNativeBrowserWebviewLabelPart(workspaceId || 'workspace');
+  const workspacePrefix = `${BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX}-${workspaceLabelPart}-`;
+  if (nativeBrowserWebviewLabel.startsWith(workspacePrefix)) labels.add(nativeBrowserWebviewLabel);
+  for (const label of labels) closeNativeBrowserWebview(label);
 }
 
 function restoreWorkspaceRuntimeCache(workspaceId: string) {
@@ -5406,6 +7445,7 @@ function restoreWorkspaceRuntimeCache(workspaceId: string) {
 function removeWorkspaceRuntimeCache(workspaceId: string) {
   cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
   const cached = workspaceRuntimeCache.get(workspaceId);
+  if (cached) closeNativeBrowserWebviewsForWorkspace(workspaceId, cached.browserTabs);
   if (cached) {
     for (const proxy of cached.previewProxies) {
       previewProxyProbeAt.delete(proxy.id);
@@ -5415,6 +7455,136 @@ function removeWorkspaceRuntimeCache(workspaceId: string) {
   stopEdgeDevtoolsForWorkspace(workspaceId);
   workspaceRuntimeCache.delete(workspaceId);
   clearBrowserFrames(workspaceId);
+}
+
+function markWorkspaceActive(workspaceId: string) {
+  if (!workspaceId) return;
+  workspaceLastActiveAt.set(workspaceId, Date.now());
+  workspaceMemorySleepingIds.delete(workspaceId);
+  scheduleWorkspaceMemorySaver();
+}
+
+function markWorkspaceTerminalOutput(workspaceId: string) {
+  if (!workspaceId) return;
+  workspaceLastOutputAt.set(workspaceId, Date.now());
+  workspaceMemorySleepingIds.delete(workspaceId);
+}
+
+function scheduleWorkspaceMemorySaver(delayMs = WORKSPACE_MEMORY_SAVER_CHECK_DELAY_MS) {
+  if (workspaceMemorySaverTimer || state.ideSettings.memorySaver === 'off') return;
+  workspaceMemorySaverTimer = window.setTimeout(() => {
+    workspaceMemorySaverTimer = 0;
+    void runWorkspaceMemorySaver().catch((error) => {
+      console.warn('Workspace Memory Saver failed:', error);
+    });
+  }, delayMs);
+}
+
+async function runWorkspaceMemorySaver() {
+  const mode = workspaceMemorySaverMode(state.ideSettings.memorySaver);
+  if (mode === 'off') return;
+  const policy = workspaceMemorySaverPolicy(mode);
+  if (state.workspaceSnapshots.length < policy.minWorkspaces) return;
+  const liveWorkspaceIds = liveTerminalWorkspaceIds();
+  if (liveWorkspaceIds.size <= policy.liveLimit) return;
+  const now = Date.now();
+  const candidates = [...liveWorkspaceIds]
+    .filter((workspaceId) => workspaceMemorySaverCanSleep(workspaceId, now, policy.idleMs))
+    .sort((a, b) => (workspaceLastActiveAt.get(a) ?? 0) - (workspaceLastActiveAt.get(b) ?? 0));
+  for (const workspaceId of candidates) {
+    if (liveTerminalWorkspaceIds().size <= policy.liveLimit) break;
+    await sleepWorkspaceTerminals(workspaceId);
+  }
+  if (liveTerminalWorkspaceIds().size > policy.liveLimit) {
+    scheduleWorkspaceMemorySaver(60_000);
+  }
+}
+
+function workspaceMemorySaverPolicy(mode = workspaceMemorySaverMode(state.ideSettings.memorySaver)) {
+  return mode === 'aggressive'
+    ? {
+        liveLimit: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_LIVE_LIMIT,
+        minWorkspaces: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_MIN_WORKSPACES,
+        idleMs: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_IDLE_MS
+      }
+    : {
+        liveLimit: WORKSPACE_MEMORY_SAVER_BALANCED_LIVE_LIMIT,
+        minWorkspaces: WORKSPACE_MEMORY_SAVER_BALANCED_MIN_WORKSPACES,
+        idleMs: WORKSPACE_MEMORY_SAVER_BALANCED_IDLE_MS
+      };
+}
+
+function workspaceMemorySaverIdleMs() {
+  return workspaceMemorySaverPolicy().idleMs;
+}
+
+function liveTerminalWorkspaceIds() {
+  const ids = new Set<string>();
+  for (const pane of state.terminals) {
+    if (pane.workspaceId && !pane.closed) ids.add(pane.workspaceId);
+  }
+  for (const widget of state.terminalWidgets) {
+    if (widget.workspaceId) ids.add(widget.workspaceId);
+  }
+  return ids;
+}
+
+function workspaceMemorySaverCanSleep(workspaceId: string, now: number, idleMs: number) {
+  if (!workspaceId || workspaceId === state.activeWorkspaceId) return false;
+  const snapshot = workspaceSnapshotForId(workspaceId);
+  if (!snapshot || snapshot.keepLive) return false;
+  if (workspaceHasImportantLiveActivity(workspaceId)) return false;
+  if (workspaceHasBrowserRuntime(workspaceId)) return false;
+  const lastActivity = Math.max(
+    workspaceLastActiveAt.get(workspaceId) ?? 0,
+    workspaceLastOutputAt.get(workspaceId) ?? 0
+  );
+  return now - lastActivity >= idleMs;
+}
+
+function workspaceHasImportantLiveActivity(workspaceId: string) {
+  const llmState = workspaceLlmIndicatorState(workspaceId);
+  return llmState === 'working' || llmState === 'waiting';
+}
+
+function workspaceHasBrowserRuntime(workspaceId: string) {
+  if (hasBrowserFramesForWorkspace(workspaceId)) return true;
+  const cached = workspaceRuntimeCache.get(workspaceId);
+  return Boolean(cached && (
+    cached.browserTabs.length
+    || cached.previewProxies.length
+    || cached.browserConsoleLogs.length
+    || cached.previewUrl
+  ));
+}
+
+async function sleepWorkspaceTerminals(workspaceId: string) {
+  const snapshot = workspaceSnapshotForId(workspaceId);
+  if (!snapshot || !liveTerminalWorkspaceIds().has(workspaceId)) return;
+  if (!workspaceMemorySaverCanSleep(workspaceId, Date.now(), workspaceMemorySaverIdleMs())) return;
+  updateWorkspaceTerminalSnapshotFromLive(workspaceId);
+  await closeTerminalsForWorkspace(workspaceId, {
+    backgroundKill: true,
+    saveSnapshot: false,
+    renderShellTabs: false
+  });
+  workspaceMemorySleepingIds.add(workspaceId);
+  renderWorkspaceTabs();
+  scheduleWorkspaceStorePersist();
+  setStatus(`Memory Saver slept ${workspaceDisplayLabel(snapshot)}; shell processes were stopped`);
+}
+
+function updateWorkspaceTerminalSnapshotFromLive(workspaceId: string) {
+  const snapshot = workspaceSnapshotForId(workspaceId);
+  if (!snapshot) return;
+  const terminalSnapshotState = currentWorkspaceTerminalSnapshotState(workspaceId);
+  if (!terminalSnapshotState.terminals.length && snapshot.terminals.length) return;
+  snapshot.terminals = terminalSnapshotState.terminals;
+  snapshot.terminalGroups = terminalSnapshotState.terminalGroups;
+  snapshot.activeTerminalIndex = terminalSnapshotState.activeTerminalIndex;
+  snapshot.terminalSpawnRect = terminalSnapshotState.terminalSpawnRect;
+  snapshot.updatedAt = new Date().toISOString();
+  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
 }
 
 function snapshotEditorTabsForRuntime(tabs: EditorTabState[]) {
@@ -5530,9 +7700,14 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     return;
   }
 
+  if (!await ensureWorkspaceCaptureProtectionBeforeReveal(snapshot)) return;
+  if (state.activeWorkspaceId !== snapshot.id) return;
+  markWorkspaceActive(snapshot.id);
+
   const terminalRestoreToken = ++workspaceTerminalRestoreToken;
   restoringWorkspace = true;
   try {
+    hideNativeBrowserWebview({ all: true });
     hideAllTerminalWidgets();
     clearWorkspacePanels({ skipIntermediateRenders: true });
     state.activeProfile = profile;
@@ -5560,6 +7735,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     ideScale = clamp(snapshot.ideScale || 1, 0.72, 1.45);
     setRootStyleProperty('--editor-font-size', `${editorFontSize}px`);
     setRootStyleProperty('--ide-scale', ideScale.toFixed(3));
+    syncIdeScaleSettings();
     applyNoteFontSize();
     applyNoteOpacity();
     applyCalculatorFontSize();
@@ -5574,9 +7750,9 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     setCheckedIfChanged(el.imageOpenNewTab, state.imageOpenInNewTab);
     updateExplorerOpenMode();
     updateExplorerFileSizeMode();
-    await applyWorkspaceCaptureProtection(state.workspaceCaptureProtected, { quiet: true });
 
     const deferExplorerUntilShellReady = profileNeedsExplorerShellReadyGate(profile);
+    const loadExplorerInBackground = profileLoadsWorkspaceDirectoryInBackground(profile) && !IS_TERMINAL_APP;
     setWorkspaceOpen(true, { preserveVisibility: true, deferExplorerWatch: deferExplorerUntilShellReady });
     restorePanelSnapshots(snapshot.panels);
     if (isPanelVisible('calculator')) renderCalculator();
@@ -5605,6 +7781,9 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
         if (existingPane) {
           queueWorkspaceDirectoryLoadAfterShellReady(existingPane, state.currentDir, profile, 'restoring workspace files');
         }
+      } else if (loadExplorerInBackground) {
+        deferExplorerDirectoryRestore(state.currentDir, profile.id, snapshot.id);
+        loadWorkspaceDirectoryInBackground(state.currentDir, profile.id, snapshot.id);
       } else {
         await openWorkspace(state.currentDir);
       }
@@ -5625,7 +7804,12 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
       });
     }
     refreshTitle();
-    setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}${hasLiveTerminals ? '' : ' (shells starting)'}`);
+    finishWorkspaceCaptureProtectionAfterReveal(snapshot);
+    if (hasLiveTerminals || workspaceHasRunningTerminalBackend(snapshot.id)) {
+      setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}`);
+    } else {
+      setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} restoring: ${snapshot.label} (starting shells)`);
+    }
   } finally {
     restoringWorkspace = false;
     scheduleActiveWorkspaceSnapshotSave(WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS);
@@ -5645,6 +7829,11 @@ function scheduleWorkspaceTerminalRestore(
         if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
         refreshTitle();
         renderShellTabs();
+        if (workspaceHasRunningTerminalBackend(snapshot.id)) {
+          setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}`);
+        } else {
+          setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} restore incomplete: no shell started`, true);
+        }
         saveActiveWorkspaceSnapshot();
       })
       .catch((error) => {
@@ -5656,8 +7845,13 @@ function scheduleWorkspaceTerminalRestore(
 }
 
 function isWorkspaceTerminalRestoreCurrent(workspaceId: string, token?: number) {
-  return token === undefined
-    || (token === workspaceTerminalRestoreToken && state.activeWorkspaceId === workspaceId && state.workspaceOpen);
+  return state.activeWorkspaceId === workspaceId
+    && state.workspaceOpen
+    && (token === undefined || token === workspaceTerminalRestoreToken);
+}
+
+function workspaceHasRunningTerminalBackend(workspaceId: string) {
+  return state.terminals.some((pane) => pane.workspaceId === workspaceId && Boolean(pane.backendId));
 }
 
 function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
@@ -5667,6 +7861,7 @@ function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
     const wasHidden = panel.classList.contains('hidden');
     const visible = snapshot?.visible ?? DEFAULT_PANEL_VISIBILITY[id];
     if (snapshot?.rect) layoutRatios.set(panel, snapshot.rect);
+    applyWidgetOpacity(panel, snapshot?.opacity, { persist: false });
     setPanelVisible(id, visible, { skipSave: true, skipFocus: true });
     if (visible && !wasHidden && snapshot?.rect) applyLayoutRatio(panel, snapshot.rect);
   }
@@ -5706,8 +7901,15 @@ async function restoreWorkspaceTerminals(
       // and re-TYPING the launcher command, exactly as the button does, so the CLI comes back in
       // bypass/YOLO instead of a bare shell. Regular terminals keep their saved command.
       const llmId = terminal.llmId;
-      const llmParts = llmId ? llmLauncherParts(llmId, terminalProfile.kind) : null;
+      const llmTmuxSessionName = llmId
+        ? safeLlmTmuxSessionName(terminal.llmTmuxSessionName) ?? workspaceTmuxSessionName(snapshot.id, llmId)
+        : undefined;
+      const llmParts = llmId ? llmLauncherParts(llmId, terminalProfile.kind, snapshot.id, llmTmuxSessionName) : null;
       const terminalCommand = llmParts ? llmParts.define : terminal.command;
+      if (llmId) {
+        terminalOptions.llmId = llmId;
+        terminalOptions.llmTmuxSessionName = llmTmuxSessionName;
+      }
       let restoredPane: TerminalPane | null | undefined;
       if (existingWidget) {
         restoredPane = await createTerminalTab(existingWidget, terminalCommand, terminalTitle, terminalOptions);
@@ -5718,8 +7920,20 @@ async function restoreWorkspaceTerminals(
         });
         if (widget) {
           widgetsBySnapshotId.set(widgetKey, widget);
+          applyWidgetOpacity(widget.element, terminalWidgetOpacityForSnapshot(snapshot, widgetKey), { persist: false });
           restoredPane = activePaneForWidget(widget);
         }
+      }
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
+        if (restoredPane) {
+          void closeTerminalPane(restoredPane.paneId, {
+            backgroundKill: true,
+            saveSnapshot: false,
+            renderShellTabs: false
+          });
+        }
+        hideTerminalWidgetsForWorkspace(snapshot.id);
+        return;
       }
       if (restoredPane) {
         const snapshotPaneId = terminal.snapshotPaneId || `${widgetKey}:${terminal.groupId ?? restoredPane.groupId}:${terminalSnapshots.indexOf(terminal)}`;
@@ -5737,6 +7951,7 @@ async function restoreWorkspaceTerminals(
       }
       if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
+        restoredPane.llmTmuxSessionName = llmTmuxSessionName;
         markWorkspaceLlmActivityForPane(restoredPane, WORKSPACE_LLM_START_ACTIVE_MS);
         queueTerminalShellReadyAction(
           restoredPane,
@@ -6514,6 +8729,468 @@ function applyNoteTheme(theme: NoteThemeId) {
   panel.dataset.noteThemeClass = className;
 }
 
+function defaultSnippetsStore(): SnippetsStore {
+  return {
+    version: 1,
+    activeTabId: DEFAULT_SNIPPETS_TAB_ID,
+    tabs: [{
+      id: DEFAULT_SNIPPETS_TAB_ID,
+      title: DEFAULT_SNIPPETS_TAB_TITLE,
+      items: []
+    }]
+  };
+}
+
+async function loadSnippetsStore() {
+  try {
+    const raw = await api.readSnippetsStore();
+    state.snippets = normalizeSnippetsStore(JSON.parse(raw));
+  } catch {
+    state.snippets = defaultSnippetsStore();
+    setTextContentIfChanged(el.snippetsStatus, 'Load failed');
+    el.snippetsStatus.classList.add('danger');
+  }
+  renderSnippetTabs();
+  renderSnippets();
+}
+
+async function persistSnippetsStore() {
+  try {
+    state.snippets = normalizeSnippetsStore(state.snippets);
+    await api.writeSnippetsStore(JSON.stringify(state.snippets));
+    renderSnippetsStatus();
+  } catch (error) {
+    setTextContentIfChanged(el.snippetsStatus, 'Save failed');
+    el.snippetsStatus.classList.add('danger');
+    setStatus(`Snippets save failed: ${String(error)}`, true);
+  }
+}
+
+function normalizeSnippetsStore(value: unknown): SnippetsStore {
+  const source = value && typeof value === 'object' ? value as Partial<SnippetsStore> : {};
+  const seen = new Set<string>();
+  const tabs: SnippetTab[] = [];
+  const rawTabs = Array.isArray(source.tabs) ? source.tabs.slice(0, SNIPPETS_MAX_TABS) : [];
+  for (let index = 0; index < rawTabs.length; index += 1) {
+    tabs.push(normalizeSnippetTab(rawTabs[index], index, seen));
+  }
+  if (!tabs.length) tabs.push(defaultSnippetsStore().tabs[0]);
+  const activeTabId = tabs.some((tab) => tab.id === source.activeTabId)
+    ? String(source.activeTabId)
+    : tabs[0].id;
+  return { version: 1, activeTabId, tabs };
+}
+
+function normalizeSnippetTab(value: unknown, index: number, seen: Set<string>): SnippetTab {
+  const source = value && typeof value === 'object' ? value as Partial<SnippetTab> : {};
+  let id = sanitizeSnippetId(source.id);
+  if (!id || seen.has(id)) id = index === 0 && !seen.has(DEFAULT_SNIPPETS_TAB_ID) ? DEFAULT_SNIPPETS_TAB_ID : crypto.randomUUID();
+  seen.add(id);
+  const title = sanitizeSnippetTitle(source.title, index === 0 ? DEFAULT_SNIPPETS_TAB_TITLE : `Tab ${index + 1}`);
+  const items: SnippetItem[] = [];
+  const rawItems = Array.isArray(source.items) ? source.items.slice(0, SNIPPETS_MAX_ITEMS_PER_TAB) : [];
+  for (const raw of rawItems) {
+    const item = normalizeSnippetItem(raw);
+    if (item) items.push(item);
+  }
+  return { id, title, items };
+}
+
+function normalizeSnippetItem(value: unknown): SnippetItem | null {
+  const source = value && typeof value === 'object' ? value as Partial<SnippetItem> : {};
+  const content = sanitizeSnippetText(source.content, SNIPPETS_MAX_CONTENT_CHARS).trim();
+  if (!content) return null;
+  const description = sanitizeSnippetText(source.description, SNIPPETS_MAX_DESCRIPTION_CHARS).trim();
+  const createdAt = validIsoDate(source.createdAt) ? String(source.createdAt) : new Date().toISOString();
+  const updatedAt = validIsoDate(source.updatedAt) ? String(source.updatedAt) : createdAt;
+  return {
+    id: sanitizeSnippetId(source.id) || crypto.randomUUID(),
+    content,
+    description: description || undefined,
+    createdAt,
+    updatedAt
+  };
+}
+
+function sanitizeSnippetId(value: unknown) {
+  return typeof value === 'string' && /^[A-Za-z0-9._:-]{1,96}$/.test(value) ? value : '';
+}
+
+function sanitizeSnippetTitle(value: unknown, fallback: string) {
+  const title = sanitizeSnippetText(value, SNIPPETS_MAX_TITLE_CHARS).trim();
+  return title || fallback;
+}
+
+function sanitizeSnippetText(value: unknown, maxLength: number) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\r\n?/g, '\n').slice(0, maxLength);
+}
+
+function validIsoDate(value: unknown) {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value));
+}
+
+function activeSnippetTab() {
+  state.snippets = normalizeSnippetsStore(state.snippets);
+  return state.snippets.tabs.find((tab) => tab.id === state.snippets.activeTabId) ?? state.snippets.tabs[0];
+}
+
+function renderSnippetTabs() {
+  if (getPanel('snippets').classList.contains('hidden')) return;
+  state.snippets = normalizeSnippetsStore(state.snippets);
+  const signature = snippetTabsSignature();
+  if (snippetTabsRenderSignature === signature) return;
+  const orderSignature = snippetTabsOrderSignature();
+  const sameOrder = snippetTabsOrderRenderSignature === orderSignature
+    && el.snippetsTabs.childElementCount === state.snippets.tabs.length;
+  snippetTabsRenderSignature = signature;
+  if (sameOrder) {
+    for (const tab of state.snippets.tabs) updateSnippetTabElement(snippetTabElement(tab.id), tab);
+    return;
+  }
+
+  snippetTabsOrderRenderSignature = orderSignature;
+  const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
+  for (const tab of state.snippets.tabs) {
+    seen.add(tab.id);
+    const row = snippetTabElement(tab.id);
+    updateSnippetTabElement(row, tab);
+    fragment.append(row);
+  }
+  el.snippetsTabs.replaceChildren(fragment);
+  pruneSnippetTabElementCache(seen);
+}
+
+function snippetTabsSignature() {
+  let signature = '';
+  for (let index = 0; index < state.snippets.tabs.length; index += 1) {
+    const tab = state.snippets.tabs[index];
+    if (index) signature += '\n';
+    signature += `${tab.id}\t${tab.id === state.snippets.activeTabId ? '1' : '0'}\t${tab.title}\t${tab.items.length}`;
+  }
+  return signature;
+}
+
+function snippetTabsOrderSignature() {
+  let signature = '';
+  for (let index = 0; index < state.snippets.tabs.length; index += 1) {
+    if (index) signature += '\n';
+    signature += state.snippets.tabs[index].id;
+  }
+  return signature;
+}
+
+function snippetTabElement(id: string) {
+  const cached = snippetTabElementCache.get(id);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.className = 'widget-tab snippet-tab';
+  const labelButton = document.createElement('button');
+  labelButton.className = 'widget-tab-label';
+  labelButton.type = 'button';
+  labelButton.addEventListener('click', () => {
+    const id = row.dataset.snippetTabId ?? '';
+    if (id) activateSnippetTab(id);
+  });
+  labelButton.addEventListener('dblclick', () => {
+    const id = row.dataset.snippetTabId ?? '';
+    if (id) renameSnippetTab(id);
+  });
+  labelButton.addEventListener('keydown', (event) => {
+    if (event.key !== 'F2') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const id = row.dataset.snippetTabId ?? '';
+    if (id) renameSnippetTab(id);
+  });
+  const closeButton = document.createElement('button');
+  closeButton.className = 'widget-tab-close';
+  closeButton.type = 'button';
+  closeButton.title = 'Delete snippet category';
+  closeButton.setAttribute('aria-label', 'Delete snippet category');
+  closeButton.textContent = 'x';
+  closeButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const id = row.dataset.snippetTabId ?? '';
+    if (id) deleteSnippetTab(id);
+  });
+  row.append(labelButton, closeButton);
+  snippetTabElementCache.set(id, row);
+  return row;
+}
+
+function updateSnippetTabElement(row: HTMLElement, tab: SnippetTab) {
+  const active = tab.id === state.snippets.activeTabId;
+  const signature = `${tab.id}\t${active ? '1' : '0'}\t${tab.title}\t${tab.items.length}\t${state.snippets.tabs.length}`;
+  row.dataset.snippetTabId = tab.id;
+  if (row.dataset.renderSignature === signature) return;
+  row.dataset.renderSignature = signature;
+  row.className = `widget-tab snippet-tab${active ? ' active' : ''}`;
+  const labelButton = row.firstElementChild as HTMLButtonElement;
+  const closeButton = row.lastElementChild as HTMLButtonElement;
+  labelButton.title = `${tab.title}\nDouble-click or press F2 to rename`;
+  setTextContentIfChanged(labelButton, `${tab.title} (${tab.items.length})`);
+  setDisabledIfChanged(closeButton, state.snippets.tabs.length <= 1);
+}
+
+function pruneSnippetTabElementCache(seen: Set<string>) {
+  for (const id of snippetTabElementCache.keys()) {
+    if (!seen.has(id)) snippetTabElementCache.delete(id);
+  }
+}
+
+function activateSnippetTab(id: string) {
+  if (!state.snippets.tabs.some((tab) => tab.id === id)) return;
+  state.snippets.activeTabId = id;
+  snippetEditingItemId = '';
+  renderSnippetTabs();
+  renderSnippets();
+  void persistSnippetsStore();
+}
+
+function createSnippetTab() {
+  const requested = window.prompt('New snippet category name', '');
+  if (requested === null) return;
+  const title = sanitizeSnippetTitle(requested, `Tab ${state.snippets.tabs.length + 1}`);
+  if (state.snippets.tabs.length >= SNIPPETS_MAX_TABS) {
+    setStatus(`Snippets can have up to ${SNIPPETS_MAX_TABS} tabs`, true);
+    return;
+  }
+  const tab: SnippetTab = { id: crypto.randomUUID(), title, items: [] };
+  state.snippets.tabs.push(tab);
+  state.snippets.activeTabId = tab.id;
+  snippetTabsRenderSignature = '\0';
+  snippetEditingItemId = '';
+  renderSnippetTabs();
+  renderSnippets();
+  void persistSnippetsStore();
+  setStatus(`Snippet category added: ${title}`);
+}
+
+function renameSnippetTab(id: string) {
+  const tab = state.snippets.tabs.find((item) => item.id === id);
+  if (!tab) return;
+  const requested = window.prompt('Rename snippet category', tab.title);
+  if (requested === null) return;
+  const title = sanitizeSnippetTitle(requested, tab.title);
+  tab.title = title;
+  snippetTabsRenderSignature = '\0';
+  renderSnippetTabs();
+  renderSnippetsStatus();
+  void persistSnippetsStore();
+  setStatus(`Snippet category renamed: ${title}`);
+}
+
+function deleteSnippetTab(id: string) {
+  if (state.snippets.tabs.length <= 1) return;
+  const index = state.snippets.tabs.findIndex((tab) => tab.id === id);
+  if (index < 0) return;
+  const tab = state.snippets.tabs[index];
+  const detail = tab.items.length ? ` and ${tab.items.length} snippet${tab.items.length === 1 ? '' : 's'}` : '';
+  if (!window.confirm(`Delete snippet category "${tab.title}"${detail}?`)) return;
+  state.snippets.tabs.splice(index, 1);
+  snippetTabElementCache.delete(id);
+  if (state.snippets.activeTabId === id) state.snippets.activeTabId = state.snippets.tabs[Math.max(0, index - 1)]?.id ?? state.snippets.tabs[0].id;
+  snippetEditingItemId = '';
+  snippetTabsRenderSignature = '\0';
+  renderSnippetTabs();
+  renderSnippets();
+  void persistSnippetsStore();
+  setStatus(`Snippet category deleted: ${tab.title}`);
+}
+
+function renderSnippets() {
+  if (getPanel('snippets').classList.contains('hidden')) return;
+  const tab = activeSnippetTab();
+  const query = state.snippetSearch.trim().toLowerCase();
+  const signature = snippetsSignature(tab, query, snippetEditingItemId);
+  renderSnippetFormState();
+  renderSnippetsStatus();
+  if (snippetsRenderSignature === signature) return;
+  snippetsRenderSignature = signature;
+
+  const items = query
+    ? tab.items.filter((item) => snippetSearchText(item).includes(query))
+    : tab.items;
+  const fragment = document.createDocumentFragment();
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'snippets-empty';
+    empty.textContent = query
+      ? 'No snippets match this search.'
+      : 'No snippets yet. Add a command flag, shell command, prompt line, or other paste-ready text.';
+    fragment.append(empty);
+  } else {
+    for (const item of items) fragment.append(snippetItemElement(item));
+  }
+  el.snippetsList.replaceChildren(fragment);
+}
+
+function snippetsSignature(tab: SnippetTab, query: string, editingId: string) {
+  let signature = `${tab.id}\t${query}\t${editingId}\t${tab.items.length}`;
+  for (const item of tab.items) {
+    signature += `\n${item.id}\t${item.content}\t${item.description ?? ''}\t${item.updatedAt}`;
+  }
+  return signature;
+}
+
+function snippetSearchText(item: SnippetItem) {
+  return `${item.content}\n${item.description ?? ''}`.toLowerCase();
+}
+
+function snippetItemElement(item: SnippetItem) {
+  const row = document.createElement('article');
+  row.className = 'snippet-item';
+  const body = document.createElement('div');
+  body.className = 'snippet-item-body';
+  const content = document.createElement('pre');
+  content.className = 'snippet-content';
+  content.textContent = item.content;
+  body.append(content);
+  if (item.description) {
+    const description = document.createElement('div');
+    description.className = 'snippet-description';
+    description.textContent = item.description;
+    body.append(description);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'snippet-actions';
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'snippet-action-copy';
+  copy.textContent = 'Copy';
+  copy.title = 'Copy snippet content';
+  copy.addEventListener('click', () => void copySnippetItem(item.id));
+  const edit = document.createElement('button');
+  edit.type = 'button';
+  edit.className = 'snippet-action-edit';
+  edit.textContent = 'Edit';
+  edit.title = 'Edit snippet';
+  edit.addEventListener('click', () => editSnippetItem(item.id));
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'snippet-action-delete';
+  remove.textContent = 'Del';
+  remove.title = 'Delete snippet';
+  remove.addEventListener('click', () => deleteSnippetItem(item.id));
+  actions.append(copy, edit, remove);
+  row.append(body, actions);
+  return row;
+}
+
+function renderSnippetFormState() {
+  const editing = Boolean(snippetEditingItemId);
+  setTextContentIfChanged(el.snippetsSave, editing ? 'Update' : 'Add');
+  toggleClassIfChanged(el.snippetsCancel, 'hidden', !editing);
+}
+
+function renderSnippetsStatus() {
+  const tab = activeSnippetTab();
+  const total = state.snippets.tabs.reduce((sum, item) => sum + item.items.length, 0);
+  const text = `${tab.items.length}/${total} snippets · plaintext local`;
+  setTextContentIfChanged(el.snippetsStatus, text);
+  el.snippetsStatus.classList.remove('danger');
+}
+
+function saveSnippetFromForm() {
+  const tab = activeSnippetTab();
+  const content = sanitizeSnippetText(el.snippetsContent.value, SNIPPETS_MAX_CONTENT_CHARS).trim();
+  if (!content) {
+    setStatus('Snippet content is empty', true);
+    el.snippetsContent.focus();
+    return;
+  }
+  const description = sanitizeSnippetText(el.snippetsDescription.value, SNIPPETS_MAX_DESCRIPTION_CHARS).trim();
+  const now = new Date().toISOString();
+  const editing = snippetEditingItemId
+    ? tab.items.find((item) => item.id === snippetEditingItemId)
+    : null;
+  if (editing) {
+    editing.content = content;
+    editing.description = description || undefined;
+    editing.updatedAt = now;
+    setStatus('Snippet updated');
+  } else {
+    if (tab.items.length >= SNIPPETS_MAX_ITEMS_PER_TAB) {
+      setStatus(`Each snippet tab can have up to ${SNIPPETS_MAX_ITEMS_PER_TAB} items`, true);
+      return;
+    }
+    tab.items.push({
+      id: crypto.randomUUID(),
+      content,
+      description: description || undefined,
+      createdAt: now,
+      updatedAt: now
+    });
+    setStatus('Snippet added');
+  }
+  snippetEditingItemId = '';
+  clearSnippetForm();
+  snippetTabsRenderSignature = '\0';
+  snippetsRenderSignature = '\0';
+  renderSnippetTabs();
+  renderSnippets();
+  void persistSnippetsStore();
+}
+
+function clearSnippetForm() {
+  setInputValueIfChanged(el.snippetsContent, '');
+  setInputValueIfChanged(el.snippetsDescription, '');
+  renderSnippetFormState();
+}
+
+function editSnippetItem(id: string) {
+  const tab = activeSnippetTab();
+  const item = tab.items.find((candidate) => candidate.id === id);
+  if (!item) return;
+  snippetEditingItemId = id;
+  setInputValueIfChanged(el.snippetsContent, item.content);
+  setInputValueIfChanged(el.snippetsDescription, item.description ?? '');
+  renderSnippetFormState();
+  el.snippetsContent.focus();
+}
+
+function cancelSnippetEdit() {
+  snippetEditingItemId = '';
+  clearSnippetForm();
+  renderSnippets();
+}
+
+function deleteSnippetItem(id: string) {
+  const tab = activeSnippetTab();
+  const index = tab.items.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  if (!window.confirm('Delete this snippet?')) return;
+  tab.items.splice(index, 1);
+  if (snippetEditingItemId === id) clearSnippetForm();
+  snippetEditingItemId = '';
+  snippetTabsRenderSignature = '\0';
+  snippetsRenderSignature = '\0';
+  renderSnippetTabs();
+  renderSnippets();
+  void persistSnippetsStore();
+  setStatus('Snippet deleted');
+}
+
+async function copySnippetItem(id: string) {
+  const item = activeSnippetTab().items.find((candidate) => candidate.id === id);
+  if (!item) return;
+  try {
+    await writeText(item.content);
+    setStatus('Snippet copied');
+  } catch (error) {
+    setStatus(`Snippet copy failed: ${String(error)}`, true);
+  }
+}
+
+function handleSnippetSearchInput() {
+  state.snippetSearch = el.snippetsSearch.value;
+  snippetsRenderSignature = '\0';
+  renderSnippets();
+}
+
 function toggleNotePin() {
   state.notePinned = !state.notePinned;
   renderNotePin();
@@ -7150,6 +9827,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+function terminalStartTimeoutMs(profile: ConnectionProfile) {
+  if (profile.kind === 'wsl') return TERMINAL_START_TIMEOUT_WSL_MS;
+  if (profile.kind === 'ssh') return TERMINAL_START_TIMEOUT_SSH_MS;
+  return TERMINAL_START_TIMEOUT_WINDOWS_MS;
+}
+
 function yieldToUi() {
   return new Promise<void>((resolve) => {
     window.requestAnimationFrame(() => window.setTimeout(resolve, 0));
@@ -7157,13 +9840,17 @@ function yieldToUi() {
 }
 
 function runWhenUiIdle(callback: () => void, timeout = 700) {
+  if (appShutdownStarted) return;
   const idleWindow = window as Window & {
     requestIdleCallback?: (handler: IdleRequestCallback, options?: IdleRequestOptions) => number;
   };
   const run = () => {
+    if (appShutdownStarted) return;
     const delay = uiBusyDelayMs();
     if (delay > 0) {
-      window.setTimeout(() => runWhenUiIdle(callback, timeout), delay);
+      window.setTimeout(() => {
+        if (!appShutdownStarted) runWhenUiIdle(callback, timeout);
+      }, delay);
       return;
     }
     callback();
@@ -7179,6 +9866,7 @@ function uiBusyDelayMs() {
   const scrollPause = explorerScrollingUntil - Date.now();
   if (scrollPause > 0) return scrollPause + EXPLORER_SCROLL_IDLE_MS;
   if (workspaceDragState?.dragging) return 240;
+  if (workspaceDockResizeDragging) return 120;
   return uiInputPending() ? 80 : 0;
 }
 
@@ -7398,8 +10086,12 @@ function bindEvents() {
       setStatus('Select a profile first', true);
       return;
     }
-    state.workspaceRoot = await resolveSelectedRoot();
-    await switchWorkspace(state.workspaceRoot);
+    try {
+      state.workspaceRoot = await resolveSelectedRoot();
+      await switchWorkspace(state.workspaceRoot);
+    } catch (error) {
+      setStatus(`Open workspace failed: ${String(error)}`, true);
+    }
   });
   el.saveWorkspace.addEventListener('click', () => void saveCurrentWorkspaceForLater());
   el.savedWorkspaceSelect.addEventListener('change', renderSavedWorkspaceSelect);
@@ -7408,7 +10100,7 @@ function bindEvents() {
   el.newShell.addEventListener('click', () => createTerminal(null, 'shell'));
   el.shellNewTab.addEventListener('click', () => {
     const widget = activeTerminalWidget();
-    if (widget) void createShellTabInWidget(widget);
+    if (widget) void createNewTabInWidget(widget);
     else void createTerminal(null, 'shell');
   });
   el.newWindowsShell.addEventListener('click', () => void createWindowsShell());
@@ -7461,6 +10153,22 @@ function bindEvents() {
     event.preventDefault();
     event.stopPropagation();
     void saveActiveNoteNow();
+  });
+  el.snippetsNewTab.addEventListener('click', createSnippetTab);
+  el.snippetsSearch.addEventListener('input', handleSnippetSearchInput);
+  el.snippetsForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    saveSnippetFromForm();
+  });
+  el.snippetsCancel.addEventListener('click', cancelSnippetEdit);
+  el.snippetsContent.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key === 'Enter') {
+      event.preventDefault();
+      saveSnippetFromForm();
+    } else if (event.key === 'Escape' && snippetEditingItemId) {
+      event.preventDefault();
+      cancelSnippetEdit();
+    }
   });
   el.imageNewTab.addEventListener('click', () => {
     createImageTab(undefined, true);
@@ -7591,6 +10299,28 @@ function bindEvents() {
   el.calculatorExpression.addEventListener('keydown', handleCalculatorKey);
   el.calculatorClear.addEventListener('click', clearCalculator);
   el.settingsSave.addEventListener('click', saveSettingsFromForm);
+  el.settingsWorkspaceDockPosition.addEventListener('change', () => updateWorkspaceDockSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceDockSize.addEventListener('input', () => updateWorkspaceDockSettingsFromForm());
+  el.settingsWorkspaceDockSize.addEventListener('change', () => updateWorkspaceDockSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceDockDetail.addEventListener('change', () => updateWorkspaceDockSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceFocusBorder.addEventListener('change', () => updateWorkspaceFocusSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceFocusTitle.addEventListener('change', () => updateWorkspaceFocusSettingsFromForm({ persist: true }));
+  el.settingsAgentNotificationBanners.addEventListener('change', () => updateAgentAlertSettingsFromForm({ persist: true }));
+  el.settingsAgentAlertSound.addEventListener('change', () => updateAgentAlertSettingsFromForm({ persist: true }));
+  el.settingsAgentAlertTestBanner.addEventListener('click', () => void sendAgentAlertTest('banner'));
+  el.settingsAgentAlertTestSound.addEventListener('click', () => void sendAgentAlertTest('sound'));
+  el.settingsAgentAlertTestBoth.addEventListener('click', () => void sendAgentAlertTest('both'));
+  el.settingsWidgetRadius.addEventListener('input', () => updateWidgetAppearanceSettingsFromForm());
+  el.settingsWidgetRadius.addEventListener('change', () => updateWidgetAppearanceSettingsFromForm({ persist: true }));
+  el.settingsIdeScaleReset.addEventListener('click', resetIdeScaleToDefault);
+  el.settingsWidgetFocusBorder.addEventListener('change', () => updateWidgetAppearanceSettingsFromForm({ persist: true }));
+  el.settingsWidgetFocusTitle.addEventListener('change', () => updateWidgetAppearanceSettingsFromForm({ persist: true }));
+  el.workspaceDockDetailToggle.addEventListener('click', toggleWorkspaceDockDetail);
+  el.workspaceDockResizer.addEventListener('pointerdown', startWorkspaceDockResize);
+  el.widgetOpacityRange.addEventListener('input', () => updateWidgetOpacityFromPopover());
+  el.widgetOpacityRange.addEventListener('change', () => updateWidgetOpacityFromPopover({ persist: true }));
+  el.widgetOpacityReset.addEventListener('click', resetWidgetOpacityFromPopover);
+  el.widgetOpacityClose.addEventListener('click', () => hideWidgetOpacityPopover());
   window.addEventListener('message', handleBrowserConsoleMessage);
   document.addEventListener('paste', handlePaste, true);
   document.addEventListener('keydown', handleImageClipboardShortcut, true);
@@ -7605,10 +10335,15 @@ function bindEvents() {
   document.addEventListener('keydown', handleBrowserRefreshShortcut, true);
   document.addEventListener('mousedown', handleExplorerMouseNavigation, true);
   document.addEventListener('contextmenu', handleContextMenu, true);
+  document.addEventListener('pointerdown', handleWidgetOpacityPointerDown, true);
+  document.addEventListener('keydown', handleWidgetOpacityKeydown, true);
   document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
   document.addEventListener('keydown', handleContextMenuKeydown, true);
   window.addEventListener('resize', scheduleWindowResizeWork);
-  window.addEventListener('blur', hideContextMenu);
+  window.addEventListener('blur', () => {
+    hideContextMenu();
+    hideWidgetOpacityPopover();
+  });
   window.addEventListener('pagehide', flushTerminalCwdSnapshotSave);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
@@ -7639,11 +10374,6 @@ function bindEvents() {
     flushActiveWorkspaceSnapshotSave('flush');
     flushTerminalCwdSnapshotSave();
     flushWorkspaceStorePersist();
-    pauseMarketTickerForHidden();
-    suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
-    stopAllEdgeDevtoolsSessions();
-    hideCaptureFreezeFrame();
-    if (state.captureProtectionApplied) void api.setCaptureProtection(false);
   });
 }
 
@@ -7664,6 +10394,8 @@ function scheduleWindowResizeWork() {
   windowResizeFrame = window.requestAnimationFrame(() => {
     windowResizeFrame = 0;
     hideContextMenu();
+    hideWidgetOpacityPopover();
+    applyWorkspaceDockSettings({ skipLayoutRefresh: true });
     FLOATING_PANELS.forEach((id) => {
       const panel = getPanel(id);
       if (!panel.classList.contains('hidden')) applyStoredLayoutRatio(panel);
@@ -7676,6 +10408,7 @@ function scheduleWindowResizeWork() {
     scheduleExplorerVirtualRender();
     requestCodeEditorMeasure();
     scheduleConfigureEdgeViewport();
+    scheduleNativeBrowserWebviewSync();
   });
 }
 
@@ -7754,12 +10487,19 @@ function hideContextMenu() {
 function workspaceTabContextMenu(id: string): ContextMenuItem[] {
   const workspace = workspaceSnapshotForId(id);
   if (!workspace) return [];
+  const captureLabel = workspace.captureProtected
+    ? 'Disable capture block'
+    : 'Block capture while active';
   return [
     { label: 'Open workspace', action: () => activateWorkspaceTab(id), disabled: id === state.activeWorkspaceId && state.workspaceOpen },
     { label: 'Rename workspace', action: () => startWorkspaceTabRename(id) },
     { label: 'Copy workspace', action: () => copyWorkspaceTab(id) },
     {
-      label: workspace.captureProtected ? 'Disable capture block' : 'Block capture while active',
+      label: workspace.keepLive ? 'Disable Keep live' : 'Keep live',
+      action: () => toggleWorkspaceKeepLive(id)
+    },
+    {
+      label: captureLabel,
       action: () => toggleWorkspaceCaptureProtection(id)
     },
     { separator: true },
@@ -7827,7 +10567,7 @@ function terminalContextMenuItems(target: Element, card: HTMLElement): ContextMe
     { label: 'Close split pane', action: () => { if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane || groupPaneCount <= 1, danger: true },
     { separator: true },
     { label: 'Rename shell tab', action: () => { if (widget && group) renameTerminalGroup(widget, group.groupId); else if (pane) renameTerminalTab(pane.paneId); }, disabled: !pane },
-    { label: 'New shell tab', action: () => { if (widget) void createShellTabInWidget(widget); }, disabled: !widget },
+    { label: terminalWidgetLauncherLlmId(widget) ? 'New LLM tmux tab' : 'New shell tab', action: () => { if (widget) void createNewTabInWidget(widget); }, disabled: !widget },
     { label: 'Close shell tab', action: () => { if (widget && group) void closeTerminalGroup(widget, group.groupId); else if (pane) void closeTerminalPane(pane.paneId); }, disabled: !pane, danger: true },
     { label: 'Close shell widget', action: () => { if (widget) void closeTerminalWidget(widget.widgetId); }, disabled: !widget, danger: true }
   ];
@@ -8007,6 +10747,12 @@ function posixShellQuote(value: string) {
 function bindWindowChrome() {
   el.titlebar.addEventListener('mousedown', handleTitlebarMouseDown);
   el.windowControlButtons.forEach((button) => {
+    button.addEventListener('pointerdown', (event) => {
+      if (button.dataset.windowAction !== 'close') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void runWindowAction('close');
+    }, true);
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -8048,25 +10794,66 @@ function isWindowChromeInteractive(target: EventTarget | null) {
   return target instanceof Element && Boolean(target.closest('button, input, select, textarea, a, [data-no-window-drag]'));
 }
 
+function beginAppShutdownForClose() {
+  if (appShutdownStarted) return false;
+  appShutdownStarted = true;
+  workspaceTerminalRestoreToken += 1;
+  inactiveEditorHydrationToken += 1;
+  noteHydrationToken += 1;
+  explorerVisiblePrefetchToken += 1;
+  clearExplorerBackgroundWork();
+  cancelBrowserFrameSuspend();
+  pauseMarketTickerForHidden();
+  closeAllNativeBrowserWebviews();
+  suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
+  stopAllEdgeDevtoolsSessions();
+  disableCaptureProtectionForShutdown();
+  void api.shutdownRuntimeSessions().catch(() => undefined);
+  setStatus('Closing Simple Vibe IDE...');
+  return true;
+}
+
+function scheduleWindowCloseFallback() {
+  if (appCloseFallbackTimer) return;
+  appCloseFallbackTimer = window.setTimeout(() => {
+    appCloseFallbackTimer = 0;
+    void api.forceQuitApp().catch(() => currentWindow.destroy().catch(() => undefined));
+  }, 1200);
+}
+
+async function closeCurrentWindowNow() {
+  beginAppShutdownForClose();
+  scheduleWindowCloseFallback();
+  try {
+    await api.forceQuitApp();
+  } catch {
+    // Fall through to the local window destroy path if IPC is already wedged.
+  }
+  try {
+    await currentWindow.destroy();
+  } catch {
+    await currentWindow.close().catch(() => undefined);
+  }
+}
+
 async function runWindowAction(action: string) {
   if (action === 'minimize') await currentWindow.minimize();
   else if (action === 'toggle-maximize') await currentWindow.toggleMaximize();
   else if (action === 'close') {
-    // Close immediately for a snappy exit. Don't await teardown here: the
-    // backend RunEvent::ExitRequested hook detaches runtime sessions and moves
-    // process teardown to a background worker as the window tears down. The
-    // Windows Job Object remains the hard guarantee if the app exits first. We
-    // still kick off teardown fire-and-forget so it starts a beat earlier.
+    beginAppShutdownForClose();
     flushActiveWorkspaceSnapshotSave('flush');
-    void api.shutdownRuntimeSessions().catch(() => undefined);
-    await currentWindow.close();
+    void closeCurrentWindowNow();
   }
 }
 async function resolveSelectedRoot() {
   if (!state.activeProfile) return '.';
   const requested = el.rootInput.value.trim() || state.activeProfile.root || '.';
   setStatus(`Resolving ${state.activeProfile.label} root...`);
-  const resolved = await api.resolveProfilePath(state.activeProfile.id, requested);
+  const resolved = await withTimeout(
+    api.resolveProfilePath(state.activeProfile.id, requested),
+    RESOLVE_PROFILE_PATH_TIMEOUT_MS,
+    `Resolving ${state.activeProfile.label} root`
+  );
   el.rootInput.value = resolved;
   return resolved;
 }
@@ -8080,13 +10867,24 @@ async function startLlmLauncher(id: string) {
   // produces no output), then TYPE only the short bare command (`call`, e.g. codex "${...}") at the
   // prompt. This hides the dedup boilerplate AND launches the CLI as a directly-typed foreground
   // command, which node-launched CLIs (e.g. codex via nvm) need to enter bypass/YOLO.
-  const { define, call } = llmLauncherParts(id);
-  const widget = await createTerminal(define, id, { initialHeight: 420 });
+  const profile = state.activeProfile;
+  if (!profile) return;
+  const cwd = workspaceShellCwd();
+  const tmuxSessionName = await nextLlmTmuxSessionName(profile, cwd, state.activeWorkspaceId, id);
+  const { define, call } = llmLauncherParts(id, profile.kind, state.activeWorkspaceId, tmuxSessionName);
+  const widget = await createTerminal(define, llmTmuxTabTitle(id, tmuxSessionName), {
+    initialHeight: 420,
+    profile,
+    cwd,
+    llmId: id,
+    llmTmuxSessionName: tmuxSessionName
+  });
   if (!widget) return;
   const pane = activePaneForWidget(widget);
   if (!pane?.backendId) return;
   // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
   pane.llmId = id;
+  pane.llmTmuxSessionName = tmuxSessionName;
   markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
   queueTerminalShellReadyAction(
     pane,
@@ -8103,18 +10901,21 @@ async function startLlmLauncher(id: string) {
 // at the prompt. The launch (`call`) is a BARE command (e.g. `codex "${__svi_args[@]}"`), NOT a
 // function call: node-launched CLIs (coding's nvm codex) only enter bypass/YOLO when started as a
 // directly-typed foreground command — wrapping the launch in a function breaks that. On Windows we
-// type the whole command as-is (no separate define).
+// type the whole command as-is (no separate define). Root-unsafe launchers also re-check uid in
+// the typed command before executing the CLI.
 function llmLauncherParts(
   id: string,
-  profileKind: string | undefined = state.activeProfile?.kind
+  profileKind: string | undefined = state.activeProfile?.kind,
+  workspaceId = state.activeWorkspaceId,
+  tmuxSessionName?: string | null
 ): { define: string | null; call: string } {
   const launcher = LLM_LAUNCHERS[id];
   if (!launcher) return { define: null, call: id };
   if (profileKind === 'windows') return { define: null, call: powershellLlmLauncherCommand(launcher) };
-  return bashLlmLauncherParts(launcher);
+  return bashLlmLauncherParts(launcher, safeLlmTmuxSessionName(tmuxSessionName) ?? workspaceTmuxSessionName(workspaceId, id));
 }
 
-function bashLlmLauncherParts(launcher: LlmLauncherConfig): { define: string; call: string } {
+function bashLlmLauncherParts(launcher: LlmLauncherConfig, tmuxSessionName: string): { define: string; call: string } {
   const executable = launcher.executable;
   // Add the bypass flag only when it is NOT already in the resolved command. `type` reveals an
   // alias/function body; a wrapper SCRIPT on PATH only shows its path via `type`, so also fold in
@@ -8127,6 +10928,7 @@ function bashLlmLauncherParts(launcher: LlmLauncherConfig): { define: string; ca
     `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
     `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
     `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`,
+    'unset __svi_args',
     '__svi_args=()'
   ];
   if (needsRootGate) lines.push(`__svi_euid="$(id -u 2>/dev/null || echo 1000)"`);
@@ -8134,7 +10936,70 @@ function bashLlmLauncherParts(launcher: LlmLauncherConfig): { define: string; ca
     const add = `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`;
     lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
   }
-  return { define: lines.join('\n'), call: `${executable} "\${__svi_args[@]}"` };
+  const executableCommand = bashQuote(executable);
+  const launchArgs = needsRootGate
+    ? `__svi_launch_args=(); if [ "$(id -u 2>/dev/null || echo 1000)" != 0 ]; then __svi_launch_args=("\${__svi_args[@]}"); fi`
+    : `__svi_launch_args=("\${__svi_args[@]}")`;
+  const call = [
+    `${launchArgs};`,
+    `if command -v tmux >/dev/null 2>&1; then`,
+    `  __svi_tmux_cmd="$(printf '%q ' ${executableCommand} "\${__svi_launch_args[@]}")";`,
+    `  tmux new-session -A -s ${bashQuote(tmuxSessionName)} "$__svi_tmux_cmd";`,
+    `else`,
+    `  ${executableCommand} "\${__svi_launch_args[@]}";`,
+    `fi`
+  ].join(' ');
+  return { define: lines.join('\n'), call };
+}
+
+function workspaceTmuxSessionName(workspaceId: string, agentId: string) {
+  return workspaceTmuxSessionBaseName(workspaceId, agentId);
+}
+
+function workspaceTmuxSessionBaseName(workspaceId: string, agentId: string) {
+  const workspacePart = (workspaceId || 'workspace').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 14) || 'workspace';
+  const agentPart = normalizeTerminalLlmId(agentId) ?? (agentId.replace(/[^A-Za-z0-9_-]+/g, '_') || 'agent');
+  return `svi_${workspacePart}_${agentPart}`.slice(0, 48);
+}
+
+function numberedWorkspaceTmuxSessionName(workspaceId: string, agentId: string, index: number) {
+  const base = workspaceTmuxSessionBaseName(workspaceId, agentId);
+  const suffix = `_${Math.max(1, Math.floor(index))}`;
+  return `${base.slice(0, Math.max(1, LLM_TMUX_SESSION_MAX_LEN - suffix.length))}${suffix}`;
+}
+
+function safeLlmTmuxSessionName(value: string | null | undefined) {
+  const name = String(value ?? '').trim();
+  if (!name || name.length > LLM_TMUX_SESSION_MAX_LEN) return null;
+  if (!/^svi_[A-Za-z0-9_-]+$/.test(name)) return null;
+  return name;
+}
+
+function llmTmuxSessionIndex(sessionName: string | null | undefined) {
+  const match = safeLlmTmuxSessionName(sessionName)?.match(/_(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
+
+function llmTmuxTabTitle(agentId: string, sessionName?: string | null) {
+  const label = normalizeTerminalLlmId(agentId) ?? agentId;
+  const index = llmTmuxSessionIndex(sessionName);
+  return index ? `${label} #${index}` : label;
+}
+
+async function nextLlmTmuxSessionName(
+  profile: ConnectionProfile,
+  cwd: string,
+  workspaceId: string,
+  agentId: string
+) {
+  if (profile.kind === 'windows') return undefined;
+  try {
+    return safeLlmTmuxSessionName(await api.nextLlmTmuxSession(profile.id, cwd, workspaceId, agentId))
+      ?? numberedWorkspaceTmuxSessionName(workspaceId, agentId, 1);
+  } catch (error) {
+    console.warn('Failed to allocate next tmux session name', error);
+    return numberedWorkspaceTmuxSessionName(workspaceId, agentId, 1);
+  }
 }
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
@@ -8355,9 +11220,21 @@ function resizeKeyboardTarget(direction: number) {
 
 function resizeIde(direction: number) {
   const factor = direction > 0 ? 1.05 : 1 / 1.05;
-  ideScale = clamp(ideScale * factor, 0.72, 1.45);
+  setIdeScale(ideScale * factor);
+  setStatus(`IDE scale ${ideScaleLabel()}`);
+}
+
+function resetIdeScaleToDefault() {
+  setIdeScale(1);
+  setStatus('IDE scale 100%');
+}
+
+function setIdeScale(value: number) {
+  ideScale = clamp(Number.isFinite(value) ? value : 1, 0.72, 1.45);
   setRootStyleProperty('--ide-scale', ideScale.toFixed(3));
+  syncIdeScaleSettings();
   requestAnimationFrame(() => {
+    applyWorkspaceDockSettings({ skipLayoutRefresh: true });
     FLOATING_PANELS.forEach((id) => applyStoredLayoutRatio(getPanel(id)));
     state.terminalWidgets.forEach((widget) => {
       if (widget.element.classList.contains('hidden')) return;
@@ -8638,6 +11515,7 @@ function focusableWidgets(): WidgetFocusItem[] {
   }
   addPanelFocusItem(items, 'editor');
   addPanelFocusItem(items, 'notes');
+  addPanelFocusItem(items, 'snippets');
   addPanelFocusItem(items, 'image');
   addPanelFocusItem(items, 'browser');
   addPanelFocusItem(items, 'calculator');
@@ -8691,6 +11569,8 @@ function focusWidget(item: WidgetFocusItem) {
     codeView.focus();
   } else if (item.id === 'notes') {
     el.notesBody.focus();
+  } else if (item.id === 'snippets') {
+    el.snippetsSearch.focus();
   } else if (item.id === 'browser') {
     el.previewUrl.focus();
   } else if (item.id === 'calculator') {
@@ -8710,11 +11590,166 @@ function panelFocusLabel(id: FloatingPanelId) {
   return id === 'image' ? 'Image Preview' : id[0].toUpperCase() + id.slice(1);
 }
 
+function normalizeWidgetOpacity(value: unknown) {
+  const opacity = Number(value);
+  if (!Number.isFinite(opacity)) return WIDGET_OPACITY_DEFAULT;
+  const stepped = Math.round(opacity / WIDGET_OPACITY_STEP) * WIDGET_OPACITY_STEP;
+  return clamp(stepped, WIDGET_OPACITY_MIN, WIDGET_OPACITY_MAX);
+}
+
+function widgetOpacityForElement(element: HTMLElement | null | undefined) {
+  return normalizeWidgetOpacity(element?.dataset.widgetOpacity);
+}
+
+function applyWidgetOpacity(
+  element: HTMLElement,
+  value: unknown,
+  options: { persist?: boolean } = {}
+) {
+  const opacity = normalizeWidgetOpacity(value);
+  if (opacity === WIDGET_OPACITY_DEFAULT) {
+    delete element.dataset.widgetOpacity;
+    element.style.removeProperty('--widget-opacity');
+  } else {
+    element.dataset.widgetOpacity = String(opacity);
+    element.style.setProperty('--widget-opacity', (opacity / 100).toFixed(2));
+  }
+  syncWidgetOpacityButton(element);
+  if (options.persist) saveActiveWorkspaceSnapshot();
+}
+
+function createWidgetOpacityButton() {
+  const button = document.createElement('button');
+  button.className = 'widget-opacity-button panel-mode';
+  button.type = 'button';
+  button.textContent = 'Op';
+  button.title = 'Adjust widget opacity';
+  button.setAttribute('aria-label', 'Adjust widget opacity');
+  button.addEventListener('pointerdown', (event) => event.stopPropagation());
+  button.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const element = button.closest<HTMLElement>('.floating-panel, .terminal-card');
+    if (!element) return;
+    bringPanelToFront(element);
+    showWidgetOpacityPopover(widgetOpacityTargetForElement(element), button);
+  });
+  return button;
+}
+
+function widgetOpacityTargetForElement(element: HTMLElement): WidgetOpacityTarget {
+  const widget = terminalWidgetForElement(element);
+  if (widget) return { kind: 'terminal', widgetId: widget.widgetId, element };
+  return { kind: 'panel', id: element.dataset.panel as FloatingPanelId, element };
+}
+
+function ensurePanelOpacityControl(panel: HTMLElement) {
+  const titlebar = panel.querySelector<HTMLElement>(':scope > .panel-title');
+  if (!titlebar || titlebar.querySelector('.widget-opacity-button')) {
+    syncWidgetOpacityButton(panel);
+    return;
+  }
+  const button = createWidgetOpacityButton();
+  const close = titlebar.querySelector<HTMLElement>('.panel-close');
+  titlebar.insertBefore(button, close ?? null);
+  syncWidgetOpacityButton(panel);
+}
+
+function syncWidgetOpacityButton(element: HTMLElement) {
+  const button = element.querySelector<HTMLButtonElement>(':scope > .panel-title .widget-opacity-button, :scope > .terminal-title .widget-opacity-button');
+  if (!button) return;
+  const opacity = widgetOpacityForElement(element);
+  toggleClassIfChanged(button, 'active', opacity !== WIDGET_OPACITY_DEFAULT);
+  button.title = opacity === WIDGET_OPACITY_DEFAULT
+    ? 'Adjust widget opacity'
+    : `Widget opacity ${opacity}%`;
+  button.setAttribute('aria-pressed', String(opacity !== WIDGET_OPACITY_DEFAULT));
+}
+
+function showWidgetOpacityPopover(target: WidgetOpacityTarget, anchor: HTMLElement) {
+  widgetOpacityPopoverTarget = target;
+  widgetOpacityPopoverDirty = false;
+  const opacity = widgetOpacityForElement(target.element);
+  el.widgetOpacityRange.value = String(opacity);
+  syncWidgetOpacityPopoverText();
+  el.widgetOpacityPopover.classList.remove('hidden');
+  el.widgetOpacityPopover.setAttribute('aria-hidden', 'false');
+  positionWidgetOpacityPopover(anchor);
+  el.widgetOpacityRange.focus({ preventScroll: true });
+}
+
+function positionWidgetOpacityPopover(anchor: HTMLElement) {
+  const rect = anchor.getBoundingClientRect();
+  const popover = el.widgetOpacityPopover;
+  const popoverRect = popover.getBoundingClientRect();
+  const left = clamp(rect.right - popoverRect.width, 8, Math.max(8, window.innerWidth - popoverRect.width - 8));
+  const top = clamp(rect.bottom + 6, 8, Math.max(8, window.innerHeight - popoverRect.height - 8));
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(top)}px`;
+}
+
+function syncWidgetOpacityPopoverText() {
+  const opacity = normalizeWidgetOpacity(el.widgetOpacityRange.value);
+  setTextContentIfChanged(el.widgetOpacityLabel, `Opacity ${opacity}%`);
+  const isBrowser = widgetOpacityPopoverTarget?.kind === 'panel' && widgetOpacityPopoverTarget.id === 'browser';
+  setTextContentIfChanged(
+    el.widgetOpacityNote,
+    isBrowser
+      ? 'Browser native WebView content may stay opaque; DOM chrome/iframe/canvas opacity is saved with this workspace.'
+      : 'Widget opacity is saved with the current workspace.'
+  );
+}
+
+function updateWidgetOpacityFromPopover(options: { persist?: boolean } = {}) {
+  const target = widgetOpacityPopoverTarget;
+  if (!target) return;
+  applyWidgetOpacity(target.element, el.widgetOpacityRange.value, { persist: false });
+  syncWidgetOpacityPopoverText();
+  widgetOpacityPopoverDirty = widgetOpacityPopoverDirty || !options.persist;
+  if (options.persist) {
+    widgetOpacityPopoverDirty = false;
+    saveActiveWorkspaceSnapshot();
+  }
+}
+
+function resetWidgetOpacityFromPopover() {
+  if (!widgetOpacityPopoverTarget) return;
+  el.widgetOpacityRange.value = String(WIDGET_OPACITY_DEFAULT);
+  applyWidgetOpacity(widgetOpacityPopoverTarget.element, WIDGET_OPACITY_DEFAULT, { persist: false });
+  syncWidgetOpacityPopoverText();
+  widgetOpacityPopoverDirty = false;
+  saveActiveWorkspaceSnapshot();
+}
+
+function hideWidgetOpacityPopover(options: { persist?: boolean } = {}) {
+  if (options.persist !== false && widgetOpacityPopoverDirty) {
+    widgetOpacityPopoverDirty = false;
+    saveActiveWorkspaceSnapshot();
+  }
+  widgetOpacityPopoverTarget = null;
+  el.widgetOpacityPopover.classList.add('hidden');
+  el.widgetOpacityPopover.setAttribute('aria-hidden', 'true');
+}
+
+function handleWidgetOpacityPointerDown(event: PointerEvent) {
+  if (event.target instanceof Element && event.target.closest('#widget-opacity-popover, .widget-opacity-button')) return;
+  hideWidgetOpacityPopover();
+}
+
+function handleWidgetOpacityKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') hideWidgetOpacityPopover();
+}
+
+function terminalWidgetOpacityForSnapshot(snapshot: WorkspaceSnapshot, widgetKey: string) {
+  return normalizeWidgetOpacity(snapshot.terminalWidgetOpacity?.[widgetKey]);
+}
+
 function bindFloatingPanels() {
   for (const id of FLOATING_PANELS) {
     const panel = getPanel(id);
     const handle = panel.querySelector<HTMLElement>('.panel-drag-handle');
     const grips = ensureResizeGrips(panel, id);
+    ensurePanelOpacityControl(panel);
     panel.addEventListener('pointerdown', () => {
       bringPanelToFront(panel);
       setKeyboardResizeTarget({ kind: 'panel', id });
@@ -8805,6 +11840,11 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     }
     if (id === 'editor' && wasHidden && !restoringWorkspace) void ensureEditorReady();
     if (id === 'notes' && wasHidden && !restoringWorkspace) void ensureNotesReady();
+    if (id === 'snippets' && wasHidden && !restoringWorkspace) {
+      renderSnippetTabs();
+      renderSnippets();
+      el.snippetsSearch.focus();
+    }
     if (id === 'image' && wasHidden && !restoringWorkspace) {
       renderImageTabs();
       renderImagePreview();
@@ -8833,6 +11873,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     }
     if (id === 'editor') requestCodeEditorMeasure();
   } else {
+    if (widgetOpacityPopoverTarget?.element === panel) hideWidgetOpacityPopover({ persist: true });
     if (id === 'editor' && !wasHidden) {
       syncActiveEditorTabFromView();
       destroyCodeEditorView();
@@ -8841,7 +11882,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       syncBrowserConsoleCaptureForActiveFrame();
       trimBrowserConsoleLogs();
       cancelBrowserFrameSuspend();
-      hideNativeBrowserWebview();
+      closeNativeBrowserWebviewsForWorkspace(state.activeWorkspaceId);
       suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
     }
     if (!wasHidden && keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === id) {
@@ -9230,6 +12271,18 @@ async function openWorkspace(path: string) {
   refreshTitle();
 }
 
+function loadWorkspaceDirectoryInBackground(path: string, profileId: string, workspaceId: string) {
+  if (!path || IS_TERMINAL_APP) return;
+  runWhenUiIdle(() => {
+    if (state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId || !state.workspaceOpen) return;
+    void openWorkspace(path).catch((error) => {
+      if (state.activeWorkspaceId === workspaceId && state.activeProfile?.id === profileId && state.workspaceOpen) {
+        setStatus(explorerAuthErrorMessage(error, 'load directory'), true);
+      }
+    });
+  }, 900);
+}
+
 async function switchWorkspace(path: string) {
   if (!state.activeProfile) {
     setStatus('Select a profile first', true);
@@ -9242,9 +12295,25 @@ async function switchWorkspace(path: string) {
   state.currentDir = path;
   el.rootInput.value = path;
   ensureWorkspaceTabForOpen();
-  await closeTerminalsForWorkspace(state.activeWorkspaceId);
+  markWorkspaceActive(state.activeWorkspaceId);
+  await closeTerminalsForWorkspace(state.activeWorkspaceId, {
+    backgroundKill: true,
+    saveSnapshot: false,
+    renderShellTabs: false
+  });
   discardWorkspacePreviewRuntime(state.activeWorkspaceId);
   clearWorkspacePanels();
+  if (profileLoadsWorkspaceDirectoryInBackground(profile) && !IS_TERMINAL_APP) {
+    refreshTitle();
+    deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
+    setWorkspaceOpen(true, { deferExplorerWatch: true });
+    revealWorkspaceOpenSurface();
+    const widget = await createTerminal(null, 'shell', { cwd: path });
+    if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
+    loadWorkspaceDirectoryInBackground(path, profile.id, state.activeWorkspaceId);
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+    return;
+  }
   if (profileNeedsExplorerShellReadyGate(profile) && !IS_TERMINAL_APP) {
     refreshTitle();
     deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
@@ -9270,6 +12339,7 @@ async function switchWorkspace(path: string) {
 }
 
 function discardWorkspacePreviewRuntime(workspaceId: string) {
+  closeNativeBrowserWebviewsForWorkspace(workspaceId);
   cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
   for (const proxy of state.previewProxies) {
     previewProxyProbeAt.delete(proxy.id);
@@ -9281,11 +12351,17 @@ function discardWorkspacePreviewRuntime(workspaceId: string) {
   removeWorkspaceRuntimeCache(workspaceId);
 }
 
-async function closeWorkspace(options: { killTerminals?: boolean } = {}) {
+async function closeWorkspace(options: { killTerminals?: boolean; preserveCaptureProtection?: boolean } = {}) {
   await saveAllDirtyNotes();
   const workspaceId = state.activeWorkspaceId;
-  state.workspaceCaptureProtected = false;
-  await applyWorkspaceCaptureProtection(false, { quiet: true });
+  if (workspaceId && state.activeProfile && state.workspaceOpen) {
+    flushActiveWorkspaceSnapshotSave('defer');
+  }
+  closeNativeBrowserWebviewsForWorkspace(workspaceId);
+  if (!options.preserveCaptureProtection) {
+    state.workspaceCaptureProtected = false;
+    applyWorkspaceCaptureProtectionSoon(false, { quiet: true });
+  }
   state.activeProfile = null;
   state.workspaceOpen = false;
   state.workspaceRoot = '';
@@ -9309,6 +12385,7 @@ async function closeWorkspace(options: { killTerminals?: boolean } = {}) {
 }
 
 async function closeAllTerminals() {
+  hideWidgetOpacityPopover({ persist: true });
   const terminals = [...state.terminals];
   const widgets = [...state.terminalWidgets];
   state.terminals = [];
@@ -9319,11 +12396,13 @@ async function closeAllTerminals() {
   terminalPanesByWidgetId.clear();
   terminalWidgetById.clear();
   for (const pane of terminals) {
-    await flushTerminalInput(pane).catch(() => undefined);
-    if (pane.backendId) await api.killTerminal(pane.backendId).catch(() => undefined);
+    pane.closed = true;
+    await closeTerminalBackend(pane);
     cleanupTerminalWriteBuffer(pane);
     if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
     pane.resizeObserver?.disconnect();
+    cleanupWorkspaceLlmTitleDetectionForPane(pane);
+    disposeTerminalPaneRenderer(pane);
     pane.term.dispose();
     pane.host.remove();
   }
@@ -9335,8 +12414,20 @@ async function closeAllTerminals() {
   const waitingWorkspaceIds = new Set([...workspaceLlmWaitingByPaneId.values()].map((waiting) => waiting.workspaceId));
   workspaceLlmWaitingByPaneId.clear();
   for (const workspaceId of waitingWorkspaceIds) renderWorkspaceLlmActivityTab(workspaceId);
+  const titleWorkspaceIds = new Set([...workspaceLlmTitleActivityByPaneId.values()].map((active) => active.workspaceId));
+  for (const timer of workspaceLlmTitleActivityTimers.values()) window.clearTimeout(timer);
+  workspaceLlmTitleActivityTimers.clear();
+  workspaceLlmTitleActivityByPaneId.clear();
+  for (const workspaceId of titleWorkspaceIds) renderWorkspaceLlmActivityTab(workspaceId);
   syncActivePaneClass();
   renderShellTabs();
+}
+
+function disposeTerminalPaneRenderer(pane: TerminalPane) {
+  pane.webglContextLossDisposable?.dispose();
+  pane.webglContextLossDisposable = undefined;
+  pane.webgl?.dispose();
+  pane.webgl = undefined;
 }
 
 async function closeTerminalsForWorkspace(workspaceId: string, options: CloseTerminalOptions = {}) {
@@ -9389,7 +12480,7 @@ function terminalShouldSuppressFocusReports(pane: TerminalPane) {
   // the user merely reselects the shell. That repaint makes the cursor visibly
   // sweep from the top to the bottom. Suppress only launcher-owned panes so
   // normal shells/editors keep their focus-report semantics.
-  return Boolean(pane.llmId);
+  return Boolean(terminalPaneLlmId(pane));
 }
 
 async function respondToTerminalCursorQuery(pane: TerminalPane) {
@@ -9517,15 +12608,19 @@ async function sendTerminalInputNow(pane: TerminalPane, data: string) {
 }
 
 function profileNeedsShellReadyGate(profile: ConnectionProfile | null | undefined) {
-  return profile?.kind === 'ssh' || profile?.kind === 'wsl';
+  return profile?.kind === 'ssh';
 }
 
 function profileNeedsExplorerShellReadyGate(profile: ConnectionProfile | null | undefined) {
-  // SSH Explorer/File jobs now use the IDE-local SSH_ASKPASS broker, so they
-  // must not wait for a terminal shell prompt. Waiting here can deadlock the
-  // Explorer when the shell is still at an auth/login prompt, even though the
-  // background ssh.exe can show the IDE unlock dialog itself.
-  return profile?.kind === 'wsl';
+  void profile;
+  // Explorer/file jobs use their own backend timeout and SSH askpass path. They
+  // must not depend on a terminal prompt, or one stuck shell can make unrelated
+  // workspace tabs look broken.
+  return false;
+}
+
+function profileLoadsWorkspaceDirectoryInBackground(profile: ConnectionProfile | null | undefined) {
+  return profile?.kind === 'ssh' || profile?.kind === 'wsl';
 }
 
 function terminalShellReadyProfile(pane: TerminalPane) {
@@ -9574,32 +12669,93 @@ function queueTerminalShellReadyAction(
   action: () => void | Promise<void>,
   options: { waitingStatus?: string } = {}
 ) {
-  if (!pane.backendId) return;
+  if (!pane.backendId || !isTerminalPaneAlive(pane)) return;
   if (!terminalNeedsShellReadyGate(pane) || pane.shellReadyAt) {
     void runTerminalShellReadyAction(pane, { label, run: action });
     return;
   }
+  const queued: TerminalShellReadyAction = { label, run: action };
+  queued.timer = window.setTimeout(() => {
+    queued.timer = undefined;
+    if (!pane.pendingShellReadyActions?.includes(queued)) return;
+    if (!isTerminalPaneAlive(pane) || !pane.backendId || pane.shellReadyAt) return;
+    markTerminalShellReady(pane);
+    if (terminalShellReadyStatusApplies(pane)) {
+      setStatus(`${terminalShellReadyProfile(pane)?.kind.toUpperCase() ?? 'Remote'} shell did not report ready; continuing ${label}`);
+    }
+  }, TERMINAL_SHELL_READY_ACTION_FALLBACK_MS);
   const actions = pane.pendingShellReadyActions ?? [];
-  actions.push({ label, run: action });
+  actions.push(queued);
   pane.pendingShellReadyActions = actions;
-  if (options.waitingStatus) setStatus(options.waitingStatus);
+  if (!pane.shellReadyFallbackTimer) scheduleTerminalShellReadyFallback(pane);
+  if (options.waitingStatus && terminalShellReadyStatusApplies(pane)) setStatus(options.waitingStatus);
 }
 
 function markTerminalShellReady(pane: TerminalPane) {
-  if (!pane.backendId) return;
+  if (!pane.backendId || !isTerminalPaneAlive(pane)) return;
   if (!pane.shellReadyAt) pane.shellReadyAt = performance.now();
+  clearTerminalStartupWatch(pane);
+  clearTerminalShellReadyFallback(pane);
   const actions = pane.pendingShellReadyActions;
   if (!actions?.length) return;
   pane.pendingShellReadyActions = undefined;
-  for (const action of actions) void runTerminalShellReadyAction(pane, action);
+  for (const action of actions) {
+    clearTerminalShellReadyActionTimer(action);
+    void runTerminalShellReadyAction(pane, action);
+  }
+}
+
+function handleTerminalExitEvent(pane: TerminalPane) {
+  const workspaceId = pane.workspaceId;
+  clearTerminalStartupWatch(pane);
+  flushTerminalWriteBuffer(pane);
+  failPendingTerminalShellReadyActions(pane, 'shell exited before it became ready');
+  setTerminalBackendId(pane, undefined);
+  pane.title = `${pane.title} (exited)`;
+  const widget = terminalWidgetForPane(pane);
+  if (widget) renderTerminalWidgetTabs(widget);
+  refreshWorkspaceLlmActivityAfterPaneChange(workspaceId);
 }
 
 async function runTerminalShellReadyAction(pane: TerminalPane, action: TerminalShellReadyAction) {
-  if (!pane.backendId) return;
+  if (!pane.backendId || !isTerminalPaneAlive(pane)) return;
+  if (pane.workspaceId !== state.activeWorkspaceId || !state.workspaceOpen) return;
   try {
     await action.run();
   } catch (error) {
-    setStatus(`Failed after shell login (${action.label}): ${String(error)}`, true);
+    if (terminalShellReadyStatusApplies(pane)) {
+      setStatus(`Failed after shell login (${action.label}): ${String(error)}`, true);
+    }
+  }
+}
+
+function terminalShellReadyStatusApplies(pane: TerminalPane) {
+  return isTerminalPaneAlive(pane) && pane.workspaceId === state.activeWorkspaceId && state.workspaceOpen;
+}
+
+function clearTerminalShellReadyActionTimer(action: TerminalShellReadyAction) {
+  if (!action.timer) return;
+  window.clearTimeout(action.timer);
+  action.timer = undefined;
+}
+
+function clearTerminalPendingShellReadyActions(pane: TerminalPane) {
+  const actions = pane.pendingShellReadyActions;
+  if (actions?.length) {
+    for (const action of actions) clearTerminalShellReadyActionTimer(action);
+  }
+  pane.pendingShellReadyActions = undefined;
+  clearTerminalShellReadyFallback(pane);
+}
+
+function failPendingTerminalShellReadyActions(pane: TerminalPane, reason: string) {
+  const actions = pane.pendingShellReadyActions;
+  if (!actions?.length) return;
+  const labels = actions.map((action) => action.label).join(', ');
+  clearTerminalPendingShellReadyActions(pane);
+  pane.term.write(`\r\n${reason}: ${labels}\r\n`);
+  if (terminalShellReadyStatusApplies(pane)) {
+    setStatus(`${terminalShellReadyProfile(pane)?.kind.toUpperCase() ?? 'Remote'} ${reason}: ${labels}`, true);
   }
 }
 
@@ -9665,18 +12821,123 @@ async function flushTerminalInput(pane: TerminalPane): Promise<void> {
   await trackedWrite;
 }
 
+function prunePendingTerminalBackendEvents() {
+  while (pendingTerminalDataByBackendId.size > TERMINAL_PENDING_BACKEND_EVENT_LIMIT) {
+    pendingTerminalDataByBackendId.delete(pendingTerminalDataByBackendId.keys().next().value as string);
+  }
+  while (pendingTerminalCursorQueriesByBackendId.size > TERMINAL_PENDING_BACKEND_EVENT_LIMIT) {
+    pendingTerminalCursorQueriesByBackendId.delete(pendingTerminalCursorQueriesByBackendId.keys().next().value as string);
+  }
+  while (pendingTerminalExitByBackendId.size > TERMINAL_PENDING_BACKEND_EVENT_LIMIT) {
+    pendingTerminalExitByBackendId.delete(pendingTerminalExitByBackendId.keys().next().value as string);
+  }
+}
+
+function bufferPendingTerminalData(backendId: string, data: string) {
+  if (!backendId || !data) return;
+  const previous = pendingTerminalDataByBackendId.get(backendId) ?? '';
+  const merged = previous + data;
+  pendingTerminalDataByBackendId.set(
+    backendId,
+    merged.length > TERMINAL_PENDING_BACKEND_DATA_CHARS
+      ? merged.slice(-TERMINAL_PENDING_BACKEND_DATA_CHARS)
+      : merged
+  );
+  prunePendingTerminalBackendEvents();
+}
+
+function bufferPendingTerminalCursorQuery(backendId: string) {
+  if (!backendId) return;
+  pendingTerminalCursorQueriesByBackendId.set(
+    backendId,
+    (pendingTerminalCursorQueriesByBackendId.get(backendId) ?? 0) + 1
+  );
+  prunePendingTerminalBackendEvents();
+}
+
+function bufferPendingTerminalExit(payload: TerminalExitEvent) {
+  if (!payload.id) return;
+  pendingTerminalExitByBackendId.set(payload.id, payload);
+  prunePendingTerminalBackendEvents();
+}
+
+function flushPendingTerminalBackendEvents(pane: TerminalPane, backendId: string) {
+  const data = pendingTerminalDataByBackendId.get(backendId);
+  if (data) {
+    pendingTerminalDataByBackendId.delete(backendId);
+    handleTerminalData(pane, data);
+  }
+  const cursorQueries = pendingTerminalCursorQueriesByBackendId.get(backendId) ?? 0;
+  if (cursorQueries) {
+    pendingTerminalCursorQueriesByBackendId.delete(backendId);
+    for (let index = 0; index < cursorQueries; index += 1) void respondToTerminalCursorQuery(pane);
+  }
+  const exit = pendingTerminalExitByBackendId.get(backendId);
+  if (exit) {
+    pendingTerminalExitByBackendId.delete(backendId);
+    handleTerminalExitEvent(pane);
+  }
+}
+
 function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined) {
+  const hadLlm = Boolean(terminalPaneLlmId(pane));
   if (pane.backendId) terminalPaneByBackendId.delete(pane.backendId);
-  if (!backendId) clearWorkspaceLlmWaitingForPane(pane);
+  if (!backendId) {
+    if (hadLlm) {
+      updateAgentSessionProgressForPane(pane, {
+        status: 'exited',
+        source: 'heuristic',
+        activity: 'Exited'
+      });
+    }
+    clearTerminalStartupWatch(pane);
+    clearWorkspaceLlmWaitingForPane(pane);
+    clearWorkspaceLlmTitleActivityForPane(pane);
+    clearWorkspaceLlmTitleSignalTimer(pane);
+    pane.llmTitleOscBuffer = undefined;
+    pane.detectedLlmId = undefined;
+  }
+  clearTerminalPendingShellReadyActions(pane);
   pane.backendId = backendId;
   pane.backendOutputChars = 0;
   pane.shellReadyAt = undefined;
-  pane.pendingShellReadyActions = undefined;
   if (backendId) {
     pane.llmWaitingDetectionBuffer = '';
+    pane.llmTitleOscBuffer = undefined;
     if (!terminalNeedsShellReadyGate(pane)) pane.shellReadyAt = performance.now();
+    else scheduleTerminalShellReadyFallback(pane);
   }
-  if (backendId) terminalPaneByBackendId.set(backendId, pane);
+  if (backendId) {
+    terminalPaneByBackendId.set(backendId, pane);
+    if (terminalPaneLlmId(pane)) {
+      updateAgentSessionProgressForPane(pane, {
+        status: 'idle',
+        source: pane.llmId ? 'launcher' : 'heuristic',
+        activity: 'Shell ready'
+      });
+    }
+    flushPendingTerminalBackendEvents(pane, backendId);
+  }
+  if (hadLlm || terminalPaneLlmId(pane)) renderWorkspaceLlmActivityTab(pane.workspaceId);
+}
+
+function clearTerminalShellReadyFallback(pane: TerminalPane) {
+  if (!pane.shellReadyFallbackTimer) return;
+  window.clearTimeout(pane.shellReadyFallbackTimer);
+  pane.shellReadyFallbackTimer = undefined;
+}
+
+function scheduleTerminalShellReadyFallback(pane: TerminalPane) {
+  clearTerminalShellReadyFallback(pane);
+  pane.shellReadyFallbackTimer = window.setTimeout(() => {
+    pane.shellReadyFallbackTimer = undefined;
+    if (!pane.backendId || pane.shellReadyAt || !isTerminalPaneAlive(pane)) return;
+    if (!terminalNeedsShellReadyGate(pane)) return;
+    markTerminalShellReady(pane);
+    if (terminalShellReadyStatusApplies(pane)) {
+      setStatus(`${terminalShellReadyProfile(pane)?.kind.toUpperCase() ?? 'Remote'} shell is still warming up; continuing workspace restore`);
+    }
+  }, TERMINAL_SHELL_READY_FALLBACK_MS);
 }
 
 function showTerminalWidgetsForWorkspace(workspaceId: string) {
@@ -9770,7 +13031,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   if (state.activeWorkspaceId) hideBrowserFramesForWorkspace(state.activeWorkspaceId);
   else hideAllBrowserFrames();
   disconnectActiveEdgeCdp();
-  hideNativeBrowserWebview();
+  hideNativeBrowserWebview({ all: true });
   setEdgePreviewVisible(false);
   toggleClassIfChanged(el.browserShell, 'has-preview', false);
   if (renderIntermediate && isPanelVisible('editor')) {
@@ -9868,7 +13129,8 @@ function renderWorkspaceControls(open: boolean) {
     setDisabledIfChanged(button, !open);
   }
   for (const button of el.togglePanelButtons) {
-    setDisabledIfChanged(button, !open && button.dataset.togglePanel !== 'settings');
+    const panel = button.dataset.togglePanel;
+    setDisabledIfChanged(button, !open && panel !== 'settings' && panel !== 'snippets');
   }
   setDisabledIfChanged(el.newFile, !open);
   setDisabledIfChanged(el.newFolder, !open);
@@ -10010,7 +13272,11 @@ async function fetchExplorerDirectory(profileId: string, path: string, workspace
   if (pending && !force) return cloneExplorerEntries(await pending);
 
   let read: Promise<FileEntry[]>;
-  read = api.listDirectory(profileId, path, state.showFileSizes)
+  read = withExplorerDirectoryTimeout(
+    profileId,
+    api.listDirectory(profileId, path, state.showFileSizes),
+    `Loading ${path}`
+  )
     .then((entries) => {
       cacheExplorerDirectory(profileId, path, entries, workspaceId);
       return cloneExplorerEntries(entries);
@@ -10078,7 +13344,11 @@ async function fetchExplorerDirectories(
       batchReads.set(key, pending);
     }
     try {
-      const listings = await api.listDirectories(profileId, misses, state.showFileSizes);
+      const listings = await withExplorerDirectoryTimeout(
+        profileId,
+        api.listDirectories(profileId, misses, state.showFileSizes),
+        `Loading ${misses.length} director${misses.length === 1 ? 'y' : 'ies'}`
+      );
       const completedKeys = new Set<string>();
       for (const listing of listings) {
         const key = explorerPathKey(listing.path);
@@ -10123,6 +13393,12 @@ async function fetchExplorerDirectories(
   }
 
   return results;
+}
+
+function withExplorerDirectoryTimeout<T>(profileId: string, promise: Promise<T>, label: string) {
+  const profile = profileForIdWithWindowsFallback(profileId) ?? state.activeProfile;
+  if (profile?.kind !== 'ssh' && profile?.kind !== 'wsl') return promise;
+  return withTimeout(promise, EXPLORER_REMOTE_DIRECTORY_LOAD_TIMEOUT_MS, label);
 }
 
 function explorerDirectoryCacheTtl(profileId: string) {
@@ -10172,6 +13448,7 @@ async function loadDirectory(path: string) {
     setStatus('Directory loaded');
     saveActiveWorkspaceSnapshot();
   } catch (error) {
+    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
     setStatus(explorerAuthErrorMessage(error, 'load directory'), true);
   }
 }
@@ -13932,11 +17209,13 @@ function ensureTerminalRuntime() {
   terminalRuntimePromise ??= Promise.all([
     import('@xterm/xterm'),
     import('@xterm/addon-fit'),
-    import('@xterm/addon-unicode11')
-  ]).then(([terminalModule, fitModule, unicodeModule]) => ({
+    import('@xterm/addon-unicode11'),
+    import('@xterm/addon-webgl').catch(() => null)
+  ]).then(([terminalModule, fitModule, unicodeModule, webglModule]) => ({
     Terminal: terminalModule.Terminal,
     FitAddon: fitModule.FitAddon,
-    Unicode11Addon: unicodeModule.Unicode11Addon
+    Unicode11Addon: unicodeModule.Unicode11Addon,
+    WebglAddon: webglModule?.WebglAddon
   }));
   return terminalRuntimePromise;
 }
@@ -13945,6 +17224,40 @@ function scheduleTerminalRuntimeWarmup() {
   runWhenUiIdle(() => {
     void ensureTerminalRuntime().catch(() => undefined);
   }, 1400);
+}
+
+function maybeLoadTerminalWebglAddon(term: XTermTerminal, runtime: TerminalRuntime) {
+  if (state.ideSettings.terminalRenderer !== 'auto' || !runtime.WebglAddon) return null;
+  try {
+    const addon = new runtime.WebglAddon();
+    term.loadAddon(addon);
+    return addon;
+  } catch (error) {
+    console.warn('Terminal WebGL renderer unavailable; falling back to DOM renderer.', error);
+    return null;
+  }
+}
+
+function registerTerminalWebglContextLoss(pane: TerminalPane) {
+  const webgl = pane.webgl;
+  if (!webgl) return;
+  pane.webglContextLossDisposable = webgl.onContextLoss(() => {
+    if (pane.webgl === webgl) pane.webgl = undefined;
+    pane.webglContextLost = true;
+    pane.webglContextLossDisposable?.dispose();
+    pane.webglContextLossDisposable = undefined;
+    try {
+      webgl.dispose();
+    } catch {
+      // Ignore renderer cleanup failures; xterm continues with its fallback renderer.
+    }
+    if (isTerminalPaneAlive(pane)) {
+      pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
+      scheduleFitTerminal(pane);
+      const widget = terminalWidgetForPane(pane);
+      if (widget) updateTerminalWidgetRendererBadge(widget, pane);
+    }
+  });
 }
 
 function warmEditorForPath(path: string) {
@@ -14146,8 +17459,19 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   const cwdEl = document.createElement('span');
   cwdEl.className = 'muted terminal-widget-cwd';
   cwdEl.textContent = cwd;
+  const rendererBadge = document.createElement('span');
+  rendererBadge.className = 'terminal-renderer-badge';
+  rendererBadge.textContent = 'GL?';
+  rendererBadge.title = 'Terminal renderer is starting';
+  rendererBadge.dataset.renderer = 'pending';
   const spacer = document.createElement('span');
   spacer.className = 'spacer';
+  const opacityButton = createWidgetOpacityButton();
+  const historyButton = document.createElement('button');
+  historyButton.className = 'terminal-history-toggle';
+  historyButton.type = 'button';
+  historyButton.title = 'View cached terminal history for this session';
+  historyButton.textContent = 'Hist';
   const typePadToggle = document.createElement('button');
   typePadToggle.className = 'terminal-type-toggle';
   typePadToggle.type = 'button';
@@ -14166,22 +17490,60 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   closeButton.title = 'Close shell widget';
   closeButton.setAttribute('aria-label', 'Close shell widget');
   closeButton.textContent = 'x';
-  titlebar.append(focusDot, titleEl, cwdEl, spacer, typePadToggle, typePadFocusToggle, closeButton);
+  titlebar.append(focusDot, titleEl, cwdEl, spacer, rendererBadge, opacityButton, historyButton, typePadToggle, typePadFocusToggle, closeButton);
 
   const tabbar = document.createElement('div');
   tabbar.className = 'terminal-widget-tabbar';
   const tabList = document.createElement('div');
   tabList.className = 'terminal-tab-list widget-tabs';
+  const llmSessionsButton = document.createElement('button');
+  llmSessionsButton.className = 'terminal-llm-sessions hidden';
+  llmSessionsButton.type = 'button';
+  llmSessionsButton.title = 'Open or kill tmux sessions for this LLM';
+  llmSessionsButton.setAttribute('aria-label', 'LLM tmux sessions');
+  llmSessionsButton.textContent = 'Tmux';
   const newTabButton = document.createElement('button');
   newTabButton.className = 'terminal-new-tab tab-add';
   newTabButton.type = 'button';
   newTabButton.title = 'New tab in this shell';
   newTabButton.setAttribute('aria-label', 'New tab in this shell');
   newTabButton.textContent = '+';
-  tabbar.append(tabList, newTabButton);
+  tabbar.append(tabList, llmSessionsButton, newTabButton);
 
   const hostStack = document.createElement('div');
   hostStack.className = 'terminal-host-stack';
+  const historyOverlay = document.createElement('div');
+  historyOverlay.className = 'terminal-history-overlay hidden';
+  historyOverlay.setAttribute('role', 'dialog');
+  historyOverlay.setAttribute('aria-label', 'Terminal history');
+  const historyHeader = document.createElement('div');
+  historyHeader.className = 'terminal-history-header';
+  const historyMeta = document.createElement('span');
+  historyMeta.className = 'terminal-history-meta';
+  const historyOlder = document.createElement('button');
+  historyOlder.type = 'button';
+  historyOlder.textContent = 'Older';
+  const historyNewer = document.createElement('button');
+  historyNewer.type = 'button';
+  historyNewer.textContent = 'Newer';
+  const historyCopyVisible = document.createElement('button');
+  historyCopyVisible.type = 'button';
+  historyCopyVisible.textContent = 'Copy visible';
+  const historyCopyAll = document.createElement('button');
+  historyCopyAll.type = 'button';
+  historyCopyAll.textContent = 'Copy all cached';
+  const historyClear = document.createElement('button');
+  historyClear.type = 'button';
+  historyClear.textContent = 'Clear cache';
+  const historyClose = document.createElement('button');
+  historyClose.type = 'button';
+  historyClose.textContent = 'Close';
+  historyHeader.append(historyMeta, historyOlder, historyNewer, historyCopyVisible, historyCopyAll, historyClear, historyClose);
+  const historyContent = document.createElement('textarea');
+  historyContent.className = 'terminal-history-content';
+  historyContent.readOnly = true;
+  historyContent.spellcheck = false;
+  historyOverlay.append(historyHeader, historyContent);
   const typePad = document.createElement('div');
   typePad.className = 'terminal-type-pad hidden';
   const typePadInput = document.createElement('textarea');
@@ -14201,7 +17563,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   typePadPaste.textContent = 'Paste';
   typePadActions.append(typePadHint, typePadPaste);
   typePad.append(typePadInput, typePadActions);
-  card.append(titlebar, tabbar, hostStack, typePad);
+  card.append(titlebar, tabbar, hostStack, typePad, historyOverlay);
   el.mainGrid.append(card);
   const grips = ensureResizeGrips(card, 'terminal');
   if (options.rect) applyLayoutRatio(card, options.rect);
@@ -14213,8 +17575,21 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     element: card,
     title: titleEl,
     cwd: cwdEl,
+    rendererBadge,
     tabList,
     hostStack,
+    llmSessionsButton,
+    opacityButton,
+    historyButton,
+    historyOverlay,
+    historyMeta,
+    historyContent,
+    historyOlder,
+    historyNewer,
+    historyCopyVisible,
+    historyCopyAll,
+    historyClear,
+    historyClose,
     typePadToggle,
     typePadFocusToggle,
     typePad,
@@ -14229,6 +17604,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   state.terminalWidgets.push(widget);
   terminalWidgetById.set(widget.widgetId, widget);
   terminalWidgetByElement.set(widget.element, widget);
+  syncWidgetOpacityButton(widget.element);
   if (workspaceId === state.activeWorkspaceId) visibleTerminalWorkspaceId = workspaceId;
 
   card.addEventListener('pointerdown', (event) => {
@@ -14255,6 +17631,24 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     });
   });
   closeButton.addEventListener('click', () => void closeTerminalWidget(widget.widgetId));
+  historyButton.addEventListener('pointerdown', (event) => event.stopPropagation());
+  historyButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const pane = activePaneForWidget(widget);
+    if (pane) openTerminalHistoryOverlay(pane, { source: 'button' });
+  });
+  historyOverlay.addEventListener('pointerdown', (event) => event.stopPropagation());
+  historyOverlay.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    closeTerminalHistoryOverlay(widget);
+  });
+  historyOlder.addEventListener('click', () => pageTerminalHistoryOverlay(widget, -1));
+  historyNewer.addEventListener('click', () => pageTerminalHistoryOverlay(widget, 1));
+  historyCopyVisible.addEventListener('click', () => void copyTerminalHistoryVisible(widget));
+  historyCopyAll.addEventListener('click', () => void copyTerminalHistoryAll(widget));
+  historyClear.addEventListener('click', () => clearTerminalHistoryForWidget(widget));
+  historyClose.addEventListener('click', () => closeTerminalHistoryOverlay(widget));
   typePadToggle.addEventListener('click', (event) => {
     event.stopPropagation();
     toggleTerminalTypingPad(widget);
@@ -14270,10 +17664,15 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   typePadPaste.addEventListener('click', () => void pasteTerminalTypingPadDraft(widget));
   newTabButton.addEventListener('click', (event) => {
     event.stopPropagation();
-    void createShellTabInWidget(widget);
+    void createNewTabInWidget(widget);
+  });
+  llmSessionsButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void showLlmTmuxSessionMenu(widget, llmSessionsButton);
   });
 
   syncTerminalDefaultFocusControls(widget);
+  syncTerminalHistoryControls(widget);
   syncWidgetWrapClasses(widget.element, 'terminal');
   return widget;
 }
@@ -14572,6 +17971,311 @@ function cancelTerminalFocusRequest(pane: TerminalPane) {
   }
 }
 
+function terminalHistoryCacheLimits(mode = state.ideSettings.terminalHistoryCache) {
+  const normalized = terminalHistoryCacheMode(mode);
+  if (normalized === 'deep') {
+    return {
+      enabled: true,
+      maxLines: TERMINAL_HISTORY_DEEP_MAX_LINES,
+      maxChars: TERMINAL_HISTORY_DEEP_MAX_CHARS
+    };
+  }
+  if (normalized === 'balanced') {
+    return {
+      enabled: true,
+      maxLines: TERMINAL_HISTORY_BALANCED_MAX_LINES,
+      maxChars: TERMINAL_HISTORY_BALANCED_MAX_CHARS
+    };
+  }
+  return { enabled: false, maxLines: 0, maxChars: 0 };
+}
+
+function terminalHistoryCacheForPane(pane: TerminalPane) {
+  const limits = terminalHistoryCacheLimits();
+  if (!limits.enabled) return null;
+  pane.historyCache ??= {
+    lines: [],
+    currentLine: '',
+    charCount: 0,
+    escapeCarry: ''
+  };
+  return pane.historyCache;
+}
+
+function clearTerminalHistoryCache(pane: TerminalPane) {
+  pane.historyCache = undefined;
+  const widget = terminalWidgetForPane(pane);
+  if (widget) {
+    if (widget.historyOverlayPaneId === pane.paneId) closeTerminalHistoryOverlay(widget);
+    syncTerminalHistoryControls(widget);
+  }
+}
+
+function appendTerminalHistoryCache(pane: TerminalPane, data: string) {
+  const cache = terminalHistoryCacheForPane(pane);
+  if (!cache || !data) return;
+  const complete = terminalHistoryCompletePlainChunk(cache, data);
+  if (!complete) return;
+  appendTerminalHistoryPlainText(cache, complete);
+  trimTerminalHistoryCache(pane);
+  syncTerminalHistoryControlsForPane(pane);
+}
+
+function terminalHistoryCompletePlainChunk(cache: TerminalHistoryCache, data: string) {
+  const combined = cache.escapeCarry ? `${cache.escapeCarry}${data}` : data;
+  cache.escapeCarry = '';
+  const escapeIndex = combined.lastIndexOf('\x1b');
+  if (escapeIndex >= 0) {
+    const tail = combined.slice(escapeIndex);
+    if (terminalHistoryEscapeLooksIncomplete(tail)) {
+      cache.escapeCarry = tail.slice(0, 512);
+      return stripTerminalHistoryControlSequences(combined.slice(0, escapeIndex));
+    }
+  }
+  return stripTerminalHistoryControlSequences(combined);
+}
+
+function terminalHistoryEscapeLooksIncomplete(tail: string) {
+  if (!tail.startsWith('\x1b')) return false;
+  if (tail.length === 1) return true;
+  const kind = tail[1];
+  if (kind === ']' || kind === 'P' || kind === '_' || kind === '^') {
+    return !(tail.includes('\x07') || tail.includes('\x1b\\'));
+  }
+  if (kind === '[') return !/\x1b\[[0-?]*[ -/]*[@-~]/.test(tail);
+  return tail.length < 2;
+}
+
+function stripTerminalHistoryControlSequences(data: string) {
+  return data
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[PX^_][\s\S]*?\x1b\\/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[ -/]*[@-~]/g, '');
+}
+
+function appendTerminalHistoryPlainText(cache: TerminalHistoryCache, text: string) {
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '\r') {
+      if (text[index + 1] === '\n') continue;
+      cache.currentLine = '';
+      continue;
+    }
+    if (char === '\n') {
+      pushTerminalHistoryLine(cache, cache.currentLine);
+      cache.currentLine = '';
+      continue;
+    }
+    if (char === '\b') {
+      cache.currentLine = cache.currentLine.slice(0, -1);
+      continue;
+    }
+    const code = char.charCodeAt(0);
+    if ((code < 32 || code === 127) && char !== '\t') continue;
+    cache.currentLine += char;
+  }
+  const limits = terminalHistoryCacheLimits();
+  if (limits.enabled && cache.currentLine.length > limits.maxChars) {
+    cache.currentLine = cache.currentLine.slice(-limits.maxChars);
+  }
+}
+
+function pushTerminalHistoryLine(cache: TerminalHistoryCache, line: string) {
+  cache.lines.push(line);
+  cache.charCount += line.length + 1;
+}
+
+function trimTerminalHistoryCache(pane: TerminalPane) {
+  const cache = pane.historyCache;
+  if (!cache) return;
+  const limits = terminalHistoryCacheLimits();
+  if (!limits.enabled) {
+    pane.historyCache = undefined;
+    syncTerminalHistoryControlsForPane(pane);
+    return;
+  }
+  let removeCount = 0;
+  let removeChars = 0;
+  while (
+    removeCount < cache.lines.length
+    && (cache.lines.length - removeCount > limits.maxLines || cache.charCount - removeChars > limits.maxChars)
+  ) {
+    removeChars += cache.lines[removeCount].length + 1;
+    removeCount += 1;
+  }
+  if (removeCount) {
+    cache.lines.splice(0, removeCount);
+    cache.charCount = Math.max(0, cache.charCount - removeChars);
+  }
+}
+
+function terminalHistoryLines(pane: TerminalPane) {
+  const cache = pane.historyCache;
+  if (!cache) return [];
+  return cache.currentLine ? [...cache.lines, cache.currentLine] : cache.lines;
+}
+
+function terminalHistoryLineCount(pane: TerminalPane | null | undefined) {
+  return pane ? terminalHistoryLines(pane).length : 0;
+}
+
+function terminalHasCachedHistory(pane: TerminalPane | null | undefined) {
+  return terminalHistoryCacheLimits().enabled && terminalHistoryLineCount(pane) > 0;
+}
+
+function syncTerminalHistoryControlsForPane(pane: TerminalPane) {
+  const widget = terminalWidgetForPane(pane);
+  if (!widget) return;
+  const activePane = activePaneForWidget(widget);
+  if (activePane?.paneId !== pane.paneId && widget.historyOverlayPaneId !== pane.paneId) return;
+  const lineCount = terminalHistoryLineCount(pane);
+  if (widget.historyButton.disabled || widget.historyOverlayPaneId === pane.paneId || lineCount % 100 === 0) {
+    syncTerminalHistoryControls(widget);
+    if (widget.historyOverlayPaneId === pane.paneId) renderTerminalHistoryOverlay(widget);
+  }
+}
+
+function syncTerminalHistoryControls(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  const enabled = terminalHasCachedHistory(pane);
+  setDisabledIfChanged(widget.historyButton, !enabled);
+  widget.historyButton.title = enabled
+    ? `View cached terminal history (${terminalHistoryLineCount(pane).toLocaleString()} lines, session-only)`
+    : state.ideSettings.terminalHistoryCache === 'off'
+      ? 'Terminal history cache is disabled in Settings'
+      : 'No cached terminal history yet';
+  toggleClassIfChanged(widget.historyButton, 'has-history', enabled);
+  if (!enabled && widget.historyOverlayPaneId === pane?.paneId) closeTerminalHistoryOverlay(widget);
+}
+
+function openTerminalHistoryOverlay(
+  pane: TerminalPane,
+  options: { source?: 'button' | 'top-scroll' } = {}
+) {
+  if (!terminalHasCachedHistory(pane)) {
+    setStatus(state.ideSettings.terminalHistoryCache === 'off'
+      ? 'Terminal history cache is disabled in Settings'
+      : 'No cached terminal history yet', true);
+    return;
+  }
+  const widget = terminalWidgetForPane(pane);
+  if (!widget) return;
+  const lines = terminalHistoryLines(pane);
+  let endLine = lines.length;
+  if (options.source === 'top-scroll') {
+    const xtermLines = pane.term.buffer.normal.length || pane.term.buffer.active.length || 0;
+    endLine = clamp(
+      lines.length - Math.max(0, xtermLines - TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES),
+      0,
+      lines.length
+    );
+    if (endLine <= 0) endLine = Math.min(lines.length, TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
+  }
+  widget.historyOverlayPaneId = pane.paneId;
+  widget.historyOverlayEndLine = endLine;
+  renderTerminalHistoryOverlay(widget);
+  toggleClassIfChanged(widget.historyOverlay, 'hidden', false);
+  widget.historyContent.focus();
+  window.requestAnimationFrame(() => {
+    widget.historyContent.scrollTop = widget.historyContent.scrollHeight;
+  });
+}
+
+function closeTerminalHistoryOverlay(widget: TerminalWidget) {
+  widget.historyOverlayPaneId = undefined;
+  widget.historyOverlayEndLine = undefined;
+  widget.historyOverlayPageStart = undefined;
+  widget.historyOverlayPageEnd = undefined;
+  widget.historyContent.value = '';
+  toggleClassIfChanged(widget.historyOverlay, 'hidden', true);
+}
+
+function renderTerminalHistoryOverlay(widget: TerminalWidget) {
+  const pane = widget.historyOverlayPaneId ? terminalPaneById.get(widget.historyOverlayPaneId) : null;
+  if (!pane || !terminalHasCachedHistory(pane)) {
+    closeTerminalHistoryOverlay(widget);
+    return;
+  }
+  const lines = terminalHistoryLines(pane);
+  const end = clamp(widget.historyOverlayEndLine ?? lines.length, 0, lines.length);
+  let start = Math.max(0, end - TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
+  let chars = 0;
+  for (let index = end - 1; index >= start; index -= 1) {
+    chars += lines[index].length + 1;
+    if (chars > TERMINAL_HISTORY_VISIBLE_PAGE_CHARS) {
+      start = index + 1;
+      break;
+    }
+  }
+  const visible = lines.slice(start, end).join('\n');
+  widget.historyOverlayPageStart = start;
+  widget.historyOverlayPageEnd = end;
+  if (widget.historyContent.value !== visible) widget.historyContent.value = visible;
+  const range = lines.length ? `${start + 1}-${end}` : '0';
+  setTextContentIfChanged(
+    widget.historyMeta,
+    `History ${range} / ${lines.length.toLocaleString()} lines · plain text · session-only`
+  );
+  setDisabledIfChanged(widget.historyOlder, start <= 0);
+  setDisabledIfChanged(widget.historyNewer, end >= lines.length);
+  setDisabledIfChanged(widget.historyCopyVisible, !visible);
+  setDisabledIfChanged(widget.historyCopyAll, !lines.length);
+  setDisabledIfChanged(widget.historyClear, !lines.length);
+}
+
+function pageTerminalHistoryOverlay(widget: TerminalWidget, direction: -1 | 1) {
+  const pane = widget.historyOverlayPaneId ? terminalPaneById.get(widget.historyOverlayPaneId) : null;
+  if (!pane) return;
+  const lines = terminalHistoryLines(pane);
+  if (!lines.length) return;
+  const start = widget.historyOverlayPageStart ?? 0;
+  const end = widget.historyOverlayPageEnd ?? lines.length;
+  widget.historyOverlayEndLine = direction < 0
+    ? Math.max(0, start)
+    : Math.min(lines.length, end + TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
+  renderTerminalHistoryOverlay(widget);
+  window.requestAnimationFrame(() => {
+    widget.historyContent.scrollTop = direction < 0 ? widget.historyContent.scrollHeight : 0;
+  });
+}
+
+async function copyTerminalHistoryVisible(widget: TerminalWidget) {
+  const text = widget.historyContent.value;
+  if (!text) return;
+  await writeText(text);
+  setStatus('Copied visible terminal history');
+}
+
+async function copyTerminalHistoryAll(widget: TerminalWidget) {
+  const pane = widget.historyOverlayPaneId ? terminalPaneById.get(widget.historyOverlayPaneId) : null;
+  if (!pane) return;
+  const text = terminalHistoryLines(pane).join('\n');
+  if (!text) return;
+  await writeText(text);
+  setStatus('Copied all cached terminal history');
+}
+
+function clearTerminalHistoryForWidget(widget: TerminalWidget) {
+  const pane = widget.historyOverlayPaneId ? terminalPaneById.get(widget.historyOverlayPaneId) : activePaneForWidget(widget);
+  if (!pane) return;
+  clearTerminalHistoryCache(pane);
+  setStatus('Terminal history cache cleared');
+}
+
+function handleTerminalHistoryWheel(event: WheelEvent, pane: TerminalPane) {
+  if (event.deltaY >= 0) return;
+  if (pane.term.buffer.active.type === 'alternate') return;
+  if (pane.term.buffer.active.viewportY > 0) return;
+  if (!terminalHasCachedHistory(pane)) return;
+  const lines = terminalHistoryLines(pane);
+  const xtermLines = pane.term.buffer.normal.length || pane.term.buffer.active.length || 0;
+  if (lines.length <= xtermLines + TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES) return;
+  event.preventDefault();
+  event.stopPropagation();
+  openTerminalHistoryOverlay(pane, { source: 'top-scroll' });
+}
+
 const TERMINAL_SPLIT_MIN_RATIO = 0.15;
 const TERMINAL_SPLIT_MAX_RATIO = 0.85;
 const TERMINAL_SPLIT_SNAP_RATIO = 0.5;
@@ -14770,6 +18474,7 @@ async function createTerminalTab(
     convertEol: true,
     fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
     fontSize: terminalFontSize,
+    scrollback: normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows),
     theme: { background: '#080b10', foreground: '#d8e0ea' }
   });
   const fit = new runtime.FitAddon();
@@ -14778,6 +18483,7 @@ async function createTerminalTab(
   term.unicode.activeVersion = '11';
   term.loadAddon(fit);
   term.open(host);
+  const webgl = maybeLoadTerminalWebglAddon(term, runtime) ?? undefined;
 
   const pane: TerminalPane = {
     paneId,
@@ -14786,14 +18492,24 @@ async function createTerminalTab(
     workspaceId: widget.workspaceId,
     title,
     command,
+    llmId: normalizeTerminalLlmId(options.llmId) ?? undefined,
+    llmTmuxSessionName: safeLlmTmuxSessionName(options.llmTmuxSessionName) ?? undefined,
     profileId: terminalProfile.id,
     cwd: terminalCwd,
     term,
     fit,
+    webgl,
+    webglContextLost: false,
     element: widget.element,
     host,
     outputBuffer: '',
     writeBuffer: '',
+    historyCache: state.ideSettings.terminalHistoryCache === 'off' ? undefined : {
+      lines: [],
+      currentLine: '',
+      charCount: 0,
+      escapeCarry: ''
+    },
     backendOutputChars: 0,
     cwdOutputBuffer: '',
     inputBuffer: '',
@@ -14804,11 +18520,18 @@ async function createTerminalTab(
     lastRows: term.rows,
     lastCols: term.cols
   };
+  registerTerminalWebglContextLoss(pane);
+  scheduleTerminalStartupWatch(pane, terminalProfile, title);
   state.terminals.push(pane);
   terminalPaneById.set(pane.paneId, pane);
   rememberTerminalPane(pane);
+  pane.llmTitleDisposable = term.onTitleChange((terminalTitle) => {
+    updateWorkspaceLlmTitleFromTerminalTitle(pane, terminalTitle);
+  });
+  detectTerminalPaneLlmFromMetadata(pane);
   const group = rememberPaneInTerminalGroup(widget, pane, options);
   registerTerminalFileLinks(pane);
+  registerTerminalClipboardOsc52(pane);
   if (options.focus !== false) {
     setActivePane(paneId);
     bringPanelToFront(widget.element);
@@ -14838,6 +18561,7 @@ async function createTerminalTab(
     }
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
+  host.addEventListener('wheel', (event) => handleTerminalHistoryWheel(event, pane), { capture: true, passive: false });
   bindTerminalImeCompositionGuard(pane);
 
   pane.resizeObserver = new ResizeObserver(() => {
@@ -14855,7 +18579,25 @@ async function createTerminalTab(
         updateTerminalWidgetTitle(widget);
       }
     }
-    const backendId = await api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols, widget.workspaceId, title);
+    const spawnPromise = api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols, widget.workspaceId, title);
+    let spawnTimedOut = false;
+    spawnPromise.then((lateBackendId) => {
+      if ((spawnTimedOut || !isTerminalPaneAlive(pane)) && !pane.backendId) {
+        void api.killTerminal(lateBackendId).catch(() => undefined);
+      }
+    }).catch(() => undefined);
+    const backendId = await withTimeout(
+      spawnPromise,
+      terminalStartTimeoutMs(terminalProfile),
+      `${terminalProfile.kind.toUpperCase()} shell start`
+    ).catch((error) => {
+      spawnTimedOut = String(error).includes('timed out');
+      throw error;
+    });
+    if (!isTerminalPaneAlive(pane)) {
+      void api.killTerminal(backendId).catch(() => undefined);
+      return pane;
+    }
     setTerminalBackendId(pane, backendId);
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
@@ -14865,6 +18607,18 @@ async function createTerminalTab(
     setStatus(`Terminal started: ${title}`);
     if (!options.skipSnapshotSave) saveActiveWorkspaceSnapshot();
   } catch (error) {
+    clearTerminalStartupWatch(pane);
+    if (!isTerminalPaneAlive(pane)) return pane;
+    if (terminalPaneLlmId(pane)) {
+      updateAgentSessionProgressForPane(pane, {
+        status: 'error',
+        source: 'launcher',
+        activity: 'Terminal start failed'
+      });
+    }
+    if (String(error).includes('timed out')) {
+      term.write('\r\nShell startup timed out. Close this shell and try again, or reopen the workspace.\r\n');
+    }
     term.write(`\r\nFailed to start terminal: ${String(error)}\r\n`);
     setStatus(String(error), true);
   }
@@ -14874,6 +18628,9 @@ async function createTerminalTab(
 async function closeTerminalPane(paneId: string, options: CloseTerminalOptions = {}) {
   const pane = terminalPaneById.get(paneId) ?? state.terminals.find((item) => item.paneId === paneId);
   if (!pane) return;
+  pane.closed = true;
+  clearTerminalStartupWatch(pane);
+  clearTerminalPendingShellReadyActions(pane);
   const workspaceId = pane.workspaceId;
   const widget = terminalWidgetForPane(pane);
   if (widget) removePaneFromTerminalGroup(widget, pane);
@@ -14886,6 +18643,9 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
   cleanupTerminalWriteBuffer(pane);
   if (pane.fitFrame) cancelAnimationFrame(pane.fitFrame);
   pane.resizeObserver?.disconnect();
+  cleanupWorkspaceLlmTitleDetectionForPane(pane);
+  deleteAgentSessionProgressForPane(pane);
+  disposeTerminalPaneRenderer(pane);
   pane.term.dispose();
   const terminalIndex = state.terminals.findIndex((item) => item.paneId === paneId);
   if (terminalIndex >= 0) state.terminals.splice(terminalIndex, 1);
@@ -14894,6 +18654,7 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
   if (widget && !nextInWidget) {
     const widgetIndex = state.terminalWidgets.findIndex((item) => item.widgetId === widget.widgetId);
     if (widgetIndex >= 0) state.terminalWidgets.splice(widgetIndex, 1);
+    if (widgetOpacityPopoverTarget?.element === widget.element) hideWidgetOpacityPopover({ persist: true });
     forgetTerminalWidget(widget);
     widget.element.remove();
   } else if (widget && widget.activePaneId === paneId) {
@@ -14915,13 +18676,55 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
   refreshWorkspaceLlmActivityAfterPaneChange(workspaceId);
 }
 
+function isTerminalPaneAlive(pane: TerminalPane) {
+  return !pane.closed
+    && terminalPaneById.get(pane.paneId) === pane
+    && pane.host.isConnected;
+}
+
+function scheduleTerminalStartupWatch(pane: TerminalPane, profile: ConnectionProfile, title: string) {
+  clearTerminalStartupWatch(pane);
+  const label = title || 'terminal';
+  const profileLabel = profile.label || profile.kind.toUpperCase();
+  pane.startupNoticeTimer = window.setTimeout(() => {
+    pane.startupNoticeTimer = undefined;
+    if (!terminalStartupWatchStillApplies(pane)) return;
+    pane.term.write(`\x1b[2mStarting ${profileLabel} shell for ${label}...\x1b[0m\r\n`);
+  }, TERMINAL_STARTUP_NOTICE_MS);
+  pane.startupStallTimer = window.setTimeout(() => {
+    pane.startupStallTimer = undefined;
+    if (!terminalStartupWatchStillApplies(pane)) return;
+    pane.term.write('\x1b[33mNo shell output yet. If this stays black, close this widget and try again.\x1b[0m\r\n');
+  }, TERMINAL_STARTUP_STALL_MS);
+}
+
+function terminalStartupWatchStillApplies(pane: TerminalPane) {
+  return isTerminalPaneAlive(pane)
+    && !pane.backendOutputChars
+    && !pane.shellReadyAt;
+}
+
+function clearTerminalStartupWatch(pane: TerminalPane) {
+  if (pane.startupNoticeTimer) {
+    window.clearTimeout(pane.startupNoticeTimer);
+    pane.startupNoticeTimer = undefined;
+  }
+  if (pane.startupStallTimer) {
+    window.clearTimeout(pane.startupStallTimer);
+    pane.startupStallTimer = undefined;
+  }
+}
+
 function closeTerminalBackend(pane: TerminalPane) {
   const backendId = pane.backendId;
   if (!backendId) return Promise.resolve();
-  return flushTerminalInput(pane)
-    .catch(() => undefined)
-    .then(() => api.killTerminal(backendId))
-    .catch(() => undefined);
+  return withTimeout(
+    api.killTerminal(backendId),
+    TERMINAL_CLOSE_BACKEND_TIMEOUT_MS,
+    `Closing terminal ${pane.title}`
+  ).catch((error) => {
+    console.warn(`Terminal backend close timed out or failed for ${backendId}:`, error);
+  });
 }
 
 async function closeTerminalWidget(widgetId: string, options: CloseTerminalOptions = {}) {
@@ -15275,6 +19078,7 @@ function setTerminalTabCustomTitle(pane: TerminalPane, title: string) {
     renderTerminalWidgetTabs(widget);
     updateTerminalWidgetTitle(widget, { force: true });
   }
+  if (terminalPaneLlmId(pane)) updateAgentSessionProgressForPane(pane, { title: terminalPaneLabel(pane) });
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
   setStatus(customTitle ? `Shell tab renamed: ${customTitle}` : 'Shell tab uses automatic title');
 }
@@ -15297,6 +19101,8 @@ function setTerminalGroupCustomTitle(widget: TerminalWidget, group: TerminalTabG
   terminalWidgetTabsRenderSignatures.delete(widget);
   renderTerminalWidgetTabs(widget);
   updateTerminalWidgetTitle(widget, { force: true });
+  const pane = activePaneForTerminalGroup(group);
+  if (pane && terminalPaneLlmId(pane)) updateAgentSessionProgressForPane(pane, { title: terminalGroupLabel(group) });
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
   setStatus(customTitle ? `Shell tab renamed: ${customTitle}` : 'Shell tab uses active shell title');
 }
@@ -15446,6 +19252,29 @@ function activePaneForWidget(widget: TerminalWidget) {
   return pane?.widgetId === widget.widgetId ? pane : firstTerminalPaneForWidget(widget);
 }
 
+function terminalWidgetLauncherLlmId(widget: TerminalWidget | null | undefined) {
+  if (!widget) return null;
+  const active = activePaneForWidget(widget);
+  const activeLlmId = normalizeTerminalLlmId(active?.llmId);
+  if (activeLlmId) return activeLlmId;
+  for (const pane of terminalPanesForWidget(widget)) {
+    const llmId = normalizeTerminalLlmId(pane.llmId);
+    if (llmId) return llmId;
+  }
+  return null;
+}
+
+function syncTerminalLlmSessionControls(widget: TerminalWidget) {
+  const llmId = terminalWidgetLauncherLlmId(widget);
+  const profile = profileForTerminalWidget(widget);
+  const visible = Boolean(llmId && profile?.kind !== 'windows');
+  toggleClassIfChanged(widget.llmSessionsButton, 'hidden', !visible);
+  widget.llmSessionsButton.disabled = !visible;
+  widget.llmSessionsButton.title = llmId
+    ? `Open or kill tmux sessions for ${agentAlertAgentLabel(llmId)}`
+    : 'tmux sessions are available for LLM tabs';
+}
+
 function activeTerminalWidget() {
   const pane = terminalPaneById.get(state.activePaneId);
   if (pane?.workspaceId !== state.activeWorkspaceId) {
@@ -15495,23 +19324,149 @@ async function createShellTabInWidget(widget: TerminalWidget) {
   if (pane) await restoreTerminalPythonEnvForPane(pane);
 }
 
+async function createNewTabInWidget(widget: TerminalWidget) {
+  const llmId = terminalWidgetLauncherLlmId(widget);
+  if (llmId) {
+    await createLlmTmuxTabInWidget(widget, llmId);
+    return;
+  }
+  await createShellTabInWidget(widget);
+}
+
+async function createLlmTmuxTabInWidget(
+  widget: TerminalWidget,
+  llmId: string,
+  options: { sessionName?: string; title?: string } = {}
+) {
+  const profile = profileForTerminalWidget(widget) ?? state.activeProfile;
+  if (!profile) return null;
+  const active = activePaneForWidget(widget);
+  const cwd = active?.cwd ?? workspaceShellCwd();
+  const tmuxSessionName = safeLlmTmuxSessionName(options.sessionName)
+    ?? await nextLlmTmuxSessionName(profile, cwd, widget.workspaceId, llmId);
+  const { define, call } = llmLauncherParts(llmId, profile.kind, widget.workspaceId, tmuxSessionName);
+  const title = options.title ?? llmTmuxTabTitle(llmId, tmuxSessionName);
+  const pane = await createTerminalTab(widget, define, title, {
+    profile,
+    cwd,
+    pythonEnv: active?.activePythonEnv,
+    llmId,
+    llmTmuxSessionName: tmuxSessionName
+  });
+  if (!pane?.backendId) return pane;
+  markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
+  queueTerminalShellReadyAction(
+    pane,
+    `launch ${llmId}`,
+    () => sendTerminalInputNow(pane, `${call}\r`).catch((error) => {
+      setStatus(`Failed to launch ${llmId}: ${String(error)}`, true);
+    }),
+    { waitingStatus: `Waiting for ${profile.kind.toUpperCase()} shell login before launching ${llmId}...` }
+  );
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  return pane;
+}
+
+async function showLlmTmuxSessionMenu(widget: TerminalWidget, anchor: HTMLElement) {
+  const llmId = terminalWidgetLauncherLlmId(widget);
+  const profile = profileForTerminalWidget(widget);
+  if (!llmId || !profile || profile.kind === 'windows') return;
+  const active = activePaneForWidget(widget);
+  const cwd = active?.cwd ?? workspaceShellCwd();
+  const rect = anchor.getBoundingClientRect();
+  const agent = agentAlertAgentLabel(llmId);
+  setStatus(`Loading ${agent} tmux sessions...`);
+  const items: ContextMenuItem[] = [
+    {
+      label: `New ${agent} tmux session`,
+      action: () => { void createLlmTmuxTabInWidget(widget, llmId); }
+    },
+    { separator: true }
+  ];
+  try {
+    const result = await api.listLlmTmuxSessions(profile.id, cwd, widget.workspaceId, llmId);
+    if (!result.available) {
+      items.push({
+        label: result.message || 'tmux is not available on this profile',
+        disabled: true
+      });
+    } else if (!result.sessions.length) {
+      items.push({ label: 'No existing tmux sessions', disabled: true });
+    } else {
+      for (const session of result.sessions) {
+        items.push({
+          label: `Open ${llmTmuxSessionMenuLabel(session, llmId)}`,
+          action: () => {
+            void createLlmTmuxTabInWidget(widget, llmId, {
+              sessionName: session.name,
+              title: llmTmuxTabTitle(llmId, session.name)
+            });
+          }
+        });
+        items.push({
+          label: `Kill ${llmTmuxSessionMenuLabel(session, llmId)}`,
+          danger: true,
+          action: () => {
+            void killLlmTmuxSessionFromWidget(widget, profile, cwd, session.name);
+          }
+        });
+      }
+    }
+  } catch (error) {
+    items.push({ label: `Failed to list tmux sessions: ${String(error)}`, disabled: true });
+  }
+  showContextMenu(rect.left, rect.bottom + 4, items);
+}
+
+function llmTmuxSessionMenuLabel(session: LlmTmuxSession, llmId: string) {
+  const label = llmTmuxTabTitle(llmId, session.name);
+  const state = session.attached ? 'attached' : 'detached';
+  const legacy = session.legacy ? ' legacy' : '';
+  return `${label} · ${session.name} · ${state}${legacy}`;
+}
+
+async function killLlmTmuxSessionFromWidget(
+  widget: TerminalWidget,
+  profile: ConnectionProfile,
+  cwd: string,
+  sessionName: string
+) {
+  const safeName = safeLlmTmuxSessionName(sessionName);
+  if (!safeName) {
+    setStatus('Invalid tmux session name', true);
+    return;
+  }
+  if (!window.confirm(`Kill tmux session "${safeName}"? Terminal tabs are not killed, but attached tmux clients will detach/exit.`)) return;
+  try {
+    await api.killLlmTmuxSession(profile.id, cwd, safeName);
+    setStatus(`Killed tmux session: ${safeName}`);
+    syncTerminalLlmSessionControls(widget);
+  } catch (error) {
+    setStatus(`Failed to kill tmux session: ${String(error)}`, true);
+  }
+}
+
 async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDirection) {
   const widget = terminalWidgetForPane(pane);
   if (!widget) return;
   const profile = profileForIdWithWindowsFallback(pane.profileId) ?? state.activeProfile;
   if (!profile) return;
-  const llmParts = pane.llmId ? llmLauncherParts(pane.llmId, profile.kind) : null;
+  const tmuxSessionName = pane.llmId
+    ? await nextLlmTmuxSessionName(profile, pane.cwd, pane.workspaceId, pane.llmId)
+    : undefined;
+  const llmParts = pane.llmId ? llmLauncherParts(pane.llmId, profile.kind, pane.workspaceId, tmuxSessionName) : null;
   const command = llmParts ? llmParts.define : pane.command;
-  const title = pane.title.replace(/\s+\(exited\)$/i, '') || 'shell';
+  const title = pane.llmId ? llmTmuxTabTitle(pane.llmId, tmuxSessionName) : (pane.title.replace(/\s+\(exited\)$/i, '') || 'shell');
   const newPane = await createTerminalTab(widget, command, title, {
     profile,
     cwd: pane.cwd,
     splitTargetPaneId: pane.paneId,
     splitDirection: direction,
-    pythonEnv: pane.activePythonEnv
+    pythonEnv: pane.activePythonEnv,
+    llmId: pane.llmId,
+    llmTmuxSessionName: tmuxSessionName
   });
   if (!newPane) return;
-  if (pane.llmId) newPane.llmId = pane.llmId;
   if (llmParts && newPane.backendId) {
     markWorkspaceLlmActivityForPane(newPane, WORKSPACE_LLM_START_ACTIVE_MS);
     queueTerminalShellReadyAction(
@@ -15530,6 +19485,51 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
 
 function workspaceShellCwd() {
   return state.workspaceRoot || state.currentDir || state.activeProfile?.root || '.';
+}
+
+function terminalRendererBadgeState(pane: TerminalPane | null | undefined) {
+  if (pane?.webgl) {
+    return {
+      key: 'webgl',
+      label: 'GL',
+      title: 'Terminal renderer: WebGL active'
+    };
+  }
+  if (!pane) {
+    return {
+      key: 'pending',
+      label: 'GL?',
+      title: 'Terminal renderer is not ready yet'
+    };
+  }
+  if (pane.webglContextLost) {
+    return {
+      key: 'lost',
+      label: 'GL!',
+      title: 'Terminal WebGL context was lost; xterm is using its DOM fallback'
+    };
+  }
+  if (state.ideSettings.terminalRenderer === 'dom') {
+    return {
+      key: 'dom',
+      label: 'DOM',
+      title: 'Terminal renderer: DOM compatibility selected'
+    };
+  }
+  return {
+    key: 'fallback',
+    label: 'DOM',
+    title: 'Terminal renderer: WebGL unavailable; using DOM fallback'
+  };
+}
+
+function updateTerminalWidgetRendererBadge(widget: TerminalWidget, pane = activePaneForWidget(widget)) {
+  const renderer = terminalRendererBadgeState(pane);
+  if (widget.rendererBadge.dataset.renderer !== renderer.key) {
+    widget.rendererBadge.dataset.renderer = renderer.key;
+  }
+  setTextContentIfChanged(widget.rendererBadge, renderer.label);
+  if (widget.rendererBadge.title !== renderer.title) widget.rendererBadge.title = renderer.title;
 }
 
 async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: string) {
@@ -15562,6 +19562,10 @@ function updateTerminalWidgetTitle(widget: TerminalWidget, options: { force?: bo
   if (!options.force && widget.element.classList.contains('hidden')) return;
   setTextContentIfChanged(widget.title, group ? terminalGroupLabel(group) : pane ? terminalPaneLabel(pane) : 'shell');
   setTextContentIfChanged(widget.cwd, pane?.cwd ?? '');
+  updateTerminalWidgetRendererBadge(widget, pane);
+  if (widget.historyOverlayPaneId && widget.historyOverlayPaneId !== pane?.paneId) closeTerminalHistoryOverlay(widget);
+  syncTerminalHistoryControls(widget);
+  syncTerminalLlmSessionControls(widget);
   syncTerminalTypingPadForWidget(widget);
 }
 
@@ -15663,6 +19667,67 @@ function finishTerminalImeCompositionGuard(pane: TerminalPane) {
     // is needless churn that can disturb IME state mid-commit.
     if (!terminalPaneHasFocus(pane)) focusTerminalPaneWhenReady(pane);
   }, TERMINAL_IME_RELEASE_DEFER_MS);
+}
+
+function registerTerminalClipboardOsc52(pane: TerminalPane) {
+  pane.term.parser.registerOscHandler(52, (data) => {
+    handleTerminalClipboardOsc52(pane, data);
+    return true;
+  });
+}
+
+function handleTerminalClipboardOsc52(pane: TerminalPane, data: string) {
+  const separatorIndex = data.indexOf(';');
+  if (separatorIndex < 0) return;
+  const selector = data.slice(0, separatorIndex);
+  const payload = data.slice(separatorIndex + 1);
+  if (!terminalOsc52TargetsClipboard(selector) || !payload || payload === '?') return;
+
+  let text = '';
+  try {
+    text = decodeTerminalOsc52Payload(payload);
+  } catch (error) {
+    if (terminalPaneVisibility(pane) !== 'background') {
+      setStatus(`Terminal OSC 52 copy ignored: ${String(error)}`, true);
+    }
+    return;
+  }
+  if (!text) return;
+  void writeText(text)
+    .then(() => {
+      if (terminalPaneVisibility(pane) !== 'background') {
+        setStatus(`Copied ${text.length.toLocaleString()} chars from terminal OSC 52`);
+      }
+    })
+    .catch((error) => {
+      if (terminalPaneVisibility(pane) !== 'background') {
+        setStatus(`Terminal OSC 52 copy failed: ${String(error)}`, true);
+      }
+    });
+}
+
+function terminalOsc52TargetsClipboard(selector: string) {
+  // OSC 52 is "Set clipboard": OSC 52 ; Pc ; Pd ST. Pc can name several
+  // selections; support the normal clipboard ("c") and the common empty/default
+  // form, but ignore primary/select/cut-buffer-only writes.
+  const normalized = selector.trim().toLowerCase();
+  return !normalized || normalized.includes('c');
+}
+
+function decodeTerminalOsc52Payload(payload: string) {
+  const normalized = payload.replace(/\s/g, '');
+  if (normalized.length > TERMINAL_OSC52_CLIPBOARD_MAX_BASE64_CHARS) {
+    throw new Error('payload is too large');
+  }
+  const binary = atob(normalized);
+  if (binary.length > TERMINAL_OSC52_CLIPBOARD_MAX_BYTES) {
+    throw new Error('payload is too large');
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function registerTerminalFileLinks(pane: TerminalPane) {
@@ -15795,6 +19860,13 @@ function markTerminalUserInput(pane: TerminalPane) {
 }
 
 function markWorkspaceLlmInputActivityForPane(pane: TerminalPane, data: string) {
+  if (!terminalPaneLlmId(pane)) {
+    const launchedLlmId = llmIdFromTerminalInputText(data);
+    if (!launchedLlmId) return;
+    setDetectedTerminalLlmId(pane, launchedLlmId);
+    markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
+    return;
+  }
   if (!terminalInputCountsAsWorkspaceLlmActivity(data)) return;
   markWorkspaceLlmUserActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
 }
@@ -16073,6 +20145,7 @@ function fitTerminal(pane: TerminalPane) {
     if (pane.lastRows === pane.term.rows && pane.lastCols === pane.term.cols) return;
     pane.lastRows = pane.term.rows;
     pane.lastCols = pane.term.cols;
+    pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     if (pane.backendId) void api.resizeTerminal(pane.backendId, pane.term.rows, pane.term.cols);
   } catch {
     // xterm can throw while hidden or before first layout; safe to ignore.
@@ -16467,7 +20540,7 @@ async function savePastedImage(
     fingerprint,
     createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   };
-  state.imageHistory = [item, ...state.imageHistory].slice(0, 24);
+  state.imageHistory = [item, ...state.imageHistory].slice(0, IMAGE_HISTORY_LIMIT);
   state.imagePreviewDataUrl = dataUrl;
   setImageTabSourcePath(targetTab, result.path);
   const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(result.tag, pasteTarget) : false;
@@ -16566,7 +20639,7 @@ async function reusePastedImage(
   state.imageHistory = [
     existing.item,
     ...state.imageHistory.filter((item) => item !== existing.item && item.path !== existing.item.path)
-  ].slice(0, 24);
+  ].slice(0, IMAGE_HISTORY_LIMIT);
   state.imagePreviewDataUrl = existing.item.dataUrl || dataUrl;
   state.imagePreviewZoom = 1;
   state.imagePreviewOffsetX = 0;
@@ -17008,7 +21081,22 @@ function imageHistorySignature() {
 }
 
 function previewImageHistoryItem(item: PastedImageItem) {
-  state.imagePreviewDataUrl = item.dataUrl;
+  void previewImageHistoryItemNow(item);
+}
+
+async function previewImageHistoryItemNow(item: PastedImageItem) {
+  let dataUrl = item.dataUrl;
+  if (!dataUrl && item.path && state.activeProfile) {
+    try {
+      setStatus(`Loading image ${item.path}...`);
+      dataUrl = await api.readFileDataUrl(state.activeProfile.id, item.path);
+      item.dataUrl = dataUrl;
+    } catch (error) {
+      setStatus(`Image preview could not be restored: ${String(error)}`, true);
+      return;
+    }
+  }
+  state.imagePreviewDataUrl = dataUrl;
   state.imagePreviewLabel = item.tag;
   state.imagePreviewZoom = 1;
   state.imagePreviewOffsetX = 0;
@@ -17233,10 +21321,21 @@ async function canUseDirectLocalPreview(url: string) {
   }
 }
 
-function handleTerminalData(pane: TerminalPane, data: string, llmDetectionData = data) {
+function handleTerminalData(
+  pane: TerminalPane,
+  data: string,
+  llmDetectionData = data,
+  options: TerminalDataHandlingOptions = {}
+) {
+  clearTerminalStartupWatch(pane);
   pane.backendOutputChars += data.length;
-  const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, llmDetectionData);
-  if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, llmDetectionData, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  appendTerminalHistoryCache(pane, data);
+  markWorkspaceTerminalOutput(pane.workspaceId);
+  if (options.detectLlmState !== false) {
+    updateWorkspaceLlmTitleFromTerminalData(pane, llmDetectionData);
+    const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, llmDetectionData);
+    if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, llmDetectionData, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  }
   const visibility = enqueueTerminalWrite(pane, data);
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
@@ -17256,11 +21355,11 @@ function handleTerminalData(pane: TerminalPane, data: string, llmDetectionData =
 function handleTerminalSnapshotData(pane: TerminalPane, output: string) {
   if (!output) return;
   const alreadyWritten = pane.backendOutputChars;
-  // Replayed backlog scrollback can still contain prompts that were answered long ago;
-  // judge the LLM waiting/working state only from the tail, which approximates the
-  // screen the CLI is actually showing.
+  // Replayed backlog scrollback can contain long-answered approval dialogs. It may restore
+  // visual terminal contents, cwd, and history, but it is not a live LLM state signal.
+  pane.llmTitleDetectionSuppressUntil = performance.now() + TERMINAL_SNAPSHOT_LLM_TITLE_SUPPRESS_MS;
   const replay = (chunk: string) =>
-    handleTerminalData(pane, chunk, chunk.slice(-WORKSPACE_LLM_SNAPSHOT_DETECTION_TAIL_CHARS));
+    handleTerminalData(pane, chunk, chunk.slice(-WORKSPACE_LLM_SNAPSHOT_DETECTION_TAIL_CHARS), { detectLlmState: false });
   if (alreadyWritten > 0) {
     if (output.length <= alreadyWritten) return;
     replay(output.slice(alreadyWritten));
@@ -17400,6 +21499,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.focusFrame) window.cancelAnimationFrame(pane.focusFrame);
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
   if (pane.focusRetryTimer) window.clearTimeout(pane.focusRetryTimer);
+  if (pane.shellReadyFallbackTimer) window.clearTimeout(pane.shellReadyFallbackTimer);
   if (pane.portScanTimer) window.clearTimeout(pane.portScanTimer);
   if (pane.cwdScanTimer) window.clearTimeout(pane.cwdScanTimer);
   if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
@@ -17409,6 +21509,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.focusFrame = undefined;
   pane.writeTimer = undefined;
   pane.focusRetryTimer = undefined;
+  pane.shellReadyFallbackTimer = undefined;
   pane.portScanTimer = undefined;
   pane.cwdScanTimer = undefined;
   pane.inputFlushTimer = undefined;
@@ -17859,6 +21960,7 @@ function updateTerminalCwd(pane: TerminalPane, cwd: string) {
   pane.cwd = normalized;
   const widget = terminalWidgetForPane(pane);
   if (widget) updateTerminalWidgetTitle(widget);
+  if (terminalPaneLlmId(pane)) updateAgentSessionProgressForPane(pane, { cwd: normalized });
   scheduleTerminalCwdSnapshotSave(pane);
 }
 
@@ -18643,7 +22745,7 @@ function nativeBrowserPreviewRect() {
 
 function activeBrowserUsesNativeWebview() {
   const active = browserTabForId(state.activeBrowserTabId);
-  return USE_NATIVE_BROWSER_WEBVIEW
+  return nativeBrowserWebviewAllowedForActiveWorkspace()
     && nativeBrowserWebviewVisible
     && Boolean(active)
     && nativeBrowserWebviewTabId === active?.id
@@ -18664,7 +22766,7 @@ function nativeBrowserWebviewLabelForTab(tab: BrowserTab, workspaceId = state.ac
   ].join('-');
 }
 
-function hideNativeBrowserWebview() {
+function hideNativeBrowserWebview(options: { all?: boolean } = {}) {
   nativeBrowserWebviewRequestSeq += 1;
   if (nativeBrowserWebviewSyncFrame) {
     window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
@@ -18674,9 +22776,64 @@ function hideNativeBrowserWebview() {
   nativeBrowserWebviewTabId = '';
   nativeBrowserWebviewLabel = '';
   nativeBrowserWebviewUrl = '';
-  if (!nativeBrowserWebviewVisible && !label) return;
+  if (!nativeBrowserWebviewVisible && !label && !options.all) return;
   nativeBrowserWebviewVisible = false;
-  void api.hideBrowserWebview(label || undefined).catch(() => undefined);
+  if (label) scheduleNativeBrowserWebviewClose(label);
+  void api.hideBrowserWebview(options.all ? undefined : (label || undefined)).catch(() => undefined);
+}
+
+function closeNativeBrowserWebview(label = nativeBrowserWebviewLabel) {
+  if (label) cancelNativeBrowserWebviewClose(label);
+  else cancelAllNativeBrowserWebviewCloses();
+  nativeBrowserWebviewRequestSeq += 1;
+  if (nativeBrowserWebviewSyncFrame) {
+    window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
+    nativeBrowserWebviewSyncFrame = 0;
+  }
+  if (!label || label === nativeBrowserWebviewLabel) {
+    nativeBrowserWebviewTabId = '';
+    nativeBrowserWebviewLabel = '';
+    nativeBrowserWebviewUrl = '';
+    nativeBrowserWebviewVisible = false;
+  }
+  void api.closeBrowserWebview(label || undefined).catch(() => undefined);
+}
+
+function closeAllNativeBrowserWebviews() {
+  cancelAllNativeBrowserWebviewCloses();
+  nativeBrowserWebviewRequestSeq += 1;
+  if (nativeBrowserWebviewSyncFrame) {
+    window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
+    nativeBrowserWebviewSyncFrame = 0;
+  }
+  nativeBrowserWebviewTabId = '';
+  nativeBrowserWebviewLabel = '';
+  nativeBrowserWebviewUrl = '';
+  nativeBrowserWebviewVisible = false;
+  void api.closeBrowserWebview().catch(() => undefined);
+}
+
+function scheduleNativeBrowserWebviewClose(label: string, delayMs = BROWSER_NATIVE_HIDDEN_CLOSE_DELAY_MS) {
+  if (!label) return;
+  cancelNativeBrowserWebviewClose(label);
+  const timer = window.setTimeout(() => {
+    nativeBrowserWebviewCloseTimers.delete(label);
+    if (nativeBrowserWebviewVisible && nativeBrowserWebviewLabel === label) return;
+    void api.closeBrowserWebview(label).catch(() => undefined);
+  }, delayMs);
+  nativeBrowserWebviewCloseTimers.set(label, timer);
+}
+
+function cancelNativeBrowserWebviewClose(label: string) {
+  const timer = nativeBrowserWebviewCloseTimers.get(label);
+  if (!timer) return;
+  window.clearTimeout(timer);
+  nativeBrowserWebviewCloseTimers.delete(label);
+}
+
+function cancelAllNativeBrowserWebviewCloses() {
+  for (const timer of nativeBrowserWebviewCloseTimers.values()) window.clearTimeout(timer);
+  nativeBrowserWebviewCloseTimers.clear();
 }
 
 function scheduleNativeBrowserWebviewSync() {
@@ -18693,7 +22850,11 @@ function scheduleNativeBrowserWebviewSync() {
 }
 
 async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?: boolean; loadUrl?: string; navigate?: boolean } = {}) {
-  if (!USE_NATIVE_BROWSER_WEBVIEW) return;
+  if (!nativeBrowserWebviewAllowedForActiveWorkspace()) {
+    hideNativeBrowserWebview();
+    if (!isBrowserPanelHidden()) loadBrowserTabFallback(tab);
+    return;
+  }
   if (isBrowserPanelHidden() || document.hidden) {
     hideNativeBrowserWebview();
     return;
@@ -18701,12 +22862,14 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
   const requestId = ++nativeBrowserWebviewRequestSeq;
   const label = nativeBrowserWebviewLabelForTab(tab);
   const previousLabel = nativeBrowserWebviewVisible ? nativeBrowserWebviewLabel : '';
+  cancelNativeBrowserWebviewClose(label);
   nativeBrowserWebviewTabId = tab.id;
   nativeBrowserWebviewLabel = label;
   nativeBrowserWebviewUrl = tab.url;
   nativeBrowserWebviewVisible = true;
   hideAllBrowserFrames();
   if (previousLabel && previousLabel !== label) {
+    scheduleNativeBrowserWebviewClose(previousLabel);
     void api.hideBrowserWebview(previousLabel).catch(() => undefined);
   }
   disconnectActiveEdgeCdp();
@@ -19703,7 +23866,8 @@ function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
   }
   if (USE_NATIVE_BROWSER_WEBVIEW) {
     renderBrowserTabActivation(previousActiveId, tab);
-    void showNativeBrowserWebview(tab);
+    if (nativeBrowserWebviewAllowedForActiveWorkspace()) void showNativeBrowserWebview(tab);
+    else loadBrowserTabFallback(tab);
     if (!alreadyActive) logBrowserConsole('info', `Activated tab ${tab.url}`);
     if (shouldSave) saveActiveWorkspaceSnapshot();
     return;
@@ -19739,6 +23903,7 @@ function closeBrowserTab(id: string) {
   const wasActive = state.activeBrowserTabId === id;
   const closedTab = state.browserTabs[index];
   const closedUrl = closedTab.url;
+  closeNativeBrowserWebview(nativeBrowserWebviewLabelForTab(closedTab));
   closeEdgeBrowserTab(closedTab);
   state.browserTabs.splice(index, 1);
   forgetBrowserTab(closedTab);

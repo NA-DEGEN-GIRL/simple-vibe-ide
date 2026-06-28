@@ -7,7 +7,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child as ProcessChild, Command, Stdio};
+use std::process::{Child as ProcessChild, Command, Output, Stdio};
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::Condvar;
@@ -17,8 +19,9 @@ use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
-    State, WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    State, WebviewBuilder, WebviewUrl, WindowEvent,
 };
+use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -33,12 +36,22 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Ole::CF_HDROP;
 
 #[cfg(windows)]
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+
+#[cfg(windows)]
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 #[cfg(windows)]
+use windows::core::BOOL;
+
+#[cfg(windows)]
+use windows::Win32::Foundation::{HWND, LPARAM};
+
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowDisplayAffinity, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE,
+    EnumChildWindows, GetAncestor, GetClassNameW, GetWindowDisplayAffinity,
+    SetWindowDisplayAffinity, GA_ROOT, MB_ICONASTERISK, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR,
+    WDA_NONE, WINDOW_DISPLAY_AFFINITY,
 };
 
 #[cfg(windows)]
@@ -118,14 +131,38 @@ const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
 const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
 const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
 const BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX: &str = "browser-preview-webview";
+const WSL_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(8);
+const WSL_FAST_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(4);
+const WSL_WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
+const WSL_WARMUP_CACHE_TTL: Duration = Duration::from_secs(30);
+const WSL_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
+const WSL_TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(450);
+const REMOTE_SHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+const REMOTE_DIRECTORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(18);
+const LLM_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+const RENDERER_HEARTBEAT_STARTUP_GRACE: Duration = Duration::from_secs(30);
+const RENDERER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const RENDERER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+const RENDERER_RECOVERY_RELOAD_COOLDOWN: Duration = Duration::from_secs(120);
+const RENDERER_RECOVERY_STABLE_AFTER: Duration = Duration::from_secs(35);
+const RENDERER_RECOVERY_WARN_ATTEMPTS: u32 = 3;
+const SNIPPETS_STORE_FILE: &str = "snippets.v1.json";
+const SNIPPETS_STORE_MAX_BYTES: usize = 1024 * 1024;
+const DEFAULT_SNIPPETS_STORE: &str = r#"{"version":1,"activeTabId":"general","tabs":[{"id":"general","title":"General","items":[]}]}"#;
+const LLM_TMUX_SESSION_MAX_LEN: usize = 48;
 
 type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
+
+static WSL_HOME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static WSL_WARMUP_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+static WSL_WARMUP_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
     forwards: Mutex<HashMap<String, ForwardSession>>,
     exports: Mutex<HashMap<String, ExportSession>>,
     edge_sessions: EdgeSessionStore,
+    renderer_health: Mutex<RendererHealthState>,
 }
 
 impl IdeState {
@@ -135,6 +172,7 @@ impl IdeState {
             forwards: Mutex::new(HashMap::new()),
             exports: Mutex::new(HashMap::new()),
             edge_sessions: Arc::new(Mutex::new(HashMap::new())),
+            renderer_health: Mutex::new(RendererHealthState::new()),
         }
     }
 }
@@ -165,6 +203,38 @@ struct ExportSession {
 struct EdgeDevtoolsSessionState {
     child: Option<ProcessChild>,
     port: u16,
+}
+
+struct RendererHealthState {
+    last_heartbeat: Instant,
+    last_reload: Option<Instant>,
+    reload_attempts: u32,
+    pending_notice: Option<RendererRecoveryNotice>,
+}
+
+impl RendererHealthState {
+    fn new() -> Self {
+        Self {
+            last_heartbeat: Instant::now(),
+            last_reload: None,
+            reload_attempts: 0,
+            pending_notice: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RendererRecoveryNotice {
+    kind: String,
+    attempts: u32,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RendererHeartbeatResponse {
+    recovery: Option<RendererRecoveryNotice>,
 }
 
 #[cfg(not(windows))]
@@ -304,7 +374,17 @@ fn default_windows_root() -> String {
 }
 
 fn default_wsl_root(distro: &str) -> String {
-    detect_wsl_home(distro).unwrap_or_else(|| "/home".to_string())
+    let cache = WSL_HOME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(root) = guard.get(distro) {
+            return root.clone();
+        }
+    }
+    let root = detect_wsl_home(distro).unwrap_or_else(|| "/home".to_string());
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(distro.to_string(), root.clone());
+    }
+    root
 }
 
 fn wsl_start_directory_arg(cwd: &str, fallback_cwd: &str) -> String {
@@ -425,11 +505,7 @@ fn wsl_posix_path_to_windows_path(profile: &ConnectionProfile, path: &str) -> Op
     if !normalized.starts_with('/') {
         return None;
     }
-    let distro = profile.distro.as_deref()?;
-    let tail = normalized.trim_start_matches('/').replace('/', "\\");
-    Some(PathBuf::from(format!(
-        "\\\\wsl.localhost\\{distro}\\{tail}"
-    )))
+    None
 }
 
 fn hide_command_window(command: &mut Command) -> &mut Command {
@@ -1054,6 +1130,12 @@ fn push_ssh_background_options(command: &mut Command) {
         .arg("NumberOfPasswordPrompts=1");
 }
 
+fn ssh_remote_bash_command(script: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    let loader = format!(". <(printf %s {encoded} | base64 -d)");
+    format!("bash -lc {}", shell_quote(&loader))
+}
+
 fn ssh_terminal_bootstrap_script(alias: &str, remote_command: &str) -> String {
     let ssh_path = powershell_single_quote(&ssh_executable_string());
     let ssh_add_path = powershell_single_quote(&ssh_add_executable_string());
@@ -1111,11 +1193,11 @@ if ($agentStatus -eq 1) {{
   Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; using the IDE SSH askpass prompt instead.'
 }}
 $sshArgs = @({common_options})
-# Windows PowerShell 5.1 hands native args to ssh.exe inside auto-added quotes WITHOUT
-# escaping embedded double quotes, and ssh.exe's MSVCRT argv parser then strips them.
-# That corrupted the remote bash bootstrap (its rcfile heredoc lost every double quote,
-# so bash aborted at `case ;...;` and never ran the launcher command). Pre-escape each
-# quote, doubling any backslash run in front of it, so the argv round-trip is lossless.
+# Keep the native argv quote escape as a defensive layer, but the terminal bootstrap is
+# primarily passed as a quote-free base64 loader now. Windows PowerShell 5.1 -> ssh.exe
+# can still strip embedded double quotes from native args on some hosts, which corrupts
+# the remote bash rcfile (`case ;...;`). Avoiding those quotes in the ssh argv is the
+# robust path; this replacement protects any future quoted launcher suffix.
 $remoteCommandArg = $remoteCommand -replace '(\\*)"', '$1$1\"'
 $sshArgs += @('-tt', $aliasName, $remoteCommandArg)
 & $ssh @sshArgs
@@ -1296,6 +1378,35 @@ struct ExportProgressEvent {
     directory: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentAlertPayload {
+    title: String,
+    body: String,
+    show_banner: bool,
+    play_sound: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmTmuxSession {
+    name: String,
+    attached: bool,
+    windows: u32,
+    created_at: Option<u64>,
+    activity_at: Option<u64>,
+    legacy: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmTmuxSessionListResult {
+    available: bool,
+    base_name: String,
+    sessions: Vec<LlmTmuxSession>,
+    message: Option<String>,
+}
+
 #[tauri::command]
 fn list_profiles() -> Vec<ConnectionProfile> {
     let mut profiles = vec![ConnectionProfile {
@@ -1357,123 +1468,703 @@ fn answer_ssh_auth_prompt(id: String, secret: Option<String>) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn set_capture_protection(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window is not available".to_string())?;
-    if enabled {
-        show_capture_cover(&app, &window)?;
-    } else {
-        hide_capture_cover(&app);
+fn renderer_heartbeat(state: State<'_, IdeState>) -> RendererHeartbeatResponse {
+    let Ok(mut health) = state.renderer_health.lock() else {
+        return RendererHeartbeatResponse { recovery: None };
+    };
+    let now = Instant::now();
+    health.last_heartbeat = now;
+    if let Some(reload) = health.last_reload {
+        let elapsed = reload.elapsed();
+        if elapsed >= RENDERER_RECOVERY_RELOAD_COOLDOWN {
+            health.reload_attempts = 0;
+            health.last_reload = None;
+            health.pending_notice = None;
+        } else if elapsed >= RENDERER_RECOVERY_STABLE_AFTER {
+            health.pending_notice = None;
+        }
     }
-    set_window_capture_protection(&window, enabled)
+    let recovery = health.pending_notice.clone();
+    RendererHeartbeatResponse { recovery }
 }
 
-fn show_capture_cover<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    main: &tauri::WebviewWindow<R>,
+#[tauri::command]
+fn send_agent_alert(app: AppHandle, payload: AgentAlertPayload) -> Result<(), String> {
+    let title = normalize_agent_alert_text(&payload.title, 96);
+    let body = normalize_agent_alert_text(&payload.body, 180);
+    let mut banner_error = None;
+
+    if payload.show_banner {
+        if let Err(error) = app
+            .notification()
+            .builder()
+            .title(if title.is_empty() {
+                "Simple Vibe IDE".to_string()
+            } else {
+                title
+            })
+            .body(body)
+            .show()
+        {
+            banner_error = Some(error.to_string());
+        }
+    }
+
+    if payload.play_sound {
+        play_native_agent_alert_sound();
+    }
+
+    if let Some(error) = banner_error {
+        Err(format!("notification banner failed: {error}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_agent_alert_text(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    for ch in value.chars() {
+        if count >= max_chars {
+            out.push('…');
+            break;
+        }
+        if ch == '\r' || ch == '\n' || ch == '\t' {
+            out.push(' ');
+            count += 1;
+        } else if !ch.is_control() {
+            out.push(ch);
+            count += 1;
+        }
+    }
+    out.trim().to_string()
+}
+
+#[cfg(windows)]
+fn play_native_agent_alert_sound() {
+    let _ = unsafe { MessageBeep(MB_ICONASTERISK) };
+}
+
+#[cfg(not(windows))]
+fn play_native_agent_alert_sound() {}
+
+#[tauri::command]
+async fn list_llm_tmux_sessions(
+    profile_id: String,
+    cwd: String,
+    workspace_id: String,
+    agent_id: String,
+) -> Result<LlmTmuxSessionListResult, String> {
+    run_blocking_command("list llm tmux sessions", move || {
+        let profile = profile_from_id(&profile_id);
+        let cwd = normalize_profile_path(&profile, &cwd);
+        list_llm_tmux_sessions_direct(&profile, &cwd, &workspace_id, &agent_id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn next_llm_tmux_session(
+    profile_id: String,
+    cwd: String,
+    workspace_id: String,
+    agent_id: String,
+) -> Result<String, String> {
+    run_blocking_command("next llm tmux session", move || {
+        let profile = profile_from_id(&profile_id);
+        let cwd = normalize_profile_path(&profile, &cwd);
+        next_llm_tmux_session_direct(&profile, &cwd, &workspace_id, &agent_id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn kill_llm_tmux_session(
+    profile_id: String,
+    cwd: String,
+    session_name: String,
 ) -> Result<(), String> {
-    let cover = create_capture_cover(app)?;
-    sync_capture_cover(main, &cover)?;
+    run_blocking_command("kill llm tmux session", move || {
+        if !is_safe_llm_tmux_session_name(&session_name) {
+            return Err("invalid tmux session name".to_string());
+        }
+        let profile = profile_from_id(&profile_id);
+        let cwd = normalize_profile_path(&profile, &cwd);
+        kill_llm_tmux_session_direct(&profile, &cwd, &session_name)
+    })
+    .await
+}
+
+fn list_llm_tmux_sessions_direct(
+    profile: &ConnectionProfile,
+    _cwd: &str,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Result<LlmTmuxSessionListResult, String> {
+    let base_name = llm_tmux_session_base_name(workspace_id, agent_id);
+    if profile.kind == "windows" {
+        return Ok(LlmTmuxSessionListResult {
+            available: false,
+            base_name,
+            sessions: Vec::new(),
+            message: Some("tmux is only used for WSL/SSH profiles".to_string()),
+        });
+    }
+    let output = run_profile_shell_with_timeout(
+        profile,
+        "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; tmux list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{session_activity}' 2>/dev/null || true",
+        None,
+        LLM_TMUX_COMMAND_TIMEOUT,
+    )?;
+    let text = String::from_utf8_lossy(&output);
+    if text
+        .lines()
+        .any(|line| line.trim() == "__SVI_TMUX_MISSING__")
+    {
+        return Ok(LlmTmuxSessionListResult {
+            available: false,
+            base_name,
+            sessions: Vec::new(),
+            message: Some("tmux is not installed on this profile".to_string()),
+        });
+    }
+    let mut sessions = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if !is_llm_tmux_session_for_base(name, &base_name) || !is_safe_llm_tmux_session_name(name) {
+            continue;
+        }
+        let attached = parts.next().unwrap_or("0") == "1";
+        let windows = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let created_at = parts.next().and_then(|value| value.parse().ok());
+        let activity_at = parts.next().and_then(|value| value.parse().ok());
+        sessions.push(LlmTmuxSession {
+            name: name.to_string(),
+            attached,
+            windows,
+            created_at,
+            activity_at,
+            legacy: name == base_name,
+        });
+    }
+    sessions.sort_by(|left, right| {
+        llm_tmux_session_sort_key(&left.name, &base_name)
+            .cmp(&llm_tmux_session_sort_key(&right.name, &base_name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(LlmTmuxSessionListResult {
+        available: true,
+        base_name,
+        sessions,
+        message: None,
+    })
+}
+
+fn next_llm_tmux_session_direct(
+    profile: &ConnectionProfile,
+    cwd: &str,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Result<String, String> {
+    let list = list_llm_tmux_sessions_direct(profile, cwd, workspace_id, agent_id)?;
+    let base = list.base_name;
+    let used = list
+        .sessions
+        .iter()
+        .filter_map(|session| llm_tmux_session_index(&session.name, &base))
+        .collect::<HashSet<_>>();
+    for index in 1..1000 {
+        if !used.contains(&index) {
+            return Ok(numbered_llm_tmux_session_name(&base, index));
+        }
+    }
+    Ok(numbered_llm_tmux_session_name(&base, 1000))
+}
+
+fn kill_llm_tmux_session_direct(
+    profile: &ConnectionProfile,
+    _cwd: &str,
+    session_name: &str,
+) -> Result<(), String> {
+    if profile.kind == "windows" {
+        return Err("tmux is only used for WSL/SSH profiles".to_string());
+    }
+    let script = format!(
+        "if ! command -v tmux >/dev/null 2>&1; then echo 'tmux is not installed' >&2; exit 127; fi; tmux kill-session -t {}",
+        shell_quote(session_name)
+    );
+    run_profile_shell_with_timeout(profile, &script, None, LLM_TMUX_COMMAND_TIMEOUT).map(|_| ())
+}
+
+fn llm_tmux_session_base_name(workspace_id: &str, agent_id: &str) -> String {
+    let workspace_part = sanitize_llm_tmux_part(workspace_id, "workspace", 14);
+    let agent_part = sanitize_llm_tmux_part(agent_id, "agent", LLM_TMUX_SESSION_MAX_LEN);
+    trim_llm_tmux_session_name(&format!("svi_{workspace_part}_{agent_part}"))
+}
+
+fn sanitize_llm_tmux_part(value: &str, fallback: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        let next = if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            ch
+        } else {
+            '_'
+        };
+        out.push(next);
+        if out.len() >= max_len {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn trim_llm_tmux_session_name(value: &str) -> String {
+    value.chars().take(LLM_TMUX_SESSION_MAX_LEN).collect()
+}
+
+fn numbered_llm_tmux_session_name(base: &str, index: u32) -> String {
+    let suffix = format!("_{index}");
+    let base_len = LLM_TMUX_SESSION_MAX_LEN.saturating_sub(suffix.len());
+    let mut name: String = base.chars().take(base_len).collect();
+    name.push_str(&suffix);
+    name
+}
+
+fn is_safe_llm_tmux_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= LLM_TMUX_SESSION_MAX_LEN
+        && name.starts_with("svi_")
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn is_llm_tmux_session_for_base(name: &str, base: &str) -> bool {
+    if name == base {
+        return true;
+    }
+    llm_tmux_session_index(name, base).is_some()
+}
+
+fn llm_tmux_session_index(name: &str, base: &str) -> Option<u32> {
+    let suffix = name.strip_prefix(base)?.strip_prefix('_')?;
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+fn llm_tmux_session_sort_key(name: &str, base: &str) -> u32 {
+    if name == base {
+        0
+    } else {
+        llm_tmux_session_index(name, base).unwrap_or(u32::MAX)
+    }
+}
+
+#[tauri::command]
+fn read_snippets_store(app: AppHandle) -> Result<String, String> {
+    let path = snippets_store_path(&app)?;
+    if !path.exists() {
+        return Ok(DEFAULT_SNIPPETS_STORE.to_string());
+    }
+    let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+    if metadata.len() as usize > SNIPPETS_STORE_MAX_BYTES {
+        return Err("Snippets store is too large".to_string());
+    }
+    fs::read_to_string(path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn write_snippets_store(app: AppHandle, payload: String) -> Result<(), String> {
+    if payload.len() > SNIPPETS_STORE_MAX_BYTES {
+        return Err("Snippets store is too large".to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(&payload).map_err(|error| error.to_string())?;
+    let path = snippets_store_path(&app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, payload).map_err(|error| error.to_string())
+}
+
+fn snippets_store_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    Ok(dir.join(SNIPPETS_STORE_FILE))
+}
+
+fn main_webview_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Option<tauri::WebviewWindow<R>> {
+    app.get_webview_window("main").or_else(|| {
+        app.webview_windows()
+            .into_iter()
+            .find(|(label, _)| !is_auxiliary_webview_label(label))
+            .map(|(_, window)| window)
+    })
+}
+
+fn main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<tauri::Window<R>> {
+    app.get_window("main").or_else(|| {
+        app.windows()
+            .into_iter()
+            .find(|(label, _)| !is_auxiliary_webview_label(label))
+            .map(|(_, window)| window)
+    })
+}
+
+fn is_auxiliary_webview_label(label: &str) -> bool {
+    label == "capture-cover" || is_browser_webview_label(label)
+}
+
+#[tauri::command]
+fn set_capture_protection(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled {
+        close_capture_cover(&app);
+        if let Err(error) = set_app_capture_protection(&app, true) {
+            CAPTURE_PROTECTION_ACTIVE.store(false, Ordering::Relaxed);
+            return Err(format!("failed to enable capture protection: {error}"));
+        }
+        CAPTURE_PROTECTION_ACTIVE.store(true, Ordering::Relaxed);
+    } else {
+        CAPTURE_PROTECTION_ACTIVE.store(false, Ordering::Relaxed);
+        if let Err(error) = set_app_capture_protection(&app, false) {
+            close_capture_cover(&app);
+            return Err(format!("failed to disable capture protection: {error}"));
+        }
+        close_capture_cover(&app);
+    }
     Ok(())
 }
 
-fn create_capture_cover<R: tauri::Runtime>(
+fn set_app_capture_protection<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-) -> Result<tauri::WebviewWindow<R>, String> {
-    if let Some(window) = app.get_webview_window("capture-cover") {
-        return Ok(window);
+    enabled: bool,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if let Some(hwnd) = cached_main_hwnd() {
+            match set_hwnd_capture_protection(hwnd, enabled) {
+                Ok(()) => return Ok(()),
+                Err(cached_error) => {
+                    forget_main_hwnd();
+                    let window = main_webview_window(app).ok_or_else(|| {
+                        let labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
+                        format!(
+                            "cached main window handle failed: {cached_error}; main window handle is not available; open webview windows: {labels:?}"
+                        )
+                    })?;
+                    return set_window_capture_protection(&window, enabled).map_err(|error| {
+                        format!(
+                            "cached main window handle failed: {cached_error}; refreshed main window handle also failed: {error}"
+                        )
+                    });
+                }
+            }
+        }
+        let window = main_webview_window(app).ok_or_else(|| {
+            let labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
+            format!("main window handle is not available; open webview windows: {labels:?}")
+        })?;
+        set_window_capture_protection(&window, enabled)
     }
-
-    WebviewWindowBuilder::new(
-        app,
-        "capture-cover",
-        WebviewUrl::App("capture-cover.html".into()),
-    )
-    .title("Protected Workspace")
-    .decorations(false)
-    .resizable(false)
-    .visible(false)
-    .skip_taskbar(true)
-    .shadow(false)
-    .build()
-    .map_err(|error| error.to_string())
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        if enabled {
+            Err("capture protection is only available on Windows".to_string())
+        } else {
+            Ok(())
+        }
+    }
 }
 
-fn hide_capture_cover<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if let Some(cover) = app.get_webview_window("capture-cover") {
-        let _ = cover.hide();
+fn refresh_active_capture_protection<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if !CAPTURE_PROTECTION_ACTIVE.load(Ordering::Relaxed) {
+        return;
     }
+    let _ = set_app_capture_protection(app, true);
 }
 
+// Do not create a separate top-level protection window. OBS Window Capture can
+// bind to that decoy and keep showing its startup white frame even when
+// protection is off. This cleanup hook only closes stale cover windows from
+// older builds/processes.
 fn close_capture_cover<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(cover) = app.get_webview_window("capture-cover") {
         let _ = cover.close();
     }
 }
 
-fn sync_capture_cover<R: tauri::Runtime>(
-    main: &tauri::WebviewWindow<R>,
-    cover: &tauri::WebviewWindow<R>,
-) -> Result<(), String> {
-    let position = main.outer_position().map_err(|error| error.to_string())?;
-    let size = main.outer_size().map_err(|error| error.to_string())?;
-    cover
-        .set_position(PhysicalPosition::new(position.x, position.y))
-        .map_err(|error| error.to_string())?;
-    cover
-        .set_size(PhysicalSize::new(size.width, size.height))
-        .map_err(|error| error.to_string())?;
-    position_capture_cover_behind_main(main, cover, position, size)?;
-    bring_window_to_front(main);
-    Ok(())
-}
-
+// Set true only while capture protection is enabled. The window move/resize/focus
+// handlers check this first so unprotected workspaces pay just one atomic load
+// per event instead of a window-registry lookup.
+static CAPTURE_PROTECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
-fn position_capture_cover_behind_main<R: tauri::Runtime>(
-    main: &tauri::WebviewWindow<R>,
-    cover: &tauri::WebviewWindow<R>,
-    position: PhysicalPosition<i32>,
-    size: PhysicalSize<u32>,
-) -> Result<(), String> {
-    let main_hwnd = main.hwnd().map_err(|error| error.to_string())?;
-    let cover_hwnd = cover.hwnd().map_err(|error| error.to_string())?;
-    unsafe {
-        SetWindowPos(
-            cover_hwnd,
-            Some(main_hwnd),
-            position.x,
-            position.y,
-            size.width as i32,
-            size.height as i32,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-    }
-    .map_err(|error| error.to_string())
-}
-
-#[cfg(not(windows))]
-fn position_capture_cover_behind_main<R: tauri::Runtime>(
-    _main: &tauri::WebviewWindow<R>,
-    cover: &tauri::WebviewWindow<R>,
-    _position: PhysicalPosition<i32>,
-    _size: PhysicalSize<u32>,
-) -> Result<(), String> {
-    cover.show().map_err(|error| error.to_string())
-}
+static MAIN_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
+static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 fn set_window_capture_protection<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     enabled: bool,
 ) -> Result<(), String> {
-    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    let hwnd = main_capture_hwnd(window)?;
+    set_hwnd_capture_protection(hwnd, enabled)
+}
+
+#[cfg(windows)]
+fn set_hwnd_capture_protection(hwnd: HWND, enabled: bool) -> Result<(), String> {
+    // WDA_EXCLUDEFROMCAPTURE (not WDA_MONITOR): it is the framework-aligned value
+    // used by Tao/Tauri, but we call the native API directly instead of
+    // WebviewWindow::set_content_protected. In the active workspace toggle path
+    // the Tauri wrapper can leave the IPC promise unresolved; a direct user32
+    // call keeps this command synchronous and observable.
     let affinity = if enabled {
         WDA_EXCLUDEFROMCAPTURE
     } else {
         WDA_NONE
     };
-    unsafe { SetWindowDisplayAffinity(hwnd, affinity) }.map_err(|error| error.to_string())
+    let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let root_hwnd = if root_hwnd.0.is_null() {
+        hwnd
+    } else {
+        root_hwnd
+    };
+
+    let applied_affinity = set_display_affinity_strict(root_hwnd, affinity, enabled)?;
+
+    let root_affinity = query_display_affinity(root_hwnd)
+        .map(|value| affinity_label(value).to_string())
+        .unwrap_or_else(|error| format!("query failed: {error}"));
+    let mut child_successes = 0usize;
+    let mut child_failures = 0usize;
+    let mut child_warnings = Vec::new();
+
+    for child in descendant_hwnds(root_hwnd) {
+        match unsafe { SetWindowDisplayAffinity(child, applied_affinity) } {
+            Ok(()) => {
+                child_successes += 1;
+                match query_display_affinity(child) {
+                    Ok(value) if !affinity_is_expected(enabled, value) => {
+                        child_warnings.push(format!(
+                            "{} reported {} after setting {}",
+                            hwnd_description(child),
+                            affinity_label(value),
+                            affinity_label(applied_affinity.0)
+                        ));
+                    }
+                    Err(error) => {
+                        child_warnings.push(format!(
+                            "{} affinity query failed after setting {}: {error}",
+                            hwnd_description(child),
+                            affinity_label(applied_affinity.0)
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) => {
+                child_failures += 1;
+                if is_likely_capture_child(child) {
+                    child_warnings.push(format!(
+                        "{} failed to set {}: {error}",
+                        hwnd_description(child),
+                        affinity_label(applied_affinity.0)
+                    ));
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "capture protection {}: root={} observed={} child_set={} child_failed={}",
+        if enabled { "enabled" } else { "disabled" },
+        hwnd_description(root_hwnd),
+        root_affinity,
+        child_successes,
+        child_failures
+    );
+    for warning in child_warnings.into_iter().take(8) {
+        eprintln!("capture protection warning: {warning}");
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn main_capture_hwnd<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> Result<HWND, String> {
+    if let Some(hwnd) = cached_main_hwnd() {
+        return Ok(hwnd);
+    }
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    remember_main_hwnd(hwnd);
+    Ok(hwnd)
+}
+
+#[cfg(windows)]
+fn remember_main_hwnd(hwnd: HWND) {
+    if !hwnd.0.is_null() {
+        MAIN_WINDOW_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn forget_main_hwnd() {
+    MAIN_WINDOW_HWND.store(0, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn cached_main_hwnd() -> Option<HWND> {
+    let raw = MAIN_WINDOW_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        None
+    } else {
+        Some(HWND(raw as *mut core::ffi::c_void))
+    }
+}
+
+#[cfg(windows)]
+fn set_display_affinity_strict(
+    hwnd: HWND,
+    affinity: WINDOW_DISPLAY_AFFINITY,
+    enabled: bool,
+) -> Result<WINDOW_DISPLAY_AFFINITY, String> {
+    let mut applied_affinity = affinity;
+    if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
+        if enabled && affinity.0 == WDA_EXCLUDEFROMCAPTURE.0 {
+            let first_error = format_display_affinity_error(hwnd, error, true);
+            unsafe { SetWindowDisplayAffinity(hwnd, WDA_MONITOR) }.map_err(|fallback_error| {
+                format!(
+                    "{first_error}; WDA_MONITOR fallback also failed: {}",
+                    format_display_affinity_error(hwnd, fallback_error, true)
+                )
+            })?;
+            applied_affinity = WDA_MONITOR;
+            eprintln!(
+                "capture protection fallback: {} rejected WDA_EXCLUDEFROMCAPTURE; using WDA_MONITOR",
+                hwnd_description(hwnd)
+            );
+        } else {
+            return Err(format_display_affinity_error(hwnd, error, enabled));
+        }
+    }
+
+    match query_display_affinity(hwnd) {
+        Ok(value) if !affinity_is_expected(enabled, value) => Err(format!(
+            "{} reported {} after setting {}",
+            hwnd_description(hwnd),
+            affinity_label(value),
+            affinity_label(applied_affinity.0)
+        )),
+        _ => Ok(applied_affinity),
+    }
+}
+
+#[cfg(windows)]
+fn format_display_affinity_error(hwnd: HWND, error: windows::core::Error, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "{} on {} (WDA_EXCLUDEFROMCAPTURE requires DWM and Windows 10 version 2004 / build 19041 or newer)",
+            error,
+            hwnd_description(hwnd)
+        )
+    } else {
+        format!("{} on {}", error, hwnd_description(hwnd))
+    }
+}
+
+#[cfg(windows)]
+fn descendant_hwnds(root_hwnd: HWND) -> Vec<HWND> {
+    let mut children = Vec::new();
+    unsafe extern "system" fn collect_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let children = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+        children.push(hwnd);
+        true.into()
+    }
+
+    let lparam = LPARAM(&mut children as *mut Vec<HWND> as isize);
+    let _ = unsafe { EnumChildWindows(Some(root_hwnd), Some(collect_child), lparam) };
+    children
+}
+
+#[cfg(windows)]
+fn query_display_affinity(hwnd: HWND) -> Result<u32, String> {
+    let mut value = 0u32;
+    unsafe { GetWindowDisplayAffinity(hwnd, &mut value) }.map_err(|error| error.to_string())?;
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn affinity_is_expected(enabled: bool, value: u32) -> bool {
+    if enabled {
+        value == WDA_EXCLUDEFROMCAPTURE.0 || value == WDA_MONITOR.0
+    } else {
+        value == WDA_NONE.0
+    }
+}
+
+#[cfg(windows)]
+fn affinity_label(value: u32) -> &'static str {
+    match value {
+        value if value == WDA_NONE.0 => "WDA_NONE",
+        value if value == WDA_MONITOR.0 => "WDA_MONITOR",
+        value if value == WDA_EXCLUDEFROMCAPTURE.0 => "WDA_EXCLUDEFROMCAPTURE",
+        _ => "UNKNOWN",
+    }
+}
+
+#[cfg(windows)]
+fn hwnd_description(hwnd: HWND) -> String {
+    match window_class_name(hwnd) {
+        Some(class_name) => format!("{} class={class_name}", hwnd_hex(hwnd)),
+        None => hwnd_hex(hwnd),
+    }
+}
+
+#[cfg(windows)]
+fn hwnd_hex(hwnd: HWND) -> String {
+    format!("0x{:X}", hwnd.0 as usize)
+}
+
+#[cfg(windows)]
+fn window_class_name(hwnd: HWND) -> Option<String> {
+    let mut buffer = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if len <= 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+#[cfg(windows)]
+fn is_likely_capture_child(hwnd: HWND) -> bool {
+    window_class_name(hwnd)
+        .map(|class_name| {
+            class_name.contains("Chrome")
+                || class_name.contains("WebView")
+                || class_name.contains("Widget")
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(not(windows))]
@@ -1521,7 +2212,14 @@ where
 }
 
 #[tauri::command]
-fn resolve_profile_path(profile_id: String, path: String) -> Result<String, String> {
+async fn resolve_profile_path(profile_id: String, path: String) -> Result<String, String> {
+    run_blocking_command("resolve profile path", move || {
+        resolve_profile_path_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn resolve_profile_path_blocking(profile_id: String, path: String) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let trimmed = path.trim();
     if profile.kind == "wsl" && (trimmed.is_empty() || trimmed == "~") {
@@ -1724,7 +2422,8 @@ fn remote_file_signature(profile: &ConnectionProfile, path: &str) -> Result<Stri
         "stat -c '%Y:%s' -- {0} 2>/dev/null || stat -f '%m:%z' -- {0}",
         shell_quote(path)
     );
-    let bytes = run_profile_shell(profile, &script, None)?;
+    let bytes =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
     let signature = String::from_utf8_lossy(&bytes).trim().to_string();
     if signature.is_empty() {
         return Err("could not stat remote file".to_string());
@@ -2327,6 +3026,7 @@ fn spawn_terminal_direct(
 ) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let cwd = normalize_profile_path(&profile, &cwd);
+    warm_wsl_profile(&profile)?;
     let (program, args) = terminal_command(&profile, &cwd, command.clone());
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -2525,18 +3225,29 @@ fn resize_terminal_host(state: &IdeState, id: String, rows: u16, cols: u16) -> R
 }
 
 fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
-    let mut terminals = state
+    let session = state
         .terminals
         .lock()
-        .map_err(|_| "terminal state poisoned".to_string())?;
-    if let Some(mut session) = terminals.remove(&id) {
-        if let Some(pid) = session.child.process_id() {
-            kill_process_tree(pid);
-        }
-        let _ = session.child.kill();
-        let _ = session.child.wait();
+        .map_err(|_| "terminal state poisoned".to_string())?
+        .remove(&id);
+    if let Some(session) = session {
+        terminate_terminal_session_background(session);
     }
     Ok(())
+}
+
+fn terminate_terminal_session_background(session: TerminalSession) {
+    let _ = thread::Builder::new()
+        .name("simple-vibe-terminal-kill".to_string())
+        .spawn(move || terminate_terminal_session(session));
+}
+
+fn terminate_terminal_session(mut session: TerminalSession) {
+    if let Some(pid) = session.child.process_id() {
+        kill_process_tree(pid);
+    }
+    let _ = session.child.kill();
+    let _ = session.child.wait();
 }
 
 fn drain_runtime_sessions(state: &IdeState) -> RuntimeShutdownBatch {
@@ -2563,12 +3274,8 @@ fn drain_runtime_sessions(state: &IdeState) -> RuntimeShutdownBatch {
 }
 
 fn terminate_runtime_sessions(batch: RuntimeShutdownBatch) {
-    for mut session in batch.terminals {
-        if let Some(pid) = session.child.process_id() {
-            kill_process_tree(pid);
-        }
-        let _ = session.child.kill();
-        let _ = session.child.wait();
+    for session in batch.terminals {
+        terminate_terminal_session(session);
     }
 
     for mut forward in batch.forwards {
@@ -2603,6 +3310,132 @@ fn shutdown_runtime_sessions_background(state: &IdeState) {
     let _ = thread::Builder::new()
         .name("simple-vibe-runtime-shutdown".to_string())
         .spawn(move || terminate_runtime_sessions(batch));
+}
+
+fn shutdown_app_runtime(app: &AppHandle) {
+    close_capture_cover(app);
+    let _ = close_browser_webview(app.clone(), None);
+    shutdown_runtime_sessions_background(app.state::<IdeState>().inner());
+    shutdown_session_ssh_agent();
+}
+
+fn request_app_exit(app: AppHandle) {
+    if APP_EXIT_REQUESTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    shutdown_app_runtime(&app);
+    let _ = thread::Builder::new()
+        .name("simple-vibe-app-exit".to_string())
+        .spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            app.exit(0);
+            thread::sleep(Duration::from_millis(900));
+            std::process::exit(0);
+        });
+}
+
+fn start_renderer_watchdog(app: AppHandle) {
+    let _ = thread::Builder::new()
+        .name("simple-vibe-renderer-watchdog".to_string())
+        .spawn(move || {
+            if !sleep_renderer_watchdog(RENDERER_HEARTBEAT_STARTUP_GRACE) {
+                return;
+            }
+            if let Ok(mut health) = app.state::<IdeState>().renderer_health.lock() {
+                health.last_heartbeat = Instant::now();
+            }
+
+            loop {
+                if !sleep_renderer_watchdog(RENDERER_HEARTBEAT_CHECK_INTERVAL) {
+                    return;
+                }
+
+                let Some(notice) = renderer_watchdog_recovery_notice(&app) else {
+                    continue;
+                };
+                let _ = app.emit("renderer-recovery", notice);
+
+                let reload_app = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // A renderer reload cannot reattach the current JS objects to
+                    // in-process PTYs or child WebViews. Drain them deliberately
+                    // so recovery does not leave orphaned shells/WebView2
+                    // processes behind. Workspace snapshots recreate fresh
+                    // shells after reload.
+                    let _ = close_browser_webview(reload_app.clone(), None);
+                    shutdown_runtime_sessions_background(reload_app.state::<IdeState>().inner());
+                    if let Some(window) = main_webview_window(&reload_app) {
+                        let _ = window.reload();
+                    }
+                });
+            }
+        });
+}
+
+fn sleep_renderer_watchdog(duration: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return false;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= duration {
+            return true;
+        }
+        let remaining = duration.saturating_sub(elapsed);
+        thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+fn renderer_watchdog_recovery_notice(app: &AppHandle) -> Option<RendererRecoveryNotice> {
+    let now = Instant::now();
+    let state = app.state::<IdeState>();
+    let Ok(mut health) = state.renderer_health.lock() else {
+        return None;
+    };
+    if health.last_heartbeat.elapsed() < RENDERER_HEARTBEAT_TIMEOUT {
+        return None;
+    }
+    if health
+        .last_reload
+        .map(|last| last.elapsed() < RENDERER_RECOVERY_RELOAD_COOLDOWN)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    health.reload_attempts = health.reload_attempts.saturating_add(1);
+    health.last_reload = Some(now);
+    // Reset the timestamp before scheduling the reload so the watchdog does
+    // not immediately trigger again while WebView2 is recreating the renderer.
+    health.last_heartbeat = now;
+    let attempts = health.reload_attempts;
+    let message = if attempts > RENDERER_RECOVERY_WARN_ATTEMPTS {
+        format!(
+            "Renderer stopped responding repeatedly (attempt {attempts}); reloading the UI and restarting runtime sessions"
+        )
+    } else {
+        format!("Renderer stopped responding; recovering the UI (attempt {attempts})")
+    };
+    let notice = RendererRecoveryNotice {
+        kind: if attempts > RENDERER_RECOVERY_WARN_ATTEMPTS {
+            "repeated-reload".to_string()
+        } else {
+            "reload".to_string()
+        },
+        attempts,
+        message,
+    };
+    health.pending_notice = Some(notice.clone());
+    Some(notice)
+}
+
+#[tauri::command]
+fn force_quit_app(app: tauri::AppHandle) {
+    request_app_exit(app);
 }
 
 fn start_port_forward_host(
@@ -2816,9 +3649,8 @@ fn stop_port_forward_host(state: &IdeState, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn spawn_terminal(
+async fn spawn_terminal(
     app: tauri::AppHandle,
-    state: State<'_, IdeState>,
     profile_id: String,
     cwd: String,
     command: Option<String>,
@@ -2827,17 +3659,21 @@ fn spawn_terminal(
     workspace_id: Option<String>,
     title: Option<String>,
 ) -> Result<String, String> {
-    spawn_terminal_direct(
-        app,
-        &state,
-        profile_id,
-        cwd,
-        command,
-        rows,
-        cols,
-        workspace_id,
-        title,
-    )
+    run_blocking_command("spawn terminal", move || {
+        let state = app.state::<IdeState>();
+        spawn_terminal_direct(
+            app.clone(),
+            state.inner(),
+            profile_id,
+            cwd,
+            command,
+            rows,
+            cols,
+            workspace_id,
+            title,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2856,8 +3692,12 @@ fn resize_terminal(
 }
 
 #[tauri::command]
-fn kill_terminal(state: State<'_, IdeState>, id: String) -> Result<(), String> {
-    kill_terminal_host(&state, id)
+async fn kill_terminal(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    run_blocking_command("kill terminal", move || {
+        let state = app.state::<IdeState>();
+        kill_terminal_host(state.inner(), id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2946,12 +3786,14 @@ async fn show_browser_webview(
                 .map_err(|error| error.to_string())?;
         }
         webview.show().map_err(|error| error.to_string())?;
+        refresh_active_capture_protection(&app);
         return Ok(());
     }
 
-    let main = app
-        .get_window("main")
-        .ok_or_else(|| "main window is not available".to_string())?;
+    let main = main_window(&app).ok_or_else(|| {
+        let labels = app.windows().keys().cloned().collect::<Vec<_>>();
+        format!("main window is not available; open windows: {labels:?}")
+    })?;
     let app_for_load = app.clone();
     let label_for_load = label.clone();
     let webview_builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed_url))
@@ -2968,11 +3810,14 @@ async fn show_browser_webview(
                     event: event.to_string(),
                 },
             );
+            refresh_active_capture_protection(&app_for_load);
         });
     let webview = main
         .add_child(webview_builder, position, size)
         .map_err(|error| error.to_string())?;
-    webview.show().map_err(|error| error.to_string())
+    webview.show().map_err(|error| error.to_string())?;
+    refresh_active_capture_protection(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2989,6 +3834,27 @@ fn hide_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), Str
             continue;
         }
         webview.hide().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn close_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), String> {
+    // Child WebViews keep running media after `hide()`. Use close() only at true
+    // destroy boundaries (panel/workspace close), while workspace switching can
+    // still hide and later re-show a preserved preview without reloading.
+    if let Some(label) = label {
+        let label = normalize_browser_webview_label(Some(label))?;
+        if let Some(webview) = app.get_webview(&label) {
+            webview.close().map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    for (label, webview) in app.webviews() {
+        if !is_browser_webview_label(&label) {
+            continue;
+        }
+        webview.close().map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -3430,6 +4296,16 @@ fn detect_wsl_distros() -> Vec<String> {
 }
 
 fn detect_wsl_home(distro: &str) -> Option<String> {
+    if let Some(user) = detect_wsl_user(distro) {
+        if user == "root" {
+            return Some("/root".to_string());
+        }
+        if let Some(home) = detect_wsl_home_for_user(distro, &user) {
+            return Some(home);
+        }
+        return Some(format!("/{}/{}", "home", user));
+    }
+
     let mut direct = Command::new("wsl.exe");
     direct
         .current_dir(windows_spawn_cwd())
@@ -3439,7 +4315,7 @@ fn detect_wsl_home(distro: &str) -> Option<String> {
         .arg("~")
         .arg("--exec")
         .arg("pwd");
-    if let Ok(output) = hide_command_window(&mut direct).output() {
+    if let Ok(output) = command_output_with_timeout(&mut direct, WSL_HOME_DETECT_TIMEOUT) {
         if let Some(home) = detect_wsl_home_from_output(output) {
             return Some(home);
         }
@@ -3454,8 +4330,13 @@ fn detect_wsl_home(distro: &str) -> Option<String> {
         .arg("sh")
         .arg("-lc")
         .arg("printf %s \"$HOME\"");
-    let output = hide_command_window(&mut command).output().ok()?;
-    detect_wsl_home_from_output(output)
+    if let Ok(output) = command_output_with_timeout(&mut command, WSL_HOME_DETECT_TIMEOUT) {
+        if let Some(home) = detect_wsl_home_from_output(output) {
+            return Some(home);
+        }
+    }
+
+    None
 }
 
 fn detect_wsl_home_from_output(output: std::process::Output) -> Option<String> {
@@ -3470,6 +4351,46 @@ fn detect_wsl_home_from_output(output: std::process::Output) -> Option<String> {
         }
     }
     None
+}
+
+fn detect_wsl_user(distro: &str) -> Option<String> {
+    let mut command = Command::new("wsl.exe");
+    command
+        .current_dir(windows_spawn_cwd())
+        .arg("-d")
+        .arg(distro)
+        .arg("--exec")
+        .arg("id")
+        .arg("-un");
+    let output = command_output_with_timeout(&mut command, WSL_FAST_HOME_DETECT_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+    let user = text.trim();
+    (!user.is_empty()
+        && !user.contains('/')
+        && !user.contains('\\')
+        && !user.contains(char::is_whitespace))
+    .then(|| user.to_string())
+}
+
+fn detect_wsl_home_for_user(distro: &str, user: &str) -> Option<String> {
+    let script = format!(
+        "h=$(/usr/bin/getent passwd {} 2>/dev/null | /usr/bin/cut -d: -f6); [ -n \"$h\" ] && printf %s \"$h\"",
+        shell_quote(user)
+    );
+    let mut command = Command::new("wsl.exe");
+    command
+        .current_dir(windows_spawn_cwd())
+        .arg("-d")
+        .arg(distro)
+        .arg("--exec")
+        .arg("sh")
+        .arg("-lc")
+        .arg(script);
+    let output = command_output_with_timeout(&mut command, WSL_FAST_HOME_DETECT_TIMEOUT).ok()?;
+    detect_wsl_home_from_output(output)
 }
 
 fn detect_ssh_aliases() -> Vec<String> {
@@ -3596,21 +4517,12 @@ fn terminal_command(
                 .ssh_alias
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
-            let remote_command = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
-                format!(
-                    "bash -lc {}",
-                    shell_quote(&bash_bootstrap_script(
-                        Some(cwd),
-                        Some(&profile.root),
-                        Some(&command)
-                    ))
-                )
+            let remote_script = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
+                bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command))
             } else {
-                format!(
-                    "bash -lc {}",
-                    shell_quote(&bash_bootstrap_script(Some(cwd), Some(&profile.root), None))
-                )
+                bash_bootstrap_script(Some(cwd), Some(&profile.root), None)
             };
+            let remote_command = ssh_remote_bash_command(&remote_script);
             (
                 "powershell.exe".to_string(),
                 vec![
@@ -3675,8 +4587,11 @@ fn bash_bootstrap_script(
     ));
     script.push_str(
         "exec bash --rcfile <(cat <<'__SVIDE_RC__'\n\
-[ -f ~/.bashrc ] && . ~/.bashrc\n\
 __simple_vibe_ide_prompt_command() { local __sv_status=$?; printf '\\033]7;file://simple-vibe-ide%s\\033\\\\' \"$PWD\"; return $__sv_status; }\n\
+case \";${PROMPT_COMMAND:-};\" in *__simple_vibe_ide_prompt_command*) ;; *) PROMPT_COMMAND=\"__simple_vibe_ide_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}\" ;; esac\n\
+export PROMPT_COMMAND\n\
+__simple_vibe_ide_prompt_command\n\
+[ -f ~/.bashrc ] && . ~/.bashrc\n\
 case \";${PROMPT_COMMAND:-};\" in *__simple_vibe_ide_prompt_command*) ;; *) PROMPT_COMMAND=\"__simple_vibe_ide_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}\" ;; esac\n\
 export PROMPT_COMMAND\n\
 __simple_vibe_ide_prompt_command\n\
@@ -4188,7 +5103,8 @@ fn list_remote_directory(
 find {quoted_path} -mindepth 1 -maxdepth 1 -printf '%y\t{size_format}\t%f\n' 2>/dev/null || exit 3
 "#,
     );
-    let bytes = run_profile_shell(profile, &script, None)?;
+    let bytes =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut entries = Vec::new();
     for line in text.lines() {
@@ -4247,7 +5163,8 @@ printf '__SVIDE_DIR_END__\\t{index}\\n'\n"
         ));
     }
 
-    let bytes = run_profile_shell(profile, &script, None)?;
+    let bytes =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
     Ok(parse_remote_directory_batch(
         paths,
         &String::from_utf8_lossy(&bytes),
@@ -4702,7 +5619,8 @@ fn remote_path_is_directory(profile: &ConnectionProfile, path: &str) -> Result<b
         "if [ -d {path} ]; then printf dir; elif [ -e {path} ]; then printf file; else exit 1; fi",
         path = shell_quote(path)
     );
-    let output = run_profile_shell(profile, &script, None)?;
+    let output =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
     Ok(String::from_utf8_lossy(&output).trim() == "dir")
 }
 
@@ -4807,7 +5725,8 @@ fn export_remote_source_info(
         "if [ -d {0} ]; then printf 'dir\\t0'; elif [ -f {0} ]; then printf 'file\\t'; wc -c < {0}; else printf 'other\\t0'; fi",
         shell_quote(path)
     );
-    let output = run_profile_shell(profile, &script, None)?;
+    let output =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
     let text = String::from_utf8_lossy(&output);
     let mut parts = text.trim().splitn(2, '\t');
     let kind = parts.next().unwrap_or("other").to_string();
@@ -5417,7 +6336,8 @@ fn create_remote_directory(profile: &ConnectionProfile, path: &str) -> Result<()
 
 fn remote_path_exists(profile: &ConnectionProfile, path: &str) -> Result<bool, String> {
     let script = format!("if [ -e {} ]; then printf y; fi", shell_quote(path));
-    let output = run_profile_shell(profile, &script, None)?;
+    let output =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
     Ok(output == b"y")
 }
 
@@ -5489,6 +6409,44 @@ fn run_profile_shell(
     script: &str,
     stdin_data: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, String> {
+    run_profile_shell_with_timeout(profile, script, stdin_data, REMOTE_SHELL_COMMAND_TIMEOUT)
+}
+
+fn run_profile_shell_with_timeout(
+    profile: &ConnectionProfile,
+    script: &str,
+    stdin_data: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let attempts = if profile.kind == "wsl" {
+        WSL_TRANSIENT_RETRY_ATTEMPTS
+    } else {
+        1
+    };
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match run_profile_shell_once(profile, script, stdin_data.clone(), timeout) {
+            Ok(stdout) => return Ok(stdout),
+            Err(error)
+                if profile.kind == "wsl"
+                    && is_wsl_transient_error(&error)
+                    && attempt + 1 < attempts =>
+            {
+                last_error = Some(error);
+                thread::sleep(WSL_TRANSIENT_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "WSL command failed".to_string()))
+}
+
+fn run_profile_shell_once(
+    profile: &ConnectionProfile,
+    script: &str,
+    stdin_data: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let mut command = match profile.kind.as_str() {
         "wsl" => {
             let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
@@ -5520,26 +6478,213 @@ fn run_profile_shell(
     };
     if stdin_data.is_some() {
         command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = hide_command_window(&mut command)
         .spawn()
         .map_err(|err| format!("failed to run remote shell: {err}"))?;
+    let pid = child.id();
+    assign_child_to_cleanup_job(pid);
     if let Some(data) = stdin_data {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(&data).map_err(|err| err.to_string())?;
         }
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("failed to wait for remote shell: {err}"))?;
-    if !output.status.success() {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader =
+        stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
+    let stderr_reader =
+        stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if profile.kind == "ssh" {
+                        clear_ssh_askpass_cache_for_profile(profile);
+                    }
+                    return Err(format!(
+                        "remote shell timed out after {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(format!("failed to wait for remote shell: {err}")),
+        }
+    };
+    let stdout = join_process_output(stdout_reader)?;
+    let stderr = join_process_output(stderr_reader)?;
+    if !status.success() {
         if profile.kind == "ssh" {
             clear_ssh_askpass_cache_for_profile(profile);
         }
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err(String::from_utf8_lossy(&stderr).trim().to_string());
     }
-    Ok(output.stdout)
+    Ok(stdout)
+}
+
+fn warm_wsl_profile(profile: &ConnectionProfile) -> Result<(), String> {
+    if profile.kind != "wsl" {
+        return Ok(());
+    }
+
+    let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
+    if wsl_warmup_recent(distro) || !begin_wsl_warmup(distro) {
+        return Ok(());
+    }
+
+    let result = warm_wsl_distro(distro);
+    finish_wsl_warmup(distro, result.is_ok());
+    result
+}
+
+fn warm_wsl_distro(distro: &str) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 0..WSL_TRANSIENT_RETRY_ATTEMPTS {
+        let mut command = Command::new("wsl.exe");
+        command
+            .current_dir(windows_spawn_cwd())
+            .arg("-d")
+            .arg(distro)
+            .arg("--exec")
+            .arg("sh")
+            .arg("-lc")
+            .arg("true");
+        match command_output_with_timeout(&mut command, WSL_WARMUP_TIMEOUT) {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let error = command_output_error_message(&output);
+                if is_wsl_transient_error(&error) && attempt + 1 < WSL_TRANSIENT_RETRY_ATTEMPTS {
+                    last_error = Some(error);
+                    thread::sleep(WSL_TRANSIENT_RETRY_DELAY);
+                    continue;
+                }
+                return Err(format!("WSL warmup failed: {error}"));
+            }
+            Err(error)
+                if is_wsl_transient_error(&error) && attempt + 1 < WSL_TRANSIENT_RETRY_ATTEMPTS =>
+            {
+                last_error = Some(error);
+                thread::sleep(WSL_TRANSIENT_RETRY_DELAY);
+            }
+            Err(error) => return Err(format!("WSL warmup failed: {error}")),
+        }
+    }
+    Err(format!(
+        "WSL warmup failed: {}",
+        last_error.unwrap_or_else(|| "unexpected WSL failure".to_string())
+    ))
+}
+
+fn wsl_warmup_recent(distro: &str) -> bool {
+    let cache = WSL_WARMUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(distro).copied())
+        .is_some_and(|instant| instant.elapsed() < WSL_WARMUP_CACHE_TTL)
+}
+
+fn begin_wsl_warmup(distro: &str) -> bool {
+    let in_flight = WSL_WARMUP_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut guard) = in_flight.lock() else {
+        return true;
+    };
+    guard.insert(distro.to_string())
+}
+
+fn finish_wsl_warmup(distro: &str, succeeded: bool) {
+    if let Some(in_flight) = WSL_WARMUP_IN_FLIGHT.get() {
+        if let Ok(mut guard) = in_flight.lock() {
+            guard.remove(distro);
+        }
+    }
+    if !succeeded {
+        return;
+    }
+    let cache = WSL_WARMUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(distro.to_string(), Instant::now());
+    }
+}
+
+fn is_wsl_transient_error(message: &str) -> bool {
+    message.contains("Wsl/Service/E_UNEXPECTED") || message.contains("E_UNEXPECTED")
+}
+
+fn command_output_error_message(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => format!("{stderr}\n{stdout}"),
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (true, true) => format!("process exited with status {}", output.status),
+    }
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = hide_command_window(command)
+        .spawn()
+        .map_err(|err| format!("failed to start process: {err}"))?;
+    let pid = child.id();
+    assign_child_to_cleanup_job(pid);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader =
+        stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
+    let stderr_reader =
+        stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_tree(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_process_output(stdout_reader);
+                    let _ = join_process_output(stderr_reader);
+                    return Err(format!("process timed out after {}s", timeout.as_secs()));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(format!("failed to wait for process: {err}")),
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: join_process_output(stdout_reader)?,
+        stderr: join_process_output(stderr_reader)?,
+    })
+}
+
+fn read_process_output(reader: &mut dyn Read) -> Vec<u8> {
+    let mut output = Vec::new();
+    let _ = reader.read_to_end(&mut output);
+    output
+}
+
+fn join_process_output(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Result<Vec<u8>, String> {
+    let Some(handle) = handle else {
+        return Ok(Vec::new());
+    };
+    handle
+        .join()
+        .map_err(|_| "remote shell output reader failed".to_string())
 }
 
 fn proxy_stream(
@@ -7032,13 +8177,22 @@ fn run_ssh_askpass_helper_request(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(IdeState::default())
         .invoke_handler(tauri::generate_handler![
             list_profiles,
             list_wsl_profiles,
             windows_shell_root,
             answer_ssh_auth_prompt,
+            renderer_heartbeat,
+            send_agent_alert,
+            list_llm_tmux_sessions,
+            next_llm_tmux_session,
+            kill_llm_tmux_session,
+            read_snippets_store,
+            write_snippets_store,
             set_capture_protection,
+            force_quit_app,
             resolve_profile_path,
             list_directory,
             list_directories,
@@ -7070,6 +8224,7 @@ pub fn run() {
             start_preview_proxy,
             show_browser_webview,
             hide_browser_webview,
+            close_browser_webview,
             reload_browser_webview,
             start_edge_devtools_session,
             edge_devtools_new_page,
@@ -7080,7 +8235,7 @@ pub fn run() {
             shutdown_runtime_sessions_command
         ])
         .setup(|app| {
-            let window = app.get_webview_window("main").expect("main window");
+            let window = main_webview_window(app.handle()).expect("main window");
             let app_handle = app.handle().clone();
             let product_name = app
                 .config()
@@ -7088,21 +8243,23 @@ pub fn run() {
                 .clone()
                 .unwrap_or_else(|| "Simple Vibe IDE".to_string());
             start_ssh_askpass_server(app_handle.clone());
+            start_renderer_watchdog(app_handle.clone());
             show_window_on_primary_monitor(&window);
+            CAPTURE_PROTECTION_ACTIVE.store(false, Ordering::Relaxed);
+            #[cfg(windows)]
+            if let Ok(hwnd) = window.hwnd() {
+                remember_main_hwnd(hwnd);
+            }
+            let _ = set_window_capture_protection(&window, false);
+            close_capture_cover(&app_handle);
             let app_for_events = app_handle.clone();
-            let main_for_events = window.clone();
             window.on_window_event(move |event| match event {
-                WindowEvent::CloseRequested { .. } => close_capture_cover(&app_for_events),
-                WindowEvent::Moved(_)
-                | WindowEvent::Resized(_)
-                | WindowEvent::ScaleFactorChanged { .. } => {
-                    if let Some(cover) = app_for_events.get_webview_window("capture-cover") {
-                        if cover.is_visible().unwrap_or(false) {
-                            let _ = sync_capture_cover(&main_for_events, &cover);
-                        }
-                    }
+                WindowEvent::CloseRequested { .. } => {
+                    request_app_exit(app_for_events.clone());
                 }
-                WindowEvent::Destroyed => close_capture_cover(&app_for_events),
+                WindowEvent::Destroyed => {
+                    shutdown_app_runtime(&app_for_events);
+                }
                 _ => {}
             });
             let delayed_window = window.clone();
@@ -7125,8 +8282,7 @@ pub fn run() {
             // The Windows cleanup Job Object is the hard guarantee if the
             // process exits before the background worker finishes.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                shutdown_runtime_sessions_background(app_handle.state::<IdeState>().inner());
-                shutdown_session_ssh_agent();
+                shutdown_app_runtime(app_handle);
             }
         });
 }

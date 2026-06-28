@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Simple Vibe IDE",
         "width": 1500,
         "height": 960,

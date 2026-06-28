@@ -13,6 +13,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "url": "terminal.html",
         "title": "Simple Vibe Terminal",
         "width": 1200,

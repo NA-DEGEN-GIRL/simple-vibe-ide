@@ -35,6 +35,7 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 한 화면에 띄워
 - `Browser`: 로컬 서버 미리보기
 - `Image`: 붙여넣은 이미지 미리보기
 - `Notes`: 작업 메모
+- `Snip`: 전역 Snippets / 치트 시트
 - `Calc`: 간단 계산기
 - `Set`: 앱 설정
 
@@ -67,6 +68,26 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 한 화면에 띄워
 5. 실행하려면 사람이 직접 shell에서 `Enter`를 누릅니다.
 
 `Type` pad는 자동 실행하지 않습니다. 실수로 긴 명령이나 LLM 프롬프트가 바로 실행되는 것을 막기 위해서입니다.
+
+### 터미널 렌더러
+
+`Set` 패널의 `Terminal renderer` 기본값은 `Auto`입니다.
+
+- 기본적으로 WebGL 렌더러를 사용해 resize/scroll 때 생기는 terminal 글자 깨짐을 줄입니다.
+- WebGL을 사용할 수 없거나 context가 손실되면 DOM 렌더러로 자동 fallback됩니다.
+- 문제가 생기면 `DOM compatibility`로 바꿔 새 shell에서 확인할 수 있습니다.
+- shell 제목줄의 `GL`/`DOM` 배지는 해당 shell이 실제로 사용하는 렌더러 상태를 간단히 표시합니다. `GL!`은 WebGL context 손실 후 fallback 상태입니다.
+
+### 터미널 scrollback / History cache
+
+`Set` 패널에서 `Terminal scrollback rows`와 `Terminal history cache`를 조절할 수 있습니다.
+
+- `Terminal scrollback rows` 기본값은 `1000`입니다.
+- `0`은 무제한이 아니라 `No scrollback / fastest`입니다. 터미널 자체의 과거 줄을 보관하지 않아 가장 가볍습니다.
+- `Terminal history cache`는 앱 실행 중 메모리에만 plain text 기록을 보관합니다. 디스크나 workspace snapshot에는 저장하지 않습니다.
+- shell 위쪽 `Hist` 버튼을 누르거나, 터미널 맨 위에서 더 위로 스크롤하면 읽기 전용 History overlay로 더 오래된 출력 내용을 볼 수 있습니다.
+- History overlay의 내용은 ANSI 색/커서 제어를 제거한 읽기용 로그입니다. TUI 화면을 그대로 재현하는 기능은 아닙니다.
+- 터미널 출력에는 secret이 섞일 수 있으므로 `Copy all cached`는 필요한 경우에만 사용하세요.
 
 ## 5. 자주 쓰는 단축키
 
@@ -131,7 +152,19 @@ Notes는 작업 중 빠르게 적는 메모장입니다.
 
 LLM에게 시킬 일, 다음에 볼 파일, 테스트 결과를 적어두면 편합니다.
 
-## 11. Workspace 저장 / 불러오기
+## 11. Snippets
+
+Snippets는 workspace와 무관하게 앱 전체에서 쓰는 전역 치트 시트입니다.
+
+- `Snip` 버튼으로 열고 닫습니다.
+- `+`로 분야별 탭을 만들 수 있습니다.
+- 각 항목은 복사할 내용과 선택 설명으로 구성됩니다.
+- `Copy`는 내용만 클립보드에 복사합니다.
+- 검색은 현재 탭의 내용과 설명을 함께 찾습니다.
+
+Snippets는 로컬 설정 파일에 평문으로 저장됩니다. 토큰, 비밀번호, private key 같은 secret은 저장하지 마세요.
+
+## 12. Workspace 저장 / 불러오기
 
 workspace는 현재 작업 맥락을 저장합니다.
 
@@ -144,7 +177,84 @@ workspace는 현재 작업 맥락을 저장합니다.
 
 앱을 닫거나 재빌드하면 실제 shell process는 종료될 수 있습니다. 대신 workspace를 다시 열면 UI와 작업 맥락을 빠르게 복원하는 방식입니다.
 
-## 12. 앱 종료
+### Memory Saver
+
+`Set` 패널의 `Workspace memory saver` 기본값은 `Balanced`입니다.
+
+- workspace가 많아졌을 때 오래 안 쓴 inactive workspace의 shell/PTY를 정리해 RAM 사용량을 줄입니다.
+- 해당 workspace tab과 layout snapshot은 유지되고, 다시 열면 shell이 새로 시작됩니다.
+- sleep된 workspace의 실행 중이던 shell process는 종료됩니다. 출력이 계속 나는 workspace는 idle로 보지 않지만, 장시간 서버/작업은 `Keep live`를 켜두는 것이 안전합니다.
+- dev server나 장시간 실행 작업을 유지해야 하는 workspace는 workspace tab 우클릭 메뉴에서 `Keep live`를 켜세요.
+
+### Workspace tab 위치
+
+`Set` 패널의 `Workspace tabs`에서 workspace tab 위치를 `Top`, `Bottom`, `Left side dock`, `Right side dock` 중 선택할 수 있습니다.
+
+- `Top`은 기존과 같은 상단 tab bar입니다.
+- `Bottom`은 같은 tab bar를 작업 영역 아래에 둡니다.
+- `Left side dock` / `Right side dock`은 workspace 이름 리스트를 세로 dock으로 표시하고, 작업 영역은 dock 옆의 남은 공간으로 밀려납니다.
+- 좌/우 dock은 경계선을 드래그해 폭을 조절할 수 있습니다.
+- 좌/우 dock의 `Detail` 버튼은 모든 workspace detail을 펼치거나 접습니다. 각 workspace 행의 `▸`/`▾` 버튼으로 workspace별 detail도 따로 열고 닫을 수 있습니다.
+- workspace detail에는 Codex/Claude/Grok/Agy shell이 감지되면 agent 종류, 상태, shell 제목, cwd, 최근 activity가 runtime-only로 표시되며, 카드를 누르면 해당 shell로 이동합니다.
+- 이 detail 정보는 workspace snapshot에 transcript 원문으로 저장되지 않습니다. 현재 버전은 terminal title/output/input/exit 신호 기반의 가벼운 표시이며, tool/todo/token 같은 구조화 정보는 추후 확장 대상입니다.
+- workspace resume/replay로 복원된 과거 terminal 출력은 `대기` 상태 판정에 사용하지 않습니다. 실제 live 선택지/질문이 새로 출력될 때만 `대기`로 바뀝니다.
+- `Active workspace indicator`에서 선택된 workspace를 표시하는 방식을 조절할 수 있습니다.
+  - `Blue outer border`: 현재처럼 선택된 workspace 외곽/인셋 라인으로 표시합니다.
+  - `Highlight tab title`: workspace 이름이 있는 제목줄만 색으로 강조합니다. 좌/우 dock에서 detail을 펼쳐도 detail 전체가 아니라 제목줄만 강조됩니다.
+
+### LLM launcher tmux 재접속
+
+WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmux`가 설치된 경우 workspace+agent 단위 번호가 붙은 새 tmux session으로 실행합니다.
+
+- 같은 workspace의 같은 agent 버튼을 여러 번 누르면 `codex #1`, `codex #2`처럼 별도 session/tab이 생깁니다.
+- LLM shell widget의 `+` 버튼도 plain shell이 아니라 같은 agent의 새 tmux session tab을 추가합니다.
+- LLM shell widget의 `Tmux` 버튼은 기존 tmux session 목록을 보여줍니다. session을 선택하면 현재 widget에 새 tab으로 attach합니다.
+- `Tmux` 목록의 `Kill`은 확인 후 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
+- `tmux`가 없거나 Windows profile에서는 기존처럼 직접 실행합니다.
+- 기존 bypass/YOLO 인자 자동 추가와 중복 방지는 그대로 유지됩니다.
+
+### Agent alerts
+
+`Set` 패널의 `Agent alerts`에서 LLM 상태 알림을 켜고 끌 수 있습니다.
+
+- `Windows notification banners`: 작업 완료, 오류, 사용자 입력 필요 상태로 보일 때 Windows 알림 배너를 띄웁니다.
+- `Light sound alert`: 같은 상태 변화에 Windows 네이티브 짧은 beep를 냅니다. WebView 포커스가 없어도 울리도록 처리합니다.
+- 두 옵션은 서로 독립적입니다. 배너만 켜거나, 소리만 켜거나, 둘 다 끌 수 있습니다.
+- `Test native path`의 `Banner` / `Sound` / `Both` 버튼은 상태 판정 로직을 거치지 않고 같은 네이티브 알림 경로를 즉시 호출합니다.
+  - 버튼을 누르면 같은 영역에 permission 확인, backend `send_agent_alert` 성공/실패, OS 배너 미표시 가능성까지 진단 로그가 남습니다.
+  - `Sound`는 나는데 `Banner` 로그가 backend OK로 끝나면 상태 판정 문제가 아니라 Windows/Tauri 배너 표시 계층 문제일 가능성이 큽니다.
+  - 테스트 버튼도 반응이 없으면 Windows/Tauri 알림 경로 문제입니다.
+  - 테스트 버튼은 되는데 실제 작업 완료 알림만 안 뜨면 LLM 상태 판정 문제입니다.
+- 배너가 계속 안 보이면 Windows 알림/방해 금지/앱별 알림 허용 상태를 확인해야 합니다.
+- 현재 상태 판정은 workspace agent activity와 같은 title/output/input/exit 기반 신호를 사용하므로 완벽하지 않을 수 있습니다.
+
+### 송출 보호
+
+capture block이 켜진 workspace는 열 때 송출 보호 적용을 먼저 시도한 뒤 내용을 복원합니다.
+보호 적용에 실패하면 실제 workspace 내용을 보여주지 않고 보호 안내 화면을 유지합니다.
+
+### 위젯 모양 / 선택 표시
+
+`Set` 패널에서 위젯 모서리 R값을 실시간으로 조절할 수 있습니다. 기본값은 현재 스타일과 같은 `8px`입니다.
+
+`IDE scale`에는 현재 전체 UI 배율이 표시됩니다. 터미널 렌더링 문제를 확인할 때는 `Reset 100%`를 눌러 100% 상태에서 먼저 비교하세요.
+
+Active widget indicator 옵션은 독립적으로 켜고 끌 수 있습니다.
+
+- `Blue outer border`: 현재 선택된 위젯 외곽의 푸른 테두리
+- `Highlight title bar`: 현재 선택된 위젯의 제목줄 색상 강조
+
+둘 다 켜거나, 둘 중 하나만 쓰거나, 둘 다 끌 수 있습니다.
+
+각 위젯 제목줄의 `Op` 버튼으로 해당 위젯 전체 투명도를 조절할 수 있습니다.
+
+- 범위는 `45%`부터 `100%`까지이며, 기본값은 `100%`입니다.
+- 값은 workspace layout에 저장되어 IDE를 다시 열어도 유지됩니다.
+- 슬라이더를 움직이는 동안은 해당 위젯의 CSS opacity만 바뀌므로 전체 UI를 다시 그리지 않습니다.
+- drag/resize 중에는 조작하기 쉽도록 일시적으로 더 선명하게 표시됩니다.
+- Browser의 native WebView 내용은 OS child window라 투명도가 완전히 동일하게 적용되지 않을 수 있습니다.
+
+## 13. 앱 종료
 
 앱을 닫으면 창은 먼저 닫히고, shell/WSL/SSH 관련 정리는 백그라운드에서 처리됩니다.
 
@@ -164,4 +274,3 @@ workspace는 현재 작업 맥락을 저장합니다.
 8. 작업 끝나면 shell에서 git 상태 확인 후 앱 종료
 
 한글 프롬프트를 자주 쓴다면, shell에 직접 길게 치기보다 `Type` pad를 기본 입력창처럼 쓰는 것이 안전합니다.
-

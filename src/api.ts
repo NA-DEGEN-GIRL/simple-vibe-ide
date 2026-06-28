@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, PortForwardResult, PreviewProxyResult } from './types';
+import type { AgentAlertPayload, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RendererHeartbeatResponse } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -9,6 +9,17 @@ export const api = {
     invoke<void>('answer_ssh_auth_prompt', { id, secret }),
   setCaptureProtection: (enabled: boolean) =>
     invoke<void>('set_capture_protection', { enabled }),
+  rendererHeartbeat: () => invoke<RendererHeartbeatResponse>('renderer_heartbeat'),
+  readSnippetsStore: () => invoke<string>('read_snippets_store'),
+  writeSnippetsStore: (payload: string) => invoke<void>('write_snippets_store', { payload }),
+  forceQuitApp: () => invoke<void>('force_quit_app'),
+  sendAgentAlert: (payload: AgentAlertPayload) => invoke<void>('send_agent_alert', { payload }),
+  listLlmTmuxSessions: (profileId: string, cwd: string, workspaceId: string, agentId: string) =>
+    invoke<LlmTmuxSessionListResult>('list_llm_tmux_sessions', { profileId, cwd, workspaceId, agentId }),
+  nextLlmTmuxSession: (profileId: string, cwd: string, workspaceId: string, agentId: string) =>
+    invoke<string>('next_llm_tmux_session', { profileId, cwd, workspaceId, agentId }),
+  killLlmTmuxSession: (profileId: string, cwd: string, sessionName: string) =>
+    invoke<void>('kill_llm_tmux_session', { profileId, cwd, sessionName }),
   resolveProfilePath: (profileId: string, path: string) =>
     invoke<string>('resolve_profile_path', { profileId, path }),
   listDirectory: (profileId: string, path: string, includeSizes = true) =>
@@ -102,6 +113,7 @@ export const api = {
   ) =>
     invoke<void>('show_browser_webview', { label, url, x, y, width, height, navigate }),
   hideBrowserWebview: (label?: string) => invoke<void>('hide_browser_webview', { label }),
+  closeBrowserWebview: (label?: string) => invoke<void>('close_browser_webview', { label }),
   reloadBrowserWebview: (label?: string) => invoke<void>('reload_browser_webview', { label }),
   startEdgeDevtoolsSession: (workspaceId: string) =>
     invoke<EdgeDevtoolsSession>('start_edge_devtools_session', { workspaceId }),
