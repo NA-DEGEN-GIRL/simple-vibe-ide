@@ -51,6 +51,797 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-04 - Reduce app-glass WebGL contexts and recover context loss
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- App-glass surfaces now share one liquidGL renderer/context with multiple per-surface lenses instead of creating a separate WebGL context for each titlebar/profile/widget surface. The individual glass planes and per-scope material settings remain intact; only the number of WebGL contexts is reduced.
+- App-glass planes that fall back with `init-failed` are no longer skipped forever. They now keep a retry backoff, clear the fallback marker when the retry is due, and attempt to promote back to liquidGL when a refresh runs.
+- Removing a liquidGL renderer now schedules a recoverable retry pass for any active `init-failed` planes, so closing widgets can let previously failed glass surfaces come back.
+- Added forced diagnostic breadcrumbs for app-glass `init-failed`, `retry-init-failed`, and `context-lost` events with active target count, renderer count, init-failed count, and lost-context count.
+- The `glass diagnostics` toggle now makes app-glass diagnostics actually enter the diagnostic log even when the broader debug log toggle is off.
+- App-glass canvases now hide immediately on `webglcontextlost` before disposal/retry, so a lost context is less likely to leave a white fallback surface over the main UI.
+- Shared app-glass canvases/mirrors are layered under the normal titlebar/profile/widget content so reducing contexts does not intentionally remove glass surfaces or overlay text/buttons.
+- Floating panels and terminal widgets now keep a minimum z-index above the shared app-glass canvas, and `bringPanelToFront` bases its next value on the actual current max z-index from restored panels/widgets. Shared app-glass lens paint order is also sorted by owner z-index so the glass surface order follows widget stacking.
+- After internal-agent and Claude review, the shared app-glass canvas is now treated as a hidden render source instead of the visible glass layer. Each app-glass lens copies only its own rendered rect into a small owner-local mirror canvas inside that widget's stacking context, restoring the intended `glass plane < glass render < widget content` order without returning to one WebGL context per widget.
+- The vendored liquidGL renderer exposes a narrow per-lens post-render hook so the app can copy the just-rendered lens rect into its local mirror without allocating viewport-sized mirrors for every widget.
+- App-glass mirror geometry now avoids using liquidGL's frozen `_baseRect` outside active tilt, so normal drag/resize/layout refreshes continue to use the live target rect.
+- Follow-up Claude/internal-agent review cleanup split owner-local glass shadows back below mirror canvases, compensated edge-clipped mirror blits so top/title surfaces do not stretch their 2px bleed, keeps the owner-local mirror visible immediately when a transient tilt mirror is destroyed, clips local mirrors to the target radius, and guards the per-lens hook so one failed mirror copy cannot abort later lenses.
+- Explorer row glass now uses the same hidden-source/local-mirror model inside each file row. The Explorer row renderer keeps one hidden WebGL canvas, but each visible row receives a small row-local mirror so row glass is no longer lost behind the Explorer/file-list stacking context. Follow-up fixes hide inactive hover-only row mirrors after transient tilt cleanup and force row-local mirror synchronization after Explorer row renders, so always-on rows do not stay blank until hovered and hover-only rows do not leave a glass trail.
+- Added targeted `explorer-scroll` diagnostics without changing Explorer layout. When app diagnostics or glass diagnostics are enabled, Explorer scroll/render/resize and bottom/right pointer attempts log scrollTop/scrollLeft, client/scroll sizes, rendered virtual row window, padding/overflow, file-list rect, and resize-grip rects so the horizontal-scroll/resize-hit overlap can be diagnosed from runtime evidence.
+- Explorer glass resize hit zones are now narrowed only for the Explorer panel after diagnostics showed the bottom resize grip fully overlapping the native horizontal scrollbar. Corner resize handles remain available while the horizontal/vertical scrollbars get most of their clickable area back.
+- Added an Explorer-specific glass setting for horizontal scrollbar bottom gap. The existing side inset came from the shared glass widget horizontal padding, but the Explorer row glass overlay means the file list is not always the final child, so the generic bottom margin was not applied to the horizontal scrollbar.
+- Workspace row/container glass and Explorer row glass now bind WebGL context-loss handlers, log forced `glass` diagnostics, dispose lost renderers, and retry after a short backoff instead of staying permanently blank or stale.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `node --check public/vendor/liquidgl/liquidGL.js`
+- `git diff --check -- src/main.ts src/styles.css public/vendor/liquidgl/liquidGL.js codex.md`
+
+### 2026-07-03 - Widget-local app glass show/hide refresh
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Opening, closing, hiding, or restoring a floating/terminal widget now refreshes only that widget's app-glass owner instead of scheduling a full app-glass recapture across every visible widget.
+- Terminal widget teardown explicitly cleans up only its own app-glass renderer/tilt state before removing the widget element.
+- Added a workspace LLM `done-unread` state so finished inactive LLM work stays visually marked until that workspace is clicked, with configurable glass colors for the workspace status dot and agent status badge.
+- Simplified glass widget header highlights to one shared color/strength/X-length/Y-length/inset model, rendered as a single 2D radial gradient instead of separate selected/idle horizontal/vertical gradient layers.
+- Wired Image Preview tabs to the glass chrome variables so global and Image Preview custom tab/selected-tab backgrounds apply to image editor tabs.
+- Extended glass chrome settings with configurable colors for common/per-panel buttons, tabs, cards, dividers, and top-down/select controls. Profile dropdowns now expose body text plus option/selected-option background and text colors in glass mode.
+- Follow-up subagent review fixes: scoped common top-down/select styling to glass settings and active glass widgets, hid per-panel select controls where the panel has no select menu, restored header-highlight move/radius controls, prevented Browser tab child buttons from inheriting generic button glass backgrounds, fixed Notes select hover specificity, and wired Snippets tabs/search/form chrome to global/custom glass chrome variables.
+- Split selected glass widget header highlights from the base header highlight in the same settings group while keeping both on the single radial-gradient model.
+- Added direct header-highlight gradient controls for general and selected headers so light origin, spread, softness, afterglow, and edge falloff drive the single radial gradient instead of fixed visual stops.
+- Reworked the visible header-highlight controls around a softer model: labels now distinguish general vs selected headers, exposed stop controls were replaced with spread/softness/afterglow-style controls, and defaults use a wider lower-alpha falloff to avoid a visible two-step band.
+- Replaced editable glass range value `<output>` fields with real text inputs and guarded global shortcuts while editing, so typing numbers, minus signs, decimals, Escape, and Ctrl +/- no longer get stolen by IDE-level key handlers.
+- Added Glass settings export/import buttons. The JSON package includes IDE background, common glass material, workspace row/dock glass, and app glass settings, and import re-applies/persists them with a full glass recapture.
+- Wired Shell/LLM terminal widget tabs to the common glass chrome variables so global tab background, selected tab background, divider, button outline, hover, and padding settings visibly apply to terminal tabs instead of staying transparent/hard-coded.
+- Changed danger status details from an in-grid row to a fixed overlay toast, so long error messages no longer push the main widget area down.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-07-02 - Glass chrome controls, Explorer copy/paste, and agent alert fixes
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src/api.ts`, `src-tauri/src/lib.rs`)
+- Added a shared glass `탭/버튼/내부 surface` settings block plus per-panel overrides for Profile/actions, Explorer, Editor, Image Preview, Browser, Notes, and Snippets.
+- Applied those glass chrome variables to Explorer path/export rows, Notes scroll/body/footer, Snippets cards/forms, Image Preview chrome/history/stage, Browser empty/chrome surfaces, and Profile/actions controls.
+- Removed the `Reset panel layout` toolbar button and handler.
+- Added Explorer-internal multi-select Copy/Paste via `Ctrl+C`/`Ctrl+V` and context menu. Same-folder copies use `_copy_000`, `_copy_001`, etc.; directory self-copy is rejected by the backend.
+- Added a clearer dev-mode message when the frontend is hot-reloaded before the Tauri backend has restarted with `copy_profile_paths`, and preserved remote copy basenames instead of applying attachment-style filename sanitizing.
+- Fixed LLM status edge cases: Codex title-only panes now still run output waiting detection for implement/choice prompts, Claude/output-scraped working states can produce done alerts, scrollback waiting false positives are suppressed more aggressively, and workspace tab rename/drag classes survive LLM activity rerenders.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `git diff --check`
+
+### 2026-07-01 - Port full-wrapper app glass mode
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Added an opt-in app-wide `appGlass` settings group for full-wrapper glass mode while keeping the default glass-off UI path unchanged.
+- Extended the Glass settings popover with controls for app-wide scope toggles, liquidGL material, titlebar/window buttons, floating widget wrappers/topbars, terminal readability, Explorer row hover, and diagnostics.
+- Added wrapper glass planes for titlebar, window controls, profile/actions, floating panels, terminal widgets, Settings, Notes, and Snippets; xterm, browser iframe, editor, and other content remain normal overlay content above the glass plane.
+- Added target-isolated app glass renderers so high-z window controls do not force one global liquidGL canvas over panel contents.
+- Wired panel show/hide, z-order, drag, resize, terminal widget creation, settings changes, and background changes to app glass geometry refresh or recapture.
+- Follow-up self/Claude review hardening: stopped the vendored per-renderer scroll RAF loop for app glass, fixed teardown observer cleanup before dispose, skipped repeated renderer creation for init-failed CSS fallbacks, moved app renderer overlays into each target owner stacking context, RAF-coalesced panel drag/resize geometry renders, and kept window-control hit targets full-size while centering the smaller glass plane.
+- Fixed owner-local app glass renderer alignment by positioning viewport-sized canvases/mirrors with negative owner offsets instead of `position: fixed`, so left-docked workspace layouts do not shift Explorer/widget refraction. App-glass renderers now own their viewport resize/zoom and mirror clip correction instead of letting the vendored default resize path overwrite local stacking-context math. Removed the visible floating-panel resize corner glyph; resize hit zones still work through cursor changes.
+- App glass tilt now links normal overlay content to the tilting glass plane, so titlebar/window-button labels and widget contents follow the glass motion instead of leaving only the liquid surface tilted.
+- Hardened high-angle app-glass tilt by letting the active shell overflow during tilt and restoring follower transform/backface/transform-box styles on cleanup, so content and attached title/background layers do not shear away from the glass plane or clip one side.
+- Fixed the liquidGL tilt mirror/background layer to keep using the frozen pre-tilt lens rect and scaled pivot while the mirror is transformed; this keeps the refracted background attached to the glass instead of re-clipping separately from the tilted text/content.
+- Repainted app-glass renderers immediately after a tilt mirror is destroyed on mouse leave, so the normal liquidGL canvas redraws instead of leaving the wrapper as a plain transparent fallback after hover. Settings-panel grid rows are now explicit so glass overlay/canvas children cannot steal an implicit grid row and leave dead space below the Settings body.
+- Made app-glass tilt followers consistent again: Settings panel bodies now tilt with the glass instead of only the header, and the top titlebar tilt carries the window-controls group with it. Glass-mode resize hit zones are moved inside the rounded widget bounds with higher z-index so hidden overflow no longer makes resize feel unavailable, and Settings keeps extra bottom scroll padding.
+- Floating widget drag/resize now flushes the owner-local liquidGL geometry immediately instead of waiting for the deferred full app-glass refresh, so the glass surface stays attached to the moving content. Starting a widget drag/resize or titlebar window drag also suspends/resets active tilt first, then restores tilt after the interaction.
+- Stabilized glass-mode widget resize coordinates by suspending tilt before measuring the widget, using layout offset metrics instead of transformed viewport rects for active panel rects, exempting resize grips from the generic glass overlay `position: relative` rule, and giving corner resize hit zones priority over edge hit zones so diagonal cursors remain reachable.
+- Fixed the app-glass master toggle so turning `Glass 테마 사용` off also deactivates workspace dock/container/row glass without deleting the saved per-workspace glass settings. Glass mode also no longer rewrites floating widgets from `position:absolute` to `position:relative`, and drag start now commits layout-space panel metrics instead of transformed viewport metrics, preventing widgets from jumping down when grabbing their header.
+- Moved the panel visibility/z-order fix back into the common floating-panel path instead of treating it as glass-only: panel toolbar toggles now bring an already-visible but buried widget to the front before hiding it, workspace restore clears stale geometry for panels whose snapshot has no rect, and the Settings panel is no longer saved/restored per workspace so `Set` cannot be hidden by workspace switching.
+- Added an IDE Settings `Glass 테마 사용` toggle for app-wide glass, split the profile/action toolbar into optional two-card glass surfaces, and made app-glass shadow on/off visually obvious with dedicated CSS shadow strength/Y/blur controls instead of relying only on the clipped liquidGL internal shadow element. Shadow-off now becomes truly shadowless, and the shadow sliders are disabled while the shadow toggle is off.
+- Moved the saved workspace controls into the connection/profile card when profile/actions are split, and stretched the split profile/action cards to a shared row height.
+- Moved the `개별 workspace row liquid glass 켜기` master toggle out of the top of the Glass popover and into the workspace-row section it controls.
+- Kept the Glass popover open while clicking elsewhere in the IDE or changing window focus; it now closes through the explicit close button or Escape key.
+- Aligned Glass/settings checkbox rows so checkbox marks sit on the same vertical line as their labels instead of dropping to a second row.
+- Fixed non-split profile/action glass mode so controls inside `display: contents` profile cards are lifted above the shared glass plane instead of disappearing behind it.
+- Reworked the Glass popover into collapsible setting groups. Fast on/off toggles for App Glass scopes, Explorer row overlay, workspace row liquidGL, and workspace dock container glass now live together near the top, while detailed material/layout controls stay in their own foldable sections.
+- Range value outputs in the Glass popover are now directly editable: click the displayed number, type a value, then press Enter or blur to apply.
+- Replaced the real app Explorer row glass overlay with inner per-row liquidGL lens targets that follow the shared common glass material by default, keep text as a normal overlay, rebuild safely around virtual-row recycling, and refresh after scroll/panel geometry changes without leaving a continuous liquidGL RAF loop running.
+- Cleaned up terminal-widget glass chrome: removed the header focus-target controls from the visible shell header, added static-style full-header highlight controls with gradient stop/inset/glow settings, suppressed legacy active/focus outlines in glass mode, and made the terminal host/tabbar/type pad/input/split backgrounds individually transparent/tunable over the glass surface.
+- Added glass-only widget spacing and chrome cleanup controls so widget contents can breathe inside the outer glass lens: widget padding X/Y, header button background/outline/hover/active/radius, and glass-scoped overrides for terminal/floating-panel header buttons. This removes old solid button/background residue from the terminal header so full-width highlights can be tuned seamlessly.
+- Clarified Glass settings naming around one `전체 공통 material` plus explicit per-scope `개별 material` sections for titlebar, window buttons, profile/actions, terminal widgets, floating panels, Notes/Snippets, Settings panel, Explorer rows, and workspace rows; the workspace-row liquidGL master toggle now lives with the row material section instead of the top scope switches. Widget header highlights are always full-header now, and their X/Y inset controls accept negative values so the highlight can overrun widget padding up to the outer glass edge.
+- Removed hidden CSS-line residue from glass widget chrome by making button outline width, header divider line, glass-plane inset line, and title-highlight inset-line width separately tunable; the new defaults leave those line widths at zero instead of drawing permanent CSS outlines. Glass widget title bars now keep the non-glass wrapping behavior when toolbar controls spill to two lines, instead of clipping wrapped menus under the fixed glass topbar height.
+- Removed the widget opacity (`Op`) menu from glass mode: the button is hidden in glass headers, and any open opacity popover is closed/blocked while `Glass 테마 사용` is active. Non-glass widget opacity controls remain unchanged.
+- Renamed the confusing `일반 탭 highlight` workspace setting to `Workspace row idle highlight`, and renamed the paired selected controls to `Workspace row selected highlight / rail` so this row-specific idle/selected highlight does not look like the separate widget title selected/idle highlight controls.
+- Fixed terminal widget header highlight state in glass mode: terminal cards no longer use selected header highlight merely because they keep the internal `.active` terminal-card class; selected highlight now follows the actual keyboard-target widget state, while inactive terminals use the idle header highlight.
+- Added glass-mode calculator chrome cleanup: calculator display, input, key grid, operator/equals buttons, and history rows now use transparent/translucent glass-compatible backgrounds instead of opaque black blocks.
+- Added terminal-specific glass controls for the `+` tab button, Recall/Paste type-pad buttons, and xterm/history scrollbars. These now have separate bg/outline/hover/disabled or thumb/track/width CSS variables so they can be made translucent like the rest of the terminal glass chrome.
+- Restored the terminal `Focus: Shell/Type` button that switches a shell widget's default focus target between the xterm shell and Type pad. The button is visible again in glass headers and uses the glass active button styling when Type pad is selected.
+- Cleaned up the Glass settings material menu so generic `Floating panels` / `Notes/Snippets` material groups are no longer shown as duplicate widget-level controls. Explorer, Editor, Image Preview, Browser, Notes, Snippets, Calculator, Settings, and Shell terminal now each expose their own `개별 material` group, while shared chrome/highlight controls are labeled as common panel/header settings. Header highlight also gained separate X/Y move controls in addition to inset/overrun.
+- Removed the old side workspace `Glass` button because workspace glass is now controlled only from the central Glass settings. This also removes the stale startup event binding that caused `Cannot read properties of undefined (reading 'addEventListener')` and could prevent later startup work such as ticker price updates from running.
+- Fixed shell glass selected-header state by marking the owning terminal card as the keyboard target even when the internal split leaf owns resize focus; clicking a shell now applies selected highlight again, while other widgets still show idle highlight. Also nudged the `GL` renderer badge down for better vertical alignment with neighboring header controls.
+- Extended workspace tab/row glass beyond the left/right side dock: the same workspace row liquidGL/material/outline/text/highlight/selected-rail settings now also apply when workspace tabs are at the top or bottom. In top/bottom mode the LLM detail dock stays absent, but the tabs and `+` button can still use container glass, row/tab liquidGL, and selected glass highlighting.
+- Extended common widget header highlights with separate vertical strength and vertical gradient-stop controls, while renaming the existing start/mid/end controls as horizontal so both axes can be tuned independently.
+- Reworked widget header highlight rendering so horizontal and vertical strength controls blend into one single-color highlight mask instead of stacking two colored gradient layers.
+- Added real-app hover-only row liquidGL toggles for workspace tab/row glass and Explorer row glass, matching the static lab behavior where glass-over-glass only renders under the current mouse hover target.
+- Made Editor and Notes glass panels transparent internally like the shell widget: editor tabs/body/CodeMirror surfaces and notes tabs/body/footer drop their solid backgrounds in glass mode.
+- Clarified terminal glass as a shared Shell/LLM scope and keeps terminal widgets first in app-glass setup order, so Shell, Codex, Claude, Grok, and Antigravity widgets share the same terminal glass material.
+- Matched glass-mode app scroll containers to the shell terminal scrollbar variables/style instead of inventing a separate scrollbar look, and hardened the terminal history/cache overlay so top-scroll cache view no longer inherits generic glass widget margins or stale tilt geometry.
+- Removed the app-glass liquidGL renderer cap: all active app glass targets now request real liquidGL, and only genuine init failures remain on CSS fallback.
+- Optimized app-glass interaction refresh: clicking/focusing/z-ordering widgets and drag/resize/drop now refresh only the affected widget's owner-local liquidGL geometry, while full recapture stays reserved for background, visibility/topology, window resize, and settings changes. Diagnostics now distinguish local/topology/recapture app-glass refresh reasons.
+- Implemented the first liquid-glass performance stage without lowering visual quality: vendored liquidGL now skips empty dynamic-node work, reuses same-size textures with `texSubImage2D`, hoists snapshot-stage geometry reads per render pass, and the app avoids redundant pre-render `updateMetrics()` loops on owner-local/app-glass reuse paths.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+
+### 2026-07-01 - Stabilize Windows dev launcher and tmux stale delivery recovery
+
+#### Changed (`src/main.ts`, `vite.config.ts`, `vite.terminal.config.ts`, `scripts/windows-tauri-dev.cmd`)
+- Ignored local agent/worklog/temp folders such as `.antigravitycli/` in Vite dev watchers so Windows dev mode does not crash on WSL-mapped directory entries that look like JSON files.
+- Added automatic stale-delivery recovery for visible LLM tmux panes: when tmux probe state keeps changing while IDE terminal data stays stale, the app now replaces only the IDE PTY backend and reattaches to the same tmux session instead of killing the LLM process.
+- Kept stale-delivery probes active for visible tmux-backed LLM panes even when the diagnostic panel is not open; normal probe logs still respect the debug-log setting, while reconnect start/finish/failure logs are forced for auditability.
+- Hardened the Windows Tauri dev `.cmd` launcher against `Program Files (x86)` batch parsing issues and normalized the repo path shown in its startup output.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+
+### 2026-07-01 - Add background apply toggle and clean static terminal glass
+
+#### Context
+- Requested: let the real app disable the decorative background that is tuned from the glass settings, and fix the static terminal glass prototypes whose text disappeared after refresh.
+- Also requested: remove the static reference card and preempt the square shadow/aura seen around rounded terminal glass surfaces.
+
+#### Changed (`src/main.ts`, `src/styles.css`, local static glass labs)
+- Added a `배경설정 적용` toggle to the glass settings. When off, the app hides the decorative IDE background layer, disables glass background grid/noise/wallpaper effects, restores the title/workspace chrome to the normal default dark style, and keeps liquidGL snapshots on a plain safe fallback background.
+- Raised the static terminal overlay content above liquidGL mirror/canvas layers and forced its labels visible, matching the earlier workspace/titlebar fix pattern.
+- Removed external terminal prototype box-shadows/glow auras so rounded glass cards do not show rectangular shadow artifacts outside their radius.
+- Removed the static reference glass card from the glass debug page and workspace virtual lab.
+- Reworked the static terminal glass preview into one real-UI-shaped terminal instead of four decorative variants: no visible parent container, codex/claude/shell tabs, tmux green status bar, split shell panes, typing pad, Recall/Paste controls, and detailed static controls for terminal radius, outline, soft outline, padding, chrome, buttons, split panes, tmux bar, and text sizing.
+- Updated the static terminal lab so codex and split-shell examples are separate draggable/resizable glass widgets, added a resizable Explorer glass widget beside the workspace dock, and added per-widget GL buttons that open a compact glass settings popover.
+- Added a static `topbar text Y` control so glass widgets can test vertical content offsets separately from topbar height; the real app's default topbar layout should still center content automatically with flex alignment.
+- Fixed the static workspace container glass toggle by keeping the container plane measurable in layout, hiding it with opacity/visibility when off, raising it above the dock surface but below workspace rows, and logging its visible/opacity/z-index state in the glass diagnostics.
+- Restored the static Explorer row hover/selection tint with a dedicated per-row highlight layer and controls for hover color, hover alpha, and active alpha, so future file-hover effects can target individual `.explorer-row` lines.
+- Raised the static workspace container liquidGL renderer to sit just below the dock/titlebar stacking layer instead of using the lower row-canvas z-index, and logged the container canvas parent/z-index so the container lens can be distinguished from plain CSS opacity.
+- Added a separate static `workspace glass` checkbox so individual workspace row/+ liquidGL lenses can be disabled while leaving the workspace container glass, titlebar/window glass, and terminal/explorer glass enabled for comparison.
+- Re-aligned the static workspace container renderer with the working workspace-virtual lab layering: the shell remains above body-level liquidGL canvases, container liquidGL uses a body-level `9996` layer with preserved target opacity, and row inset highlights now derive from row/background/outline/shadow alpha so fully-zero row effects do not leave a faint separator line.
+- Moved the static titlebar liquidGL target to an inner glass plane, leaving the title text/window controls as normal overlay content; added a final high-z override for the workspace dock so body-level container/row canvases cannot cover the row text.
+- Split the static workspace-container liquidGL renderer from the titlebar-container renderer and added console-backed glass diagnostics (`ccanvas`, `tcanvas`, `containerLenses`, `titlebarLenses`) so the workspace container on/off state can be verified independently.
+- Moved the static workspace-container renderer canvas into the workspace dock stacking context at the same layer as the container plane, instead of leaving it behind the whole dock as a body-level canvas; row/content layers remain above it.
+- Adjusted the dock-local workspace-container canvas to stay viewport-aligned while living inside the dock stacking context (`position:absolute` with negative dock offset), and expanded diagnostics with `cpos` so placement/opacity can be checked from console logs.
+- Put the workspace-container WebGL canvas below the container plane and gave the plane its own frost-derived backdrop blur/tint layer, so container glass on/off is visible even when the WebGL texture is subtle or transparent over a dark background.
+- Normalized titlebar and workspace container glass to the same structure: a persistent outer container surface plus an inner liquidGL lens target, keeping container tint/blur from being wiped by liquidGL target initialization.
+- Added a separate static `titlebar R` control so titlebar container radius can be tuned independently from workspace row radius.
+- Split the static top-glass renderers by stacking context: workspace row/+ lenses now render inside the workspace dock, titlebar button/clock lenses render inside the titlebar, and terminal lenses stay body-level. This keeps glass above container surfaces but below text/content overlays.
+- Kept liquidGL hover/tilt mirror canvases on the same local glass layer instead of raising them above overlay content, so workspace/titlebar labels stay visible while top glass tilts.
+- Split the static `+` workspace control into a glass lens surface plus an overlay label, matching the titlebar button pattern, so the `+` control keeps its liquidGL surface on hover without sacrificing visible text.
+- Ensured newly created hover/tilt mirror canvases for the static `+` workspace lens and titlebar button lenses are immediately re-parented into their local dock/titlebar renderer layer; otherwise liquidGL clears the active lens from the WebGL canvas and the glass appears to disappear while hovered.
+- Added static global glass effect controls. Workspace rows, dock container, titlebar container, buttons, and terminal/explorer panes each have a `개별 설정` toggle; when a scope toggle is off, that scope follows the global refraction/bevel/frost/magnify/specular/shadow/tilt/reveal settings and global radius.
+- Added a static widget selected-state title highlight for non-workspace widgets. The selected/idle terminal, shell, and explorer examples now color only the title text area instead of the full topbar chrome, with separate controls for selected/idle color, strength, width, padding, radius, and selected widget.
+- Added tilt followers for non-workspace glass overlays so titlebar button labels and terminal/explorer/shell content tilt with their glass surface instead of remaining flat while only the lens moves.
+- Added global outline settings to the static global glass controls. Scope-level outline controls now follow the global outline color/alpha/width/softness when their `개별 설정` toggle is off.
+- Removed fixed inset/glow residue from the static non-workspace title highlight, so selected/idle title highlights leave no visible CSS scar when their strength controls are zero.
+- Reorganized the static glass debug settings into grouped cards for background/snapshot source, global glass defaults, per-scope glass overrides, workspace dock/row styling, titlebar/terminal chrome, widget title highlighting, and log output. Added the missing container/titlebar soft-outline controls while grouping.
+- Fixed static per-scope custom glass toggles so switching `workspace 개별 설정` and other scope inheritance toggles forces a full liquidGL rebuild/recapture instead of only doing a lightweight option refresh. This makes workspace-specific glass settings immediately override or follow the global glass defaults as intended.
+- Split static workspace rows into a hidden inner `.workspace-tab-glass` liquidGL surface plus normal overlay content, so workspace refraction/bevel/frost/magnify/tilt settings affect the actual glass plane instead of being visually buried under the row/text layer. Added workspace glass diagnostics that log custom/global scope values and first-lens options.
+- Fixed a liquidGL options-sharing bug in the static lab: liquidGL stores the same options object on every lens in a renderer, so the workspace `+` button lens could overwrite all workspace row lens options with button/global values. Each lens now gets an isolated options object before scope settings are applied, and diagnostics include `liso=1` when isolation is active.
+- Added a static `hover row만 glass` experiment for workspace rows. When enabled, all workspace row lenses stay initialized but the row renderer only draws the currently hovered workspace or `+` lens; non-hover rows show the normal CSS row surface, and diagnostics report `hoverOnly` plus active hover lens count.
+- Made the hover-only workspace glass experiment respond immediately by tracking the active row in JavaScript, rendering synchronously on pointer enter/leave/move, and forcibly clearing inactive tilt mirror/transform state instead of waiting for liquidGL's default smooth tilt reset.
+- Extended the same static row-glass pattern to Explorer file rows: each file line now has an inner liquidGL row plane, separate Explorer row effect/outline controls, and an optional hover-only mode that renders glass only for the currently hovered file row.
+- Hid the static terminal/explorer widget corner resize glyphs by default; the resize hit zones remain active and reveal the glyph only when the pointer is near a corner or while resizing, matching the desired future glass-mode behavior for the real app.
+- Generalized the static `top glass samples container` toggle so it now applies to glass-over-glass stacks beyond workspace rows: workspace rows sample dock container glass, titlebar buttons sample titlebar container glass, and Explorer file-row glass samples the terminal/explorer panel glass underneath.
+- Added a visible Explorer row style overlay for row bg/inset/outline/soft-outline controls, because liquidGL clears the target element background while rendering the WebGL lens; the controls now affect the visible row shell as well as the lens geometry.
+- Fixed the static Explorer row off-state: hover-only glass tracking is disabled when Explorer row glass is off, row dividers no longer leave residual top/bottom lines, and hover text/glow fades to neutral when Explorer hover intensity is set to zero.
+- Changed the static non-workspace widget selected/idle highlight from a title-text-only box to a full topbar-line overlay. The settings now expose separate selected/idle start/mid/edge alpha and gradient stop controls, plus topbar inset/radius, so the highlight can match the real app chrome without leaving an unwanted rectangular title box.
+- Extended the same detailed gradient controls to the existing static workspace normal/selected header highlights as separate workspace-only settings, adding mid alpha plus mid/edge/fade stop controls without sharing the widget topbar highlight settings.
+- Added separate static widget topbar highlight top/bottom cut controls in addition to the shared Y inset, so the lower edge of the full-line highlight can be trimmed independently without shifting the whole topbar content.
+- Added a static full-glass Profile tab strip above the terminal board. The left workspace dock now stays beside both the Profile strip and terminal area like the real app layout, while the terminal/explorer/shell examples remain below as draggable/resizable widgets.
+- Removed the static active prompt-target/focus chips from the terminal and split-shell chrome preview, since that control is planned to be removed from the real app as well.
+- Split the static Profile strip into two separate glass surfaces: a connection/profile/root card and a workspace actions/launch card. Removed the `Copy cd` action from both the static preview and the real app toolbar/Explorer context menu.
+- Filled the static workspace actions card with the full default workspace-bar button set after `Copy cd` removal: saved workspace controls, shell/Windows shell, Codex/Claude/Grok/Antigravity, panel toggles, reset/status, and ticker add controls.
+- Added static full-card glass mockups for the Editor, Image Preview/Paste Target, Calculator, and Browser widgets so their chrome/content can be compared on the same glass board. The widget close buttons and titlebar minimize/maximize/close controls now use macOS-style traffic-light circles in glass mode, with static controls for circle size, circle opacity, and icon opacity.
+- Refined the static traffic-light buttons using closer macOS color/border/icon references: titlebar controls now persist after reload even if old saved settings disabled `window buttons glass`, use red/yellow/green order, and show hover-only close/minimize/zoom glyphs.
+- Updated the static Editor/Image/Browser mockups for style review: the Editor body is transparent like terminal text-over-glass with sample code, the Image widget shows a small sample image preview, and the Browser mock labels the transparent area as an empty-page placeholder rather than implying loaded webpages should become transparent.
+- Compared the static glass board against the app's floating panel list. The static board currently covers Profile/action strip, Workspace dock, Explorer, terminal/codex/shell split, Editor, Image Preview, Calculator, Browser, and Settings; Notes and Snippets remain to be mocked before the board is fully app-complete.
+- Added the static right-side Settings panel as a single glass surface that follows the shared terminal/default glass material, with the settings controls rendered as normal overlay content above it.
+- Reverted the static titlebar/window/widget close controls from macOS traffic-light circles back to a clean Windows-style square control treatment, with controls for size, gap, radius, background/hover alpha, close-hover red alpha, outline alpha, and icon opacity/size.
+- Restored the static titlebar window-control order to the Windows order (`minimize`, `maximize`, `close`) and added a separate hover-highlight overlay so minimize/maximize also visibly highlight above the liquidGL surface.
+- Optimized static panel movement/resizing so draggable widget panels and dock width changes only update liquidGL lens metrics and re-render existing canvases instead of recapturing/recreating all glass renderers on every layout change.
+- Optimized the static glass lab boot/rebuild path: the page now paints CSS UI first, starts the heavy liquidGL/html2canvas boot during idle time, logs apply timings, switches static renderers to on-demand rendering instead of continuous RAF loops, and disposes liquidGL renderer resize/scroll/WebGL resources when rebuilding.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Local HTML script syntax checks for `.vibe-ide-temp/glass-lab/index.html`, `.vibe-ide-temp/glass-lab/demos/workspace-virtual.html`, and `.vibe-ide-temp/glass-debug/index.html`.
+
+### 2026-06-30 - Fix container-glass sampling and shared text/outline controls
+
+#### Context
+- Reported: enabling container glass made the workspace row glasses lose their glass effect, and enabling top-row container sampling made the result worse.
+- Also reported: the common/base outline color did not visually apply to selected/captured/+ rows, the `Workspaces` header only exposed size, and agent base text color did not affect visible agent title/activity/meta text.
+
+#### Changed (`src/main.ts`, `src/styles.css`, local static glass labs)
+- Container glass now uses an isolated liquidGL renderer/canvas instead of being added to the same global row renderer, so row lenses keep their own material/effect.
+- Top-row container sampling now composites the isolated container renderer into a dedicated hidden sample canvas before row recapture.
+- Kept the base safe snapshot stage active while container sampling is enabled so the container renderer still has a stable background source.
+- Added a `상태별 외곽선 색 사용` toggle. When it is off, active/locked/captured rows and the `+` button all use the common/base outline color and shared outline width/softness.
+- Added `헤더 굵기` for the `Workspaces` dock header.
+- Agent base text color/weight now cascades to title/activity/meta when the base control is changed, and saved custom base values also apply if detailed colors/weights are still at defaults.
+- LLM/agent card base tint, border, and inset highlight now derive from the agent-card background alpha, and the per-LLM top highlight derives from the LLM border alpha. When those controls are set to zero, the faint hidden card boundary disappears in both the app and local static glass labs.
+- Split normal tab highlight from selected tab highlight. Both can be independently enabled/disabled and tuned for color, opacity, center/edge strength, size, offset, and radius.
+- Added glass controls for agent status labels such as `작업`, `idle`, `대기`, `오류`, and `종료`: shared padding/radius/border/background intensity plus per-status colors. The local static workspace lab mirrors these controls for visual testing.
+- Added a static-only prototype for titlebar glass: the full `Simple Vibe IDE` title row and clock use non-reactive/container-style glass by default, while minimize/maximize/close buttons stay separate reactive row-style glass lenses above it. Titlebar container/button styling now reuses the shared container/row settings instead of separate one-off controls, and the lab preserves button text opacity/pointer layers.
+- Expanded tmux freeze diagnostics with capture/title/window marker and checksum parse states, probe output size, pane visibility, writer frame/timer ages, backend output char count, and a short `tmux stale-delivery` warning line when tmux changes while IDE-side terminal data is stale.
+- Raised/fixed static titlebar button content layers so window button glyphs stay visible above liquidGL canvases/mirrors. The static titlebar buttons now target a separate inner glass plane while the glyph label stays as a non-liquid overlay, so hover/tilt cannot hide the text. The titlebar clock now uses the same row liquidGL material via its own inner glass plane, with only its tilt disabled, and exposes/defaults a clock horizontal padding control so the time glass is not cramped. When titlebar/window-button glass is disabled, the inner glass planes are fully hidden so no faint button-shaped ghost remains.
+- Added a static-only 4-way terminal liquid glass comparison board to the glass debug mini app. Each variant uses one whole-card glass plane with terminal text/chrome as overlay content, shares the existing liquidGL effect controls, and can be dragged/repositioned with localStorage persistence.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Local HTML script syntax checks for `.vibe-ide-temp/glass-lab/index.html`, `.vibe-ide-temp/glass-lab/demos/workspace-virtual.html`, and `.vibe-ide-temp/glass-debug/index.html`.
+
+### 2026-06-30 - Trim source-smear experiment and align workspace status previews
+
+#### Context
+- Follow-up glass tuning made the source-smear highlight experiment feel unnecessary, while the real IDE still needed the static lab's clearer LLM/header coloring and consistent workspace status-dot previews.
+
+#### Changed (`src/main.ts`, `src/styles.css`, local static glass labs)
+- Removed the source-smear highlight controls and source-smear snapshot drawing from the local static glass lab/debug pages. The real IDE did not have the source-smear setting ported.
+- Added separate selected-header highlight center/edge strength controls in the real IDE and wired them to the glass highlight gradient.
+- Updated the real IDE glass agent cards so LLM/Agy color backgrounds use the same left-to-right fade and right/bleed sizing behavior as the static lab.
+- Workspace tabs now always render a status dot; workspaces without an active LLM state use the idle dot for visual consistency.
+- Added static preview rows for working, waiting/input-required, done/exited, and plain idle workspace states.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Local HTML script syntax checks for `.vibe-ide-temp/glass-lab/index.html`, `.vibe-ide-temp/glass-lab/demos/workspace-virtual.html`, and `.vibe-ide-temp/glass-debug/index.html`.
+
+### 2026-06-30 - Fill missing glass container and status-dot controls
+
+#### Context
+- Follow-up testing found that some static glass-lab controls were still missing from the real IDE popup, especially container glass on/off and whether top workspace rows sample the container glass result.
+- The LLM working status dot also lost the old soft green pulse in workspace glass mode, and capture-blocked/applied workspace examples needed to prove that the dot remains visible.
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Added real IDE controls for container glass lens on/off, top-row container sampling, container glass background/outline, row height, header/pill text, control padding/slot, detail/agent padding, agent badge sizing, LLM status-dot position, and working pulse tuning.
+- Added a workspace container glass plane and a separate container snapshot stage so workspace rows can optionally refract either the plain IDE background or the container-glass result.
+- Restored configurable working-dot pulse in side-dock glass mode and kept explicit protected/capture-applied LLM dots visible.
+- Updated local static glass labs with working-dot pulse controls and capture-blocked working examples.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Local HTML script syntax checks for `.vibe-ide-temp/glass-lab/index.html`, `.vibe-ide-temp/glass-lab/demos/workspace-virtual.html`, and `.vibe-ide-temp/glass-debug/index.html`.
+
+### 2026-06-30 - Port latest static glass tuning controls into the app
+
+#### Context
+- Requested: take the latest static workspace/liquid glass tuning options and apply them to the real IDE app, then review the settings for missing wiring.
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Expanded liquidGL effect ranges in the app to match the static lab: wider refraction, bevel depth, and bevel width controls.
+- Added shared workspace row outline controls with common width/softness and separate colors for normal, active, locked, and captured rows.
+- Added separate selected highlight color so the header highlight can be tuned independently from the selected accent/fill.
+- Added LLM/Agy agent-card color gradient controls: per-agent colors, background/border alpha, left/right/top/bottom sizing, left/right bleed, radius, and overflow toggle.
+- Added LLM status-dot color/size/glow/label-padding controls for glass side docks.
+- When a wallpaper/custom background image is selected, the procedural base/mid/end background no longer tints the image behind it; only explicit overlays such as grid/noise remain controlled by their own settings.
+- The side-dock `+` glass button now follows the shared row outline width/soft outline variables.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+- Local settings wiring review found 141 glass controls across 11 sections with no duplicate paths.
+
+### 2026-06-30 - Refine workspace glass dock controls and probe reliability
+
+#### Context
+- Follow-up glass testing showed selected workspaces could receive both the legacy workspace highlight and the new glass highlight, plus-button glass did not tilt, noise controls were hard to verify, and container blur could visually soften the liquidGL rows.
+- The new tmux freeze probe also failed in the real app because the checksum helper used an `awk` command whose field references were stripped before execution in that environment.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
+- In side-dock glass mode, legacy active workspace border/title highlighting is suppressed so glass highlight/rail/badge are the only selected-state visual.
+- The side-dock `+` button now uses the same liquidGL tilt settings as workspace rows.
+- Added an explicit IDE background noise on/off setting and made noise size/contrast visibly affect the procedural noise CSS.
+- Side-dock rows keep full width without reserving a permanent scrollbar gutter, including when glass is disabled.
+- Capture lock buttons now color only the lock/capture icon in both glass and non-glass modes, without the old yellow/green button background.
+- Capture-applied rows keep their capture outline in glass mode; normal/protected rows respect the configured glass outline alpha.
+- Selected glow and rail glow now default to zero, and the capture-applied row uses a crisp outline without a baked-in blur glow. This keeps CSS decoration separate from the liquidGL `shadow` option.
+- Dock/container blur now renders on a separate container surface layer instead of applying `backdrop-filter` on the parent, so it does not blur the liquidGL row canvases underneath.
+- Added a separate container surface opacity setting and auto-hide the container surface when bg, blur, and saturation are neutral, so setting the container to zero returns to the original background instead of leaving a faint compositor haze.
+- Glass settings and Diagnostics log popovers can be dragged by their header.
+- Replaced the tmux probe checksum `awk` calls with a shell `read` helper so the probe no longer fails with `awk: ... printf ..., ,`.
+- Updated the local static glass labs so the workspace tuner includes a same-effect reference card, migrates old default selected glows to zero, exposes dock surface opacity/bg/blur/saturate, and the mini app supports custom background image upload/URL/fit for faster visual comparisons before rebuilding the IDE.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Local tmux smoke confirmed the checksum helper emits tab-delimited checksum/byte rows without `awk`.
+
+### 2026-06-30 - Add privacy-safe tmux freeze probes
+
+#### Context
+- Reported: when an IDE-launched tmux LLM pane appears frozen, the existing terminal watchdog and title-poll logs can say the pane was refreshed but still do not reveal whether tmux content itself is changing.
+
+#### Changed (`src-tauri/src/lib.rs`, `src/main.ts`, `src/api.ts`, `src/types.ts`, `docs/USER_GUIDE.ko.md`)
+- Added a backend `llm_tmux_pane_probe` command for IDE-managed WSL/SSH tmux sessions.
+- When Diagnostics log is enabled, visible tmux-backed LLM panes now emit compact `terminal: tmux probe` records with tmux pane state, command/pid, activity/history, checksum+byte summaries for recent capture/title/window data, and IDE-side data/refresh/write backlog ages.
+- The probe intentionally does not log raw terminal output, pane titles, clipboard, file contents, env values, or secrets; checksums are only for change detection.
+
+#### Expected debugging signal
+- `cap` changing while `dataAge`/`refreshAge` stay old points toward IDE/PTY delivery or render-path stalls.
+- `cap`, title/window checksums, and session activity staying fixed points more toward the tmux pane/process itself being idle or stuck.
+- Nonzero `pending`/`writes` points toward a frontend xterm write backlog.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Local tmux smoke confirmed the probe format returns tab-delimited metadata plus checksum/byte lines without raw pane contents.
+
+### 2026-06-29 - Add workspace liquid glass and IDE background tuning
+
+#### Context
+- Requested: port the static liquidGL workspace experiment into the real app, with IDE background selection and per-workspace glass settings available from an in-app floating popup.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`, `docs/GLASS_WIDGETS.md`, `docs/THIRD_PARTY_NOTICES.md`, `public/vendor/liquidgl/*`)
+- Added a decorative IDE background layer with selectable presets, custom image upload/URL, light/noise tuning, and persistence in IDE settings.
+- Added a `Glass` popup for left/right workspace dock that controls workspace row liquidGL on/off, effect parameters, dock/container shell styling, row radius/padding, text/icon styling, selected highlight/rail/badge styling, and background tuning.
+- Real liquidGL is applied per `.workspace-tab` row instead of to the entire dock, so individual workspaces can tilt independently.
+- The app now follows the static demo structure more closely: each `.workspace-tab` row is the liquidGL target, the safe snapshot stage contains only the IDE background, and the real workspace row DOM is kept visible above the lens so text/icons stay sharp instead of being refracted from a cloned dock texture.
+- The side workspace dock shell stays transparent like the static lab; only a subtle outline remains around the group so the individual workspace rows own the visible glass.
+- The side dock `+` button now also receives the same glass material, but its liquidGL tilt is forced off.
+- The vendored liquidGL copy has a local `preserveTargetOpacity` option used by workspace glass so rows do not stay blank if snapshot/reveal is delayed.
+- The top IDE chrome now lets the decorative background continue behind the `Simple Vibe IDE` titlebar/workspace controls with a light translucent blur, giving the app a more seamless future-friendly shell.
+- The global liquidGL canvas and liquidGL hover mirror/shadow overlays are moved under `.shell`; the side dock itself is raised as a transparent stacking layer above those canvases, so row-shaped glass stays behind the real labels/icons even during tilt. Diagnostics log emits compact `glass` entries with canvas/mirror parent and z-index, dock/shell z-index, label hit-test, target opacity, and label metadata.
+- In glass side-dock mode the workspace resizer remains an absolute high-z hit target, and the workspace list no longer reserves a permanent scrollbar gutter so row widths line up with the glass `+` button.
+- Dock/container shell settings were added separately from row glass settings: padding, gap, background alpha, blur, saturation, side border, outline alpha/inset/radius, shadow, header opacity, and header pill background can be tuned while keeping the default static-demo-like transparent shell.
+- The liquidGL snapshot target is the safe `#ide-glass-snapshot-stage`, not terminal/browser/editor content.
+- Added docs describing supported glass scope and why terminal/browser widgets need separate compositor-safe approaches.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Guard Codex done alerts during tmux scrollback
+
+#### Context
+- Reported: while Codex was still working inside an IDE-launched tmux session,
+  scrolling up/down in the terminal could make the workspace briefly look idle
+  and send a false "finished" alert.
+
+#### Changed (`src/main.ts`, `src-tauri/src/lib.rs`, `src/api.ts`, `src/types.ts`)
+- Codex tmux status-line parsing now ignores `Ready`/idle candidates from the
+  tmux-painted title fallback. Direct OSC/window-title updates are still allowed;
+  the guard only blocks stale tmux status repaints from overriding active work.
+- Added a direct tmux pane-title query path for IDE-launched Codex tmux
+  sessions. While a Codex title-based working state is active, the frontend asks
+  the backend for `#{pane_title}` from tmux itself and treats that as trusted
+  title state, independent of terminal scrollback/copy-mode redraws.
+- While the terminal is actually viewing xterm scrollback or the terminal
+  history overlay, title-expiry completion is deferred and re-checked instead
+  of relying on one fixed short timeout.
+- A short wheel-time fallback remains for tmux mouse/copy-mode redraws where
+  xterm cannot prove whether the viewport is still scrolled back.
+- Diagnostics log records when a stale Codex tmux idle title is ignored or a
+  title idle/expiry is deferred after scrollback activity.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Local tmux smoke confirmed `tmux display-message -p '#{pane_title}'` follows
+  OSC 2 title changes from `SVI_PROBE_WORKING` to `Ready`.
+
+### 2026-06-28 - Make agent alert banners clickable and minimal
+
+#### Context
+- Requested: clicking an agent alert should jump directly to the relevant
+  workspace/LLM, the banner should use the app icon, and banner text should only
+  say which workspace/LLM needs input or finished.
+
+#### Changed (`src/main.ts`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`, `public/icon.png`)
+- Real agent status alerts now use a frontend clickable Web Notification first,
+  with the Simple Vibe IDE app icon and a click handler that focuses the app,
+  activates the target workspace, and selects the target LLM pane when it still
+  exists.
+- If the clickable frontend notification fails, the existing backend native
+  banner path remains as a fallback.
+- Sound continues to use the backend native alert path and remains independent
+  from banner display.
+- Agent alert title/body are now intentionally minimal: LLM + state in the title
+  and workspace name in the body. Pane title, cwd, and activity text are not
+  included.
+- Windows tray balloon fallback now tries to reuse the main window/class icon
+  before falling back to the generic system application icon.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `git diff --check`
+
+### 2026-06-28 - Add Grok Build hook bridge
+
+#### Context
+- Grok Build title/OSC status is useful but not enough for precise
+  `working`/`waiting`/`done` detection, especially because plan/question screens
+  can still show spinner-like activity.
+- Actual Grok hook testing showed Grok 0.2.67 emits snake_case event names such
+  as `session_start`, `user_prompt_submit`, `pre_tool_use`, `post_tool_use`,
+  and `stop`.
+
+#### Changed (`src/main.ts`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
+- Added `Set` -> `Agent event bridge` -> `Grok hooks` with ask / auto / off.
+- When launching Grok in a WSL workspace, Simple Vibe IDE can install/update
+  `~/.grok/hooks/simple-vibe-ide.json` and
+  `~/.grok/hooks/simple-vibe-ide-hook.sh`.
+- The global Grok hook stays inert unless the IDE launches Grok with temporary
+  `SVIDE_AGENT_*` bridge env vars; no port/token is stored in the hook files.
+- The hook posts only compact metadata to the local bridge
+  (event/session/cwd/toolName/timestamps/truncation flags), not prompt text or
+  tool input/output bodies.
+- The backend now canonicalizes Grok snake_case hook names to the existing
+  PascalCase bridge event names and maps Subagent/compact events to status.
+- Grok hook events now drive working/done/error status, while Grok title/output
+  can still supplement question/approval waiting detection without letting idle
+  title text prematurely end a hook-tracked turn.
+
+#### Verified (repo-side only)
+- Created a temporary global Grok hook and confirmed real headless Grok emitted
+  `session_start`, `user_prompt_submit`, `pre_tool_use`, `post_tool_use`, and
+  `stop` payloads.
+- Ran a local bridge smoke test and confirmed the final hook script shape posted
+  five compact events to `/agent-event?agent=grok&session=...`.
+- Temporary test hook files were removed afterward.
+- `npm run check`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+
+### 2026-06-28 - Add in-app diagnostics log popup
+
+#### Context
+- Reported debugging pain: terminal/tmux freeze, agent status transitions, and
+  notification banner failures are hard to diagnose from screenshots alone.
+- A lightweight debug-mode log panel can let the user copy event metadata back
+  to the agent without exposing raw terminal output or secrets.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Added `Set` -> `Diagnostics log` with enable, open, copy, and clear actions.
+- The log is a local ring buffer and is off by default.
+- A small previous-session heartbeat is persisted so a force-close/freeze can be
+  reported on the next launch as an unclean shutdown breadcrumb with the last
+  heartbeat/event time.
+- Captured events include terminal render watchdog refreshes, visible pane
+  flushes, agent status/source transitions, hook bridge events, alert requests,
+  and memory-saver sleep decisions.
+- Renderer watchdog recovery notices are forced into the diagnostic log even if
+  general diagnostic capture is off.
+- Log text is sanitized/truncated and intentionally avoids raw terminal output,
+  clipboard text, file contents, tokens, and env values.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Add visible terminal render watchdog
+
+#### Context
+- Reported: tmux panes can look frozen until the user clicks/triple-clicks the
+  terminal, even when the underlying session has continued.
+- Memory Saver is unlikely for the active workspace because it never sleeps the
+  currently active workspace; the symptom matches stale xterm write/render
+  flush more closely.
+
+#### Changed (`src/main.ts`)
+- Visible terminal output now records recent data time and schedules a short
+  render watchdog.
+- The watchdog cancels a stale visible `requestAnimationFrame` write flush,
+  flushes pending output, and forces an xterm viewport refresh for recently
+  received data.
+- Workspace activation/resume now flushes and refreshes all visible panes in the
+  active terminal split group, not only the widget's single active pane.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Fix done alerts on working timeout expiry
+
+#### Context
+- Reported: a workspace visibly changed from `작업중` to `idle` while viewing
+  another workspace, but no Windows/sound alert fired.
+- Follow-up concern: `Prompt sent` / temporary UI working should not be treated
+  as a real completed job, or simply typing/submitting a prompt could create a
+  false done alert when the short activity window expires.
+
+#### Changed (`src/main.ts`)
+- Alert transition detection now treats a recently expired raw `working`
+  progress record as previous `working` when the next state is `idle`/`exited`.
+- This fixes the timeout-driven path where `effectiveAgentSessionStatus()` had
+  already converted the previous record to `idle` before the alert predicate ran.
+- Added done-alert eligibility flags to agent progress records.
+- `Prompt sent`, launcher startup, and generic heuristic working are excluded
+  from done alerts.
+- Codex/title working can fire a done alert on a short title-expiry transition.
+- Claude/hook working can fire a done alert only on an explicit hook transition
+  such as `Stop`/`SessionEnd`; hook working timeout alone does not fire done.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Auto-update saved workspace layouts
+
+#### Context
+- Reported: after pressing `Save WS` once, later panel/widget layout changes are
+  easy to forget to save manually, so restarting can load an older saved layout.
+
+#### Changed (`src/main.ts`, `docs/USER_GUIDE.ko.md`)
+- Saved workspace entries now keep a lightweight link from the live workspace
+  snapshot to the saved entry.
+- When a linked live workspace snapshot changes, the matching saved workspace is
+  automatically updated in place instead of requiring another manual `Save WS`.
+- A 30-second safety timer also snapshots the active workspace, and hiding the
+  app flushes a snapshot, so missed UI-save triggers are less likely.
+- Existing saved workspaces are linked lazily when the open workspace name,
+  profile, and root match the saved entry.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
+### 2026-06-28 - Tighten tmux launcher/runtime status follow-up
+
+#### Context
+- Reported: a freshly rebuilt app still appeared to type the old tmux launch
+  command shape (`env ... 'claude' ...`) and some Claude sessions still exposed
+  the non-demo account identity.
+- Reported: Codex in another workspace could remain `작업중` after the turn had
+  already finished, then flip to idle only after clicking that workspace.
+- Reported: the LLM widget `Tmux` and `+` buttons still looked misaligned.
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Bumped the typed POSIX LLM launcher marker to `__svi_launch_v=5`; a pasted
+  launch command without this marker is from an older built runtime.
+- Claude local hook setup now also keeps `.claude/settings.local.json` `env`
+  current for the safe `IS_DEMO` passthrough, so Claude itself gets demo/privacy
+  mode even if shell alias expansion differs.
+- tmux status-line title detection now stops extending a Codex `working` state
+  when the exact same quoted working title repeats for more than a short stale
+  window. A changing spinner still refreshes normally.
+- Terminal `+` no longer inherits the global tab-add button class, and both LLM
+  tab controls share explicit button box styling.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Local shell/tmux smoke confirmed an alias-based `claude` launch can still set
+  `IS_DEMO`.
+
+### 2026-06-28 - Preserve Claude aliases for demo/privacy env
+
+#### Context
+- Reported: manually entering tmux then running `claude` hid the email, but the
+  IDE-created tmux Claude session still showed it, so `IS_DEMO`/privacy launch
+  customization was not actually equivalent.
+- Also reported: Claude hook install prompt appeared again even after the local
+  hook was already installed.
+
+#### Changed (`src/main.ts`, `.gitignore`, `docs/USER_GUIDE.ko.md`)
+- POSIX LLM launch now builds a shell-quoted launcher command and runs it via
+  `eval`, with env assignments before the command name. This keeps safe env
+  passthrough while allowing user `claude` aliases/functions/wrappers to expand.
+- tmux LLM launch now starts `bash -ic` with that launcher command, so tmux
+  sessions also source normal interactive shell customizations before launching
+  Claude/Codex/Grok/Agy.
+- `Ask` mode for Claude hooks now checks whether the Simple Vibe IDE local hook
+  is already present; if it is, launch continues without asking again.
+- Ignored the generated local Claude hook files so the public repo does not
+  accidentally track workspace-local hook configuration.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `git diff --check`
+- Local shell smoke confirmed an alias-based `claude` launch can set `IS_DEMO`
+  through the new launcher shape.
+
+### 2026-06-28 - Restore Codex working detection inside tmux
+
+#### Context
+- Reported: Codex sessions stayed `idle` / `Prompt sent` even while the model
+  was visibly working, including in a newly created tmux session.
+- Root cause verified with a synthetic tmux PTY smoke: tmux did not forward the
+  inner app's OSC title to the outer xterm stream. Instead it repainted the app
+  title inside its status line, e.g. a quoted `Thinking`/spinner segment. The
+  previous Codex title-only patch was looking only at OSC/onTitleChange signals,
+  so tmux-backed Codex never refreshed `working`.
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Codex remains title-only, but tmux status-line title text is now treated as a
+  title signal. Generic Codex terminal output is still not used as fallback.
+- OSC title parsing now also accepts OSC 1 in addition to OSC 0/2.
+- Codex title classifier recognizes more spinner glyphs and a few direct
+  waiting-title phrases.
+- Matched the LLM widget `Tmux` and `+` button margins/font sizing so the two
+  controls line up consistently.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `git diff --check`
+- Synthetic tmux PTY smoke confirmed a quoted spinner title can be extracted
+  from tmux status output.
+
+### 2026-06-28 - Remove pinned Notes yellow outline
+
+#### Context
+- Reported: a Notes widget could show a yellow outer border while not selected.
+- Root cause: the Notes `Pin` state intentionally added a yellow box shadow,
+  which looked like a stale selection/focus outline.
+
+#### Changed (`src/styles.css`)
+- `Pin` now only keeps Notes above other widgets. It no longer changes the
+  widget outer border/shadow color.
+- Active widget indication still comes from the normal focus border/title
+  settings.
+
+#### Verified (repo-side only)
+- `git diff --check`
+
+### 2026-06-28 - Add Claude hook bridge and safe tmux env passthrough
+
+#### Context
+- Planned: keep Codex status title-only, but improve Claude status by using
+  Claude Code local hooks when available.
+- Reported: Claude launched through Simple Vibe IDE's tmux path did not inherit
+  benign local environment such as `IS_DEMO=1`, so demo/privacy mode could
+  differ from a manually typed shell launch.
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src/types.ts`, `src-tauri/src/lib.rs`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Added a token-protected local Agent Event Bridge in the Tauri backend. It
+  accepts small hook JSON events and emits `agent-bridge-event` to the frontend.
+- Added `Set` -> `Agent event bridge`:
+  - Claude hook mode: ask / auto / off.
+  - tmux env passthrough allow-list, defaulting to `IS_DEMO`.
+- WSL Claude launches can install/update workspace-local
+  `.claude/settings.local.json` and `.claude/simple-vibe-ide-hook.sh`. The hook
+  script contains no port/token; those are injected only into the launched
+  Claude process environment.
+- Claude hook events now drive `working` / `waiting` / `idle` / `error` /
+  `exited` workspace agent status with `hook` source precedence. Once a pane
+  receives hook events, title/output heuristics no longer override it.
+- POSIX LLM launcher commands now wrap tmux/direct launches with `env
+  "${__svi_env_args[@]}" ...`, so safe allow-listed env vars such as `IS_DEMO`
+  survive tmux process startup without printing their values in the typed
+  command.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+
+#### Needs real Windows/WSL smoke
+- Confirm WSL Claude hook events reach the backend and update workspace detail
+  status while another workspace is active.
+- Confirm `IS_DEMO=1` or another safe non-secret env var is visible to a newly
+  launched Claude tmux session.
+
+### 2026-06-28 - Improve Type pad recovery, workspace dock UI, and alert fallback
+
+#### Context
+- Reported: pasting from Type pad into tmux-backed sessions can appear to drop
+  text when the shell/CLI is not ready for cursor input.
+- Reported: side workspace active-title highlighting looked segmented around
+  the lock/copy/close buttons, and expanded LLM detail cards were hard to
+  distinguish from each other and from the next workspace.
+- Reported: `Banner` alert test logs showed permission granted and backend OK,
+  but no visible Windows banner.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src/api.ts`, `src/types.ts`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
+- Type pad paste now explicitly returns focus/keyboard ownership to the active
+  shell before writing the paste payload.
+- Added a runtime-only Type pad `Recall` button that restores recently pasted
+  Type pad text, so swallowed text can be recovered without retyping.
+- Workspace tab controls now sit inside one header row, so active title
+  highlighting paints as one consistent block instead of per-button segments.
+- Expanded side-dock workspace detail now has stronger spacing/dividers, and
+  LLM cards use cheap status-colored left accents plus compact styling. Agent
+  cards now also get subtle agent-specific backgrounds/top accents so Codex and
+  Claude rows are easier to distinguish.
+- LLM widget `Tmux` and `+` buttons now share an explicit fixed width as well
+  as height/padding, preventing the controls from visually drifting apart.
+- Codex `Model interrupted to submit steer instructions` output is treated as
+  explicitly not-waiting, and clearly-active/not-waiting output now clears stale
+  waiting buffers before older prompt text can re-trigger `대기`.
+- LLM title/status detection now recognizes Simple Vibe IDE tmux session prefixes
+  such as `svi_<workspace>_codex_1:` and also tests a stripped title candidate,
+  so tmux-backed tabs can still drive Codex/Claude/Grok status indicators.
+- Ambiguous background terminal output no longer starts a new `working` state by
+  itself. It can only extend that same pane's existing working window; explicit
+  active-work text or title signals are required to start working. This avoids
+  prompt/footer repaints in other workspaces briefly flipping to `작업중`.
+- Mouse-wheel scrolling inside tmux-backed LLM terminals now briefly suppresses
+  LLM title/output detection, so tmux copy-mode/scrollback redraws containing an
+  old approval prompt do not flip the workspace into `대기`.
+- Codex status is now title-only: OSC/window-title signals drive Codex
+  `working`/`waiting`/`idle`, while terminal output is no longer used as a
+  Codex fallback. Manually typed `codex` still registers the pane, but ongoing
+  status comes from title changes to avoid tmux scrollback false positives.
+- Windows agent alert banners now also try a native tray balloon fallback after
+  the Tauri notification plugin path. The debug log reports plugin/tray results.
+- Added a backend-native `Banner 5s` delayed alert test button so Windows
+  background delivery can be tested without relying on a WebView timer after the
+  click. Real LLM-triggered alerts also write request/OK/FAILED debug lines, so
+  status-event failures and Windows banner-delivery failures are distinguishable.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+
+#### Needs real Windows smoke
+- Confirm `Banner` test shows either a normal notification or tray balloon while
+  another app has focus.
+- Confirm Type pad `Recall` recovers a swallowed tmux paste without persisting
+  the text after app restart.
+
+### 2026-06-28 - Add workspace detail privacy controls
+
+#### Context
+- Reported: side workspace detail cards can reveal path/folder text too
+  prominently, and capture-blocked workspaces should have a compact option that
+  hides non-essential detail rows.
+
+#### Changed (`src/main.ts`, `src/styles.css`, `docs/USER_GUIDE.ko.md`)
+- Added `Set` -> `Workspace detail content` toggles:
+  - `Show activity/title line`
+  - `Show path/source line`
+  - `Hide both extra lines on capture-blocked workspaces`
+- Capture-blocked workspace detail cards now default to hiding the activity and
+  path/source rows, while still showing the agent badge/name/status row.
+- Reduced the activity/title detail row typography to match the smaller
+  path/source row so it reads as secondary information.
+
+#### Verified (repo-side only)
+- `npm run check`
+- `npm run build`
+- `git diff --check`
+
 ### 2026-06-28 - Polish LLM toolbar and alert diagnostics
 
 #### Context

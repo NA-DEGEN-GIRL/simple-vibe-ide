@@ -8,9 +8,10 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Output, Stdio};
-#[cfg(windows)]
-use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, AtomicU32};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 #[cfg(windows)]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -39,19 +40,23 @@ use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 
 #[cfg(windows)]
-use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{
+    DragQueryFileW, Shell_NotifyIconW, HDROP, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+};
 
 #[cfg(windows)]
 use windows::core::BOOL;
 
 #[cfg(windows)]
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetAncestor, GetClassNameW, GetWindowDisplayAffinity,
-    SetWindowDisplayAffinity, GA_ROOT, MB_ICONASTERISK, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR,
-    WDA_NONE, WINDOW_DISPLAY_AFFINITY,
+    EnumChildWindows, GetAncestor, GetClassLongPtrW, GetClassNameW, GetWindowDisplayAffinity,
+    LoadIconW, SendMessageW, SetWindowDisplayAffinity, GA_ROOT, GCLP_HICON, GCLP_HICONSM, HICON,
+    ICON_BIG, ICON_SMALL, ICON_SMALL2, IDI_APPLICATION, MB_ICONASTERISK, WDA_EXCLUDEFROMCAPTURE,
+    WDA_MONITOR, WDA_NONE, WINDOW_DISPLAY_AFFINITY, WM_GETICON,
 };
 
 #[cfg(windows)]
@@ -129,23 +134,28 @@ const LOCAL_DIRECTORY_BATCH_PARALLELISM: usize = 4;
 const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
 const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
+const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 256;
 const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
 const BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX: &str = "browser-preview-webview";
 const WSL_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(8);
 const WSL_FAST_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(4);
 const WSL_WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WSL_WARMUP_CACHE_TTL: Duration = Duration::from_secs(30);
+const WSL_DISTRO_LIST_TIMEOUT: Duration = Duration::from_secs(4);
+const WSL_DISTRO_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 const WSL_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
 const WSL_TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(450);
 const REMOTE_SHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const REMOTE_DIRECTORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(18);
 const LLM_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+const LLM_TMUX_TITLE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDERER_HEARTBEAT_STARTUP_GRACE: Duration = Duration::from_secs(30);
 const RENDERER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const RENDERER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const RENDERER_RECOVERY_RELOAD_COOLDOWN: Duration = Duration::from_secs(120);
 const RENDERER_RECOVERY_STABLE_AFTER: Duration = Duration::from_secs(35);
 const RENDERER_RECOVERY_WARN_ATTEMPTS: u32 = 3;
+const AGENT_BRIDGE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SNIPPETS_STORE_FILE: &str = "snippets.v1.json";
 const SNIPPETS_STORE_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_SNIPPETS_STORE: &str = r#"{"version":1,"activeTabId":"general","tabs":[{"id":"general","title":"General","items":[]}]}"#;
@@ -156,12 +166,14 @@ type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 static WSL_HOME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static WSL_WARMUP_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 static WSL_WARMUP_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static WSL_DISTRO_LIST_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
 
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
     forwards: Mutex<HashMap<String, ForwardSession>>,
     exports: Mutex<HashMap<String, ExportSession>>,
     edge_sessions: EdgeSessionStore,
+    agent_bridge: AgentBridgeStore,
     renderer_health: Mutex<RendererHealthState>,
 }
 
@@ -172,6 +184,7 @@ impl IdeState {
             forwards: Mutex::new(HashMap::new()),
             exports: Mutex::new(HashMap::new()),
             edge_sessions: Arc::new(Mutex::new(HashMap::new())),
+            agent_bridge: AgentBridgeStore::new(),
             renderer_health: Mutex::new(RendererHealthState::new()),
         }
     }
@@ -184,7 +197,7 @@ impl Default for IdeState {
 }
 
 struct TerminalSession {
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    input_tx: SyncSender<Vec<u8>>,
     child: Box<dyn portable_pty::Child + Send>,
     master: Box<dyn MasterPty + Send>,
     rows: u16,
@@ -203,6 +216,66 @@ struct ExportSession {
 struct EdgeDevtoolsSessionState {
     child: Option<ProcessChild>,
     port: u16,
+}
+
+#[derive(Clone)]
+struct AgentBridgeRuntime {
+    port: u16,
+    token: String,
+}
+
+struct AgentBridgeStore {
+    runtime: Mutex<Option<AgentBridgeRuntime>>,
+    sessions: Arc<Mutex<HashMap<String, AgentBridgeSession>>>,
+}
+
+impl AgentBridgeStore {
+    fn new() -> Self {
+        Self {
+            runtime: Mutex::new(None),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AgentBridgeSession {
+    agent_id: String,
+    pane_id: String,
+    workspace_id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentBridgeInfo {
+    port: u16,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterAgentBridgeSessionPayload {
+    session_id: String,
+    agent_id: String,
+    pane_id: String,
+    workspace_id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentBridgeEvent {
+    agent_id: String,
+    session_id: String,
+    pane_id: Option<String>,
+    workspace_id: Option<String>,
+    cwd: Option<String>,
+    raw_event_name: String,
+    status: Option<String>,
+    activity: Option<String>,
+    transcript_path: Option<String>,
+    source: String,
 }
 
 struct RendererHealthState {
@@ -543,11 +616,26 @@ fn start_ssh_askpass_server(_app: AppHandle) {}
 #[cfg(windows)]
 fn start_ssh_askpass_server(app: AppHandle) {
     let _ = SSH_ASKPASS_SERVER.get_or_init(|| {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local SSH askpass broker");
-        let port = listener
-            .local_addr()
-            .expect("local SSH askpass broker address")
-            .port();
+        let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("failed to bind local SSH askpass broker: {error}");
+                return Arc::new(SshAskpassServer {
+                    port: 0,
+                    token: String::new(),
+                    app,
+                    pending: Mutex::new(HashMap::new()),
+                    cache: Mutex::new(HashMap::new()),
+                });
+            }
+        };
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(error) => {
+                eprintln!("failed to read local SSH askpass broker address: {error}");
+                0
+            }
+        };
         let server = Arc::new(SshAskpassServer {
             port,
             token: Uuid::new_v4().to_string(),
@@ -653,7 +741,6 @@ fn handle_ssh_askpass_http_request(
     write_plain_http_response(&mut stream, 200, "OK", &format!("{secret}\n"))
 }
 
-#[cfg(windows)]
 fn write_plain_http_response(
     stream: &mut TcpStream,
     code: u16,
@@ -1385,6 +1472,25 @@ struct AgentAlertPayload {
     body: String,
     show_banner: bool,
     play_sound: bool,
+    delay_ms: Option<u64>,
+    debug_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentAlertResult {
+    notification_plugin_ok: bool,
+    tray_balloon_ok: bool,
+    banner_error: Option<String>,
+    scheduled_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentAlertDelayedResultEvent {
+    debug_id: Option<String>,
+    result: Option<AgentAlertResult>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1407,6 +1513,49 @@ struct LlmTmuxSessionListResult {
     message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmTmuxPaneTitleResult {
+    available: bool,
+    session_name: String,
+    pane_title: Option<String>,
+    window_name: Option<String>,
+    pane_in_mode: bool,
+    pane_dead: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmTmuxPaneProbeResult {
+    available: bool,
+    session_name: String,
+    pane_in_mode: bool,
+    pane_dead: bool,
+    current_command: Option<String>,
+    pane_pid: Option<u32>,
+    alternate_on: bool,
+    history_size: Option<u32>,
+    session_activity: Option<u64>,
+    pane_active: bool,
+    title_checksum: Option<String>,
+    title_bytes: Option<u32>,
+    window_checksum: Option<String>,
+    window_bytes: Option<u32>,
+    capture_checksum: Option<String>,
+    capture_bytes: Option<u32>,
+    meta_seen: bool,
+    title_seen: bool,
+    window_seen: bool,
+    capture_seen: bool,
+    title_parse: Option<String>,
+    window_parse: Option<String>,
+    capture_parse: Option<String>,
+    probe_stdout_lines: u32,
+    probe_stdout_bytes: u32,
+    message: Option<String>,
+}
+
 #[tauri::command]
 fn list_profiles() -> Vec<ConnectionProfile> {
     let mut profiles = vec![ConnectionProfile {
@@ -1424,9 +1573,18 @@ fn list_profiles() -> Vec<ConnectionProfile> {
 }
 
 #[tauri::command]
-fn list_wsl_profiles() -> Vec<ConnectionProfile> {
+async fn list_wsl_profiles() -> Vec<ConnectionProfile> {
+    run_blocking_command("list wsl profiles", list_wsl_profiles_blocking)
+        .await
+        .unwrap_or_else(|_| wsl_profiles_from_distros(Vec::new()))
+}
+
+fn list_wsl_profiles_blocking() -> Result<Vec<ConnectionProfile>, String> {
+    Ok(wsl_profiles_from_distros(detect_wsl_distros()))
+}
+
+fn wsl_profiles_from_distros(detected_wsl: Vec<String>) -> Vec<ConnectionProfile> {
     let mut profiles = Vec::new();
-    let detected_wsl = detect_wsl_distros();
     if detected_wsl.is_empty() {
         profiles.push(ConnectionProfile {
             id: "wsl:Ubuntu".to_string(),
@@ -1489,35 +1647,115 @@ fn renderer_heartbeat(state: State<'_, IdeState>) -> RendererHeartbeatResponse {
 }
 
 #[tauri::command]
-fn send_agent_alert(app: AppHandle, payload: AgentAlertPayload) -> Result<(), String> {
+fn send_agent_alert(
+    app: AppHandle,
+    payload: AgentAlertPayload,
+) -> Result<AgentAlertResult, String> {
     let title = normalize_agent_alert_text(&payload.title, 96);
     let body = normalize_agent_alert_text(&payload.body, 180);
-    let mut banner_error = None;
+    let delay_ms = payload.delay_ms.unwrap_or(0).min(60_000);
+    if delay_ms > 0 {
+        let app_for_delay = app.clone();
+        let debug_id = payload.debug_id.clone();
+        let delayed_title = title.clone();
+        let delayed_body = body.clone();
+        let show_banner = payload.show_banner;
+        let play_sound = payload.play_sound;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(delay_ms));
+            let result = send_agent_alert_now(
+                &app_for_delay,
+                &delayed_title,
+                &delayed_body,
+                show_banner,
+                play_sound,
+            );
+            let event = match result {
+                Ok(result) => AgentAlertDelayedResultEvent {
+                    debug_id,
+                    result: Some(result),
+                    error: None,
+                },
+                Err(error) => AgentAlertDelayedResultEvent {
+                    debug_id,
+                    result: None,
+                    error: Some(error),
+                },
+            };
+            let _ = app_for_delay.emit("agent-alert-delayed-result", event);
+        });
+        return Ok(AgentAlertResult {
+            notification_plugin_ok: false,
+            tray_balloon_ok: false,
+            banner_error: None,
+            scheduled_delay_ms: Some(delay_ms),
+        });
+    }
+    send_agent_alert_now(&app, &title, &body, payload.show_banner, payload.play_sound)
+}
 
-    if payload.show_banner {
+fn send_agent_alert_now(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    show_banner: bool,
+    play_sound: bool,
+) -> Result<AgentAlertResult, String> {
+    let mut banner_errors = Vec::new();
+    let mut notification_plugin_ok = false;
+    #[cfg(windows)]
+    let mut tray_balloon_ok = false;
+    #[cfg(not(windows))]
+    let tray_balloon_ok = false;
+
+    if show_banner {
         if let Err(error) = app
             .notification()
             .builder()
             .title(if title.is_empty() {
                 "Simple Vibe IDE".to_string()
             } else {
-                title
+                title.to_string()
             })
-            .body(body)
+            .body(body.to_string())
             .show()
         {
-            banner_error = Some(error.to_string());
+            banner_errors.push(format!("notification plugin failed: {error}"));
+        } else {
+            notification_plugin_ok = true;
+        }
+
+        #[cfg(windows)]
+        match show_windows_agent_alert_balloon(&title, &body) {
+            Ok(()) => {
+                tray_balloon_ok = true;
+            }
+            Err(error) => {
+                banner_errors.push(format!("tray balloon failed: {error}"));
+            }
         }
     }
 
-    if payload.play_sound {
+    if play_sound {
         play_native_agent_alert_sound();
     }
 
-    if let Some(error) = banner_error {
-        Err(format!("notification banner failed: {error}"))
+    if show_banner && !notification_plugin_ok && !tray_balloon_ok {
+        Err(format!(
+            "notification banner failed: {}",
+            banner_errors.join("; ")
+        ))
     } else {
-        Ok(())
+        Ok(AgentAlertResult {
+            notification_plugin_ok,
+            tray_balloon_ok,
+            banner_error: if banner_errors.is_empty() {
+                None
+            } else {
+                Some(banner_errors.join("; "))
+            },
+            scheduled_delay_ms: None,
+        })
     }
 }
 
@@ -1538,6 +1776,393 @@ fn normalize_agent_alert_text(value: &str, max_chars: usize) -> String {
         }
     }
     out.trim().to_string()
+}
+
+#[tauri::command]
+fn agent_bridge_info(
+    app: AppHandle,
+    state: State<'_, IdeState>,
+) -> Result<AgentBridgeInfo, String> {
+    let runtime = start_agent_bridge_if_needed(app, state.inner())?;
+    Ok(AgentBridgeInfo {
+        port: runtime.port,
+        token: runtime.token,
+    })
+}
+
+#[tauri::command]
+fn register_agent_bridge_session(
+    state: State<'_, IdeState>,
+    payload: RegisterAgentBridgeSessionPayload,
+) -> Result<(), String> {
+    if !agent_bridge_safe_id(&payload.session_id)
+        || !agent_bridge_safe_id(&payload.pane_id)
+        || !agent_bridge_safe_id(&payload.workspace_id)
+        || !agent_bridge_safe_agent(&payload.agent_id)
+    {
+        return Err("invalid agent bridge session".to_string());
+    }
+    let mut sessions = state
+        .agent_bridge
+        .sessions
+        .lock()
+        .map_err(|_| "agent bridge sessions are unavailable".to_string())?;
+    sessions.insert(
+        payload.session_id.clone(),
+        AgentBridgeSession {
+            agent_id: payload.agent_id,
+            pane_id: payload.pane_id,
+            workspace_id: payload.workspace_id,
+            cwd: payload.cwd,
+        },
+    );
+    if sessions.len() > 256 {
+        let keys: Vec<String> = sessions
+            .keys()
+            .take(sessions.len().saturating_sub(256))
+            .cloned()
+            .collect();
+        for key in keys {
+            sessions.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+fn start_agent_bridge_if_needed(
+    app: AppHandle,
+    state: &IdeState,
+) -> Result<AgentBridgeRuntime, String> {
+    let mut runtime_guard = state
+        .agent_bridge
+        .runtime
+        .lock()
+        .map_err(|_| "agent bridge is unavailable".to_string())?;
+    if let Some(runtime) = runtime_guard.clone() {
+        return Ok(runtime);
+    }
+
+    let listener = TcpListener::bind(("0.0.0.0", 0))
+        .map_err(|error| format!("failed to bind agent bridge: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read agent bridge port: {error}"))?
+        .port();
+    let runtime = AgentBridgeRuntime {
+        port,
+        token: Uuid::new_v4().to_string(),
+    };
+    let token = runtime.token.clone();
+    let sessions = state.agent_bridge.sessions.clone();
+    let app_for_thread = app.clone();
+    thread::Builder::new()
+        .name("simple-vibe-agent-bridge".to_string())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let app_for_request = app_for_thread.clone();
+                        let token_for_request = token.clone();
+                        let sessions_for_request = sessions.clone();
+                        let _ = thread::Builder::new()
+                            .name("simple-vibe-agent-bridge-request".to_string())
+                            .spawn(move || {
+                                let _ = handle_agent_bridge_http_request(
+                                    &app_for_request,
+                                    &token_for_request,
+                                    &sessions_for_request,
+                                    stream,
+                                );
+                            });
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .map_err(|error| format!("failed to start agent bridge: {error}"))?;
+    *runtime_guard = Some(runtime.clone());
+    Ok(runtime)
+}
+
+fn handle_agent_bridge_http_request(
+    app: &AppHandle,
+    token: &str,
+    sessions: &Arc<Mutex<HashMap<String, AgentBridgeSession>>>,
+    mut stream: TcpStream,
+) -> std::io::Result<()> {
+    let _ = stream.set_read_timeout(Some(AGENT_BRIDGE_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(AGENT_BRIDGE_IO_TIMEOUT));
+    let buffer = match read_http_headers(&mut stream, 128 * 1024) {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            return write_plain_http_response(&mut stream, 400, "Bad Request", "bad headers\n")
+        }
+    };
+    let Some(header_end) = find_http_header_end(&buffer) else {
+        return write_plain_http_response(&mut stream, 400, "Bad Request", "missing headers\n");
+    };
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let Some(request_line) = header_text.lines().next() else {
+        return write_plain_http_response(&mut stream, 400, "Bad Request", "bad request\n");
+    };
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default();
+    let uri = request_parts.next().unwrap_or_default();
+    if method != "POST" {
+        return write_plain_http_response(&mut stream, 405, "Method Not Allowed", "POST only\n");
+    }
+    if !uri.starts_with("/agent-event") {
+        return write_plain_http_response(&mut stream, 404, "Not Found", "not found\n");
+    }
+    if http_header_value(&header_text, "x-svi-agent-token").as_deref() != Some(token) {
+        return write_plain_http_response(&mut stream, 403, "Forbidden", "bad token\n");
+    }
+    let length = http_content_length(&header_text)
+        .unwrap_or(0)
+        .min(2 * 1024 * 1024);
+    let body_start = header_end + 4;
+    let mut body = buffer.get(body_start..).unwrap_or_default().to_vec();
+    if body.len() < length {
+        let mut rest = vec![0_u8; length - body.len()];
+        stream.read_exact(&mut rest)?;
+        body.extend(rest);
+    }
+    body.truncate(length);
+    let value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(_) => return write_plain_http_response(&mut stream, 400, "Bad Request", "bad json\n"),
+    };
+    let query = agent_bridge_query_pairs(uri);
+    let session_id = query
+        .get("session")
+        .cloned()
+        .filter(|value| agent_bridge_safe_id(value));
+    let Some(session_id) = session_id else {
+        return write_plain_http_response(&mut stream, 400, "Bad Request", "missing session\n");
+    };
+    let registered = sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(&session_id).cloned());
+    let agent_id = query
+        .get("agent")
+        .cloned()
+        .filter(|value| agent_bridge_safe_agent(value))
+        .or_else(|| registered.as_ref().map(|session| session.agent_id.clone()))
+        .unwrap_or_else(|| "agent".to_string());
+    let raw_event_name = agent_bridge_event_name(&value);
+    let status = agent_bridge_status_for_event(&raw_event_name).map(str::to_string);
+    let activity = agent_bridge_activity_for_event(&raw_event_name, &value);
+    let event = AgentBridgeEvent {
+        agent_id,
+        session_id,
+        pane_id: registered.as_ref().map(|session| session.pane_id.clone()),
+        workspace_id: registered
+            .as_ref()
+            .map(|session| session.workspace_id.clone()),
+        cwd: registered.as_ref().map(|session| session.cwd.clone()),
+        raw_event_name,
+        status,
+        activity,
+        transcript_path: value
+            .get("transcript_path")
+            .or_else(|| value.get("transcriptPath"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        source: "hook".to_string(),
+    };
+    let _ = app.emit("agent-bridge-event", event);
+    write_plain_http_response(&mut stream, 200, "OK", "ok\n")
+}
+
+fn agent_bridge_safe_id(value: &str) -> bool {
+    let len = value.len();
+    len > 0
+        && len <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn agent_bridge_safe_agent(value: &str) -> bool {
+    let len = value.len();
+    len > 0
+        && len <= 48
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn agent_bridge_query_pairs(uri: &str) -> HashMap<String, String> {
+    let mut pairs = HashMap::new();
+    let Some((_, query)) = uri.split_once('?') else {
+        return pairs;
+    };
+    for item in query.split('&') {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        pairs.insert(key.to_string(), value.to_string());
+    }
+    pairs
+}
+
+fn agent_bridge_event_name(value: &serde_json::Value) -> String {
+    let raw = value
+        .get("hook_event_name")
+        .or_else(|| value.get("hookEventName"))
+        .or_else(|| value.get("event"))
+        .or_else(|| value.get("event_name"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    agent_bridge_canonical_event_name(&raw)
+}
+
+fn agent_bridge_canonical_event_name(value: &str) -> String {
+    match value {
+        "session_start" | "SessionStart" => "SessionStart",
+        "user_prompt_submit" | "UserPromptSubmit" => "UserPromptSubmit",
+        "pre_tool_use" | "PreToolUse" => "PreToolUse",
+        "post_tool_use" | "PostToolUse" => "PostToolUse",
+        "post_tool_use_failure" | "PostToolUseFailure" => "PostToolUseFailure",
+        "permission_request" | "PermissionRequest" => "PermissionRequest",
+        "permission_denied" | "PermissionDenied" => "PermissionDenied",
+        "notification" | "Notification" => "Notification",
+        "subagent_start" | "SubagentStart" => "SubagentStart",
+        "subagent_stop" | "SubagentStop" | "subagent_end" | "SubagentEnd" => "SubagentStop",
+        "pre_compact" | "PreCompact" => "PreCompact",
+        "post_compact" | "PostCompact" => "PostCompact",
+        "stop" | "Stop" => "Stop",
+        "stop_failure" | "StopFailure" => "StopFailure",
+        "session_end" | "SessionEnd" => "SessionEnd",
+        other => other,
+    }
+    .to_string()
+}
+
+fn agent_bridge_status_for_event(event_name: &str) -> Option<&'static str> {
+    match event_name {
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart" | "PreCompact" => {
+            Some("working")
+        }
+        "Notification" | "PermissionRequest" => Some("waiting"),
+        "Stop" | "SubagentStop" | "PostCompact" | "SessionStart" => Some("idle"),
+        "StopFailure" | "PostToolUseFailure" | "PermissionDenied" => Some("error"),
+        "SessionEnd" => Some("exited"),
+        _ => None,
+    }
+}
+
+fn agent_bridge_activity_for_event(event_name: &str, value: &serde_json::Value) -> Option<String> {
+    let activity = match event_name {
+        "UserPromptSubmit" => "Prompt submitted".to_string(),
+        "PreToolUse" => {
+            let tool_name = value
+                .get("tool_name")
+                .or_else(|| value.get("toolName"))
+                .or_else(|| value.pointer("/tool/name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool");
+            format!("Running {tool_name}")
+        }
+        "PostToolUse" => "Tool finished".to_string(),
+        "PostToolUseFailure" => "Tool failed".to_string(),
+        "SubagentStart" => "Subagent started".to_string(),
+        "Notification" | "PermissionRequest" => value
+            .get("message")
+            .or_else(|| value.get("notification"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("Waiting for your response")
+            .to_string(),
+        "PermissionDenied" => "Permission denied".to_string(),
+        "Stop" | "SubagentStop" => "Finished".to_string(),
+        "StopFailure" => "Stop hook failed".to_string(),
+        "PreCompact" => "Compacting conversation".to_string(),
+        "PostCompact" => "Compaction finished".to_string(),
+        "SessionEnd" => "Session ended".to_string(),
+        "SessionStart" => "Session started".to_string(),
+        _ => return None,
+    };
+    Some(normalize_agent_alert_text(&activity, 160))
+}
+
+#[cfg(windows)]
+fn show_windows_agent_alert_balloon(title: &str, body: &str) -> Result<(), String> {
+    let hwnd = cached_main_hwnd().ok_or_else(|| "main window hwnd is not available".to_string())?;
+    let icon_id = AGENT_ALERT_TRAY_ICON_ID.fetch_add(1, Ordering::Relaxed);
+    let mut data = NOTIFYICONDATAW::default();
+    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = hwnd;
+    data.uID = icon_id;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = 0;
+    data.hIcon = windows_agent_alert_icon(hwnd);
+    fill_wide_fixed(&mut data.szTip, "Simple Vibe IDE");
+
+    if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+        return Err(windows::core::Error::from_win32().to_string());
+    }
+
+    data.uFlags = NIF_INFO;
+    fill_wide_fixed(
+        &mut data.szInfoTitle,
+        if title.is_empty() {
+            "Simple Vibe IDE"
+        } else {
+            title
+        },
+    );
+    fill_wide_fixed(&mut data.szInfo, body);
+    data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        let error = windows::core::Error::from_win32().to_string();
+        let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+        return Err(error);
+    }
+
+    let delete_hwnd = hwnd.0 as isize;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(10));
+        let mut delete_data = NOTIFYICONDATAW::default();
+        delete_data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        delete_data.hWnd = HWND(delete_hwnd as *mut core::ffi::c_void);
+        delete_data.uID = icon_id;
+        let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &delete_data) };
+    });
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_agent_alert_icon(hwnd: HWND) -> HICON {
+    unsafe {
+        for icon_kind in [ICON_SMALL2, ICON_SMALL, ICON_BIG] {
+            let icon = SendMessageW(hwnd, WM_GETICON, Some(WPARAM(icon_kind as usize)), None);
+            if icon.0 != 0 {
+                return HICON(icon.0 as *mut core::ffi::c_void);
+            }
+        }
+        for class_index in [GCLP_HICONSM, GCLP_HICON] {
+            let icon = GetClassLongPtrW(hwnd, class_index);
+            if icon != 0 {
+                return HICON(icon as *mut core::ffi::c_void);
+            }
+        }
+        LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+    }
+}
+
+#[cfg(windows)]
+fn fill_wide_fixed<const N: usize>(target: &mut [u16; N], value: &str) {
+    target.fill(0);
+    for (index, unit) in value.encode_utf16().take(N.saturating_sub(1)).enumerate() {
+        target[index] = unit;
+    }
 }
 
 #[cfg(windows)]
@@ -1591,6 +2216,40 @@ async fn kill_llm_tmux_session(
         let profile = profile_from_id(&profile_id);
         let cwd = normalize_profile_path(&profile, &cwd);
         kill_llm_tmux_session_direct(&profile, &cwd, &session_name)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn llm_tmux_pane_title(
+    profile_id: String,
+    cwd: String,
+    session_name: String,
+) -> Result<LlmTmuxPaneTitleResult, String> {
+    run_blocking_command("llm tmux pane title", move || {
+        if !is_safe_llm_tmux_session_name(&session_name) {
+            return Err("invalid tmux session name".to_string());
+        }
+        let profile = profile_from_id(&profile_id);
+        let cwd = normalize_profile_path(&profile, &cwd);
+        llm_tmux_pane_title_direct(&profile, &cwd, &session_name)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn llm_tmux_pane_probe(
+    profile_id: String,
+    cwd: String,
+    session_name: String,
+) -> Result<LlmTmuxPaneProbeResult, String> {
+    run_blocking_command("llm tmux pane probe", move || {
+        if !is_safe_llm_tmux_session_name(&session_name) {
+            return Err("invalid tmux session name".to_string());
+        }
+        let profile = profile_from_id(&profile_id);
+        let cwd = normalize_profile_path(&profile, &cwd);
+        llm_tmux_pane_probe_direct(&profile, &cwd, &session_name)
     })
     .await
 }
@@ -1704,6 +2363,250 @@ fn kill_llm_tmux_session_direct(
         shell_quote(session_name)
     );
     run_profile_shell_with_timeout(profile, &script, None, LLM_TMUX_COMMAND_TIMEOUT).map(|_| ())
+}
+
+fn llm_tmux_pane_title_direct(
+    profile: &ConnectionProfile,
+    _cwd: &str,
+    session_name: &str,
+) -> Result<LlmTmuxPaneTitleResult, String> {
+    if profile.kind == "windows" {
+        return Ok(LlmTmuxPaneTitleResult {
+            available: false,
+            session_name: session_name.to_string(),
+            pane_title: None,
+            window_name: None,
+            pane_in_mode: false,
+            pane_dead: false,
+            message: Some("tmux is only used for WSL/SSH profiles".to_string()),
+        });
+    }
+    let script = format!(
+        concat!(
+            "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; ",
+            "if ! tmux has-session -t {session} 2>/dev/null; then printf '__SVI_TMUX_NOT_FOUND__\\n'; exit 0; fi; ",
+            "tmux display-message -p -t {session}: '#{{pane_title}}\t#{{window_name}}\t#{{pane_in_mode}}\t#{{pane_dead}}' 2>/dev/null || printf '__SVI_TMUX_NOT_FOUND__\\n'"
+        ),
+        session = shell_quote(session_name)
+    );
+    let output = run_profile_shell_with_timeout(profile, &script, None, LLM_TMUX_TITLE_TIMEOUT)?;
+    let text = String::from_utf8_lossy(&output);
+    if text
+        .lines()
+        .any(|line| line.trim() == "__SVI_TMUX_MISSING__")
+    {
+        return Ok(LlmTmuxPaneTitleResult {
+            available: false,
+            session_name: session_name.to_string(),
+            pane_title: None,
+            window_name: None,
+            pane_in_mode: false,
+            pane_dead: false,
+            message: Some("tmux is not installed on this profile".to_string()),
+        });
+    }
+    if text
+        .lines()
+        .any(|line| line.trim() == "__SVI_TMUX_NOT_FOUND__")
+    {
+        return Ok(LlmTmuxPaneTitleResult {
+            available: false,
+            session_name: session_name.to_string(),
+            pane_title: None,
+            window_name: None,
+            pane_in_mode: false,
+            pane_dead: false,
+            message: Some("tmux session was not found".to_string()),
+        });
+    }
+    let Some(line) = text.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(LlmTmuxPaneTitleResult {
+            available: false,
+            session_name: session_name.to_string(),
+            pane_title: None,
+            window_name: None,
+            pane_in_mode: false,
+            pane_dead: false,
+            message: Some("tmux did not return pane title".to_string()),
+        });
+    };
+    let mut parts = line.split('\t');
+    let pane_title = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let window_name = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let pane_in_mode = parts.next().unwrap_or("0").trim() == "1";
+    let pane_dead = parts.next().unwrap_or("0").trim() == "1";
+    Ok(LlmTmuxPaneTitleResult {
+        available: true,
+        session_name: session_name.to_string(),
+        pane_title,
+        window_name,
+        pane_in_mode,
+        pane_dead,
+        message: None,
+    })
+}
+
+fn llm_tmux_empty_probe_result(
+    session_name: &str,
+    available: bool,
+    message: Option<String>,
+) -> LlmTmuxPaneProbeResult {
+    LlmTmuxPaneProbeResult {
+        available,
+        session_name: session_name.to_string(),
+        pane_in_mode: false,
+        pane_dead: false,
+        current_command: None,
+        pane_pid: None,
+        alternate_on: false,
+        history_size: None,
+        session_activity: None,
+        pane_active: false,
+        title_checksum: None,
+        title_bytes: None,
+        window_checksum: None,
+        window_bytes: None,
+        capture_checksum: None,
+        capture_bytes: None,
+        meta_seen: false,
+        title_seen: false,
+        window_seen: false,
+        capture_seen: false,
+        title_parse: None,
+        window_parse: None,
+        capture_parse: None,
+        probe_stdout_lines: 0,
+        probe_stdout_bytes: 0,
+        message,
+    }
+}
+
+fn parse_cksum_line(line: &str) -> (Option<String>, Option<u32>, String) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return (None, None, "empty".to_string());
+    }
+    let mut parts = trimmed.split_whitespace();
+    let checksum = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let bytes_text = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let bytes = bytes_text.and_then(|value| value.parse().ok());
+    let state = match (checksum, bytes_text, bytes) {
+        (Some(_), Some(_), Some(0)) => "ok-empty",
+        (Some(_), Some(_), Some(_)) => "ok",
+        (Some(_), Some(_), None) => "bad-bytes",
+        (Some(_), None, _) => "missing-bytes",
+        _ => "missing-checksum",
+    };
+    (checksum.map(ToOwned::to_owned), bytes, state.to_string())
+}
+
+fn llm_tmux_pane_probe_direct(
+    profile: &ConnectionProfile,
+    _cwd: &str,
+    session_name: &str,
+) -> Result<LlmTmuxPaneProbeResult, String> {
+    if profile.kind == "windows" {
+        return Ok(llm_tmux_empty_probe_result(
+            session_name,
+            false,
+            Some("tmux is only used for WSL/SSH profiles".to_string()),
+        ));
+    }
+    let target = format!("{}:", session_name);
+    let script = format!(
+        concat!(
+            "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; ",
+            "__svi_target={target}; ",
+            "if ! tmux has-session -t \"$__svi_target\" 2>/dev/null; then printf '__SVI_TMUX_NOT_FOUND__\\n'; exit 0; fi; ",
+            "__svi_cksum() {{ cksum | {{ read __svi_sum __svi_bytes __svi_rest; printf '%s\\t%s\\n' \"$__svi_sum\" \"$__svi_bytes\"; }}; }}; ",
+            "__svi_title=$(tmux display-message -p -t \"$__svi_target\" '#{{pane_title}}' 2>/dev/null || true); ",
+            "__svi_window=$(tmux display-message -p -t \"$__svi_target\" '#{{window_name}}' 2>/dev/null || true); ",
+            "printf '__SVI_TMUX_META__\\t'; ",
+            "tmux display-message -p -t \"$__svi_target\" '#{{pane_in_mode}}\t#{{pane_dead}}\t#{{pane_current_command}}\t#{{pane_pid}}\t#{{alternate_on}}\t#{{history_size}}\t#{{session_activity}}\t#{{pane_active}}' 2>/dev/null || printf '0\\t1\\t\\t\\t0\\t0\\t\\t0'; ",
+            "printf '__SVI_TMUX_TITLE__\\t'; printf '%s' \"$__svi_title\" | __svi_cksum; ",
+            "printf '__SVI_TMUX_WINDOW__\\t'; printf '%s' \"$__svi_window\" | __svi_cksum; ",
+            "printf '__SVI_TMUX_CAPTURE__\\t'; tmux capture-pane -p -e -t \"$__svi_target\" -S -200 2>/dev/null | __svi_cksum"
+        ),
+        target = shell_quote(&target)
+    );
+    let output = run_profile_shell_with_timeout(profile, &script, None, LLM_TMUX_TITLE_TIMEOUT)?;
+    let text = String::from_utf8_lossy(&output);
+    if text
+        .lines()
+        .any(|line| line.trim() == "__SVI_TMUX_MISSING__")
+    {
+        return Ok(llm_tmux_empty_probe_result(
+            session_name,
+            false,
+            Some("tmux is not installed on this profile".to_string()),
+        ));
+    }
+    if text
+        .lines()
+        .any(|line| line.trim() == "__SVI_TMUX_NOT_FOUND__")
+    {
+        return Ok(llm_tmux_empty_probe_result(
+            session_name,
+            false,
+            Some("tmux session was not found".to_string()),
+        ));
+    }
+
+    let mut result = llm_tmux_empty_probe_result(session_name, true, None);
+    result.probe_stdout_bytes = u32::try_from(output.len()).unwrap_or(u32::MAX);
+    result.probe_stdout_lines = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
+    for line in text.lines() {
+        let line = line.trim_end();
+        if let Some(meta) = line.strip_prefix("__SVI_TMUX_META__\t") {
+            result.meta_seen = true;
+            let mut parts = meta.split('\t');
+            result.pane_in_mode = parts.next().unwrap_or("0").trim() == "1";
+            result.pane_dead = parts.next().unwrap_or("0").trim() == "1";
+            result.current_command = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            result.pane_pid = parts.next().and_then(|value| value.trim().parse().ok());
+            result.alternate_on = parts.next().unwrap_or("0").trim() == "1";
+            result.history_size = parts.next().and_then(|value| value.trim().parse().ok());
+            result.session_activity = parts.next().and_then(|value| value.trim().parse().ok());
+            result.pane_active = parts.next().unwrap_or("0").trim() == "1";
+        } else if let Some(value) = line.strip_prefix("__SVI_TMUX_TITLE__\t") {
+            result.title_seen = true;
+            let (checksum, bytes, parse_state) = parse_cksum_line(value);
+            result.title_checksum = checksum;
+            result.title_bytes = bytes;
+            result.title_parse = Some(parse_state);
+        } else if let Some(value) = line.strip_prefix("__SVI_TMUX_WINDOW__\t") {
+            result.window_seen = true;
+            let (checksum, bytes, parse_state) = parse_cksum_line(value);
+            result.window_checksum = checksum;
+            result.window_bytes = bytes;
+            result.window_parse = Some(parse_state);
+        } else if let Some(value) = line.strip_prefix("__SVI_TMUX_CAPTURE__\t") {
+            result.capture_seen = true;
+            let (checksum, bytes, parse_state) = parse_cksum_line(value);
+            result.capture_checksum = checksum;
+            result.capture_bytes = bytes;
+            result.capture_parse = Some(parse_state);
+        }
+    }
+    Ok(result)
 }
 
 fn llm_tmux_session_base_name(workspace_id: &str, agent_id: &str) -> String {
@@ -1921,6 +2824,8 @@ fn close_capture_cover<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 static CAPTURE_PROTECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static MAIN_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(windows)]
+static AGENT_ALERT_TRAY_ICON_ID: AtomicU32 = AtomicU32::new(0x5349_0000);
 static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
@@ -2692,6 +3597,34 @@ fn restore_deleted_paths_blocking(
 }
 
 #[tauri::command]
+async fn delete_note_file_permanently(profile_id: String, path: String) -> Result<(), String> {
+    run_blocking_command("delete note file permanently", move || {
+        delete_note_file_permanently_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn delete_note_file_permanently_blocking(profile_id: String, path: String) -> Result<(), String> {
+    let profile = profile_from_id(&profile_id);
+    let path = normalize_profile_path(&profile, &path);
+    if !is_note_file_path(&path) {
+        return Err("only files under .vibe-ide-temp/notes can be deleted permanently".to_string());
+    }
+    match profile.kind.as_str() {
+        "windows" => delete_local_note_file_permanently(Path::new(&path)),
+        "wsl" => {
+            if let Some(windows_path) = wsl_posix_path_to_windows_path(&profile, &path) {
+                delete_local_note_file_permanently(&windows_path)
+            } else {
+                delete_remote_note_file_permanently(&profile, &path)
+            }
+        }
+        "ssh" => delete_remote_note_file_permanently(&profile, &path),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+#[tauri::command]
 fn open_path(profile_id: String, path: String) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
@@ -2788,7 +3721,19 @@ fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn save_clipboard_image_file(
+async fn save_clipboard_image_file(
+    profile_id: String,
+    target_dir: String,
+    file_name: String,
+    base64_data: String,
+) -> Result<String, String> {
+    run_blocking_command("save clipboard image", move || {
+        save_clipboard_image_file_blocking(profile_id, target_dir, file_name, base64_data)
+    })
+    .await
+}
+
+fn save_clipboard_image_file_blocking(
     profile_id: String,
     target_dir: String,
     file_name: String,
@@ -2819,7 +3764,18 @@ fn save_clipboard_image_file(
 }
 
 #[tauri::command]
-fn copy_dropped_files(
+async fn copy_dropped_files(
+    profile_id: String,
+    target_dir: String,
+    source_paths: Vec<String>,
+) -> Result<usize, String> {
+    run_blocking_command("copy dropped files", move || {
+        copy_dropped_files_blocking(profile_id, target_dir, source_paths)
+    })
+    .await
+}
+
+fn copy_dropped_files_blocking(
     profile_id: String,
     target_dir: String,
     source_paths: Vec<String>,
@@ -2840,6 +3796,71 @@ fn copy_dropped_files(
             }
         }
         "ssh" => copy_dropped_files_to_remote(&profile, &target_dir, &source_paths),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+#[tauri::command]
+async fn copy_profile_paths(
+    profile_id: String,
+    source_paths: Vec<String>,
+    target_dir: String,
+) -> Result<Vec<String>, String> {
+    run_blocking_command("copy profile paths", move || {
+        copy_profile_paths_blocking(profile_id, source_paths, target_dir)
+    })
+    .await
+}
+
+fn copy_profile_paths_blocking(
+    profile_id: String,
+    source_paths: Vec<String>,
+    target_dir: String,
+) -> Result<Vec<String>, String> {
+    if source_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let profile = profile_from_id(&profile_id);
+    let target_dir = normalize_profile_path(&profile, &target_dir);
+    let source_paths: Vec<String> = source_paths
+        .iter()
+        .map(|path| normalize_profile_path(&profile, path))
+        .collect();
+
+    match profile.kind.as_str() {
+        "windows" => {
+            let local_sources: Vec<PathBuf> = source_paths
+                .iter()
+                .map(|path| PathBuf::from(path.as_str()))
+                .collect();
+            copy_profile_paths_to_local(Path::new(&target_dir), &local_sources).map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect()
+            })
+        }
+        "wsl" => {
+            let target_windows = wsl_posix_path_to_windows_path(&profile, &target_dir);
+            let source_windows: Vec<PathBuf> = source_paths
+                .iter()
+                .filter_map(|path| wsl_posix_path_to_windows_path(&profile, path))
+                .collect();
+            if let Some(windows_dir) = target_windows {
+                if source_windows.len() == source_paths.len() {
+                    let created = copy_profile_paths_to_local(&windows_dir, &source_windows)?;
+                    return created
+                        .into_iter()
+                        .map(|path| {
+                            local_file_name(&path).map(|name| join_posix(&target_dir, &name))
+                        })
+                        .collect();
+                }
+            }
+            copy_profile_paths_to_remote(&profile, &target_dir, &source_paths)
+        }
+        "ssh" => copy_profile_paths_to_remote(&profile, &target_dir, &source_paths),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
 }
@@ -2949,7 +3970,20 @@ fn open_export_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn save_attachment(
+async fn save_attachment(
+    profile_id: String,
+    current_dir: String,
+    session_id: String,
+    file_name: String,
+    base64_data: String,
+) -> Result<AttachmentResult, String> {
+    run_blocking_command("save attachment", move || {
+        save_attachment_blocking(profile_id, current_dir, session_id, file_name, base64_data)
+    })
+    .await
+}
+
+fn save_attachment_blocking(
     profile_id: String,
     current_dir: String,
     session_id: String,
@@ -3062,9 +4096,19 @@ fn spawn_terminal_direct(
         .master
         .try_clone_reader()
         .map_err(|err| err.to_string())?;
-    let writer = Arc::new(Mutex::new(
-        pair.master.take_writer().map_err(|err| err.to_string())?,
-    ));
+    let mut writer = pair.master.take_writer().map_err(|err| err.to_string())?;
+    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(TERMINAL_INPUT_QUEUE_CAPACITY);
+    thread::Builder::new()
+        .name("simple-vibe-terminal-input".to_string())
+        .spawn(move || {
+            for data in input_rx {
+                if writer.write_all(&data).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        })
+        .map_err(|err| format!("failed to start terminal input writer: {err}"))?;
     let terminal_id = Uuid::new_v4().to_string();
 
     let read_id = terminal_id.clone();
@@ -3123,7 +4167,7 @@ fn spawn_terminal_direct(
         .insert(
             terminal_id.clone(),
             TerminalSession {
-                writer,
+                input_tx,
                 child,
                 master: pair.master,
                 rows,
@@ -3135,33 +4179,30 @@ fn spawn_terminal_direct(
 }
 
 fn write_terminal_host(state: &IdeState, id: String, data: String) -> Result<(), String> {
-    let writer = terminal_writer(state, &id)?;
-    write_terminal_bytes(&writer, data.as_bytes())
+    let input_tx = terminal_input_sender(state, &id)?;
+    write_terminal_bytes(&input_tx, data.as_bytes())
 }
 
-fn terminal_writer(
-    state: &IdeState,
-    id: &str,
-) -> Result<Arc<Mutex<Box<dyn Write + Send>>>, String> {
+fn terminal_input_sender(state: &IdeState, id: &str) -> Result<SyncSender<Vec<u8>>, String> {
     let terminals = state
         .terminals
         .lock()
         .map_err(|_| "terminal state poisoned".to_string())?;
     terminals
         .get(id)
-        .map(|session| session.writer.clone())
+        .map(|session| session.input_tx.clone())
         .ok_or_else(|| format!("terminal not found: {id}"))
 }
 
-fn write_terminal_bytes(
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
-    data: &[u8],
-) -> Result<(), String> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| "terminal writer poisoned".to_string())?;
-    writer.write_all(data).map_err(|err| err.to_string())?;
-    writer.flush().map_err(|err| err.to_string())
+fn write_terminal_bytes(input_tx: &SyncSender<Vec<u8>>, data: &[u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    match input_tx.try_send(data.to_vec()) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err("terminal input queue is full; try again".to_string()),
+        Err(TrySendError::Disconnected(_)) => Err("terminal input writer is closed".to_string()),
+    }
 }
 
 fn push_terminal_output_without_dsr_queries(
@@ -3624,7 +4665,14 @@ fn start_preview_proxy_host(
 }
 
 #[tauri::command]
-fn probe_local_http_url(target_url: String) -> Result<bool, String> {
+async fn probe_local_http_url(target_url: String) -> Result<bool, String> {
+    run_blocking_command("probe local http url", move || {
+        probe_local_http_url_blocking(target_url)
+    })
+    .await
+}
+
+fn probe_local_http_url_blocking(target_url: String) -> Result<bool, String> {
     let target = parse_http_preview_target(&target_url)?;
     let addr = SocketAddr::from(([127, 0, 0, 1], target.port));
     Ok(TcpStream::connect_timeout(&addr, Duration::from_millis(450)).is_ok())
@@ -3701,26 +4749,38 @@ async fn kill_terminal(app: tauri::AppHandle, id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn start_port_forward(
-    state: State<'_, IdeState>,
+async fn start_port_forward(
+    app: tauri::AppHandle,
     profile_id: String,
     remote_port: u16,
     local_port: u16,
 ) -> Result<PortForwardResult, String> {
-    start_port_forward_host(&state, profile_id, remote_port, local_port)
+    run_blocking_command("start port forward", move || {
+        let state = app.state::<IdeState>();
+        start_port_forward_host(state.inner(), profile_id, remote_port, local_port)
+    })
+    .await
 }
 
 #[tauri::command]
-fn start_preview_proxy(
-    state: State<'_, IdeState>,
+async fn start_preview_proxy(
+    app: tauri::AppHandle,
     target_url: String,
 ) -> Result<PortForwardResult, String> {
-    start_preview_proxy_host(&state, target_url)
+    run_blocking_command("start preview proxy", move || {
+        let state = app.state::<IdeState>();
+        start_preview_proxy_host(state.inner(), target_url)
+    })
+    .await
 }
 
 #[tauri::command]
-fn stop_port_forward(state: State<'_, IdeState>, id: String) -> Result<(), String> {
-    stop_port_forward_host(&state, id)
+async fn stop_port_forward(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    run_blocking_command("stop port forward", move || {
+        let state = app.state::<IdeState>();
+        stop_port_forward_host(state.inner(), id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4278,21 +5338,44 @@ fn decode_devtools_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn detect_wsl_distros() -> Vec<String> {
+    if let Some(cached) = cached_wsl_distros(false) {
+        return cached;
+    }
     let mut command = Command::new("wsl.exe");
     command.current_dir(windows_spawn_cwd()).arg("-l").arg("-q");
-    let output = hide_command_window(&mut command).output();
+    let output = command_output_with_timeout(&mut command, WSL_DISTRO_LIST_TIMEOUT);
     let Ok(output) = output else {
-        return Vec::new();
+        return cached_wsl_distros(true).unwrap_or_default();
     };
     if !output.status.success() {
-        return Vec::new();
+        return cached_wsl_distros(true).unwrap_or_default();
     }
     let raw = String::from_utf8_lossy(&output.stdout).replace('\0', "");
-    raw.lines()
+    let distros: Vec<String> = raw
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| line.trim_end_matches('\r').to_string())
-        .collect()
+        .collect();
+    store_wsl_distros(&distros);
+    distros
+}
+
+fn cached_wsl_distros(allow_stale: bool) -> Option<Vec<String>> {
+    let cache = WSL_DISTRO_LIST_CACHE.get_or_init(|| Mutex::new(None));
+    let guard = cache.lock().ok()?;
+    let (instant, distros) = guard.as_ref()?;
+    if allow_stale || instant.elapsed() <= WSL_DISTRO_LIST_CACHE_TTL {
+        return Some(distros.clone());
+    }
+    None
+}
+
+fn store_wsl_distros(distros: &[String]) {
+    let cache = WSL_DISTRO_LIST_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), distros.to_vec()));
+    }
 }
 
 fn detect_wsl_home(distro: &str) -> Option<String> {
@@ -5588,6 +6671,43 @@ mv -- {trash} {original}",
     run_profile_shell(profile, &script, None).map(|_| ())
 }
 
+fn is_note_file_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.iter().any(|part| *part == "..") {
+        return false;
+    }
+    parts.windows(3).any(|window| {
+        window[0] == ".vibe-ide-temp" && window[1] == "notes" && !window[2].is_empty()
+    })
+}
+
+fn delete_local_note_file_permanently(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        return Err("note delete target is a directory".to_string());
+    }
+    fs::remove_file(path).map_err(|err| err.to_string())
+}
+
+fn delete_remote_note_file_permanently(
+    profile: &ConnectionProfile,
+    path: &str,
+) -> Result<(), String> {
+    let script = format!(
+        "if [ ! -e {path} ]; then exit 0; fi\n\
+if [ -d {path} ]; then echo 'note delete target is a directory' >&2; exit 1; fi\n\
+rm -f -- {path}",
+        path = shell_quote(path)
+    );
+    run_profile_shell(profile, &script, None).map(|_| ())
+}
+
 fn deleted_path_display_name(profile: &ConnectionProfile, path: &str) -> Result<String, String> {
     match profile.kind.as_str() {
         "windows" => local_file_name(Path::new(path)),
@@ -6233,6 +7353,27 @@ fn copy_dropped_files_to_local(
     Ok(copied)
 }
 
+fn copy_profile_paths_to_local(
+    target_dir: &Path,
+    source_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    if !target_dir.is_dir() {
+        return Err("paste target is not a directory".to_string());
+    }
+
+    let mut created = Vec::new();
+    for source in source_paths {
+        if !source.exists() {
+            return Err("copied source does not exist".to_string());
+        }
+        let name = local_file_name(source)?;
+        let target = unique_local_copy_child_path(target_dir, &name);
+        copy_local_path_recursive(source, &target)?;
+        created.push(target);
+    }
+    Ok(created)
+}
+
 fn copy_local_source_to_local(source: &Path, target_dir: &Path) -> Result<(), String> {
     if !source.exists() {
         return Err("dropped source does not exist".to_string());
@@ -6275,6 +7416,57 @@ fn copy_dropped_files_to_remote(
         copied += 1;
     }
     Ok(copied)
+}
+
+fn copy_profile_paths_to_remote(
+    profile: &ConnectionProfile,
+    target_dir: &str,
+    source_paths: &[String],
+) -> Result<Vec<String>, String> {
+    create_remote_directory(profile, target_dir)?;
+    let mut created = Vec::new();
+    for source in source_paths {
+        if !remote_path_exists(profile, source)? {
+            return Err("copied source does not exist".to_string());
+        }
+        let name = remote_path_basename(source);
+        let target = unique_remote_copy_child_path(profile, target_dir, &name)?;
+        copy_remote_path(profile, source, &target)?;
+        created.push(target);
+    }
+    Ok(created)
+}
+
+fn copy_remote_path(profile: &ConnectionProfile, source: &str, target: &str) -> Result<(), String> {
+    let script = format!(
+        r#"set -e
+src={src}
+dst={dst}
+if [ ! -e "$src" ]; then
+  echo "copied source does not exist" >&2
+  exit 1
+fi
+if [ -d "$src" ]; then
+  src_real="$(cd "$src" && pwd -P)"
+  dst_parent="$(dirname -- "$dst")"
+  mkdir -p -- "$dst_parent"
+  dst_parent_real="$(cd "$dst_parent" && pwd -P)"
+  dst_base="$(basename -- "$dst")"
+  dst_real="$dst_parent_real/$dst_base"
+  case "$dst_real/" in
+    "$src_real"/*)
+      echo "cannot copy a folder into itself" >&2
+      exit 1
+      ;;
+  esac
+fi
+cp -a -- "$src" "$dst"
+"#,
+        src = shell_quote(source),
+        dst = shell_quote(target)
+    );
+    run_profile_shell(profile, &script, None)?;
+    Ok(())
 }
 
 fn copy_local_source_to_remote(
@@ -6357,6 +7549,26 @@ fn unique_local_child_path(parent: &Path, name: &str) -> PathBuf {
     parent.join(format!("{stem} copy{extension}"))
 }
 
+fn copy_suffix_name(name: &str, index: usize) -> String {
+    let (stem, extension) = split_name_extension(name);
+    format!("{stem}_copy_{index:03}{extension}")
+}
+
+fn unique_local_copy_child_path(parent: &Path, name: &str) -> PathBuf {
+    let candidate = parent.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    for index in 0..10000 {
+        let candidate = parent.join(copy_suffix_name(name, index));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(copy_suffix_name(name, 10000))
+}
+
 fn unique_remote_child_path(
     profile: &ConnectionProfile,
     parent: &str,
@@ -6375,6 +7587,25 @@ fn unique_remote_child_path(
         }
     }
     Ok(join_posix(parent, &format!("{stem} copy{extension}")))
+}
+
+fn unique_remote_copy_child_path(
+    profile: &ConnectionProfile,
+    parent: &str,
+    name: &str,
+) -> Result<String, String> {
+    let candidate = join_posix(parent, name);
+    if !remote_path_exists(profile, &candidate)? {
+        return Ok(candidate);
+    }
+
+    for index in 0..10000 {
+        let candidate = join_posix(parent, &copy_suffix_name(name, index));
+        if !remote_path_exists(profile, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Ok(join_posix(parent, &copy_suffix_name(name, 10000)))
 }
 
 fn split_name_extension(name: &str) -> (&str, &str) {
@@ -6487,17 +7718,22 @@ fn run_profile_shell_once(
         .map_err(|err| format!("failed to run remote shell: {err}"))?;
     let pid = child.id();
     assign_child_to_cleanup_job(pid);
-    if let Some(data) = stdin_data {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&data).map_err(|err| err.to_string())?;
-        }
-    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_reader =
         stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
     let stderr_reader =
         stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
+    let stdin_writer = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut stdin| {
+            thread::spawn(move || {
+                stdin
+                    .write_all(&data)
+                    .and_then(|_| stdin.flush())
+                    .map_err(|err| err.to_string())
+            })
+        })
+    });
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -6507,6 +7743,9 @@ fn run_profile_shell_once(
                     kill_process_tree(pid);
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_stdin_writer(stdin_writer);
+                    let _ = join_process_output(stdout_reader);
+                    let _ = join_process_output(stderr_reader);
                     if profile.kind == "ssh" {
                         clear_ssh_askpass_cache_for_profile(profile);
                     }
@@ -6520,6 +7759,7 @@ fn run_profile_shell_once(
             Err(err) => return Err(format!("failed to wait for remote shell: {err}")),
         }
     };
+    let stdin_result = join_stdin_writer(stdin_writer);
     let stdout = join_process_output(stdout_reader)?;
     let stderr = join_process_output(stderr_reader)?;
     if !status.success() {
@@ -6528,6 +7768,7 @@ fn run_profile_shell_once(
         }
         return Err(String::from_utf8_lossy(&stderr).trim().to_string());
     }
+    stdin_result?;
     Ok(stdout)
 }
 
@@ -6685,6 +7926,15 @@ fn join_process_output(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Result<Ve
     handle
         .join()
         .map_err(|_| "remote shell output reader failed".to_string())
+}
+
+fn join_stdin_writer(handle: Option<thread::JoinHandle<Result<(), String>>>) -> Result<(), String> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    handle
+        .join()
+        .map_err(|_| "remote shell stdin writer failed".to_string())?
 }
 
 fn proxy_stream(
@@ -8186,9 +9436,13 @@ pub fn run() {
             answer_ssh_auth_prompt,
             renderer_heartbeat,
             send_agent_alert,
+            agent_bridge_info,
+            register_agent_bridge_session,
             list_llm_tmux_sessions,
             next_llm_tmux_session,
             kill_llm_tmux_session,
+            llm_tmux_pane_title,
+            llm_tmux_pane_probe,
             read_snippets_store,
             write_snippets_store,
             set_capture_protection,
@@ -8206,11 +9460,13 @@ pub fn run() {
             rename_path,
             delete_paths,
             restore_deleted_paths,
+            delete_note_file_permanently,
             open_path,
             run_powershell_script_as_admin,
             read_clipboard_file_paths,
             save_clipboard_image_file,
             copy_dropped_files,
+            copy_profile_paths,
             start_export_path,
             cancel_export_path,
             open_export_path,
@@ -8235,7 +9491,10 @@ pub fn run() {
             shutdown_runtime_sessions_command
         ])
         .setup(|app| {
-            let window = main_webview_window(app.handle()).expect("main window");
+            let Some(window) = main_webview_window(app.handle()) else {
+                eprintln!("main window was not available during setup");
+                return Ok(());
+            };
             let app_handle = app.handle().clone();
             let product_name = app
                 .config()
@@ -8270,7 +9529,9 @@ pub fn run() {
                     show_window_on_primary_monitor(&focus_window);
                 });
             });
-            window.set_title(&product_name).expect("set title");
+            if let Err(error) = window.set_title(&product_name) {
+                eprintln!("failed to set main window title: {error}");
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

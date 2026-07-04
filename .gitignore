@@ -4,6 +4,8 @@ dist-terminal/
 src-tauri/target/
 src-tauri/gen/
 .handoff/
+.claude/settings.local.json
+.claude/simple-vibe-ide-hook.sh
 .antigravitycli/
 .vibe-ide/attachments/
 .vibe-ide/tmp/

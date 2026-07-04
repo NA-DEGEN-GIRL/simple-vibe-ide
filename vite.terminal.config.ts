@@ -3,6 +3,17 @@ import { defineConfig } from 'vite';
 const projectRoot = process.cwd();
 const enableSourceMaps = process.env.SVIDE_SOURCEMAP === '1';
 const buildId = process.env.SVIDE_BUILD_ID ?? new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12);
+const ignoredWatchPaths = [
+  '**/src-tauri/**',
+  '**/.antigravitycli/**',
+  '**/.claude/**',
+  '**/.codex/**',
+  '**/.handoff/**',
+  '**/.vibe-ide-temp/**',
+  '**/dist/**',
+  '**/dist-terminal/**',
+  '**/target/**'
+];
 
 export default defineConfig({
   root: projectRoot,
@@ -16,7 +27,7 @@ export default defineConfig({
     port: 15321,
     watch: {
       usePolling: true,
-      ignored: ['**/src-tauri/**']
+      ignored: ignoredWatchPaths
     }
   },
   envPrefix: ['VITE_', 'TAURI_'],

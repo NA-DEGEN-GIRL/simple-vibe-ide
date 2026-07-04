@@ -108,6 +108,47 @@ export interface AgentAlertPayload {
   body: string;
   showBanner: boolean;
   playSound: boolean;
+  delayMs?: number;
+  debugId?: string;
+}
+
+export interface AgentAlertResult {
+  notificationPluginOk: boolean;
+  trayBalloonOk: boolean;
+  bannerError?: string | null;
+  scheduledDelayMs?: number | null;
+}
+
+export interface AgentAlertDelayedResultEvent {
+  debugId?: string | null;
+  result?: AgentAlertResult | null;
+  error?: string | null;
+}
+
+export interface AgentBridgeInfo {
+  port: number;
+  token: string;
+}
+
+export interface RegisterAgentBridgeSessionPayload {
+  sessionId: string;
+  agentId: string;
+  paneId: string;
+  workspaceId: string;
+  cwd: string;
+}
+
+export interface AgentBridgeEvent {
+  agentId: string;
+  sessionId: string;
+  paneId?: string | null;
+  workspaceId?: string | null;
+  cwd?: string | null;
+  rawEventName: string;
+  status?: string | null;
+  activity?: string | null;
+  transcriptPath?: string | null;
+  source: string;
 }
 
 export interface LlmTmuxSession {
@@ -123,6 +164,45 @@ export interface LlmTmuxSessionListResult {
   available: boolean;
   baseName: string;
   sessions: LlmTmuxSession[];
+  message?: string | null;
+}
+
+export interface LlmTmuxPaneTitleResult {
+  available: boolean;
+  sessionName: string;
+  paneTitle?: string | null;
+  windowName?: string | null;
+  paneInMode: boolean;
+  paneDead: boolean;
+  message?: string | null;
+}
+
+export interface LlmTmuxPaneProbeResult {
+  available: boolean;
+  sessionName: string;
+  paneInMode: boolean;
+  paneDead: boolean;
+  currentCommand?: string | null;
+  panePid?: number | null;
+  alternateOn: boolean;
+  historySize?: number | null;
+  sessionActivity?: number | null;
+  paneActive: boolean;
+  titleChecksum?: string | null;
+  titleBytes?: number | null;
+  windowChecksum?: string | null;
+  windowBytes?: number | null;
+  captureChecksum?: string | null;
+  captureBytes?: number | null;
+  metaSeen: boolean;
+  titleSeen: boolean;
+  windowSeen: boolean;
+  captureSeen: boolean;
+  titleParse?: string | null;
+  windowParse?: string | null;
+  captureParse?: string | null;
+  probeStdoutLines: number;
+  probeStdoutBytes: number;
   message?: string | null;
 }
 

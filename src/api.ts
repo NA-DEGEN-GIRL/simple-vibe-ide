@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AgentAlertPayload, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RendererHeartbeatResponse } from './types';
+import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse } from './types';
 
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
@@ -13,13 +13,20 @@ export const api = {
   readSnippetsStore: () => invoke<string>('read_snippets_store'),
   writeSnippetsStore: (payload: string) => invoke<void>('write_snippets_store', { payload }),
   forceQuitApp: () => invoke<void>('force_quit_app'),
-  sendAgentAlert: (payload: AgentAlertPayload) => invoke<void>('send_agent_alert', { payload }),
+  sendAgentAlert: (payload: AgentAlertPayload) => invoke<AgentAlertResult>('send_agent_alert', { payload }),
+  agentBridgeInfo: () => invoke<AgentBridgeInfo>('agent_bridge_info'),
+  registerAgentBridgeSession: (payload: RegisterAgentBridgeSessionPayload) =>
+    invoke<void>('register_agent_bridge_session', { payload }),
   listLlmTmuxSessions: (profileId: string, cwd: string, workspaceId: string, agentId: string) =>
     invoke<LlmTmuxSessionListResult>('list_llm_tmux_sessions', { profileId, cwd, workspaceId, agentId }),
   nextLlmTmuxSession: (profileId: string, cwd: string, workspaceId: string, agentId: string) =>
     invoke<string>('next_llm_tmux_session', { profileId, cwd, workspaceId, agentId }),
   killLlmTmuxSession: (profileId: string, cwd: string, sessionName: string) =>
     invoke<void>('kill_llm_tmux_session', { profileId, cwd, sessionName }),
+  llmTmuxPaneTitle: (profileId: string, cwd: string, sessionName: string) =>
+    invoke<LlmTmuxPaneTitleResult>('llm_tmux_pane_title', { profileId, cwd, sessionName }),
+  llmTmuxPaneProbe: (profileId: string, cwd: string, sessionName: string) =>
+    invoke<LlmTmuxPaneProbeResult>('llm_tmux_pane_probe', { profileId, cwd, sessionName }),
   resolveProfilePath: (profileId: string, path: string) =>
     invoke<string>('resolve_profile_path', { profileId, path }),
   listDirectory: (profileId: string, path: string, includeSizes = true) =>
@@ -46,6 +53,8 @@ export const api = {
     invoke<DeletedPathItem[]>('delete_paths', { profileId, paths }),
   restoreDeletedPaths: (profileId: string, items: DeletedPathItem[]) =>
     invoke<void>('restore_deleted_paths', { profileId, items }),
+  deleteNoteFilePermanently: (profileId: string, path: string) =>
+    invoke<void>('delete_note_file_permanently', { profileId, path }),
   openPath: (profileId: string, path: string) =>
     invoke<void>('open_path', { profileId, path }),
   runPowerShellScriptAsAdmin: (profileId: string, path: string) =>
@@ -55,6 +64,8 @@ export const api = {
     invoke<string>('save_clipboard_image_file', { profileId, targetDir, fileName, base64Data }),
   copyDroppedFiles: (profileId: string, targetDir: string, sourcePaths: string[]) =>
     invoke<number>('copy_dropped_files', { profileId, targetDir, sourcePaths }),
+  copyProfilePaths: (profileId: string, sourcePaths: string[], targetDir: string) =>
+    invoke<string[]>('copy_profile_paths', { profileId, sourcePaths, targetDir }),
   startExportPath: (profileId: string, path: string) =>
     invoke<ExportStartResult>('start_export_path', { profileId, path }),
   cancelExportPath: (id: string) => invoke<void>('cancel_export_path', { id }),

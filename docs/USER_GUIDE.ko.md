@@ -69,6 +69,8 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 한 화면에 띄워
 
 `Type` pad는 자동 실행하지 않습니다. 실수로 긴 명령이나 LLM 프롬프트가 바로 실행되는 것을 막기 위해서입니다.
 
+`Recall`은 최근 Type pad로 보낸 텍스트를 다시 불러옵니다. paste가 tmux/CLI 상태 때문에 기대대로 들어가지 않은 경우에도 방금 보낸 텍스트를 다시 복구할 수 있습니다. 이 히스토리는 앱 실행 중 메모리에만 보관됩니다.
+
 ### 터미널 렌더러
 
 `Set` 패널의 `Terminal renderer` 기본값은 `Auto`입니다.
@@ -175,6 +177,10 @@ workspace는 현재 작업 맥락을 저장합니다.
 - 열린 editor/image/browser/note 상태
 - shell widget 배치
 
+`Save WS`를 한 번 눌러 저장된 workspace는 이후 같은 열린 workspace의 배치/탭/위젯 상태가 바뀌면 자동으로 해당 saved workspace 항목도 갱신됩니다.
+앱은 변경 이벤트와 별도로 약 30초마다 active workspace를 안전 저장하고, 앱이 백그라운드로 갈 때도 한 번 flush합니다.
+즉, 매번 `Save WS`를 다시 누르지 않아도 나중에 IDE를 다시 열었을 때 최근 배치에 가깝게 복원됩니다.
+
 앱을 닫거나 재빌드하면 실제 shell process는 종료될 수 있습니다. 대신 workspace를 다시 열면 UI와 작업 맥락을 빠르게 복원하는 방식입니다.
 
 ### Memory Saver
@@ -198,9 +204,26 @@ workspace는 현재 작업 맥락을 저장합니다.
 - workspace detail에는 Codex/Claude/Grok/Agy shell이 감지되면 agent 종류, 상태, shell 제목, cwd, 최근 activity가 runtime-only로 표시되며, 카드를 누르면 해당 shell로 이동합니다.
 - 이 detail 정보는 workspace snapshot에 transcript 원문으로 저장되지 않습니다. 현재 버전은 terminal title/output/input/exit 신호 기반의 가벼운 표시이며, tool/todo/token 같은 구조화 정보는 추후 확장 대상입니다.
 - workspace resume/replay로 복원된 과거 terminal 출력은 `대기` 상태 판정에 사용하지 않습니다. 실제 live 선택지/질문이 새로 출력될 때만 `대기`로 바뀝니다.
+- `Workspace detail content`에서 detail 카드의 보조 줄을 조절할 수 있습니다.
+  - `Show activity/title line`: agent 이름 아래의 activity/title 줄을 표시합니다.
+  - `Show path/source line`: cwd/path와 detection source 줄을 표시합니다.
+  - `Hide both extra lines on capture-blocked workspaces`: capture block이 켜진 workspace에서는 위 두 보조 줄을 숨겨 detail에도 경로가 덜 드러나게 합니다.
 - `Active workspace indicator`에서 선택된 workspace를 표시하는 방식을 조절할 수 있습니다.
   - `Blue outer border`: 현재처럼 선택된 workspace 외곽/인셋 라인으로 표시합니다.
   - `Highlight tab title`: workspace 이름이 있는 제목줄만 색으로 강조합니다. 좌/우 dock에서 detail을 펼쳐도 detail 전체가 아니라 제목줄만 강조됩니다.
+
+#### Workspace Liquid Glass / IDE 배경
+
+`Set` 패널의 `IDE 배경 / Workspace Glass`에서 팝업을 열 수 있습니다. 좌/우 workspace dock에서는 dock header의 `Glass` 버튼으로도 같은 팝업을 열 수 있습니다.
+
+- `개별 workspace liquid glass 켜기`를 켜면 각 workspace row가 하나의 독립적인 liquidGL 대상이 됩니다. dock 전체를 통째로 glass 처리하지 않습니다.
+- 팝업에서 IDE 배경 프리셋, 커스텀 배경 이미지/URL, 조명, 노이즈 on/off/강도, dock/container shell 배경·opacity·blur·outline·shadow·padding, row radius/패딩, liquidGL refraction/bevel/frost/tilt, 선택 highlight/rail/badge, workspace/agent 글자색과 크기를 조절할 수 있습니다.
+- glass 모드에서는 기존 `Active workspace indicator`의 파란 border/title 강조가 중복으로 얹히지 않고, glass 전용 highlight/rail/badge 설정만 선택 표시를 담당합니다.
+- liquidGL의 `shadow`와 CSS row/선택/capture 그림자는 별도입니다. 기본값은 선택 glow와 rail glow를 0으로 두어 glass 주변에 의도하지 않은 외부 그림자가 생기지 않게 했습니다.
+- dock/container blur는 liquidGL row 자체가 아니라 container surface 레이어에만 적용되도록 분리되어 있습니다.
+- 설정은 앱 설정에 저장되므로 새로고침/재실행 후에도 유지됩니다.
+- capture lock workspace는 glass 모드와 일반 모드 모두 노란 배경 덩어리 대신 자물쇠 아이콘 색 위주로 표시됩니다.
+- 현재 실제 liquidGL 적용 대상은 workspace row입니다. 터미널/xterm, 브라우저 iframe 같은 내부 위젯은 성능과 compositor 제약 때문에 별도 wrapper/overlay 방식 검토가 필요합니다. 자세한 후보는 `docs/GLASS_WIDGETS.md`에 정리되어 있습니다.
 
 ### LLM launcher tmux 재접속
 
@@ -212,6 +235,28 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 - `Tmux` 목록의 `Kill`은 확인 후 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
 - `tmux`가 없거나 Windows profile에서는 기존처럼 직접 실행합니다.
 - 기존 bypass/YOLO 인자 자동 추가와 중복 방지는 그대로 유지됩니다.
+- `Set` -> `Agent event bridge`의 `tmux env passthrough`는 tmux 안에서 새 LLM을 띄울 때 유지할 환경변수 이름을 지정합니다. 기본값은 `IS_DEMO`이며, token/secret/key/password 계열 이름은 안전상 무시됩니다.
+
+### Claude local hook 상태 브리지
+
+`Set` -> `Agent event bridge`에서 Claude Code / Grok Build hook 기반 상태 판정을 설정할 수 있습니다.
+
+- `Ask before installing local hook`: Claude 버튼을 눌렀을 때 현재 workspace의 `.claude/settings.local.json`과 `.claude/simple-vibe-ide-hook.sh`를 설치/갱신할지 묻습니다.
+- `Auto install/update local hook`: 묻지 않고 설치/갱신합니다.
+- `Off`: hook을 쓰지 않고 기존 terminal title/output 기반 상태 판정만 사용합니다.
+- `Ask` 모드에서도 Simple Vibe IDE hook이 이미 설치되어 있으면 다시 묻지 않습니다.
+- 기본 `tmux env passthrough`에 `IS_DEMO`가 들어 있는 경우, local Claude settings의 `env.IS_DEMO`도 `1`로 맞춰 Claude 자체 demo/privacy 표시가 일반 shell 실행과 달라지지 않게 합니다.
+- 현재 자동 설치는 WSL workspace를 대상으로 합니다. hook 파일에는 bridge port/token 값이 저장되지 않고, Claude 실행 시점의 임시 환경변수로만 전달됩니다.
+- hook 이벤트가 들어온 Claude pane은 hook 상태를 우선 사용하므로 tmux scrollback/출력 재렌더가 `대기`/`작업중`으로 오인되는 일을 줄입니다.
+
+Grok Build도 별도의 `Grok hooks` 옵션을 제공합니다.
+
+- `Ask before installing global hook`: Grok 버튼을 눌렀을 때 WSL 사용자의 `~/.grok/hooks/simple-vibe-ide.json`과 `~/.grok/hooks/simple-vibe-ide-hook.sh`를 설치/갱신할지 묻습니다.
+- `Auto install/update global hook`: 묻지 않고 설치/갱신합니다.
+- 이 global hook은 항상 로드될 수 있지만, Simple Vibe IDE가 Grok을 실행할 때 넣는 `SVIDE_AGENT_*` 임시 환경변수가 없으면 bridge로 아무 것도 보내지 않습니다.
+- Grok hook payload는 IDE bridge로 보낼 때 event/session/cwd/toolName 같은 최소 메타데이터만 남기고 prompt, tool input/output 원문은 버립니다.
+- 실제 Grok 0.2.67 hook 이벤트는 `session_start`, `user_prompt_submit`, `pre_tool_use`, `post_tool_use`, `stop` 같은 snake_case로 들어오며, IDE backend가 이를 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` 형태로 정규화합니다.
+- Grok의 `Stop` 이벤트는 작업 완료 알림의 기준으로 쓰고, 질문/승인 화면은 title/output 보조 탐지를 함께 사용합니다.
 
 ### Agent alerts
 
@@ -220,13 +265,30 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 - `Windows notification banners`: 작업 완료, 오류, 사용자 입력 필요 상태로 보일 때 Windows 알림 배너를 띄웁니다.
 - `Light sound alert`: 같은 상태 변화에 Windows 네이티브 짧은 beep를 냅니다. WebView 포커스가 없어도 울리도록 처리합니다.
 - 두 옵션은 서로 독립적입니다. 배너만 켜거나, 소리만 켜거나, 둘 다 끌 수 있습니다.
+- 실제 agent 상태 알림 배너는 workspace 이름, LLM 이름, 상태만 간단히 보여줍니다. 터미널 제목, cwd, activity 상세 텍스트는 배너에 넣지 않습니다.
+- 실제 agent 상태 알림 배너를 누르면 IDE가 열리고 해당 workspace의 해당 LLM pane으로 이동합니다. pane이 이미 사라진 경우에는 가능한 범위에서 workspace까지 이동합니다.
+- 배너 아이콘은 앱 아이콘을 사용합니다. Windows fallback tray balloon도 가능한 경우 main window 앱 아이콘을 사용합니다.
 - `Test native path`의 `Banner` / `Sound` / `Both` 버튼은 상태 판정 로직을 거치지 않고 같은 네이티브 알림 경로를 즉시 호출합니다.
-  - 버튼을 누르면 같은 영역에 permission 확인, backend `send_agent_alert` 성공/실패, OS 배너 미표시 가능성까지 진단 로그가 남습니다.
+  - 버튼을 누르면 같은 영역에 permission 확인, backend `send_agent_alert` 성공/실패, Tauri notification plugin 및 Windows tray balloon fallback 결과가 진단 로그로 남습니다.
+  - `Banner 5s`는 Rust backend가 5초 뒤 native banner를 직접 발사합니다. 버튼을 누른 뒤 다른 프로그램으로 전환해서 IDE/WebView timer와 무관하게 뜨는지 확인할 수 있습니다.
+  - 실제 LLM 상태 변화로 알림을 요청할 때도 `real alert request/OK/FAILED` 로그가 남습니다. 이 로그가 없으면 상태 판정/event 미발사 쪽, 로그가 있는데 배너만 없으면 Windows/Tauri 배너 표시 계층 쪽으로 보면 됩니다.
   - `Sound`는 나는데 `Banner` 로그가 backend OK로 끝나면 상태 판정 문제가 아니라 Windows/Tauri 배너 표시 계층 문제일 가능성이 큽니다.
   - 테스트 버튼도 반응이 없으면 Windows/Tauri 알림 경로 문제입니다.
   - 테스트 버튼은 되는데 실제 작업 완료 알림만 안 뜨면 LLM 상태 판정 문제입니다.
 - 배너가 계속 안 보이면 Windows 알림/방해 금지/앱별 알림 허용 상태를 확인해야 합니다.
-- 현재 상태 판정은 workspace agent activity와 같은 title/output/input/exit 기반 신호를 사용하므로 완벽하지 않을 수 있습니다.
+- Claude hook bridge가 활성화된 pane은 hook 이벤트를 우선 사용하고, 그 외에는 workspace agent activity와 같은 title/output/input/exit 기반 신호를 사용합니다. 따라서 hook이 없는 agent/status는 아직 완벽하지 않을 수 있습니다.
+
+### Diagnostics log
+
+`Set` -> `Diagnostics log`에서 앱 내부 진단 로그를 켜고 별도 팝업으로 볼 수 있습니다.
+
+- 기본값은 꺼짐입니다. 문제가 재현될 때만 `Capture app diagnostic events`를 켜면 됩니다.
+- `Open log`는 현재 메모리에 쌓인 로그를 보여주고, `Copy`로 전체 로그를 복사할 수 있습니다.
+- 로그는 터미널 렌더 watchdog, visible pane flush, agent 상태/source 변경, Claude hook bridge 이벤트, 알림 요청/성공/실패, memory saver sleep 같은 이벤트 메타데이터만 남깁니다.
+- Diagnostics가 켜져 있고 IDE가 띄운 tmux 기반 LLM pane이 보이는 상태라면 `tmux probe` 로그가 주기적으로 남습니다. 이 로그는 tmux pane의 dead/copy-mode/alternate-screen 상태, 현재 command/pid, 최근 capture/title/window의 checksum+byte 길이, IDE 쪽 data/refresh age와 write backlog만 기록해서 freeze가 tmux 내부 정지인지 IDE 렌더/PTY 전달 문제인지 가르는 데 씁니다.
+- raw terminal 출력, clipboard 내용, 파일 본문, token/secret/env 값은 기록하지 않습니다.
+- IDE가 정상 종료되지 않았다고 보이면, 다음 실행 때 `previous session did not shut down cleanly` 항목과 마지막 heartbeat/event 시간이 남습니다.
+- 이전 세션 로그는 최근 일부만 브라우저 로컬 저장소에 보존되는 디버그용 breadcrumb입니다. 완전한 crash dump는 아니지만 강제 종료 직전 어느 영역이 마지막으로 기록됐는지 확인하는 데 쓸 수 있습니다.
 
 ### 송출 보호
 

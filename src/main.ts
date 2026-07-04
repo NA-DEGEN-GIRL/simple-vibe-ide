@@ -11,10 +11,80 @@ import type { WebglAddon as XTermWebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { api } from './api';
-import type { BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, LlmTmuxSession, PortForwardResult, RendererHeartbeatResponse, RendererRecoveryNotice, SnippetItem, SnippetsStore, SnippetTab, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { AgentAlertDelayedResultEvent, AgentAlertResult, AgentBridgeEvent, AgentBridgeInfo, BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxSession, PortForwardResult, RendererHeartbeatResponse, RendererRecoveryNotice, SnippetItem, SnippetsStore, SnippetTab, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 declare const __SVIDE_BUILD_ID__: string;
+
+type LiquidGLLensLike = {
+  el?: Element;
+  options?: Record<string, unknown>;
+  originalOpacity?: string;
+  originalShadow?: string;
+  originalTransition?: string;
+  _preserveTargetOpacity?: boolean;
+  setShadow?: (enabled: boolean) => void;
+  setTilt?: (enabled: boolean) => void;
+  tiltX?: number;
+  tiltY?: number;
+  updateMetrics?: () => void;
+  _shadowEl?: HTMLElement | null;
+  _mirror?: HTMLElement | null;
+  _mirrorClipUpdater?: EventListenerOrEventListenerObject;
+  _createMirrorCanvas?: () => void;
+  _baseRect?: DOMRect | null;
+  _mirrorActive?: boolean;
+  _pivotOrigin?: string;
+  _tiltActive?: boolean;
+  _tiltInteracting?: boolean;
+  _appGlassMirrorCreatePatched?: boolean;
+  _appGlassMirrorDestroyPatched?: boolean;
+  _appGlassLocalMirror?: HTMLCanvasElement | null;
+  _appGlassLocalMirrorCtx?: CanvasRenderingContext2D | null;
+  _sviAfterRenderLens?: (renderer: LiquidGLRendererLike) => void;
+  _appGlassTiltObserver?: MutationObserver | null;
+  _appGlassTiltFollowers?: HTMLElement[];
+  _destroyMirrorCanvas?: () => void;
+  _sizeObs?: ResizeObserver;
+};
+
+type LiquidGLRendererLike = {
+  lenses?: LiquidGLLensLike[];
+  snapshotTarget?: Element;
+  canvas?: HTMLCanvasElement;
+  gl?: { isContextLost?: () => boolean };
+  staticSnapshotCanvas?: HTMLCanvasElement;
+  scaleFactor?: number;
+  useExternalTicker?: boolean;
+  _uploadTexture?: (canvas: HTMLCanvasElement) => void;
+  captureSnapshot?: () => Promise<unknown>;
+  render?: () => void;
+  dispose?: () => void;
+  _rafId?: number | null;
+  _resizeCanvas?: () => void;
+  _resizeHandler?: EventListenerOrEventListenerObject | null;
+  _resizeObserver?: ResizeObserver | null;
+  _scrollRafId?: number | null;
+  _scrollTimeout?: number | null;
+  _isScrolling?: boolean;
+  _sviWorkspaceHoverOnlyFilterInstalled?: boolean;
+  _sviWorkspaceHoverOnlyOriginalRender?: (...args: unknown[]) => unknown;
+  _sviExplorerHoverOnlyFilterInstalled?: boolean;
+  _sviExplorerHoverOnlyOriginalRender?: (...args: unknown[]) => unknown;
+};
+
+declare global {
+  interface Window {
+    liquidGL?: ((options?: Record<string, unknown>) => unknown) & {
+      registerDynamic?: (elements: Element[] | NodeListOf<Element> | Element) => void;
+      syncWith?: (config?: Record<string, unknown>) => void;
+    };
+    html2canvas?: unknown;
+    __liquidGLRenderer__?: LiquidGLRendererLike;
+    __sviWorkspaceContainerLiquidGLRenderer__?: LiquidGLRendererLike | null;
+    __liquidGLNoWebGL__?: boolean;
+  }
+}
 
 interface TerminalPane {
   paneId: string;
@@ -33,6 +103,8 @@ interface TerminalPane {
   // from older snapshots without llmId metadata. This drives indicators/detection
   // but is not saved as launcher-owned state.
   detectedLlmId?: string;
+  llmBridgeSessionId?: string;
+  llmHookActive?: boolean;
   profileId: string;
   cwd: string;
   term: XTermTerminal;
@@ -66,15 +138,43 @@ interface TerminalPane {
   focusRetryTimer?: number;
   lastUserInputAt?: number;
   llmWaitingDetectionBuffer?: string;
+  llmOutputDetectionBuffer?: string;
+  llmOutputDetectionTimer?: number;
+  llmOutputDetectionMarkActivity?: boolean;
   llmWaitingSuppressUntil?: number;
   llmTitleOscBuffer?: string;
   llmTitleSignalTimer?: number;
   llmTitlePendingSignal?: WorkspaceLlmTitleSignal;
   llmTitlePendingActivity?: string;
   llmTitleDetectionSuppressUntil?: number;
+  llmTitleStatusBuffer?: string;
+  llmTitleStatusLastCandidate?: string;
+  llmTitleStatusLastSignal?: WorkspaceLlmTitleSignal;
+  llmTitleStatusLastChangedAt?: number;
+  llmScrollDetectionSuppressUntil?: number;
+  llmTitleDoneSuppressUntil?: number;
+  llmTmuxTitlePollTimer?: number;
+  llmTmuxTitlePollPromise?: Promise<void>;
+  llmTmuxTitleLastValue?: string;
+  tmuxFreezeProbeTimer?: number;
+  tmuxFreezeProbePromise?: Promise<void>;
+  tmuxFreezeProbeLastSignature?: string;
+  tmuxFreezeProbeLastLoggedAt?: number;
+  tmuxFreezeProbeLastChangedAt?: number;
+  tmuxStaleDeliveryCount?: number;
+  tmuxStaleRecoveryLastAt?: number;
+  tmuxStaleRecoveryPromise?: Promise<void>;
   llmTitleDisposable?: { dispose: () => void };
   activePythonEnv?: TerminalPythonEnvSnapshot;
   pendingTerminalWrites?: number;
+  lastTerminalDataAt?: number;
+  lastTerminalRefreshAt?: number;
+  writeFrameScheduledAt?: number;
+  writeTimerScheduledAt?: number;
+  renderWatchdogTimer?: number;
+  lastRenderWatchdogLogAt?: number;
+  historyControlsSyncTimer?: number;
+  historyControlsLastSyncAt?: number;
   writeDrainPromise?: Promise<void>;
   writeDrainResolve?: () => void;
   cursorQueryResponsePromise?: Promise<void>;
@@ -99,6 +199,7 @@ interface TerminalHistoryCache {
 }
 
 type TerminalSplitDirection = 'row' | 'column';
+type EditorSplitDirection = 'row' | 'column';
 
 type TerminalSplitNode =
   | { kind: 'pane'; paneId: string }
@@ -117,6 +218,37 @@ interface TerminalTabGroup {
   activePaneId: string;
   customTitle?: string;
   root: TerminalSplitNode;
+}
+
+type EditorSplitNode =
+  | { kind: 'pane'; paneId: string }
+  | {
+      kind: 'split';
+      splitId: string;
+      direction: EditorSplitDirection;
+      ratio: number;
+      first: EditorSplitNode;
+      second: EditorSplitNode;
+    };
+
+interface EditorPaneState {
+  id: string;
+  tabIds: string[];
+  activeTabId: string;
+}
+
+interface EditorPaneElements {
+  pane: HTMLElement;
+  tabs: HTMLDivElement;
+  body: HTMLDivElement;
+}
+
+interface EditorPaneViewState {
+  view: CodeMirrorView | null;
+  file: OpenFileState | null;
+  renderSignature: string;
+  renderToken: number;
+  languageCompartment?: import('@codemirror/state').Compartment;
 }
 
 interface TerminalWidget {
@@ -148,6 +280,7 @@ interface TerminalWidget {
   typePadFocusToggle: HTMLButtonElement;
   typePad: HTMLElement;
   typePadInput: HTMLTextAreaElement;
+  typePadRecall: HTMLButtonElement;
   typePadPaste: HTMLButtonElement;
   tabGroups: TerminalTabGroup[];
   activeGroupId: string;
@@ -279,6 +412,505 @@ interface EditorThemeChoice {
   vars: Record<string, string>;
 }
 
+type IdeBackgroundPreset = 'liquid' | 'procedural-demo' | 'ide-default' | 'ide-editor' | 'ide-blue' | 'custom';
+type IdeBackgroundFit = 'cover' | 'contain' | 'stretch';
+type WorkspaceGlassRailStyle = 'pill' | 'line' | 'top' | 'bottom' | 'outline';
+type WorkspaceGlassTextBlend = 'normal' | 'difference';
+type WorkspaceGlassReveal = 'none' | 'fade';
+
+interface IdeBackgroundLightSettings {
+  color: string;
+  alpha: number;
+  x: number;
+  y: number;
+  size: number;
+}
+
+interface IdeBackgroundSettings {
+  enabled: boolean;
+  preset: IdeBackgroundPreset;
+  customImageSrc: string;
+  customImageName: string;
+  customImageUrl: string;
+  fit: IdeBackgroundFit;
+  wallpaperOpacity: number;
+  base: string;
+  accentA: string;
+  accentB: string;
+  gridAlpha: number;
+  noiseEnabled: boolean;
+  noiseOpacity: number;
+  noiseSize: number;
+  noiseContrast: number;
+  noiseTint: string;
+  noiseTintAlpha: number;
+  lightA: IdeBackgroundLightSettings;
+  lightB: IdeBackgroundLightSettings;
+  lightC: IdeBackgroundLightSettings;
+}
+
+interface WorkspaceGlassEffectSettings {
+  radius: number;
+  outlineColor: string;
+  outlineAlpha: number;
+  outlineWidth: number;
+  outlineSoftAlpha: number;
+  outlineSoftWidth: number;
+  refraction: number;
+  bevelDepth: number;
+  bevelWidth: number;
+  frost: number;
+  magnify: number;
+  shadow: boolean;
+  specular: boolean;
+  tilt: boolean;
+  tiltFactor: number;
+  reveal: WorkspaceGlassReveal;
+}
+
+interface WorkspaceGlassSettings {
+  enabled: boolean;
+  useCustomEffect: boolean;
+  effect: WorkspaceGlassEffectSettings;
+  containerUseCustomEffect: boolean;
+  containerEffect: WorkspaceGlassEffectSettings;
+  dockPadding: number;
+  dockGap: number;
+  dockBgAlpha: number;
+  dockSurfaceOpacity: number;
+  dockBlur: number;
+  dockSaturate: number;
+  dockSideBorderAlpha: number;
+  dockOutlineAlpha: number;
+  dockOutlineInset: number;
+  dockShadowAlpha: number;
+  dockShadowY: number;
+  dockShadowBlur: number;
+  dockHeaderOpacity: number;
+  dockPillAlpha: number;
+  containerGlassEnabled: boolean;
+  rowSamplesContainer: boolean;
+  rowHoverOnly: boolean;
+  containerRadius: number;
+  containerGlassBgAlpha: number;
+  containerGlassOutlineAlpha: number;
+  rowRadius: number;
+  rowHeight: number;
+  rowPaddingX: number;
+  rowPaddingY: number;
+  rowGap: number;
+  rowBgAlpha: number;
+  rowShadowAlpha: number;
+  rowShadowY: number;
+  rowShadowBlur: number;
+  outlineAlpha: number;
+  outlineWidth: number;
+  outlineSoftAlpha: number;
+  outlineSoftWidth: number;
+  outlineBaseAccent: string;
+  outlineUseStateColors: boolean;
+  activeOutlineAccent: string;
+  protectedOutlineAccent: string;
+  captureOutlineAccent: string;
+  activeAccent: string;
+  textColor: string;
+  textSize: number;
+  textWeight: number;
+  textBlend: WorkspaceGlassTextBlend;
+  fontScale: number;
+  headerTextUseCustom: boolean;
+  headerColor: string;
+  headerSize: number;
+  headerWeight: number;
+  pillColor: string;
+  pillSize: number;
+  iconColor: string;
+  iconSize: number;
+  controlPaddingX: number;
+  controlPaddingY: number;
+  controlSlotWidth: number;
+  lockOffIconColor: string;
+  lockIconColor: string;
+  captureIconColor: string;
+  detailButtonUseWidgetChrome: boolean;
+  detailButtonBgAlpha: number;
+  detailButtonBgColor: string;
+  detailButtonOutlineAlpha: number;
+  detailButtonOutlineColor: string;
+  detailButtonOutlineWidth: number;
+  detailButtonHoverAlpha: number;
+  detailButtonHoverColor: string;
+  detailButtonActiveAlpha: number;
+  detailButtonActiveColor: string;
+  detailButtonRadius: number;
+  agentTextColor: string;
+  agentTextWeight: number;
+  agentTitleColor: string;
+  agentTitleSize: number;
+  agentTitleWeight: number;
+  agentActivityColor: string;
+  agentActivitySize: number;
+  agentActivityWeight: number;
+  agentMetaColor: string;
+  agentMetaSize: number;
+  agentMetaWeight: number;
+  detailPaddingX: number;
+  detailPaddingY: number;
+  agentGap: number;
+  agentPaddingX: number;
+  agentPaddingY: number;
+  agentBadgeSize: number;
+  agentStatusSize: number;
+  agentBadgeWeight: number;
+  agentStatusWeight: number;
+  agentBadgeHeight: number;
+  agentStatusPaddingX: number;
+  agentStatusRadius: number;
+  agentStatusBorderWidth: number;
+  agentStatusBgAlpha: number;
+  agentStatusBorderAlpha: number;
+  agentStatusIdleColor: string;
+  agentStatusWorkingColor: string;
+  agentStatusWaitingColor: string;
+  agentStatusErrorColor: string;
+  agentStatusDoneUnreadColor: string;
+  agentStatusExitedColor: string;
+  agentBgAlpha: number;
+  agentTypeBgAlpha: number;
+  agentTypeBorderAlpha: number;
+  agentTypeBgLeft: number;
+  agentTypeBgRight: number;
+  agentTypeBgTop: number;
+  agentTypeBgBottom: number;
+  agentTypeBgBleedLeft: number;
+  agentTypeBgBleedRight: number;
+  agentTypeBgWidth: number;
+  agentTypeBgRadius: number;
+  agentTypeBgOverflow: boolean;
+  agentCodexAccent: string;
+  agentClaudeAccent: string;
+  agentGrokAccent: string;
+  agentAgyAccent: string;
+  llmWorkingColor: string;
+  llmWaitingColor: string;
+  llmIdleColor: string;
+  llmErrorColor: string;
+  llmDoneUnreadColor: string;
+  llmExitedColor: string;
+  llmStatusDotLeft: number;
+  llmStatusDotTop: number;
+  llmStatusDotSize: number;
+  llmStatusDotGlow: number;
+  llmWorkingPulseEnabled: boolean;
+  llmWorkingPulseDuration: number;
+  llmWorkingPulseDimOpacity: number;
+  llmWorkingPulseRingSize: number;
+  llmWorkingPulseGlowAlpha: number;
+  llmLabelPadding: number;
+  tabHighlight: boolean;
+  tabHighlightAccent: string;
+  tabHighlightOpacity: number;
+  tabHighlightStrongAlpha: number;
+  tabHighlightSoftAlpha: number;
+  tabHighlightWidth: number;
+  tabHighlightLeft: number;
+  tabHighlightRight: number;
+  tabHighlightTop: number;
+  tabHighlightBottom: number;
+  tabHighlightShiftX: number;
+  tabHighlightRadius: number;
+  selectedHighlight: boolean;
+  selectedRail: boolean;
+  selectedBadge: boolean;
+  selectedRailStyle: WorkspaceGlassRailStyle;
+  selectedAccent: string;
+  selectedFillAlpha: number;
+  selectedOutlineAlpha: number;
+  selectedGlowAlpha: number;
+  selectedOutlineWidth: number;
+  selectedGlowY: number;
+  selectedGlowBlur: number;
+  selectedGlowSpread: number;
+  selectedBadgeSize: number;
+  selectedHighlightAccent: string;
+  selectedHighlightOpacity: number;
+  selectedHighlightStrongAlpha: number;
+  selectedHighlightSoftAlpha: number;
+  selectedHighlightWidth: number;
+  selectedHighlightLeft: number;
+  selectedHighlightRight: number;
+  selectedHighlightTop: number;
+  selectedHighlightBottom: number;
+  selectedHighlightShiftX: number;
+  selectedHighlightRadius: number;
+  selectedRailAlpha: number;
+  selectedRailWidth: number;
+  selectedRailInset: number;
+  selectedRailOffset: number;
+  selectedRailRadius: number;
+  selectedRailGlow: number;
+}
+
+interface AppGlassChromeSettings {
+  surfaceAlpha: number;
+  surfaceColor: string;
+  fieldAlpha: number;
+  fieldColor: string;
+  fieldTextColor: string;
+  fieldOutlineAlpha: number;
+  fieldOutlineColor: string;
+  selectOptionBgColor: string;
+  selectOptionTextColor: string;
+  selectOptionSelectedBgColor: string;
+  selectOptionSelectedTextColor: string;
+  tabAlpha: number;
+  tabColor: string;
+  tabActiveAlpha: number;
+  tabActiveColor: string;
+  buttonAlpha: number;
+  buttonColor: string;
+  buttonOutlineAlpha: number;
+  buttonOutlineColor: string;
+  buttonOutlineWidth: number;
+  buttonHoverAlpha: number;
+  buttonHoverColor: string;
+  buttonRadius: number;
+  itemAlpha: number;
+  itemColor: string;
+  itemTextColor: string;
+  itemOutlineAlpha: number;
+  itemOutlineColor: string;
+  dividerAlpha: number;
+  dividerColor: string;
+  paddingX: number;
+  paddingY: number;
+}
+
+type AppGlassChromeScope = 'profile' | 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'snippets' | 'terminal' | 'settings';
+
+interface AppGlassSettings {
+  enabled: boolean;
+  useCustomEffect: boolean;
+  titlebar: boolean;
+  windowControls: boolean;
+  profileActions: boolean;
+  profileActionsSplit: boolean;
+  explorerPanel: boolean;
+  editorPanel: boolean;
+  imagePanel: boolean;
+  browserPanel: boolean;
+  notesPanel: boolean;
+  snippetsPanel: boolean;
+  calculatorPanel: boolean;
+  floatingPanels: boolean;
+  terminalWidgets: boolean;
+  notesSnippets: boolean;
+  settingsPanel: boolean;
+  explorerRows: boolean;
+  explorerRowsHoverOnly: boolean;
+  explorerRowsSamplePanel: boolean;
+  effect: WorkspaceGlassEffectSettings;
+  titlebarUseCustomEffect: boolean;
+  titlebarEffect: WorkspaceGlassEffectSettings;
+  windowControlsUseCustomEffect: boolean;
+  windowControlsEffect: WorkspaceGlassEffectSettings;
+  profileActionsUseCustomEffect: boolean;
+  profileActionsEffect: WorkspaceGlassEffectSettings;
+  terminalWidgetsUseCustomEffect: boolean;
+  terminalWidgetsEffect: WorkspaceGlassEffectSettings;
+  explorerPanelUseCustomEffect: boolean;
+  explorerPanelEffect: WorkspaceGlassEffectSettings;
+  editorPanelUseCustomEffect: boolean;
+  editorPanelEffect: WorkspaceGlassEffectSettings;
+  imagePanelUseCustomEffect: boolean;
+  imagePanelEffect: WorkspaceGlassEffectSettings;
+  browserPanelUseCustomEffect: boolean;
+  browserPanelEffect: WorkspaceGlassEffectSettings;
+  notesPanelUseCustomEffect: boolean;
+  notesPanelEffect: WorkspaceGlassEffectSettings;
+  snippetsPanelUseCustomEffect: boolean;
+  snippetsPanelEffect: WorkspaceGlassEffectSettings;
+  calculatorPanelUseCustomEffect: boolean;
+  calculatorPanelEffect: WorkspaceGlassEffectSettings;
+  floatingPanelsUseCustomEffect: boolean;
+  floatingPanelsEffect: WorkspaceGlassEffectSettings;
+  notesSnippetsUseCustomEffect: boolean;
+  notesSnippetsEffect: WorkspaceGlassEffectSettings;
+  settingsPanelUseCustomEffect: boolean;
+  settingsPanelEffect: WorkspaceGlassEffectSettings;
+  explorerRowsUseCustomEffect: boolean;
+  explorerRowsEffect: WorkspaceGlassEffectSettings;
+  chrome: AppGlassChromeSettings;
+  terminalChromeUseCustom: boolean;
+  terminalChrome: AppGlassChromeSettings;
+  settingsChromeUseCustom: boolean;
+  settingsChrome: AppGlassChromeSettings;
+  profileChromeUseCustom: boolean;
+  profileChrome: AppGlassChromeSettings;
+  explorerChromeUseCustom: boolean;
+  explorerChrome: AppGlassChromeSettings;
+  editorChromeUseCustom: boolean;
+  editorChrome: AppGlassChromeSettings;
+  imageChromeUseCustom: boolean;
+  imageChrome: AppGlassChromeSettings;
+  browserChromeUseCustom: boolean;
+  browserChrome: AppGlassChromeSettings;
+  notesChromeUseCustom: boolean;
+  notesChrome: AppGlassChromeSettings;
+  snippetsChromeUseCustom: boolean;
+  snippetsChrome: AppGlassChromeSettings;
+  headerTextColor: string;
+  headerTextSize: number;
+  headerTextWeight: number;
+  bodyTextColor: string;
+  mutedTextColor: string;
+  shadowAlpha: number;
+  shadowBlur: number;
+  shadowY: number;
+  titlebarRadius: number;
+  titlebarAlpha: number;
+  titlebarOutlineAlpha: number;
+  titlebarBlur: number;
+  windowButtonSize: number;
+  windowButtonGap: number;
+  windowButtonRadius: number;
+  windowButtonBgAlpha: number;
+  windowButtonBgColor: string;
+  windowButtonHoverAlpha: number;
+  windowButtonHoverColor: string;
+  windowButtonCloseHoverAlpha: number;
+  windowButtonCloseHoverColor: string;
+  windowButtonOutlineAlpha: number;
+  windowButtonOutlineColor: string;
+  windowButtonIconAlpha: number;
+  windowButtonIconSize: number;
+  widgetRadius: number;
+  widgetGlassAlpha: number;
+  widgetOutlineAlpha: number;
+  widgetOutlineWidth: number;
+  widgetOutlineSoftAlpha: number;
+  widgetOutlineSoftWidth: number;
+  widgetChromeAlpha: number;
+  widgetHeaderDividerAlpha: number;
+  widgetGlassInsetAlpha: number;
+  widgetPaddingX: number;
+  widgetPaddingY: number;
+  widgetTopbarHeight: number;
+  widgetTopbarContentY: number;
+  widgetButtonBgAlpha: number;
+  widgetButtonBgColor: string;
+  widgetButtonOutlineAlpha: number;
+  widgetButtonOutlineColor: string;
+  widgetButtonOutlineWidth: number;
+  widgetButtonHoverAlpha: number;
+  widgetButtonHoverColor: string;
+  widgetButtonActiveAlpha: number;
+  widgetButtonActiveColor: string;
+  widgetButtonRadius: number;
+  widgetTitleHighlight: boolean;
+  widgetTitleColor: string;
+  widgetTitleAlpha: number;
+  widgetTitleSizeX: number;
+  widgetTitleSizeY: number;
+  widgetTitleOriginX: number;
+  widgetTitleOriginY: number;
+  widgetTitleCoreStop: number;
+  widgetTitleMidStrength: number;
+  widgetTitleEdgeStrength: number;
+  widgetTitleSoftness: number;
+  widgetTitleSelectedColor: string;
+  widgetTitleSelectedAlpha: number;
+  widgetTitleSelectedSizeX: number;
+  widgetTitleSelectedSizeY: number;
+  widgetTitleSelectedOriginX: number;
+  widgetTitleSelectedOriginY: number;
+  widgetTitleSelectedCoreStop: number;
+  widgetTitleSelectedMidStop: number;
+  widgetTitleSelectedSoftStop: number;
+  widgetTitleSelectedFadeStop: number;
+  widgetTitleSelectedMidStrength: number;
+  widgetTitleSelectedEdgeStrength: number;
+  widgetTitleSelectedSoftness: number;
+  widgetTitleSelectedPadX: number;
+  widgetTitleSelectedPadY: number;
+  widgetTitleSelectedShiftX: number;
+  widgetTitleSelectedShiftY: number;
+  widgetTitleSelectedRadius: number;
+  widgetTitleSelectedMidAlpha: number;
+  widgetTitleSelectedSoftAlpha: number;
+  widgetTitleSelectedTopAlpha: number;
+  widgetTitleSelectedVerticalMidAlpha: number;
+  widgetTitleSelectedBottomAlpha: number;
+  widgetTitleIdleColor: string;
+  widgetTitleIdleAlpha: number;
+  widgetTitleIdleMidAlpha: number;
+  widgetTitleIdleSoftAlpha: number;
+  widgetTitleIdleTopAlpha: number;
+  widgetTitleIdleVerticalMidAlpha: number;
+  widgetTitleIdleBottomAlpha: number;
+  widgetTitleWidth: number;
+  widgetTitlePadX: number;
+  widgetTitlePadY: number;
+  widgetTitleShiftX: number;
+  widgetTitleShiftY: number;
+  widgetTitleRadius: number;
+  widgetTitleFullWidth: boolean;
+  widgetTitleMidStop: number;
+  widgetTitleSoftStop: number;
+  widgetTitleFadeStop: number;
+  widgetTitleVerticalMidStop: number;
+  widgetTitleVerticalSoftStop: number;
+  widgetTitleVerticalFadeStop: number;
+  widgetTitleIdleInsetAlpha: number;
+  widgetTitleSelectedInsetAlpha: number;
+  widgetTitleInsetWidth: number;
+  widgetTitleSelectedGlowAlpha: number;
+  terminalTextContrast: number;
+  terminalDimOpacity: number;
+  terminalPaneBgAlpha: number;
+  terminalPaneIdleBgAlpha: number;
+  terminalPaneIdleBgColor: string;
+  terminalPaneSelectedBgAlpha: number;
+  terminalPaneSelectedBgColor: string;
+  terminalPaneOutlineAlpha: number;
+  editorPaneIdleBgAlpha: number;
+  editorPaneIdleBgColor: string;
+  editorPaneSelectedBgAlpha: number;
+  editorPaneSelectedBgColor: string;
+  terminalHostBgAlpha: number;
+  terminalTabbarBgAlpha: number;
+  terminalTypePadBgAlpha: number;
+  terminalInputBgAlpha: number;
+  terminalNewTabBgAlpha: number;
+  terminalNewTabBgColor: string;
+  terminalNewTabOutlineAlpha: number;
+  terminalNewTabOutlineColor: string;
+  terminalNewTabHoverAlpha: number;
+  terminalNewTabHoverColor: string;
+  terminalTypePadButtonBgAlpha: number;
+  terminalTypePadButtonBgColor: string;
+  terminalTypePadButtonOutlineAlpha: number;
+  terminalTypePadButtonOutlineColor: string;
+  terminalTypePadButtonHoverAlpha: number;
+  terminalTypePadButtonHoverColor: string;
+  terminalTypePadButtonDisabledAlpha: number;
+  terminalScrollbarThumbAlpha: number;
+  terminalScrollbarThumbHoverAlpha: number;
+  terminalScrollbarTrackAlpha: number;
+  terminalScrollbarWidth: number;
+  explorerHorizontalScrollbarBottomGap: number;
+  terminalHostOutlineAlpha: number;
+  terminalSplitResizerAlpha: number;
+  explorerRowsRadius: number;
+  explorerHoverColor: string;
+  explorerHoverAlpha: number;
+  explorerActiveAlpha: number;
+  explorerSelectedRailColor: string;
+  explorerSelectedRailAlpha: number;
+  explorerSelectedRailWidth: number;
+  diagnostics: boolean;
+}
+
 interface IdeSettings {
   uiFont: string;
   monoFont: string;
@@ -290,10 +922,22 @@ interface IdeSettings {
   workspaceDockPosition: WorkspaceDockPosition;
   workspaceDockSize: number;
   workspaceDockDetailOpen: boolean;
+  workspaceDockDetailShowActivity: boolean;
+  workspaceDockDetailShowMeta: boolean;
+  workspaceDockDetailHideProtectedExtra: boolean;
   workspaceFocusBorder: boolean;
   workspaceFocusTitle: boolean;
+  workspaceSideDockGlass: boolean;
+  ideBackground: IdeBackgroundSettings;
+  glassEffect: WorkspaceGlassEffectSettings;
+  workspaceGlass: WorkspaceGlassSettings;
+  appGlass: AppGlassSettings;
   agentNotificationBanners: boolean;
   agentAlertSound: boolean;
+  agentEventClaudeHooks: AgentEventClaudeHookMode;
+  agentEventGrokHooks: AgentEventGrokHookMode;
+  llmTmuxEnvPassthrough: string;
+  debugLogEnabled: boolean;
   widgetRadius: number;
   widgetFocusBorder: boolean;
   widgetFocusTitle: boolean;
@@ -325,6 +969,13 @@ interface ExplorerDeleteUndoState {
   profileId: string;
   workspaceId: string;
   items: DeletedPathItem[];
+}
+
+interface ExplorerClipboardState {
+  profileId: string;
+  sourcePaths: string[];
+  names: string[];
+  copiedAt: number;
 }
 
 interface TextFileCacheEntry {
@@ -377,6 +1028,23 @@ interface NoteTabState {
   saving: boolean;
   loading?: boolean;
   lastSavedAt?: number;
+}
+
+interface NoteMemoryRecord {
+  id: string;
+  profileId: string;
+  workspaceKey: string;
+  path: string;
+  title: string;
+  customTitle?: string;
+  theme: NoteThemeId;
+  content: string;
+  updatedAt: number;
+}
+
+interface NoteMemoryStore {
+  version: 1;
+  notes: NoteMemoryRecord[];
 }
 
 interface LayoutRatio {
@@ -436,6 +1104,22 @@ interface EditorTabSnapshot {
   rawMode: boolean;
 }
 
+interface EditorPaneSnapshot {
+  id: string;
+  tabIds: string[];
+  activeTabId: string;
+}
+
+type WorkspaceEditorSplitSnapshot =
+  | { kind: 'pane'; paneId: string }
+  | {
+      kind: 'split';
+      direction: EditorSplitDirection;
+      ratio: number;
+      first: WorkspaceEditorSplitSnapshot;
+      second: WorkspaceEditorSplitSnapshot;
+    };
+
 interface ImageTabSnapshot {
   id: string;
   sourcePath?: string;
@@ -460,6 +1144,7 @@ interface WorkspaceSnapshot {
   id: string;
   label: string;
   customLabel?: string;
+  savedWorkspaceId?: string;
   profileId: string;
   root: string;
   currentDir: string;
@@ -475,6 +1160,9 @@ interface WorkspaceSnapshot {
   activeTerminalIndex: number;
   editorTabs: EditorTabSnapshot[];
   activeEditorTabId: string;
+  editorPanes?: EditorPaneSnapshot[];
+  activeEditorPaneId?: string;
+  editorSplitLayout?: WorkspaceEditorSplitSnapshot;
   editorOpenInNewTab: boolean;
   editorWordWrap: boolean;
   imageTabs: ImageTabSnapshot[];
@@ -497,6 +1185,7 @@ interface WorkspaceSnapshot {
   calculatorExpression?: string;
   calculatorHistory?: CalculatorHistoryItem[];
   explorerOpenMode: ExplorerOpenMode;
+  explorerAutoOpenEditor?: boolean;
   showFileSizes: boolean;
   editorFontSize: number;
   terminalFontSize: number;
@@ -530,6 +1219,9 @@ interface SavedWorkspaceStore {
 interface WorkspaceRuntimeCache {
   editorTabs: EditorTabState[];
   activeEditorTabId: string;
+  editorPanes?: EditorPaneState[];
+  activeEditorPaneId?: string;
+  editorSplitLayout?: EditorSplitNode | null;
   explorer?: ExplorerRuntimeCache;
   browserTabs: BrowserTab[];
   browserHistory: string[];
@@ -583,7 +1275,7 @@ interface EditorRuntime {
   defaultHighlightStyle: typeof import('@codemirror/language').defaultHighlightStyle;
   HighlightStyle: typeof import('@codemirror/language').HighlightStyle;
   tags: typeof import('@lezer/highlight').tags;
-  languageCompartment: import('@codemirror/state').Compartment;
+  Compartment: typeof import('@codemirror/state').Compartment;
 }
 
 interface TerminalRuntime {
@@ -629,9 +1321,30 @@ type ImageTagPasteTarget = TerminalTextTarget | 'none';
 type NoteThemeId = 'default' | 'sticky' | 'mint' | 'rose' | 'paper';
 type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
 type WorkspaceDockPosition = 'top' | 'bottom' | 'left' | 'right';
-type AgentSessionStatus = 'idle' | 'working' | 'waiting' | 'error' | 'exited';
-type AgentSessionSource = 'launcher' | 'title' | 'output' | 'heuristic';
+type AgentEventClaudeHookMode = 'ask' | 'auto' | 'off';
+type AgentEventGrokHookMode = 'ask' | 'auto' | 'off';
+type AgentSessionStatus = 'idle' | 'working' | 'waiting' | 'error' | 'done-unread' | 'exited';
+type AgentSessionSource = 'launcher' | 'title' | 'output' | 'hook' | 'heuristic';
 type AgentAlertKind = 'waiting' | 'done' | 'error';
+type DiagnosticLogSeverity = 'info' | 'warn' | 'error';
+type DiagnosticLogEntry = {
+  at: number;
+  category: string;
+  message: string;
+  severity: DiagnosticLogSeverity;
+};
+type DiagnosticSessionSnapshot = {
+  version: 1;
+  sessionId: string;
+  startedAt: number;
+  heartbeatAt: number;
+  cleanShutdown: boolean;
+  endedAt?: number;
+  lastEventAt?: number;
+  lastEventCategory?: string;
+  lastEventMessage?: string;
+  entries?: DiagnosticLogEntry[];
+};
 type TerminalDataHandlingOptions = {
   detectLlmState?: boolean;
 };
@@ -667,8 +1380,14 @@ interface AgentSessionProgress {
   source: AgentSessionSource;
   updatedAt: number;
   expiresAt?: number;
+  doneAlertEligible?: boolean;
+  doneAlertOnExpire?: boolean;
   redacted?: boolean;
 }
+const WORKSPACE_AGENT_CARD_ORDER = ['codex', 'claude', 'grok', 'antigravity'] as const;
+const WORKSPACE_AGENT_CARD_ORDER_INDEX = new Map<string, number>(
+  WORKSPACE_AGENT_CARD_ORDER.map((agentId, index) => [agentId, index])
+);
 type WorkspaceDragState = {
   id: string;
   pointerId: number;
@@ -714,6 +1433,12 @@ type LlmLauncherFlag = {
 type LlmLauncherConfig = {
   executable: string;
   flags: LlmLauncherFlag[];
+};
+
+type AgentBridgeLaunchContext = {
+  agentId: string;
+  sessionId: string;
+  bridge: AgentBridgeInfo;
 };
 
 const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
@@ -779,8 +1504,25 @@ const APP_PRODUCT_NAME = IS_TERMINAL_APP ? 'Simple Vibe Terminal' : 'Simple Vibe
 const APP_BUILD_ID = typeof __SVIDE_BUILD_ID__ === 'string' && __SVIDE_BUILD_ID__
   ? __SVIDE_BUILD_ID__
   : 'dev';
+const APP_NOTIFICATION_ICON_URL = new URL('icon.png', document.baseURI).toString();
+// WebView Notification construction can report success even when Windows does
+// not surface a visible banner from the Tauri WebView. Keep real agent alerts
+// on the backend/native notification path so Codex/Claude/Grok/Agy alerts do
+// not degrade into sound-only alerts. Click-to-focus can be re-enabled here
+// after it is verified with an actual Windows notification click event path.
+const AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS = false;
 const APP_STORAGE_PREFIX = IS_TERMINAL_APP ? 'simple-vibe-terminal' : 'simple-vibe-ide';
 const FLOATING_PANELS: FloatingPanelId[] = ['explorer', 'editor', 'image', 'browser', 'notes', 'snippets', 'calculator', 'settings'];
+const APP_GLASS_PANEL_SCOPES: Record<FloatingPanelId, string> = {
+  explorer: 'explorer-panel',
+  editor: 'editor-panel',
+  image: 'image-panel',
+  browser: 'browser-panel',
+  notes: 'notes-panel',
+  snippets: 'snippets-panel',
+  calculator: 'calculator-panel',
+  settings: 'settings-panel'
+};
 const WIDGET_WRAP_TARGETS: Array<{ id: WidgetWrapTargetId; label: string }> = [
   { id: 'terminal', label: 'Shell widgets' },
   { id: 'explorer', label: 'Explorer' },
@@ -819,6 +1561,7 @@ const SAVED_WORKSPACE_STORE_KEY = IS_TERMINAL_APP
   ? 'simple-vibe-terminal.savedLayouts.v1'
   : 'simple-vibe-ide.savedWorkspaces.v1';
 const SAVED_WORKSPACE_LIMIT = 32;
+const SAVED_WORKSPACE_AUTO_UPDATE_INTERVAL_MS = 30_000;
 const DEFAULT_SHOW_FILE_SIZES = false;
 const BROWSER_ADDRESS_HISTORY_LIMIT = 32;
 const BROWSER_ADDRESS_SUGGESTION_LIMIT = 8;
@@ -831,6 +1574,10 @@ const WORKSPACE_IMAGE_DATA_URL_PERSIST_MAX_CHARS = 6 * 1024 * 1024;
 const WORKSPACE_IMAGE_STORE_MAX_CHARS = 16 * 1024 * 1024;
 const MARKET_TICKER_STORE_KEY = `${APP_STORAGE_PREFIX}.marketTicker.v1`;
 const IDE_SETTINGS_KEY = `${APP_STORAGE_PREFIX}.settings.v1`;
+const DIAGNOSTIC_SESSION_STORAGE_KEY = `${APP_STORAGE_PREFIX}.diagnosticSession.v1`;
+const NOTES_MEMORY_STORE_KEY = `${APP_STORAGE_PREFIX}.notesMemory.v1`;
+const NOTES_MEMORY_LIMIT = 200;
+const NOTES_MEMORY_STORE_MAX_CHARS = 2 * 1024 * 1024;
 const NOTES_DIR = '.vibe-ide-temp/notes';
 const WORKSPACE_SNAPSHOT_DEBOUNCE_MS = 260;
 const WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS = 900;
@@ -858,6 +1605,16 @@ const TERMINAL_PORT_SCAN_DEBOUNCE_MS = 220;
 const TERMINAL_CWD_SCAN_DEBOUNCE_MS = 140;
 const TERMINAL_INACTIVE_WRITE_BATCH_MS = 240;
 const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
+const TERMINAL_RENDER_WATCHDOG_MS = 420;
+const TERMINAL_RENDER_WATCHDOG_STALE_RAF_MS = 500;
+const TERMINAL_RENDER_REFRESH_MIN_MS = 260;
+const TERMINAL_TMUX_FREEZE_PROBE_INTERVAL_MS = 12_000;
+const TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS = 150;
+const TERMINAL_TMUX_FREEZE_PROBE_MIN_LOG_MS = 20_000;
+const TERMINAL_TMUX_FREEZE_STALE_DATA_MS = 5_000;
+const TERMINAL_TMUX_STALE_RECOVERY_COUNT = 2;
+const TERMINAL_TMUX_STALE_RECOVERY_MIN_AGE_MS = 15_000;
+const TERMINAL_TMUX_STALE_RECOVERY_COOLDOWN_MS = 60_000;
 const TERMINAL_INPUT_BATCH_MS = 4;
 const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
 const TERMINAL_START_TIMEOUT_WINDOWS_MS = 15000;
@@ -870,6 +1627,12 @@ const TERMINAL_SHELL_READY_FALLBACK_MS = 4500;
 const TERMINAL_SHELL_READY_ACTION_FALLBACK_MS = 6500;
 const TERMINAL_PENDING_BACKEND_EVENT_LIMIT = 64;
 const TERMINAL_PENDING_BACKEND_DATA_CHARS = 128 * 1024;
+const TERMINAL_WRITE_BUFFER_MAX_CHARS = 512 * 1024;
+const TERMINAL_WRITE_BUFFER_TRIM_TARGET_CHARS = 384 * 1024;
+const TERMINAL_MAX_PENDING_TERM_WRITES = 4;
+const TERMINAL_LLM_DETECTION_THROTTLE_MS = 180;
+const TERMINAL_LLM_DETECTION_BUFFER_CHARS = 6000;
+const TERMINAL_HISTORY_CONTROL_SYNC_MIN_MS = 400;
 const TERMINAL_BACKGROUND_SCAN_BATCH_MS = 900;
 const TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS = 1200;
 const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 64 * 1024;
@@ -909,12 +1672,62 @@ const WORKSPACE_LLM_TITLE_ACTIVE_MS = 1800;
 const WORKSPACE_LLM_TITLE_WORKING_DEBOUNCE_MS = 150;
 const WORKSPACE_LLM_TITLE_IDLE_DEBOUNCE_MS = 500;
 const WORKSPACE_LLM_TITLE_OSC_BUFFER_CHARS = 4096;
+const WORKSPACE_LLM_TITLE_STATUS_BUFFER_CHARS = 4096;
+const WORKSPACE_LLM_SCROLL_DETECTION_SUPPRESS_MS = 1500;
+const WORKSPACE_LLM_SCROLL_DONE_SUPPRESS_MS = 10_000;
+const WORKSPACE_LLM_SCROLLBACK_DONE_RECHECK_MS = 2500;
+const WORKSPACE_LLM_TMUX_TITLE_POLL_MS = 1200;
+const WORKSPACE_LLM_TMUX_TITLE_POLL_RETRY_MS = 4000;
+const WORKSPACE_LLM_HOOK_ACTIVE_MS = 30 * 60_000;
 const LLM_TMUX_SESSION_MAX_LEN = 48;
+const LLM_TMUX_ENV_DANGEROUS_PATTERN = /(?:TOKEN|SECRET|PASSWORD|PASSWD|AUTH|COOKIE|KEY)/i;
+const CLAUDE_HOOK_DIR = '.claude';
+const CLAUDE_HOOK_SCRIPT_NAME = 'simple-vibe-ide-hook.sh';
+const CLAUDE_HOOK_COMMAND = `/bin/sh ${CLAUDE_HOOK_DIR}/${CLAUDE_HOOK_SCRIPT_NAME}`;
+const GROK_HOOK_DIR = '.grok/hooks';
+const GROK_HOOK_CONFIG_NAME = 'simple-vibe-ide.json';
+const GROK_HOOK_SCRIPT_NAME = 'simple-vibe-ide-hook.sh';
+const GROK_HOOK_COMMAND = `/bin/sh "$HOME/${GROK_HOOK_DIR}/${GROK_HOOK_SCRIPT_NAME}"`;
+const WORKSPACE_LLM_TMUX_TITLE_STALE_REPEAT_MS = 8000;
+const IDE_LLM_LAUNCHER_VERSION = 5;
+const CLAUDE_HOOK_EVENTS = [
+  'SessionStart',
+  'UserPromptSubmit',
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+  'PermissionRequest',
+  'PermissionDenied',
+  'Notification',
+  'Stop',
+  'StopFailure',
+  'SubagentStop',
+  'SessionEnd'
+] as const;
+const GROK_HOOK_EVENTS = [
+  'SessionStart',
+  'UserPromptSubmit',
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+  'PermissionDenied',
+  'Notification',
+  'SubagentStart',
+  'SubagentStop',
+  'Stop',
+  'StopFailure',
+  'SessionEnd'
+] as const;
 const AGENT_SESSION_ACTIVITY_MAX_CHARS = 160;
 const AGENT_SESSION_TITLE_MAX_CHARS = 80;
 const AGENT_SESSION_CWD_MAX_CHARS = 90;
 const AGENT_SESSION_OUTPUT_ACTIVITY_THROTTLE_MS = 350;
 const AGENT_ALERT_MIN_INTERVAL_MS = 4500;
+const AGENT_ALERT_DONE_EXPIRE_GRACE_MS = 30_000;
+const DIAGNOSTIC_LOG_MAX = 400;
+const DIAGNOSTIC_LOG_MESSAGE_MAX_CHARS = 260;
+const DIAGNOSTIC_LOG_PERSIST_MAX = 120;
+const DIAGNOSTIC_SESSION_HEARTBEAT_MS = 10_000;
 const WORKSPACE_DOCK_DETAIL_RENDER_THROTTLE_MS = 450;
 const TERMINAL_SNAPSHOT_LLM_TITLE_SUPPRESS_MS = 5000;
 // Snapshot replay arrives as one giant chunk whose scrollback can contain long-answered
@@ -1407,6 +2220,523 @@ const EDITOR_THEME_CHOICES: EditorThemeChoice[] = [
     }
   }
 ];
+const DEFAULT_IDE_BACKGROUND_SETTINGS: IdeBackgroundSettings = {
+  enabled: true,
+  preset: 'ide-default',
+  customImageSrc: '',
+  customImageName: '',
+  customImageUrl: '',
+  fit: 'cover',
+  wallpaperOpacity: 0,
+  base: '#080b10',
+  accentA: '#0a0f18',
+  accentB: '#111723',
+  gridAlpha: 0.10,
+  noiseEnabled: true,
+  noiseOpacity: 0.08,
+  noiseSize: 84,
+  noiseContrast: 0.58,
+  noiseTint: '#dceaff',
+  noiseTintAlpha: 0.08,
+  lightA: { color: '#4d8dff', alpha: 0.28, x: 82, y: 16, size: 52 },
+  lightB: { color: '#ffffff', alpha: 0.18, x: 16, y: 78, size: 50 },
+  lightC: { color: '#35e0ff', alpha: 0.10, x: 52, y: 48, size: 30 }
+};
+
+const DEFAULT_COMMON_GLASS_EFFECT_SETTINGS: WorkspaceGlassEffectSettings = {
+  radius: 14,
+  outlineColor: '#7aaeff',
+  outlineAlpha: 0.18,
+  outlineWidth: 1,
+  outlineSoftAlpha: 0,
+  outlineSoftWidth: 0,
+  refraction: 0.045,
+  bevelDepth: 0.18,
+  bevelWidth: 0.32,
+  frost: 2.6,
+  magnify: 1.02,
+  shadow: false,
+  specular: true,
+  tilt: true,
+  tiltFactor: 20,
+  reveal: 'fade'
+};
+
+const DEFAULT_WORKSPACE_GLASS_SETTINGS: WorkspaceGlassSettings = {
+  enabled: false,
+  useCustomEffect: false,
+  effect: {
+    radius: 14,
+    outlineColor: '#bee0ff',
+    outlineAlpha: 0,
+    outlineWidth: 1,
+    outlineSoftAlpha: 0,
+    outlineSoftWidth: 0,
+    refraction: 0,
+    bevelDepth: 0.1,
+    bevelWidth: 0.17,
+    frost: 2,
+    magnify: 1,
+    shadow: false,
+    specular: true,
+    tilt: true,
+    tiltFactor: 25,
+    reveal: 'fade'
+  },
+  containerUseCustomEffect: false,
+  containerEffect: {
+    radius: 18,
+    outlineColor: '#bee0ff',
+    outlineAlpha: 0.08,
+    outlineWidth: 1,
+    outlineSoftAlpha: 0,
+    outlineSoftWidth: 0,
+    refraction: 0.045,
+    bevelDepth: 0.18,
+    bevelWidth: 0.32,
+    frost: 2.6,
+    magnify: 1.02,
+    shadow: false,
+    specular: true,
+    tilt: false,
+    tiltFactor: 0,
+    reveal: 'fade'
+  },
+  dockPadding: 8,
+  dockGap: 6,
+  dockBgAlpha: 0,
+  dockSurfaceOpacity: 1,
+  dockBlur: 0,
+  dockSaturate: 1,
+  dockSideBorderAlpha: 0,
+  dockOutlineAlpha: 0.10,
+  dockOutlineInset: 4,
+  dockShadowAlpha: 0,
+  dockShadowY: 10,
+  dockShadowBlur: 30,
+  dockHeaderOpacity: 1,
+  dockPillAlpha: 0.052,
+  containerGlassEnabled: false,
+  rowSamplesContainer: false,
+  rowHoverOnly: false,
+  containerRadius: 18,
+  containerGlassBgAlpha: 0.035,
+  containerGlassOutlineAlpha: 0.08,
+  rowRadius: 14,
+  rowHeight: 32,
+  rowPaddingX: 4,
+  rowPaddingY: 3,
+  rowGap: 9,
+  rowBgAlpha: 0.052,
+  rowShadowAlpha: 0,
+  rowShadowY: 10,
+  rowShadowBlur: 22,
+  outlineAlpha: 0,
+  outlineWidth: 1,
+  outlineSoftAlpha: 0,
+  outlineSoftWidth: 0,
+  outlineBaseAccent: '#bee0ff',
+  outlineUseStateColors: false,
+  activeOutlineAccent: '#7fb0ff',
+  protectedOutlineAccent: '#ffd166',
+  captureOutlineAccent: '#35e070',
+  activeAccent: '#7fb0ff',
+  textColor: '#ebf5ff',
+  textSize: 1.04,
+  textWeight: 820,
+  textBlend: 'normal',
+  fontScale: 1,
+  headerTextUseCustom: false,
+  headerColor: '#ffffff',
+  headerSize: 0.78,
+  headerWeight: 800,
+  pillColor: '#dff7ff',
+  pillSize: 0.68,
+  iconColor: '#dce8f7',
+  iconSize: 16,
+  controlPaddingX: 6,
+  controlPaddingY: 4,
+  controlSlotWidth: 25,
+  lockOffIconColor: '#b8c6d8',
+  lockIconColor: '#ffd166',
+  captureIconColor: '#35e070',
+  detailButtonUseWidgetChrome: true,
+  detailButtonBgAlpha: 0.06,
+  detailButtonBgColor: '#050a12',
+  detailButtonOutlineAlpha: 0.18,
+  detailButtonOutlineColor: '#7aaeff',
+  detailButtonOutlineWidth: 1,
+  detailButtonHoverAlpha: 0.16,
+  detailButtonHoverColor: '#7aaeff',
+  detailButtonActiveAlpha: 0.20,
+  detailButtonActiveColor: '#7aaeff',
+  detailButtonRadius: 7,
+  agentTextColor: '#e8f0fa',
+  agentTextWeight: 620,
+  agentTitleColor: '#f6faff',
+  agentTitleSize: 0.86,
+  agentTitleWeight: 760,
+  agentActivityColor: '#c6d8ef',
+  agentActivitySize: 0.68,
+  agentActivityWeight: 560,
+  agentMetaColor: '#acbed8',
+  agentMetaSize: 0.68,
+  agentMetaWeight: 520,
+  detailPaddingX: 8,
+  detailPaddingY: 5,
+  agentGap: 6,
+  agentPaddingX: 8,
+  agentPaddingY: 7,
+  agentBadgeSize: 0.58,
+  agentStatusSize: 0.58,
+  agentBadgeWeight: 800,
+  agentStatusWeight: 800,
+  agentBadgeHeight: 17,
+  agentStatusPaddingX: 6,
+  agentStatusRadius: 999,
+  agentStatusBorderWidth: 0,
+  agentStatusBgAlpha: 0.18,
+  agentStatusBorderAlpha: 0.34,
+  agentStatusIdleColor: '#aac7ff',
+  agentStatusWorkingColor: '#73f19a',
+  agentStatusWaitingColor: '#ff9aa6',
+  agentStatusErrorColor: '#ffbd7d',
+  agentStatusDoneUnreadColor: '#ffe08a',
+  agentStatusExitedColor: '#a8b3c2',
+  agentBgAlpha: 0.045,
+  agentTypeBgAlpha: 0.48,
+  agentTypeBorderAlpha: 0.58,
+  agentTypeBgLeft: 0,
+  agentTypeBgRight: 0,
+  agentTypeBgTop: 0,
+  agentTypeBgBottom: 0,
+  agentTypeBgBleedLeft: 0,
+  agentTypeBgBleedRight: 0,
+  agentTypeBgWidth: 62,
+  agentTypeBgRadius: 9,
+  agentTypeBgOverflow: false,
+  agentCodexAccent: '#2e7e89',
+  agentClaudeAccent: '#8a63d2',
+  agentGrokAccent: '#3f8f52',
+  agentAgyAccent: '#d6923d',
+  llmWorkingColor: '#35e070',
+  llmWaitingColor: '#ff4d5e',
+  llmIdleColor: '#4f7555',
+  llmErrorColor: '#ff9a3d',
+  llmDoneUnreadColor: '#ffd24d',
+  llmExitedColor: '#7b8798',
+  llmStatusDotLeft: 8,
+  llmStatusDotTop: 16,
+  llmStatusDotSize: 7,
+  llmStatusDotGlow: 10,
+  llmWorkingPulseEnabled: true,
+  llmWorkingPulseDuration: 1.25,
+  llmWorkingPulseDimOpacity: 0.54,
+  llmWorkingPulseRingSize: 5,
+  llmWorkingPulseGlowAlpha: 0.85,
+  llmLabelPadding: 23,
+  tabHighlight: false,
+  tabHighlightAccent: '#bfeaff',
+  tabHighlightOpacity: 0.72,
+  tabHighlightStrongAlpha: 0.10,
+  tabHighlightSoftAlpha: 0.045,
+  tabHighlightWidth: 66,
+  tabHighlightLeft: 0,
+  tabHighlightRight: 0,
+  tabHighlightTop: 0,
+  tabHighlightBottom: 0,
+  tabHighlightShiftX: 0,
+  tabHighlightRadius: 10,
+  selectedHighlight: true,
+  selectedRail: true,
+  selectedBadge: false,
+  selectedRailStyle: 'pill',
+  selectedAccent: '#d9f6ff',
+  selectedFillAlpha: 0.16,
+  selectedOutlineAlpha: 0.18,
+  selectedGlowAlpha: 0,
+  selectedOutlineWidth: 1,
+  selectedGlowY: 0,
+  selectedGlowBlur: 0,
+  selectedGlowSpread: 0,
+  selectedBadgeSize: 0.54,
+  selectedHighlightAccent: '#d9f6ff',
+  selectedHighlightOpacity: 1,
+  selectedHighlightStrongAlpha: 0.27,
+  selectedHighlightSoftAlpha: 0.13,
+  selectedHighlightWidth: 72,
+  selectedHighlightLeft: 0,
+  selectedHighlightRight: 0,
+  selectedHighlightTop: 0,
+  selectedHighlightBottom: 0,
+  selectedHighlightShiftX: 0,
+  selectedHighlightRadius: 10,
+  selectedRailAlpha: 0.92,
+  selectedRailWidth: 4,
+  selectedRailInset: 7,
+  selectedRailOffset: 4,
+  selectedRailRadius: 999,
+  selectedRailGlow: 0
+};
+
+const DEFAULT_APP_GLASS_CHROME_SETTINGS: AppGlassChromeSettings = {
+  surfaceAlpha: 0,
+  surfaceColor: '#050a12',
+  fieldAlpha: 0.08,
+  fieldColor: '#050a12',
+  fieldTextColor: '#e2f0ff',
+  fieldOutlineAlpha: 0.20,
+  fieldOutlineColor: '#7aaeff',
+  selectOptionBgColor: '#07111f',
+  selectOptionTextColor: '#e2f0ff',
+  selectOptionSelectedBgColor: '#1b4f84',
+  selectOptionSelectedTextColor: '#ffffff',
+  tabAlpha: 0.03,
+  tabColor: '#050a12',
+  tabActiveAlpha: 0.16,
+  tabActiveColor: '#7aaeff',
+  buttonAlpha: 0.06,
+  buttonColor: '#050a12',
+  buttonOutlineAlpha: 0.18,
+  buttonOutlineColor: '#7aaeff',
+  buttonOutlineWidth: 1,
+  buttonHoverAlpha: 0.16,
+  buttonHoverColor: '#7aaeff',
+  buttonRadius: 7,
+  itemAlpha: 0.08,
+  itemColor: '#050a12',
+  itemTextColor: '#dce9f9',
+  itemOutlineAlpha: 0.16,
+  itemOutlineColor: '#7aaeff',
+  dividerAlpha: 0.16,
+  dividerColor: '#7aaeff',
+  paddingX: 8,
+  paddingY: 8
+};
+
+const DEFAULT_APP_GLASS_SETTINGS: AppGlassSettings = {
+  enabled: false,
+  useCustomEffect: false,
+  titlebar: true,
+  windowControls: true,
+  profileActions: true,
+  profileActionsSplit: true,
+  explorerPanel: true,
+  editorPanel: true,
+  imagePanel: true,
+  browserPanel: true,
+  notesPanel: true,
+  snippetsPanel: true,
+  calculatorPanel: true,
+  floatingPanels: true,
+  terminalWidgets: true,
+  notesSnippets: true,
+  settingsPanel: true,
+  explorerRows: true,
+  explorerRowsHoverOnly: false,
+  explorerRowsSamplePanel: false,
+  effect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  titlebarUseCustomEffect: false,
+  titlebarEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  windowControlsUseCustomEffect: false,
+  windowControlsEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  profileActionsUseCustomEffect: false,
+  profileActionsEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  terminalWidgetsUseCustomEffect: false,
+  terminalWidgetsEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  explorerPanelUseCustomEffect: false,
+  explorerPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  editorPanelUseCustomEffect: false,
+  editorPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  imagePanelUseCustomEffect: false,
+  imagePanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  browserPanelUseCustomEffect: false,
+  browserPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  notesPanelUseCustomEffect: false,
+  notesPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  snippetsPanelUseCustomEffect: false,
+  snippetsPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  calculatorPanelUseCustomEffect: false,
+  calculatorPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  floatingPanelsUseCustomEffect: false,
+  floatingPanelsEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  notesSnippetsUseCustomEffect: false,
+  notesSnippetsEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  settingsPanelUseCustomEffect: false,
+  settingsPanelEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  explorerRowsUseCustomEffect: false,
+  explorerRowsEffect: { ...DEFAULT_COMMON_GLASS_EFFECT_SETTINGS },
+  chrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  terminalChromeUseCustom: false,
+  terminalChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  settingsChromeUseCustom: false,
+  settingsChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  profileChromeUseCustom: false,
+  profileChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  explorerChromeUseCustom: false,
+  explorerChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  editorChromeUseCustom: false,
+  editorChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  imageChromeUseCustom: false,
+  imageChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  browserChromeUseCustom: false,
+  browserChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  notesChromeUseCustom: false,
+  notesChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  snippetsChromeUseCustom: false,
+  snippetsChrome: { ...DEFAULT_APP_GLASS_CHROME_SETTINGS },
+  headerTextColor: '#ffffff',
+  headerTextSize: 0.92,
+  headerTextWeight: 720,
+  bodyTextColor: '#e2f0ff',
+  mutedTextColor: '#aac0d8',
+  shadowAlpha: 0.48,
+  shadowBlur: 72,
+  shadowY: 28,
+  titlebarRadius: 14,
+  titlebarAlpha: 0.05,
+  titlebarOutlineAlpha: 0.08,
+  titlebarBlur: 10,
+  windowButtonSize: 28,
+  windowButtonGap: 5,
+  windowButtonRadius: 6,
+  windowButtonBgAlpha: 0.16,
+  windowButtonBgColor: '#050a12',
+  windowButtonHoverAlpha: 0.28,
+  windowButtonHoverColor: '#243044',
+  windowButtonCloseHoverAlpha: 0.56,
+  windowButtonCloseHoverColor: '#e81123',
+  windowButtonOutlineAlpha: 0.10,
+  windowButtonOutlineColor: '#cde0f8',
+  windowButtonIconAlpha: 0.88,
+  windowButtonIconSize: 15,
+  widgetRadius: 18,
+  widgetGlassAlpha: 0.028,
+  widgetOutlineAlpha: 0.48,
+  widgetOutlineWidth: 1,
+  widgetOutlineSoftAlpha: 0,
+  widgetOutlineSoftWidth: 0,
+  widgetChromeAlpha: 0.30,
+  widgetHeaderDividerAlpha: 0,
+  widgetGlassInsetAlpha: 0,
+  widgetPaddingX: 10,
+  widgetPaddingY: 8,
+  widgetTopbarHeight: 42,
+  widgetTopbarContentY: 0,
+  widgetButtonBgAlpha: 0.06,
+  widgetButtonBgColor: '#ffffff',
+  widgetButtonOutlineAlpha: 0.24,
+  widgetButtonOutlineColor: '#7aaeff',
+  widgetButtonOutlineWidth: 0,
+  widgetButtonHoverAlpha: 0.18,
+  widgetButtonHoverColor: '#7aaeff',
+  widgetButtonActiveAlpha: 0.20,
+  widgetButtonActiveColor: '#7aaeff',
+  widgetButtonRadius: 10,
+  widgetTitleHighlight: true,
+  widgetTitleColor: '#7aaeff',
+  widgetTitleAlpha: 0.20,
+  widgetTitleSizeX: 180,
+  widgetTitleSizeY: 150,
+  widgetTitleOriginX: -8,
+  widgetTitleOriginY: 42,
+  widgetTitleCoreStop: 0,
+  widgetTitleMidStrength: 0.30,
+  widgetTitleEdgeStrength: 0.04,
+  widgetTitleSoftness: 0.86,
+  widgetTitleSelectedColor: '#d9f6ff',
+  widgetTitleSelectedAlpha: 0.30,
+  widgetTitleSelectedSizeX: 190,
+  widgetTitleSelectedSizeY: 160,
+  widgetTitleSelectedOriginX: -8,
+  widgetTitleSelectedOriginY: 42,
+  widgetTitleSelectedCoreStop: 0,
+  widgetTitleSelectedMidStop: 58,
+  widgetTitleSelectedSoftStop: 104,
+  widgetTitleSelectedFadeStop: 160,
+  widgetTitleSelectedMidStrength: 0.34,
+  widgetTitleSelectedEdgeStrength: 0.06,
+  widgetTitleSelectedSoftness: 0.88,
+  widgetTitleSelectedPadX: -10,
+  widgetTitleSelectedPadY: -8,
+  widgetTitleSelectedShiftX: 0,
+  widgetTitleSelectedShiftY: 0,
+  widgetTitleSelectedRadius: 18,
+  widgetTitleSelectedMidAlpha: 0.20,
+  widgetTitleSelectedSoftAlpha: 0.12,
+  widgetTitleSelectedTopAlpha: 0,
+  widgetTitleSelectedVerticalMidAlpha: 0,
+  widgetTitleSelectedBottomAlpha: 0,
+  widgetTitleIdleColor: '#a8bed6',
+  widgetTitleIdleAlpha: 0.10,
+  widgetTitleIdleMidAlpha: 0.06,
+  widgetTitleIdleSoftAlpha: 0.035,
+  widgetTitleIdleTopAlpha: 0,
+  widgetTitleIdleVerticalMidAlpha: 0,
+  widgetTitleIdleBottomAlpha: 0,
+  widgetTitleWidth: 82,
+  widgetTitlePadX: -10,
+  widgetTitlePadY: -8,
+  widgetTitleShiftX: 0,
+  widgetTitleShiftY: 0,
+  widgetTitleRadius: 18,
+  widgetTitleFullWidth: true,
+  widgetTitleMidStop: 58,
+  widgetTitleSoftStop: 104,
+  widgetTitleFadeStop: 160,
+  widgetTitleVerticalMidStop: 42,
+  widgetTitleVerticalSoftStop: 72,
+  widgetTitleVerticalFadeStop: 100,
+  widgetTitleIdleInsetAlpha: 0.09,
+  widgetTitleSelectedInsetAlpha: 0.16,
+  widgetTitleInsetWidth: 0,
+  widgetTitleSelectedGlowAlpha: 1,
+  terminalTextContrast: 1,
+  terminalDimOpacity: 0.62,
+  terminalPaneBgAlpha: 0,
+  terminalPaneIdleBgAlpha: 0,
+  terminalPaneIdleBgColor: '#ffffff',
+  terminalPaneSelectedBgAlpha: 0.08,
+  terminalPaneSelectedBgColor: '#7aaeff',
+  terminalPaneOutlineAlpha: 0.34,
+  editorPaneIdleBgAlpha: 0,
+  editorPaneIdleBgColor: '#ffffff',
+  editorPaneSelectedBgAlpha: 0.08,
+  editorPaneSelectedBgColor: '#7aaeff',
+  terminalHostBgAlpha: 0,
+  terminalTabbarBgAlpha: 0,
+  terminalTypePadBgAlpha: 0,
+  terminalInputBgAlpha: 0,
+  terminalNewTabBgAlpha: 0.06,
+  terminalNewTabBgColor: '#050a12',
+  terminalNewTabOutlineAlpha: 0.18,
+  terminalNewTabOutlineColor: '#7aaeff',
+  terminalNewTabHoverAlpha: 0.14,
+  terminalNewTabHoverColor: '#7aaeff',
+  terminalTypePadButtonBgAlpha: 0.08,
+  terminalTypePadButtonBgColor: '#050a12',
+  terminalTypePadButtonOutlineAlpha: 0.18,
+  terminalTypePadButtonOutlineColor: '#7aaeff',
+  terminalTypePadButtonHoverAlpha: 0.16,
+  terminalTypePadButtonHoverColor: '#7aaeff',
+  terminalTypePadButtonDisabledAlpha: 0.34,
+  terminalScrollbarThumbAlpha: 0.24,
+  terminalScrollbarThumbHoverAlpha: 0.46,
+  terminalScrollbarTrackAlpha: 0.04,
+  terminalScrollbarWidth: 8,
+  explorerHorizontalScrollbarBottomGap: 8,
+  terminalHostOutlineAlpha: 0,
+  terminalSplitResizerAlpha: 0.34,
+  explorerRowsRadius: 5,
+  explorerHoverColor: '#7aaeff',
+  explorerHoverAlpha: 0.18,
+  explorerActiveAlpha: 0.26,
+  explorerSelectedRailColor: '#7aaeff',
+  explorerSelectedRailAlpha: 0.86,
+  explorerSelectedRailWidth: 2,
+  diagnostics: false
+};
+
 const DEFAULT_IDE_SETTINGS: IdeSettings = {
   uiFont: 'system',
   monoFont: 'cascadia',
@@ -1418,10 +2748,22 @@ const DEFAULT_IDE_SETTINGS: IdeSettings = {
   workspaceDockPosition: 'top',
   workspaceDockSize: WORKSPACE_DOCK_DEFAULT_SIZE,
   workspaceDockDetailOpen: false,
+  workspaceDockDetailShowActivity: true,
+  workspaceDockDetailShowMeta: true,
+  workspaceDockDetailHideProtectedExtra: true,
   workspaceFocusBorder: true,
   workspaceFocusTitle: false,
+  workspaceSideDockGlass: false,
+  ideBackground: DEFAULT_IDE_BACKGROUND_SETTINGS,
+  glassEffect: DEFAULT_COMMON_GLASS_EFFECT_SETTINGS,
+  workspaceGlass: DEFAULT_WORKSPACE_GLASS_SETTINGS,
+  appGlass: DEFAULT_APP_GLASS_SETTINGS,
   agentNotificationBanners: false,
   agentAlertSound: false,
+  agentEventClaudeHooks: 'ask',
+  agentEventGrokHooks: 'ask',
+  llmTmuxEnvPassthrough: 'IS_DEMO',
+  debugLogEnabled: false,
   widgetRadius: 8,
   widgetFocusBorder: true,
   widgetFocusTitle: false,
@@ -1442,11 +2784,610 @@ const WORKSPACE_MEMORY_SAVER_CHOICES: Array<{ id: WorkspaceMemorySaverMode; labe
   { id: 'off', label: 'Off' },
   { id: 'aggressive', label: 'Aggressive' }
 ];
+const AGENT_EVENT_CLAUDE_HOOK_CHOICES: Array<{ id: AgentEventClaudeHookMode; label: string }> = [
+  { id: 'ask', label: 'Ask before installing local hook' },
+  { id: 'auto', label: 'Auto install/update local hook' },
+  { id: 'off', label: 'Off (title/output only)' }
+];
+const AGENT_EVENT_GROK_HOOK_CHOICES: Array<{ id: AgentEventGrokHookMode; label: string }> = [
+  { id: 'ask', label: 'Ask before installing global hook' },
+  { id: 'auto', label: 'Auto install/update global hook' },
+  { id: 'off', label: 'Off (title/output only)' }
+];
 const WORKSPACE_DOCK_POSITION_CHOICES: Array<{ id: WorkspaceDockPosition; label: string }> = [
   { id: 'top', label: 'Top' },
   { id: 'bottom', label: 'Bottom' },
   { id: 'left', label: 'Left side dock' },
   { id: 'right', label: 'Right side dock' }
+];
+const LIQUIDGL_VENDOR_SCRIPTS = [
+  '/vendor/liquidgl/html2canvas.min.js',
+  '/vendor/liquidgl/liquidGL.js'
+];
+const IDE_BACKGROUND_LIQUID_IMAGES = [
+  '/vendor/liquidgl/assets/liquid-bkg-_0000_Comp-33.webp',
+  '/vendor/liquidgl/assets/liquid-bkg-_0001_Comp-183.webp',
+  '/vendor/liquidgl/assets/liquid-bkg-_0002_Comp-163.webp',
+  '/vendor/liquidgl/assets/liquid-bkg-_0003_Comp-151.webp',
+  '/vendor/liquidgl/assets/liquid-bkg-_0004_Comp-13.webp'
+];
+const IDE_BACKGROUND_PRESET_CHOICES: Array<{ id: IdeBackgroundPreset; label: string }> = [
+  { id: 'ide-default', label: 'IDE 기본 다크' },
+  { id: 'liquid', label: 'LiquidGL 데모 이미지' },
+  { id: 'procedural-demo', label: '프로시저럴 데모풍' },
+  { id: 'ide-editor', label: 'IDE 에디터 배경' },
+  { id: 'ide-blue', label: 'IDE 블루 글래스 테스트' },
+  { id: 'custom', label: '커스텀 / 직접 조정' }
+];
+const IDE_BACKGROUND_FIT_CHOICES: Array<{ id: IdeBackgroundFit; label: string }> = [
+  { id: 'cover', label: '꽉 채우기 cover' },
+  { id: 'contain', label: '전체 보이기 contain' },
+  { id: 'stretch', label: '늘이기 stretch' }
+];
+const WORKSPACE_GLASS_RAIL_STYLE_CHOICES: Array<{ id: WorkspaceGlassRailStyle; label: string }> = [
+  { id: 'pill', label: '왼쪽 pill' },
+  { id: 'line', label: '왼쪽 전체 line' },
+  { id: 'top', label: '상단 line' },
+  { id: 'bottom', label: '하단 line' },
+  { id: 'outline', label: '안쪽 outline' }
+];
+const WORKSPACE_GLASS_TEXT_BLEND_CHOICES: Array<{ id: WorkspaceGlassTextBlend; label: string }> = [
+  { id: 'normal', label: 'normal - 직접 지정 색' },
+  { id: 'difference', label: 'difference - 배경 반전' }
+];
+const WORKSPACE_GLASS_REVEAL_CHOICES: Array<{ id: WorkspaceGlassReveal; label: string }> = [
+  { id: 'fade', label: 'fade' },
+  { id: 'none', label: 'none' }
+];
+const IDE_BACKGROUND_PRESETS: Record<Exclude<IdeBackgroundPreset, 'custom'>, Partial<IdeBackgroundSettings>> = {
+  liquid: {
+    wallpaperOpacity: 1,
+    base: '#f0f0f0',
+    accentA: '#ececec',
+    accentB: '#dce8ff',
+    gridAlpha: 0,
+    noiseEnabled: true,
+    noiseOpacity: 0.04,
+    noiseSize: 96,
+    noiseContrast: 0.45,
+    noiseTint: '#ffffff',
+    noiseTintAlpha: 0,
+    lightA: { color: '#8ab4ff', alpha: 0.12, x: 78, y: 18, size: 46 },
+    lightB: { color: '#ffffff', alpha: 0.10, x: 18, y: 82, size: 44 },
+    lightC: { color: '#35e0ff', alpha: 0.05, x: 52, y: 56, size: 34 }
+  },
+  'procedural-demo': {
+    wallpaperOpacity: 0,
+    base: '#19051f',
+    accentA: '#ff4aa2',
+    accentB: '#1ecbff',
+    gridAlpha: 0.04,
+    noiseEnabled: true,
+    noiseOpacity: 0.13,
+    noiseSize: 68,
+    noiseContrast: 0.68,
+    noiseTint: '#ffd6f3',
+    noiseTintAlpha: 0.10,
+    lightA: { color: '#ff4fd8', alpha: 0.56, x: 68, y: 18, size: 66 },
+    lightB: { color: '#fff2a8', alpha: 0.30, x: 12, y: 72, size: 52 },
+    lightC: { color: '#00d8ff', alpha: 0.34, x: 96, y: 48, size: 46 }
+  },
+  'ide-default': {
+    wallpaperOpacity: 0,
+    base: '#080b10',
+    accentA: '#0a0f18',
+    accentB: '#111723',
+    gridAlpha: 0.14,
+    noiseEnabled: true,
+    noiseOpacity: 0.12,
+    noiseSize: 84,
+    noiseContrast: 0.58,
+    noiseTint: '#dceaff',
+    noiseTintAlpha: 0.10,
+    lightA: { color: '#4d8dff', alpha: 0.32, x: 82, y: 16, size: 52 },
+    lightB: { color: '#ffffff', alpha: 0.22, x: 16, y: 78, size: 50 },
+    lightC: { color: '#4d8dff', alpha: 0.12, x: 52, y: 48, size: 28 }
+  },
+  'ide-editor': {
+    wallpaperOpacity: 0,
+    base: '#0a0f18',
+    accentA: '#0b1019',
+    accentB: '#1b2d4a',
+    gridAlpha: 0.11,
+    noiseEnabled: true,
+    noiseOpacity: 0.10,
+    noiseSize: 88,
+    noiseContrast: 0.52,
+    noiseTint: '#8ab4ff',
+    noiseTintAlpha: 0.08,
+    lightA: { color: '#8ab4ff', alpha: 0.28, x: 74, y: 24, size: 48 },
+    lightB: { color: '#ffffff', alpha: 0.20, x: 16, y: 82, size: 48 },
+    lightC: { color: '#8ab4ff', alpha: 0.10, x: 52, y: 52, size: 30 }
+  },
+  'ide-blue': {
+    wallpaperOpacity: 0,
+    base: '#07111f',
+    accentA: '#12345d',
+    accentB: '#4d8dff',
+    gridAlpha: 0.18,
+    noiseEnabled: true,
+    noiseOpacity: 0.14,
+    noiseSize: 72,
+    noiseContrast: 0.62,
+    noiseTint: '#35e0ff',
+    noiseTintAlpha: 0.12,
+    lightA: { color: '#7fb0ff', alpha: 0.46, x: 72, y: 18, size: 58 },
+    lightB: { color: '#ffffff', alpha: 0.28, x: 18, y: 82, size: 52 },
+    lightC: { color: '#35e0ff', alpha: 0.16, x: 48, y: 50, size: 32 }
+  }
+};
+type GlassSettingsControl =
+  | { type: 'section'; label: string }
+  | { type: 'range'; label: string; path: string; min: number; max: number; step: number; unit?: string; recapture?: boolean; markCustomBackground?: boolean }
+  | { type: 'color'; label: string; path: string; recapture?: boolean; markCustomBackground?: boolean }
+  | { type: 'select'; label: string; path: string; choices: Array<{ id: string; label: string }>; recapture?: boolean }
+  | { type: 'checkbox'; label: string; path: string; recapture?: boolean; markCustomBackground?: boolean }
+  | { type: 'text'; label: string; path: string; placeholder?: string; recapture?: boolean }
+  | { type: 'action'; label: string; action: 'inherit-glass-effect' | 'inherit-glass-chrome'; sourcePath: string; targetPath: string; customPath: string; recapture?: boolean };
+
+type GlassInputControl = Extract<GlassSettingsControl, { path: string }>;
+
+function glassMaterialOverrideControls(sectionLabel: string, fieldPrefix: string): GlassSettingsControl[] {
+  const effectPath = `${fieldPrefix}Effect`;
+  return [
+    { type: 'section', label: sectionLabel },
+    { type: 'checkbox', label: '개별 material 사용', path: `${fieldPrefix}UseCustomEffect` },
+    { type: 'action', label: 'global material 값 상속', action: 'inherit-glass-effect', sourcePath: 'glassEffect', targetPath: effectPath, customPath: `${fieldPrefix}UseCustomEffect` },
+    { type: 'range', label: 'glass R', path: `${effectPath}.radius`, min: 0, max: 72, step: 1, unit: 'px' },
+    { type: 'color', label: 'outline 색', path: `${effectPath}.outlineColor` },
+    { type: 'range', label: 'outline 강도', path: `${effectPath}.outlineAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'range', label: 'outline 폭', path: `${effectPath}.outlineWidth`, min: 0, max: 6, step: 1, unit: 'px' },
+    { type: 'range', label: 'soft outline 강도', path: `${effectPath}.outlineSoftAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'range', label: 'soft outline 폭', path: `${effectPath}.outlineSoftWidth`, min: 0, max: 16, step: 1, unit: 'px' },
+    { type: 'range', label: 'refraction', path: `${effectPath}.refraction`, min: 0, max: 0.2, step: 0.001 },
+    { type: 'range', label: 'bevel depth', path: `${effectPath}.bevelDepth`, min: 0, max: 0.6, step: 0.001 },
+    { type: 'range', label: 'bevel width', path: `${effectPath}.bevelWidth`, min: 0, max: 1.2, step: 0.001 },
+    { type: 'range', label: 'frost', path: `${effectPath}.frost`, min: 0, max: 6, step: 0.05 },
+    { type: 'range', label: 'magnify', path: `${effectPath}.magnify`, min: 0.7, max: 1.4, step: 0.01 },
+    { type: 'checkbox', label: 'shadow', path: `${effectPath}.shadow` },
+    { type: 'checkbox', label: 'specular', path: `${effectPath}.specular` },
+    { type: 'checkbox', label: 'tilt', path: `${effectPath}.tilt` },
+    { type: 'range', label: 'tilt factor', path: `${effectPath}.tiltFactor`, min: 0, max: 40, step: 1 },
+    { type: 'select', label: 'reveal', path: `${effectPath}.reveal`, choices: WORKSPACE_GLASS_REVEAL_CHOICES }
+  ];
+}
+
+function glassChromeControls(fieldPrefix: string): GlassSettingsControl[] {
+  return [
+    { type: 'color', label: '내부 surface 색상', path: `${fieldPrefix}.surfaceColor` },
+    { type: 'range', label: '내부 surface 배경', path: `${fieldPrefix}.surfaceAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '탭 배경 색상', path: `${fieldPrefix}.tabColor` },
+    { type: 'range', label: '탭 배경', path: `${fieldPrefix}.tabAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '선택 탭 배경 색상', path: `${fieldPrefix}.tabActiveColor` },
+    { type: 'range', label: '선택 탭 배경', path: `${fieldPrefix}.tabActiveAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '버튼 배경 색상', path: `${fieldPrefix}.buttonColor` },
+    { type: 'range', label: '버튼 배경', path: `${fieldPrefix}.buttonAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '버튼 외곽선 색상', path: `${fieldPrefix}.buttonOutlineColor` },
+    { type: 'range', label: '버튼 외곽선', path: `${fieldPrefix}.buttonOutlineAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'range', label: '버튼 외곽선 두께', path: `${fieldPrefix}.buttonOutlineWidth`, min: 0, max: 4, step: 1, unit: 'px' },
+    { type: 'color', label: '버튼 hover 색상', path: `${fieldPrefix}.buttonHoverColor` },
+    { type: 'range', label: '버튼 hover', path: `${fieldPrefix}.buttonHoverAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'range', label: '버튼 라운드', path: `${fieldPrefix}.buttonRadius`, min: 0, max: 28, step: 1, unit: 'px' },
+    { type: 'color', label: '리스트/카드 배경 색상', path: `${fieldPrefix}.itemColor` },
+    { type: 'range', label: '리스트/카드 배경', path: `${fieldPrefix}.itemAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '리스트/카드 글자 색상', path: `${fieldPrefix}.itemTextColor` },
+    { type: 'color', label: '리스트/카드 외곽선 색상', path: `${fieldPrefix}.itemOutlineColor` },
+    { type: 'range', label: '리스트/카드 외곽선', path: `${fieldPrefix}.itemOutlineAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '구분선/라인 색상', path: `${fieldPrefix}.dividerColor` },
+    { type: 'range', label: '구분선/라인', path: `${fieldPrefix}.dividerAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'range', label: '내부 padding X', path: `${fieldPrefix}.paddingX`, min: 0, max: 28, step: 1, unit: 'px' },
+    { type: 'range', label: '내부 padding Y', path: `${fieldPrefix}.paddingY`, min: 0, max: 24, step: 1, unit: 'px' }
+  ];
+}
+
+function glassTopDownListControls(fieldPrefix: string): GlassSettingsControl[] {
+  return [
+    { type: 'color', label: 'select 본체 배경색', path: `${fieldPrefix}.fieldColor` },
+    { type: 'range', label: 'select 본체 배경 강도', path: `${fieldPrefix}.fieldAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: 'select 본체 글자색', path: `${fieldPrefix}.fieldTextColor` },
+    { type: 'color', label: 'select 본체 외곽선 색상', path: `${fieldPrefix}.fieldOutlineColor` },
+    { type: 'range', label: 'select 본체 외곽선 강도', path: `${fieldPrefix}.fieldOutlineAlpha`, min: 0, max: 1, step: 0.01 },
+    { type: 'color', label: '펼침 리스트 배경색', path: `${fieldPrefix}.selectOptionBgColor` },
+    { type: 'color', label: '펼침 리스트 글자색', path: `${fieldPrefix}.selectOptionTextColor` },
+    { type: 'color', label: '펼침 리스트 선택 배경색', path: `${fieldPrefix}.selectOptionSelectedBgColor` },
+    { type: 'color', label: '펼침 리스트 선택 글자색', path: `${fieldPrefix}.selectOptionSelectedTextColor` }
+  ];
+}
+
+function glassChromeOverrideControls(
+  sectionLabel: string,
+  useCustomPath: string,
+  fieldPrefix: string,
+  includeTopDownList = false
+): GlassSettingsControl[] {
+  const controls: GlassSettingsControl[] = [
+    { type: 'section', label: sectionLabel },
+    { type: 'checkbox', label: '개별 탭/버튼/surface 사용', path: useCustomPath },
+    { type: 'action', label: 'global 탭/버튼/surface 값 상속', action: 'inherit-glass-chrome', sourcePath: 'appGlass.chrome', targetPath: fieldPrefix, customPath: useCustomPath },
+    ...glassChromeControls(fieldPrefix)
+  ];
+  if (includeTopDownList) controls.push(...glassTopDownListControls(fieldPrefix));
+  return controls;
+}
+
+const GLASS_SETTINGS_CONTROLS: GlassSettingsControl[] = [
+  { type: 'section', label: '배경 / 조명' },
+  { type: 'checkbox', label: '배경설정 적용', path: 'ideBackground.enabled', recapture: true },
+  { type: 'select', label: '배경 프리셋', path: 'ideBackground.preset', choices: IDE_BACKGROUND_PRESET_CHOICES, recapture: true },
+  { type: 'text', label: '커스텀 이미지 URL / 경로', path: 'ideBackground.customImageUrl', placeholder: '/vendor/... 또는 https://...', recapture: true },
+  { type: 'select', label: '커스텀 이미지 맞춤', path: 'ideBackground.fit', choices: IDE_BACKGROUND_FIT_CHOICES, recapture: true },
+  { type: 'range', label: '월페이퍼 불투명도', path: 'ideBackground.wallpaperOpacity', min: 0, max: 1, step: 0.02, recapture: true, markCustomBackground: true },
+  { type: 'color', label: '배경 기본색', path: 'ideBackground.base', recapture: true, markCustomBackground: true },
+  { type: 'color', label: '배경 보조색 A', path: 'ideBackground.accentA', recapture: true, markCustomBackground: true },
+  { type: 'color', label: '배경 보조색 B', path: 'ideBackground.accentB', recapture: true, markCustomBackground: true },
+  { type: 'range', label: '그리드 강도', path: 'ideBackground.gridAlpha', min: 0, max: 0.32, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'checkbox', label: '노이즈 켜기', path: 'ideBackground.noiseEnabled', recapture: true, markCustomBackground: true },
+  { type: 'range', label: '노이즈 강도', path: 'ideBackground.noiseOpacity', min: 0, max: 0.36, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'range', label: '노이즈 입자 크기', path: 'ideBackground.noiseSize', min: 32, max: 180, step: 4, unit: 'px', recapture: true, markCustomBackground: true },
+  { type: 'range', label: '노이즈 대비', path: 'ideBackground.noiseContrast', min: 0, max: 1, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'color', label: '노이즈 tint 색', path: 'ideBackground.noiseTint', recapture: true, markCustomBackground: true },
+  { type: 'range', label: '노이즈 tint 강도', path: 'ideBackground.noiseTintAlpha', min: 0, max: 0.8, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'section', label: '배경 라이트 A - 주 광원' },
+  { type: 'color', label: 'A 색', path: 'ideBackground.lightA.color', recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'A 강도', path: 'ideBackground.lightA.alpha', min: 0, max: 0.85, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'A X', path: 'ideBackground.lightA.x', min: -20, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'A Y', path: 'ideBackground.lightA.y', min: -20, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'A 크기', path: 'ideBackground.lightA.size', min: 12, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'section', label: '배경 라이트 B - rim / 보조' },
+  { type: 'color', label: 'B 색', path: 'ideBackground.lightB.color', recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'B 강도', path: 'ideBackground.lightB.alpha', min: 0, max: 0.75, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'B X', path: 'ideBackground.lightB.x', min: -20, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'B Y', path: 'ideBackground.lightB.y', min: -20, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'B 크기', path: 'ideBackground.lightB.size', min: 12, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'section', label: '배경 라이트 C - 얇은 굴절선' },
+  { type: 'color', label: 'C 색', path: 'ideBackground.lightC.color', recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'C 강도', path: 'ideBackground.lightC.alpha', min: 0, max: 0.55, step: 0.01, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'C X', path: 'ideBackground.lightC.x', min: -20, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'C Y', path: 'ideBackground.lightC.y', min: -20, max: 120, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'range', label: 'C 크기', path: 'ideBackground.lightC.size', min: 8, max: 90, step: 1, recapture: true, markCustomBackground: true },
+  { type: 'section', label: 'Glass 사용 범위' },
+  { type: 'checkbox', label: 'Glass 테마 사용', path: 'appGlass.enabled', recapture: true },
+  { type: 'checkbox', label: 'Titlebar glass', path: 'appGlass.titlebar', recapture: true },
+  { type: 'checkbox', label: 'Window buttons glass', path: 'appGlass.windowControls', recapture: true },
+  { type: 'checkbox', label: 'Profile/actions glass', path: 'appGlass.profileActions', recapture: true },
+  { type: 'checkbox', label: 'Profile/actions 2-card split', path: 'appGlass.profileActionsSplit', recapture: true },
+  { type: 'checkbox', label: '터미널 공통 glass (Shell/LLM)', path: 'appGlass.terminalWidgets', recapture: true },
+  { type: 'checkbox', label: 'Explorer 패널 glass', path: 'appGlass.explorerPanel', recapture: true },
+  { type: 'checkbox', label: 'Editor 패널 glass', path: 'appGlass.editorPanel', recapture: true },
+  { type: 'checkbox', label: 'Image Preview 패널 glass', path: 'appGlass.imagePanel', recapture: true },
+  { type: 'checkbox', label: 'Browser 패널 glass', path: 'appGlass.browserPanel', recapture: true },
+  { type: 'checkbox', label: 'Notes 패널 glass', path: 'appGlass.notesPanel', recapture: true },
+  { type: 'checkbox', label: 'Snippets 패널 glass', path: 'appGlass.snippetsPanel', recapture: true },
+  { type: 'checkbox', label: 'Calculator 패널 glass', path: 'appGlass.calculatorPanel', recapture: true },
+  { type: 'checkbox', label: 'Settings 패널 glass', path: 'appGlass.settingsPanel', recapture: true },
+  { type: 'checkbox', label: 'Explorer row liquidGL', path: 'appGlass.explorerRows', recapture: true },
+  { type: 'checkbox', label: 'Explorer row hover일 때만 glass', path: 'appGlass.explorerRowsHoverOnly' },
+  { type: 'checkbox', label: 'Explorer row glass samples panel', path: 'appGlass.explorerRowsSamplePanel', recapture: true },
+  { type: 'checkbox', label: 'glass diagnostics', path: 'appGlass.diagnostics' },
+  { type: 'checkbox', label: 'workspace dock container glass', path: 'workspaceGlass.containerGlassEnabled', recapture: true },
+  { type: 'checkbox', label: 'Workspace row glass samples container', path: 'workspaceGlass.rowSamplesContainer', recapture: true },
+  { type: 'checkbox', label: 'workspace tab/row hover일 때만 glass', path: 'workspaceGlass.rowHoverOnly' },
+  { type: 'section', label: '전체 공통 material' },
+  { type: 'range', label: 'global glass R', path: 'glassEffect.radius', min: 0, max: 72, step: 1, unit: 'px' },
+  { type: 'color', label: 'global outline 색', path: 'glassEffect.outlineColor' },
+  { type: 'range', label: 'global outline 강도', path: 'glassEffect.outlineAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'global outline 폭', path: 'glassEffect.outlineWidth', min: 0, max: 6, step: 1, unit: 'px' },
+  { type: 'range', label: 'global soft outline 강도', path: 'glassEffect.outlineSoftAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'global soft outline 폭', path: 'glassEffect.outlineSoftWidth', min: 0, max: 16, step: 1, unit: 'px' },
+  { type: 'range', label: 'refraction', path: 'glassEffect.refraction', min: 0, max: 0.2, step: 0.001 },
+  { type: 'range', label: 'bevel depth', path: 'glassEffect.bevelDepth', min: 0, max: 0.6, step: 0.001 },
+  { type: 'range', label: 'bevel width', path: 'glassEffect.bevelWidth', min: 0, max: 1.2, step: 0.001 },
+  { type: 'range', label: 'frost', path: 'glassEffect.frost', min: 0, max: 6, step: 0.05 },
+  { type: 'range', label: 'magnify', path: 'glassEffect.magnify', min: 0.7, max: 1.4, step: 0.01 },
+  { type: 'checkbox', label: 'shadow', path: 'glassEffect.shadow' },
+  { type: 'checkbox', label: 'specular', path: 'glassEffect.specular' },
+  { type: 'checkbox', label: 'tilt', path: 'glassEffect.tilt' },
+  { type: 'range', label: 'tilt factor', path: 'glassEffect.tiltFactor', min: 0, max: 40, step: 1 },
+  { type: 'select', label: 'reveal', path: 'glassEffect.reveal', choices: WORKSPACE_GLASS_REVEAL_CHOICES },
+  ...glassMaterialOverrideControls('Titlebar 개별 material', 'appGlass.titlebar'),
+  ...glassMaterialOverrideControls('Window buttons 개별 material', 'appGlass.windowControls'),
+  ...glassMaterialOverrideControls('Profile/actions 개별 material', 'appGlass.profileActions'),
+  ...glassMaterialOverrideControls('터미널 공통 개별 material (Shell/LLM)', 'appGlass.terminalWidgets'),
+  ...glassMaterialOverrideControls('Explorer 패널 개별 material', 'appGlass.explorerPanel'),
+  ...glassMaterialOverrideControls('Editor 패널 개별 material', 'appGlass.editorPanel'),
+  ...glassMaterialOverrideControls('Image Preview 패널 개별 material', 'appGlass.imagePanel'),
+  ...glassMaterialOverrideControls('Browser 패널 개별 material', 'appGlass.browserPanel'),
+  ...glassMaterialOverrideControls('Notes 패널 개별 material', 'appGlass.notesPanel'),
+  ...glassMaterialOverrideControls('Snippets 패널 개별 material', 'appGlass.snippetsPanel'),
+  ...glassMaterialOverrideControls('Calculator 패널 개별 material', 'appGlass.calculatorPanel'),
+  ...glassMaterialOverrideControls('Settings 패널 개별 material', 'appGlass.settingsPanel'),
+  ...glassMaterialOverrideControls('Explorer row 개별 material', 'appGlass.explorerRows'),
+  { type: 'color', label: 'Explorer row hover 색', path: 'appGlass.explorerHoverColor' },
+  { type: 'range', label: 'Explorer row hover 강도', path: 'appGlass.explorerHoverAlpha', min: 0, max: 0.7, step: 0.01 },
+  { type: 'range', label: 'Explorer row selected 강도', path: 'appGlass.explorerActiveAlpha', min: 0, max: 0.7, step: 0.01 },
+  { type: 'color', label: 'Explorer row 선택 bar 색', path: 'appGlass.explorerSelectedRailColor' },
+  { type: 'range', label: 'Explorer row 선택 bar 투명도', path: 'appGlass.explorerSelectedRailAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'Explorer row 선택 bar 두께', path: 'appGlass.explorerSelectedRailWidth', min: 0, max: 8, step: 0.5, unit: 'px' },
+  { type: 'range', label: 'Explorer 가로 스크롤 하단 여백', path: 'appGlass.explorerHorizontalScrollbarBottomGap', min: 0, max: 28, step: 1, unit: 'px' },
+  { type: 'section', label: 'Glass 그림자' },
+  { type: 'range', label: 'shadow alpha', path: 'appGlass.shadowAlpha', min: 0, max: 0.9, step: 0.01 },
+  { type: 'range', label: 'shadow Y', path: 'appGlass.shadowY', min: -24, max: 80, step: 1, unit: 'px' },
+  { type: 'range', label: 'shadow blur', path: 'appGlass.shadowBlur', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'section', label: '공통 패널 shell - 외곽/여백' },
+  { type: 'range', label: '위젯 glass 배경 강도', path: 'appGlass.widgetGlassAlpha', min: 0, max: 0.2, step: 0.004 },
+  { type: 'range', label: '헤더 chrome tint', path: 'appGlass.widgetChromeAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '헤더 구분선 강도', path: 'appGlass.widgetHeaderDividerAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'glass 안쪽 라인 강도', path: 'appGlass.widgetGlassInsetAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '내용 패딩 X', path: 'appGlass.widgetPaddingX', min: 0, max: 28, step: 1, unit: 'px' },
+  { type: 'range', label: '내용 패딩 Y', path: 'appGlass.widgetPaddingY', min: 0, max: 24, step: 1, unit: 'px' },
+  { type: 'range', label: '헤더 높이', path: 'appGlass.widgetTopbarHeight', min: 28, max: 64, step: 1, unit: 'px' },
+  { type: 'range', label: '헤더 내용 Y 위치', path: 'appGlass.widgetTopbarContentY', min: -12, max: 12, step: 1, unit: 'px' },
+  { type: 'section', label: '공통 글자 / 색' },
+  { type: 'color', label: '헤더 글자 색', path: 'appGlass.headerTextColor' },
+  { type: 'range', label: '헤더 글자 크기', path: 'appGlass.headerTextSize', min: 0.5, max: 1.5, step: 0.01, unit: 'em' },
+  { type: 'range', label: '헤더 글자 굵기', path: 'appGlass.headerTextWeight', min: 100, max: 1000, step: 10 },
+  { type: 'color', label: '본문 글자 색', path: 'appGlass.bodyTextColor' },
+  { type: 'color', label: '보조 글자 색', path: 'appGlass.mutedTextColor' },
+  { type: 'section', label: '공통 헤더 highlight - 배경 그라디언트' },
+  { type: 'checkbox', label: '헤더 highlight 사용', path: 'appGlass.widgetTitleHighlight' },
+  { type: 'color', label: '일반 헤더 색상', path: 'appGlass.widgetTitleColor' },
+  { type: 'range', label: '일반 헤더 밝기', path: 'appGlass.widgetTitleAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '일반 가로 퍼짐', path: 'appGlass.widgetTitleSizeX', min: 40, max: 260, step: 1, unit: '%' },
+  { type: 'range', label: '일반 세로 퍼짐', path: 'appGlass.widgetTitleSizeY', min: 40, max: 260, step: 1, unit: '%' },
+  { type: 'range', label: '일반 빛 시작 X', path: 'appGlass.widgetTitleOriginX', min: -30, max: 130, step: 1, unit: '%' },
+  { type: 'range', label: '일반 빛 시작 Y', path: 'appGlass.widgetTitleOriginY', min: -30, max: 130, step: 1, unit: '%' },
+  { type: 'range', label: '일반 은은함', path: 'appGlass.widgetTitleSoftness', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '일반 잔광 밝기', path: 'appGlass.widgetTitleMidStrength', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '일반 끝 빛 남김', path: 'appGlass.widgetTitleEdgeStrength', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '일반 좌우 확장', path: 'appGlass.widgetTitlePadX', min: -48, max: 64, step: 1, unit: 'px' },
+  { type: 'range', label: '일반 상하 확장', path: 'appGlass.widgetTitlePadY', min: -32, max: 40, step: 1, unit: 'px' },
+  { type: 'range', label: '일반 X 이동', path: 'appGlass.widgetTitleShiftX', min: -80, max: 80, step: 1, unit: 'px' },
+  { type: 'range', label: '일반 Y 이동', path: 'appGlass.widgetTitleShiftY', min: -48, max: 48, step: 1, unit: 'px' },
+  { type: 'range', label: '일반 라운드', path: 'appGlass.widgetTitleRadius', min: 0, max: 56, step: 1, unit: 'px' },
+  { type: 'color', label: '선택 헤더 색상', path: 'appGlass.widgetTitleSelectedColor' },
+  { type: 'range', label: '선택 헤더 밝기', path: 'appGlass.widgetTitleSelectedAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '선택 가로 퍼짐', path: 'appGlass.widgetTitleSelectedSizeX', min: 40, max: 260, step: 1, unit: '%' },
+  { type: 'range', label: '선택 세로 퍼짐', path: 'appGlass.widgetTitleSelectedSizeY', min: 40, max: 260, step: 1, unit: '%' },
+  { type: 'range', label: '선택 빛 시작 X', path: 'appGlass.widgetTitleSelectedOriginX', min: -30, max: 130, step: 1, unit: '%' },
+  { type: 'range', label: '선택 빛 시작 Y', path: 'appGlass.widgetTitleSelectedOriginY', min: -30, max: 130, step: 1, unit: '%' },
+  { type: 'range', label: '선택 은은함', path: 'appGlass.widgetTitleSelectedSoftness', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '선택 잔광 밝기', path: 'appGlass.widgetTitleSelectedMidStrength', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '선택 끝 빛 남김', path: 'appGlass.widgetTitleSelectedEdgeStrength', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '선택 좌우 확장', path: 'appGlass.widgetTitleSelectedPadX', min: -48, max: 64, step: 1, unit: 'px' },
+  { type: 'range', label: '선택 상하 확장', path: 'appGlass.widgetTitleSelectedPadY', min: -32, max: 40, step: 1, unit: 'px' },
+  { type: 'range', label: '선택 X 이동', path: 'appGlass.widgetTitleSelectedShiftX', min: -80, max: 80, step: 1, unit: 'px' },
+  { type: 'range', label: '선택 Y 이동', path: 'appGlass.widgetTitleSelectedShiftY', min: -48, max: 48, step: 1, unit: 'px' },
+  { type: 'range', label: '선택 라운드', path: 'appGlass.widgetTitleSelectedRadius', min: 0, max: 56, step: 1, unit: 'px' },
+  { type: 'section', label: '터미널 공통 상세' },
+  { type: 'range', label: 'terminal text contrast', path: 'appGlass.terminalTextContrast', min: 0.25, max: 1.6, step: 0.01 },
+  { type: 'range', label: 'terminal dim opacity', path: 'appGlass.terminalDimOpacity', min: 0.1, max: 1, step: 0.01 },
+  { type: 'range', label: 'terminal host bg', path: 'appGlass.terminalHostBgAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'range', label: 'terminal scroll thumb', path: 'appGlass.terminalScrollbarThumbAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'terminal scroll hover', path: 'appGlass.terminalScrollbarThumbHoverAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'terminal scroll track', path: 'appGlass.terminalScrollbarTrackAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'terminal scroll width', path: 'appGlass.terminalScrollbarWidth', min: 4, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: 'active shell outline', path: 'appGlass.terminalHostOutlineAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'range', label: 'split resizer alpha', path: 'appGlass.terminalSplitResizerAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'color', label: 'terminal split idle pane 색상', path: 'appGlass.terminalPaneIdleBgColor' },
+  { type: 'range', label: 'terminal split idle pane 배경', path: 'appGlass.terminalPaneIdleBgAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'color', label: 'terminal split selected pane 색상', path: 'appGlass.terminalPaneSelectedBgColor' },
+  { type: 'range', label: 'terminal split selected pane 배경', path: 'appGlass.terminalPaneSelectedBgAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'color', label: 'editor split idle pane 색상', path: 'appGlass.editorPaneIdleBgColor' },
+  { type: 'range', label: 'editor split idle pane 배경', path: 'appGlass.editorPaneIdleBgAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'color', label: 'editor split selected pane 색상', path: 'appGlass.editorPaneSelectedBgColor' },
+  { type: 'range', label: 'editor split selected pane 배경', path: 'appGlass.editorPaneSelectedBgAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'range', label: 'terminal pane outline', path: 'appGlass.terminalPaneOutlineAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'section', label: '공통 탭/버튼/내부 surface' },
+  ...glassChromeControls('appGlass.chrome'),
+  { type: 'section', label: '공통 top-down list / select' },
+  ...glassTopDownListControls('appGlass.chrome'),
+  ...glassChromeOverrideControls('터미널 탭/버튼/surface 개별', 'appGlass.terminalChromeUseCustom', 'appGlass.terminalChrome'),
+  ...glassChromeOverrideControls('Settings 입력/버튼/surface 개별', 'appGlass.settingsChromeUseCustom', 'appGlass.settingsChrome', true),
+  ...glassChromeOverrideControls('Profile/actions 탭/버튼/surface 개별', 'appGlass.profileChromeUseCustom', 'appGlass.profileChrome', true),
+  ...glassChromeOverrideControls('Explorer 탭/버튼/surface 개별', 'appGlass.explorerChromeUseCustom', 'appGlass.explorerChrome'),
+  ...glassChromeOverrideControls('Editor 탭/버튼/surface 개별', 'appGlass.editorChromeUseCustom', 'appGlass.editorChrome'),
+  ...glassChromeOverrideControls('Image Preview 탭/버튼/surface 개별', 'appGlass.imageChromeUseCustom', 'appGlass.imageChrome'),
+  ...glassChromeOverrideControls('Browser 탭/버튼/surface 개별', 'appGlass.browserChromeUseCustom', 'appGlass.browserChrome', true),
+  ...glassChromeOverrideControls('Notes 탭/버튼/surface 개별', 'appGlass.notesChromeUseCustom', 'appGlass.notesChrome', true),
+  ...glassChromeOverrideControls('Snippets 탭/버튼/surface 개별', 'appGlass.snippetsChromeUseCustom', 'appGlass.snippetsChrome'),
+  { type: 'section', label: 'Workspace tab/row glass material / shape' },
+  { type: 'checkbox', label: 'workspace tab/row 개별 material 사용', path: 'workspaceGlass.useCustomEffect' },
+  { type: 'action', label: 'global material 값 상속', action: 'inherit-glass-effect', sourcePath: 'glassEffect', targetPath: 'workspaceGlass.effect', customPath: 'workspaceGlass.useCustomEffect' },
+  { type: 'range', label: 'row/tab glass R', path: 'workspaceGlass.effect.radius', min: 0, max: 72, step: 1, unit: 'px' },
+  { type: 'range', label: 'refraction', path: 'workspaceGlass.effect.refraction', min: 0, max: 0.2, step: 0.001 },
+  { type: 'range', label: 'bevel depth', path: 'workspaceGlass.effect.bevelDepth', min: 0, max: 0.6, step: 0.001 },
+  { type: 'range', label: 'bevel width', path: 'workspaceGlass.effect.bevelWidth', min: 0, max: 1.2, step: 0.001 },
+  { type: 'range', label: 'frost', path: 'workspaceGlass.effect.frost', min: 0, max: 6, step: 0.05 },
+  { type: 'range', label: 'magnify', path: 'workspaceGlass.effect.magnify', min: 0.7, max: 1.4, step: 0.01 },
+  { type: 'checkbox', label: 'shadow (바깥 그림자)', path: 'workspaceGlass.effect.shadow' },
+  { type: 'checkbox', label: 'specular', path: 'workspaceGlass.effect.specular' },
+  { type: 'checkbox', label: 'tilt', path: 'workspaceGlass.effect.tilt' },
+  { type: 'range', label: 'tilt factor', path: 'workspaceGlass.effect.tiltFactor', min: 0, max: 40, step: 1 },
+  { type: 'select', label: 'reveal', path: 'workspaceGlass.effect.reveal', choices: WORKSPACE_GLASS_REVEAL_CHOICES },
+  { type: 'section', label: 'Workspace dock/container glass material / shape' },
+  { type: 'checkbox', label: 'workspace container 개별 material 사용', path: 'workspaceGlass.containerUseCustomEffect' },
+  { type: 'action', label: 'global material 값 상속', action: 'inherit-glass-effect', sourcePath: 'glassEffect', targetPath: 'workspaceGlass.containerEffect', customPath: 'workspaceGlass.containerUseCustomEffect' },
+  { type: 'range', label: 'container glass R', path: 'workspaceGlass.containerEffect.radius', min: 0, max: 72, step: 1, unit: 'px' },
+  { type: 'range', label: 'refraction', path: 'workspaceGlass.containerEffect.refraction', min: 0, max: 0.2, step: 0.001 },
+  { type: 'range', label: 'bevel depth', path: 'workspaceGlass.containerEffect.bevelDepth', min: 0, max: 0.6, step: 0.001 },
+  { type: 'range', label: 'bevel width', path: 'workspaceGlass.containerEffect.bevelWidth', min: 0, max: 1.2, step: 0.001 },
+  { type: 'range', label: 'frost', path: 'workspaceGlass.containerEffect.frost', min: 0, max: 6, step: 0.05 },
+  { type: 'range', label: 'magnify', path: 'workspaceGlass.containerEffect.magnify', min: 0.7, max: 1.4, step: 0.01 },
+  { type: 'checkbox', label: 'shadow (바깥 그림자)', path: 'workspaceGlass.containerEffect.shadow' },
+  { type: 'checkbox', label: 'specular', path: 'workspaceGlass.containerEffect.specular' },
+  { type: 'select', label: 'reveal', path: 'workspaceGlass.containerEffect.reveal', choices: WORKSPACE_GLASS_REVEAL_CHOICES },
+  { type: 'section', label: 'Workspace dock container layout / surface' },
+  { type: 'range', label: 'container padding', path: 'workspaceGlass.dockPadding', min: 0, max: 32, step: 1, unit: 'px' },
+  { type: 'range', label: 'container gap', path: 'workspaceGlass.dockGap', min: 0, max: 32, step: 1, unit: 'px' },
+  { type: 'range', label: 'container bg', path: 'workspaceGlass.dockBgAlpha', min: 0, max: 0.85, step: 0.01 },
+  { type: 'range', label: 'container opacity', path: 'workspaceGlass.dockSurfaceOpacity', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'container blur', path: 'workspaceGlass.dockBlur', min: 0, max: 40, step: 1, unit: 'px' },
+  { type: 'range', label: 'container saturate', path: 'workspaceGlass.dockSaturate', min: 0.4, max: 2.4, step: 0.01 },
+  { type: 'range', label: 'side border', path: 'workspaceGlass.dockSideBorderAlpha', min: 0, max: 0.7, step: 0.01 },
+  { type: 'range', label: 'container outline', path: 'workspaceGlass.dockOutlineAlpha', min: 0, max: 0.8, step: 0.01 },
+  { type: 'range', label: 'outline inset', path: 'workspaceGlass.dockOutlineInset', min: -16, max: 32, step: 1, unit: 'px' },
+  { type: 'range', label: 'container shadow', path: 'workspaceGlass.dockShadowAlpha', min: 0, max: 0.7, step: 0.01 },
+  { type: 'range', label: 'shadow Y', path: 'workspaceGlass.dockShadowY', min: -24, max: 72, step: 1, unit: 'px' },
+  { type: 'range', label: 'shadow blur', path: 'workspaceGlass.dockShadowBlur', min: 0, max: 120, step: 1, unit: 'px' },
+  { type: 'range', label: 'header opacity', path: 'workspaceGlass.dockHeaderOpacity', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'pill bg', path: 'workspaceGlass.dockPillAlpha', min: 0, max: 0.6, step: 0.01 },
+  { type: 'range', label: 'container lens fallback bg', path: 'workspaceGlass.containerGlassBgAlpha', min: 0, max: 0.18, step: 0.004, recapture: true },
+  { type: 'range', label: 'container lens fallback outline', path: 'workspaceGlass.containerGlassOutlineAlpha', min: 0, max: 0.4, step: 0.01, recapture: true },
+  { type: 'section', label: 'Workspace tab/row layout / spacing' },
+  { type: 'range', label: '카드 간격', path: 'workspaceGlass.rowGap', min: 2, max: 22, step: 1, unit: 'px' },
+  { type: 'range', label: '카드 안쪽 X', path: 'workspaceGlass.rowPaddingX', min: 0, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: '카드 안쪽 Y', path: 'workspaceGlass.rowPaddingY', min: 0, max: 14, step: 1, unit: 'px' },
+  { type: 'range', label: 'row 높이', path: 'workspaceGlass.rowHeight', min: 24, max: 46, step: 1, unit: 'px' },
+  { type: 'section', label: 'Workspace tab/row surface / outline' },
+  { type: 'range', label: 'row 배경 강도', path: 'workspaceGlass.rowBgAlpha', min: 0, max: 0.16, step: 0.004 },
+  { type: 'range', label: 'row 바깥 그림자', path: 'workspaceGlass.rowShadowAlpha', min: 0, max: 0.32, step: 0.01 },
+  { type: 'range', label: 'row 그림자 Y', path: 'workspaceGlass.rowShadowY', min: -8, max: 28, step: 1, unit: 'px' },
+  { type: 'range', label: 'row 그림자 blur', path: 'workspaceGlass.rowShadowBlur', min: 0, max: 64, step: 1, unit: 'px' },
+  { type: 'checkbox', label: '상태별 외곽선 색 사용', path: 'workspaceGlass.outlineUseStateColors' },
+  { type: 'color', label: 'active 외곽선 색', path: 'workspaceGlass.activeOutlineAccent' },
+  { type: 'color', label: 'locked 외곽선 색', path: 'workspaceGlass.protectedOutlineAccent' },
+  { type: 'color', label: 'captured 외곽선 색', path: 'workspaceGlass.captureOutlineAccent' },
+  { type: 'section', label: 'Workspace tab/row 글자 - 개별' },
+  { type: 'range', label: 'workspace 전체 폰트 배율', path: 'workspaceGlass.fontScale', min: 0.82, max: 1.14, step: 0.01, unit: 'rem' },
+  { type: 'checkbox', label: 'workspace 헤더 글자 개별 사용', path: 'workspaceGlass.headerTextUseCustom' },
+  { type: 'color', label: 'workspace 헤더 색', path: 'workspaceGlass.headerColor' },
+  { type: 'range', label: 'workspace 헤더 크기', path: 'workspaceGlass.headerSize', min: 0.62, max: 1.12, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'workspace 헤더 굵기', path: 'workspaceGlass.headerWeight', min: 300, max: 950, step: 10 },
+  { type: 'color', label: 'pill 색', path: 'workspaceGlass.pillColor' },
+  { type: 'range', label: 'pill 크기', path: 'workspaceGlass.pillSize', min: 0.50, max: 0.95, step: 0.01, unit: 'em' },
+  { type: 'color', label: 'workspace 이름 색', path: 'workspaceGlass.textColor' },
+  { type: 'select', label: '텍스트 blend', path: 'workspaceGlass.textBlend', choices: WORKSPACE_GLASS_TEXT_BLEND_CHOICES },
+  { type: 'range', label: 'workspace 이름 크기', path: 'workspaceGlass.textSize', min: 0.78, max: 1.42, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'workspace 이름 굵기', path: 'workspaceGlass.textWeight', min: 450, max: 950, step: 10 },
+  { type: 'color', label: '아이콘 기본색', path: 'workspaceGlass.iconColor' },
+  { type: 'range', label: '아이콘 크기', path: 'workspaceGlass.iconSize', min: 11, max: 23, step: 1, unit: 'px' },
+  { type: 'range', label: '버튼 패딩 X', path: 'workspaceGlass.controlPaddingX', min: 2, max: 14, step: 1, unit: 'px' },
+  { type: 'range', label: '버튼 패딩 Y', path: 'workspaceGlass.controlPaddingY', min: 1, max: 10, step: 1, unit: 'px' },
+  { type: 'range', label: '아이콘 슬롯 너비', path: 'workspaceGlass.controlSlotWidth', min: 18, max: 36, step: 1, unit: 'px' },
+  { type: 'color', label: '잠금 off 색', path: 'workspaceGlass.lockOffIconColor' },
+  { type: 'color', label: '잠금 아이콘 색', path: 'workspaceGlass.lockIconColor' },
+  { type: 'color', label: 'capture 적용 아이콘 색', path: 'workspaceGlass.captureIconColor' },
+  { type: 'section', label: 'Workspace Detail 버튼' },
+  { type: 'checkbox', label: '공통 헤더 버튼 모양 상속', path: 'workspaceGlass.detailButtonUseWidgetChrome' },
+  { type: 'color', label: '개별 배경 색상', path: 'workspaceGlass.detailButtonBgColor' },
+  { type: 'range', label: '개별 배경', path: 'workspaceGlass.detailButtonBgAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'color', label: '개별 외곽선 색상', path: 'workspaceGlass.detailButtonOutlineColor' },
+  { type: 'range', label: '개별 외곽선', path: 'workspaceGlass.detailButtonOutlineAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '개별 외곽선 두께', path: 'workspaceGlass.detailButtonOutlineWidth', min: 0, max: 4, step: 1, unit: 'px' },
+  { type: 'color', label: '개별 hover 색상', path: 'workspaceGlass.detailButtonHoverColor' },
+  { type: 'range', label: '개별 hover', path: 'workspaceGlass.detailButtonHoverAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'color', label: '개별 active 색상', path: 'workspaceGlass.detailButtonActiveColor' },
+  { type: 'range', label: '개별 active', path: 'workspaceGlass.detailButtonActiveAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '개별 라운드', path: 'workspaceGlass.detailButtonRadius', min: 0, max: 28, step: 1, unit: 'px' },
+  { type: 'range', label: '선택 badge 크기', path: 'workspaceGlass.selectedBadgeSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
+  { type: 'color', label: 'agent 기본 글자색', path: 'workspaceGlass.agentTextColor' },
+  { type: 'range', label: 'agent 기본 굵기', path: 'workspaceGlass.agentTextWeight', min: 350, max: 950, step: 10 },
+  { type: 'color', label: 'agent 제목 색', path: 'workspaceGlass.agentTitleColor' },
+  { type: 'range', label: 'agent 제목 크기', path: 'workspaceGlass.agentTitleSize', min: 0.62, max: 1.18, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'agent 제목 굵기', path: 'workspaceGlass.agentTitleWeight', min: 350, max: 950, step: 10 },
+  { type: 'color', label: 'activity 색', path: 'workspaceGlass.agentActivityColor' },
+  { type: 'range', label: 'activity 크기', path: 'workspaceGlass.agentActivitySize', min: 0.48, max: 0.96, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'activity 굵기', path: 'workspaceGlass.agentActivityWeight', min: 300, max: 900, step: 10 },
+  { type: 'color', label: 'meta 색', path: 'workspaceGlass.agentMetaColor' },
+  { type: 'range', label: 'meta 크기', path: 'workspaceGlass.agentMetaSize', min: 0.48, max: 0.96, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'meta 굵기', path: 'workspaceGlass.agentMetaWeight', min: 300, max: 900, step: 10 },
+  { type: 'range', label: '상세 패딩 X', path: 'workspaceGlass.detailPaddingX', min: 0, max: 20, step: 1, unit: 'px' },
+  { type: 'range', label: '상세 패딩 Y', path: 'workspaceGlass.detailPaddingY', min: 0, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: 'agent 간격', path: 'workspaceGlass.agentGap', min: 2, max: 16, step: 1, unit: 'px' },
+  { type: 'range', label: 'agent 패딩 X', path: 'workspaceGlass.agentPaddingX', min: 3, max: 20, step: 1, unit: 'px' },
+  { type: 'range', label: 'agent 패딩 Y', path: 'workspaceGlass.agentPaddingY', min: 3, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: 'agent badge 크기', path: 'workspaceGlass.agentBadgeSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
+  { type: 'range', label: '상태 badge 크기', path: 'workspaceGlass.agentStatusSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'agent badge 굵기', path: 'workspaceGlass.agentBadgeWeight', min: 500, max: 950, step: 10 },
+  { type: 'range', label: '상태 badge 굵기', path: 'workspaceGlass.agentStatusWeight', min: 500, max: 950, step: 10 },
+  { type: 'range', label: 'badge 높이', path: 'workspaceGlass.agentBadgeHeight', min: 13, max: 25, step: 1, unit: 'px' },
+  { type: 'section', label: 'agent 상태 라벨' },
+  { type: 'range', label: '상태 라벨 X 여백', path: 'workspaceGlass.agentStatusPaddingX', min: 0, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 라벨 R', path: 'workspaceGlass.agentStatusRadius', min: 0, max: 999, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 라벨 border 폭', path: 'workspaceGlass.agentStatusBorderWidth', min: 0, max: 3, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 라벨 bg', path: 'workspaceGlass.agentStatusBgAlpha', min: 0, max: 0.75, step: 0.01 },
+  { type: 'range', label: '상태 라벨 border', path: 'workspaceGlass.agentStatusBorderAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'color', label: 'idle 라벨 색', path: 'workspaceGlass.agentStatusIdleColor' },
+  { type: 'color', label: '작업 라벨 색', path: 'workspaceGlass.agentStatusWorkingColor' },
+  { type: 'color', label: '대기 라벨 색', path: 'workspaceGlass.agentStatusWaitingColor' },
+  { type: 'color', label: '오류 라벨 색', path: 'workspaceGlass.agentStatusErrorColor' },
+  { type: 'color', label: '미확인 완료 라벨 색', path: 'workspaceGlass.agentStatusDoneUnreadColor' },
+  { type: 'color', label: '종료 라벨 색', path: 'workspaceGlass.agentStatusExitedColor' },
+  { type: 'section', label: 'LLM / Agy agent 배경' },
+  { type: 'range', label: 'agent 카드 bg', path: 'workspaceGlass.agentBgAlpha', min: 0, max: 0.22, step: 0.005 },
+  { type: 'range', label: 'LLM 색 배경 강도', path: 'workspaceGlass.agentTypeBgAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'LLM 색 테두리 강도', path: 'workspaceGlass.agentTypeBorderAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'LLM 색 왼쪽 inset', path: 'workspaceGlass.agentTypeBgLeft', min: -80, max: 80, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 색 오른쪽 inset', path: 'workspaceGlass.agentTypeBgRight', min: -80, max: 80, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 색 위 inset', path: 'workspaceGlass.agentTypeBgTop', min: -24, max: 32, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 색 아래 inset', path: 'workspaceGlass.agentTypeBgBottom', min: -24, max: 32, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 색 왼쪽 확장', path: 'workspaceGlass.agentTypeBgBleedLeft', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 색 오른쪽 확장', path: 'workspaceGlass.agentTypeBgBleedRight', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 색 폭', path: 'workspaceGlass.agentTypeBgWidth', min: 10, max: 150, step: 1, unit: '%' },
+  { type: 'range', label: 'LLM 색 R값', path: 'workspaceGlass.agentTypeBgRadius', min: 0, max: 36, step: 1, unit: 'px' },
+  { type: 'checkbox', label: 'LLM 색 카드 밖 확장 허용', path: 'workspaceGlass.agentTypeBgOverflow' },
+  { type: 'color', label: 'Codex 색', path: 'workspaceGlass.agentCodexAccent' },
+  { type: 'color', label: 'Claude 색', path: 'workspaceGlass.agentClaudeAccent' },
+  { type: 'color', label: 'Grok 색', path: 'workspaceGlass.agentGrokAccent' },
+  { type: 'color', label: 'Agy 색', path: 'workspaceGlass.agentAgyAccent' },
+  { type: 'section', label: 'LLM 상태 점' },
+  { type: 'color', label: 'working 점 색', path: 'workspaceGlass.llmWorkingColor' },
+  { type: 'color', label: 'waiting 점 색', path: 'workspaceGlass.llmWaitingColor' },
+  { type: 'color', label: 'idle 점 색', path: 'workspaceGlass.llmIdleColor' },
+  { type: 'color', label: 'error 점 색', path: 'workspaceGlass.llmErrorColor' },
+  { type: 'color', label: '미확인 완료 점 색', path: 'workspaceGlass.llmDoneUnreadColor' },
+  { type: 'color', label: 'exited 점 색', path: 'workspaceGlass.llmExitedColor' },
+  { type: 'range', label: '상태 점 X', path: 'workspaceGlass.llmStatusDotLeft', min: 4, max: 22, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 점 Y', path: 'workspaceGlass.llmStatusDotTop', min: 8, max: 28, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 점 크기', path: 'workspaceGlass.llmStatusDotSize', min: 4, max: 14, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 점 glow', path: 'workspaceGlass.llmStatusDotGlow', min: 0, max: 32, step: 1, unit: 'px' },
+  { type: 'checkbox', label: 'working 점 pulse', path: 'workspaceGlass.llmWorkingPulseEnabled' },
+  { type: 'range', label: 'pulse 속도', path: 'workspaceGlass.llmWorkingPulseDuration', min: 0.35, max: 3.5, step: 0.05, unit: 's' },
+  { type: 'range', label: 'pulse 어두운 정도', path: 'workspaceGlass.llmWorkingPulseDimOpacity', min: 0.20, max: 1, step: 0.02 },
+  { type: 'range', label: 'pulse 링 크기', path: 'workspaceGlass.llmWorkingPulseRingSize', min: 0, max: 14, step: 1, unit: 'px' },
+  { type: 'range', label: 'pulse 밝기', path: 'workspaceGlass.llmWorkingPulseGlowAlpha', min: 0, max: 1, step: 0.02 },
+  { type: 'range', label: '이름 왼쪽 여백', path: 'workspaceGlass.llmLabelPadding', min: 0, max: 42, step: 1, unit: 'px' },
+  { type: 'section', label: 'Workspace tab/row idle highlight' },
+  { type: 'checkbox', label: 'idle row highlight', path: 'workspaceGlass.tabHighlight' },
+  { type: 'color', label: 'idle row highlight 색', path: 'workspaceGlass.tabHighlightAccent' },
+  { type: 'range', label: 'idle row highlight 강도', path: 'workspaceGlass.tabHighlightOpacity', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'idle row 중심 강도', path: 'workspaceGlass.tabHighlightStrongAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'idle row edge 강도', path: 'workspaceGlass.tabHighlightSoftAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'idle row highlight 너비', path: 'workspaceGlass.tabHighlightWidth', min: 16, max: 180, step: 1, unit: '%' },
+  { type: 'range', label: 'idle row 좌 확장', path: 'workspaceGlass.tabHighlightLeft', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'idle row 우 확장', path: 'workspaceGlass.tabHighlightRight', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'idle row 위 확장', path: 'workspaceGlass.tabHighlightTop', min: 0, max: 36, step: 1, unit: 'px' },
+  { type: 'range', label: 'idle row 아래 확장', path: 'workspaceGlass.tabHighlightBottom', min: 0, max: 36, step: 1, unit: 'px' },
+  { type: 'range', label: 'idle row X 이동', path: 'workspaceGlass.tabHighlightShiftX', min: -120, max: 120, step: 1, unit: 'px' },
+  { type: 'range', label: 'idle row highlight 라운드', path: 'workspaceGlass.tabHighlightRadius', min: 0, max: 40, step: 1, unit: 'px' },
+  { type: 'section', label: 'Workspace tab/row selected highlight / rail' },
+  { type: 'checkbox', label: 'selected row highlight', path: 'workspaceGlass.selectedHighlight' },
+  { type: 'checkbox', label: 'rail 표시', path: 'workspaceGlass.selectedRail' },
+  { type: 'checkbox', label: 'badge 표시', path: 'workspaceGlass.selectedBadge' },
+  { type: 'select', label: 'rail 스타일', path: 'workspaceGlass.selectedRailStyle', choices: WORKSPACE_GLASS_RAIL_STYLE_CHOICES },
+  { type: 'color', label: '선택 accent', path: 'workspaceGlass.selectedAccent' },
+  { type: 'range', label: '선택 fill', path: 'workspaceGlass.selectedFillAlpha', min: 0, max: 0.42, step: 0.01 },
+  { type: 'range', label: '선택 glow', path: 'workspaceGlass.selectedGlowAlpha', min: 0, max: 0.55, step: 0.01 },
+  { type: 'range', label: 'glow Y', path: 'workspaceGlass.selectedGlowY', min: -8, max: 36, step: 1, unit: 'px' },
+  { type: 'range', label: 'glow blur', path: 'workspaceGlass.selectedGlowBlur', min: 0, max: 72, step: 1, unit: 'px' },
+  { type: 'range', label: 'glow spread', path: 'workspaceGlass.selectedGlowSpread', min: -14, max: 30, step: 1, unit: 'px' },
+  { type: 'color', label: 'selected row highlight 색', path: 'workspaceGlass.selectedHighlightAccent' },
+  { type: 'range', label: 'selected row highlight 강도', path: 'workspaceGlass.selectedHighlightOpacity', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'selected row 중심 강도', path: 'workspaceGlass.selectedHighlightStrongAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'selected row edge 강도', path: 'workspaceGlass.selectedHighlightSoftAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'selected row highlight 너비', path: 'workspaceGlass.selectedHighlightWidth', min: 16, max: 180, step: 1, unit: '%' },
+  { type: 'range', label: 'selected row 좌 확장', path: 'workspaceGlass.selectedHighlightLeft', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'selected row 우 확장', path: 'workspaceGlass.selectedHighlightRight', min: 0, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'selected row 위 확장', path: 'workspaceGlass.selectedHighlightTop', min: 0, max: 36, step: 1, unit: 'px' },
+  { type: 'range', label: 'selected row 아래 확장', path: 'workspaceGlass.selectedHighlightBottom', min: 0, max: 36, step: 1, unit: 'px' },
+  { type: 'range', label: 'selected row X 이동', path: 'workspaceGlass.selectedHighlightShiftX', min: -120, max: 120, step: 1, unit: 'px' },
+  { type: 'range', label: 'selected row highlight 라운드', path: 'workspaceGlass.selectedHighlightRadius', min: 0, max: 40, step: 1, unit: 'px' },
+  { type: 'range', label: 'rail 강도', path: 'workspaceGlass.selectedRailAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'rail 폭', path: 'workspaceGlass.selectedRailWidth', min: 1, max: 10, step: 1, unit: 'px' },
+  { type: 'range', label: 'rail inset', path: 'workspaceGlass.selectedRailInset', min: 0, max: 24, step: 1, unit: 'px' },
+  { type: 'range', label: 'rail offset', path: 'workspaceGlass.selectedRailOffset', min: -20, max: 20, step: 1, unit: 'px' },
+  { type: 'range', label: 'rail 라운드', path: 'workspaceGlass.selectedRailRadius', min: 0, max: 999, step: 1, unit: 'px' },
+  { type: 'range', label: 'rail glow', path: 'workspaceGlass.selectedRailGlow', min: 0, max: 28, step: 1, unit: 'px' }
 ];
 const PANEL_RESIZE_DIRECTIONS: WindowResizeDirection[] = ['North', 'East', 'South', 'West', 'NorthEast', 'NorthWest', 'SouthEast', 'SouthWest'];
 
@@ -1458,6 +3399,7 @@ const state = {
   currentDir: '',
   entries: [] as FileEntry[],
   explorerOpenMode: 'single' as ExplorerOpenMode,
+  explorerAutoOpenEditor: false,
   explorerSelectedPath: '',
   explorerSelectedPaths: new Set<string>(),
   explorerSelectionAnchorPath: '',
@@ -1476,6 +3418,9 @@ const state = {
   openFile: null as OpenFileState | null,
   editorTabs: [] as EditorTabState[],
   activeEditorTabId: '',
+  editorPanes: [] as EditorPaneState[],
+  activeEditorPaneId: '',
+  editorSplitLayout: null as EditorSplitNode | null,
   editorOpenInNewTab: false,
   editorWordWrap: false,
   terminalWidgets: [] as TerminalWidget[],
@@ -1522,7 +3467,7 @@ const state = {
   marketTickers: [] as MarketTickerConfig[],
   marketQuotes: new Map<string, MarketTickerQuote>(),
   marketTickerConnected: false,
-  ideSettings: { ...DEFAULT_IDE_SETTINGS } as IdeSettings,
+  ideSettings: normalizedDefaultIdeSettings(),
   showFileSizes: DEFAULT_SHOW_FILE_SIZES
 };
 
@@ -1530,11 +3475,14 @@ let codeView: CodeMirrorView | null = null;
 let codeViewFile: OpenFileState | null = null;
 let codeViewRenderSignature = '\0';
 let editorRenderToken = 0;
+const editorPaneElementCache = new Map<string, EditorPaneElements>();
+const editorPaneViewState = new Map<string, EditorPaneViewState>();
 let editorRuntimePromise: Promise<EditorRuntime> | null = null;
 let terminalRuntimePromise: Promise<TerminalRuntime> | null = null;
 let panelZ = 20;
 let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
 let keyboardResizeTargetElement: HTMLElement | null = null;
+let keyboardResizeTargetWidgetElement: HTMLElement | null = null;
 let widgetOpacityPopoverTarget: WidgetOpacityTarget | null = null;
 let widgetOpacityPopoverDirty = false;
 let terminalTextTarget: TerminalTextTarget = 'shell';
@@ -1572,6 +3520,7 @@ const panelElementCache = new Map<FloatingPanelId, HTMLElement>();
 const panelToggleCache = new Map<FloatingPanelId, HTMLButtonElement | null>();
 const workspaceTabElementCache = new Map<string, HTMLElement>();
 const workspaceTabPartCache = new WeakMap<HTMLElement, {
+  glass: HTMLDivElement;
   label: HTMLButtonElement;
   input: HTMLInputElement;
   detailToggle: HTMLButtonElement;
@@ -1587,6 +3536,7 @@ const editorTabElementCache = new Map<string, HTMLElement>();
 const exportJobById = new Map<string, ExportJobState>();
 const exportJobElementCache = new Map<string, HTMLElement>();
 let explorerDeleteUndo: ExplorerDeleteUndoState | null = null;
+let explorerClipboard: ExplorerClipboardState | null = null;
 const exportJobPartCache = new WeakMap<HTMLElement, {
   title: HTMLElement;
   detail: HTMLElement;
@@ -1624,6 +3574,8 @@ let nativeBrowserWebviewVisible = false;
 let nativeBrowserWebviewSyncFrame = 0;
 let nativeBrowserWebviewRequestSeq = 0;
 const noteSaveTimers = new Map<string, number>();
+let noteMemoryRecords: NoteMemoryRecord[] = [];
+let noteMemoryPersistTimer = 0;
 const previewProxyProbeAt = new Map<string, number>();
 const previewProxyStarts = new Map<string, Promise<PortForwardResult>>();
 const previewProxyByTargetOrigin = new Map<string, PortForwardResult>();
@@ -1657,6 +3609,8 @@ const marketTickerPartCache = new WeakMap<HTMLElement, {
 const selectOptionsRenderSignatures = new WeakMap<HTMLSelectElement, string>();
 const explorerRowElementCache = new Map<string, HTMLElement>();
 const explorerRowPartCache = new WeakMap<HTMLElement, {
+  glass: HTMLElement;
+  outline: HTMLElement;
   disclosure: HTMLElement;
   name: HTMLElement;
   size: HTMLElement;
@@ -1683,6 +3637,8 @@ let explorerFileSizeModeRenderSignature = '\0';
 let explorerOpenModeRenderSignature = '\0';
 let explorerScrollIdleTimer = 0;
 let explorerScrollingUntil = 0;
+let explorerScrollDiagnosticFrame = 0;
+let explorerScrollDiagnosticLastAt = 0;
 let explorerRowElementCachePruneTimer = 0;
 let explorerPathKeyCachePruneTimer = 0;
 let explorerDirectoryCachePruneTimer = 0;
@@ -1703,6 +3659,7 @@ let explorerDrag: {
   targetDir: string;
 } | null = null;
 let explorerDragEndAt = 0;
+let explorerAutoOpenSuppressed = 0;
 const EXPLORER_DRAG_THRESHOLD = 5;
 const EXPLORER_CLICK_SUPPRESS_MS = 250;
 let explorerWatchTimer = 0;
@@ -1735,6 +3692,7 @@ let browserLoadRequestSeq = 0;
 let windowResizeFrame = 0;
 let workspaceSnapshotTimer = 0;
 let workspacePersistTimer = 0;
+let savedWorkspaceAutoUpdateTimer = 0;
 let workspaceStorePersistSignature = '';
 let workspaceStorePersistWorkspacesSignature = '';
 let workspaceStorePersistWorkspacesJson = '[]';
@@ -1755,8 +3713,21 @@ const workspaceLlmTitleActivityTimers = new Map<string, number>();
 const agentSessionProgressByPaneId = new Map<string, AgentSessionProgress>();
 const agentSessionProgressTimers = new Map<string, number>();
 const agentAlertLastByPaneId = new Map<string, { kind: AgentAlertKind; at: number }>();
+const agentWaitingAlertSignatureByPaneId = new Map<string, string>();
 const AGENT_ALERT_DEBUG_LOG_MAX = 12;
+const AGENT_ALERT_BACKGROUND_TEST_DELAY_MS = 5000;
 const agentAlertDebugLogEntries: string[] = [];
+const diagnosticLogEntries: DiagnosticLogEntry[] = [];
+const diagnosticSessionId = crypto.randomUUID();
+let diagnosticLogRenderSignature = '\0';
+let diagnosticSessionHeartbeatTimer = 0;
+let diagnosticSessionStartedAt = Date.now();
+let diagnosticLastEventAt = 0;
+let diagnosticLastEventCategory = '';
+let diagnosticLastEventMessage = '';
+const TERMINAL_TYPING_PAD_HISTORY_MAX = 20;
+const terminalTypingPadHistory: string[] = [];
+const terminalTypingPadHistoryCursorByWidgetId = new Map<string, number>();
 const workspaceDockDetailOpenWorkspaceIds = new Set<string>();
 const workspaceDockDetailClosedWorkspaceIds = new Set<string>();
 const workspaceDockDetailRenderTimers = new Map<string, number>();
@@ -1805,6 +3776,13 @@ let workspaceTerminalRestoreToken = 0;
 let inactiveEditorHydrationToken = 0;
 let noteHydrationToken = 0;
 let explorerVisiblePrefetchToken = 0;
+let explorerLiquidGlassRenderer: LiquidGLRendererLike | undefined;
+let explorerLiquidGlassRefreshTimer = 0;
+let explorerLiquidGlassRefreshRecapture = false;
+let explorerLiquidGlassApplying = false;
+let explorerLiquidGlassTargetSignature = '';
+let explorerLiquidGlassScrollFrame = 0;
+let explorerLiquidGlassOverlayHost: HTMLDivElement | null = null;
 let appShutdownStarted = false;
 let appCloseFallbackTimer = 0;
 let terminalCwdSaveTimer = 0;
@@ -1831,6 +3809,44 @@ let workspaceDockResizeDragging = false;
 let workspaceDockLayoutFrame = 0;
 let workspaceDockDetailRenderSignature = '\0';
 let workspaceDockAppliedSignature = '\0';
+let ideBackgroundAppliedSignature = '\0';
+let glassSettingsControlsRendered = false;
+let glassSettingsPersistTimer = 0;
+const GLASS_SETTINGS_SECTION_OPEN_STORE_KEY = 'simple-vibe-ide:glass-settings-sections:v1';
+let glassSettingsSectionOpenState: Record<string, boolean> | null = null;
+let liquidGLScriptsPromise: Promise<void> | null = null;
+let workspaceLiquidGlassRefreshTimer = 0;
+let workspaceLiquidGlassRefreshRecapture = false;
+let workspaceLiquidGlassApplying = false;
+let workspaceLiquidGlassLastDiagnosticAt = 0;
+let workspaceLiquidGlassLastHoverDiagnosticAt = 0;
+let workspaceLiquidGlassHoverOnlyTarget: HTMLElement | null = null;
+let appGlassRefreshTimer = 0;
+let appGlassRefreshRecapture = false;
+let appGlassDeferredRecapture = false;
+let appGlassApplying = false;
+let appGlassAppliedTopologySignature = '\0';
+let appGlassGeometryFrame = 0;
+let appGlassInitFailedRetryTimer = 0;
+let appGlassInitFailedRetryDueAt = 0;
+const appGlassOwnerGeometryFrames = new WeakMap<HTMLElement, number>();
+const appGlassOwnerRefreshTimers = new WeakMap<HTMLElement, number>();
+const appGlassOwnerRefreshRecapture = new WeakMap<HTMLElement, boolean>();
+const appGlassRenderers = new Map<string, LiquidGLRendererLike>();
+let appGlassSharedRenderer: LiquidGLRendererLike | undefined;
+const appGlassRendererViewportSignatures = new WeakMap<LiquidGLRendererLike, string>();
+const appGlassTiltFollowerOriginalStyles = new WeakMap<HTMLElement, {
+  transform: string;
+  transition: string;
+  transformOrigin: string;
+  transformStyle: string;
+  transformBox: string;
+  backfaceVisibility: string;
+  willChange: string;
+}>();
+type AppGlassTiltSuspension = { lens: LiquidGLLensLike; tiltEnabled: boolean };
+let appGlassLastDiagnosticAt = 0;
+let explorerLiquidGlassHoverOnlyTarget: HTMLElement | null = null;
 let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
 let editorLoadingTimer = 0;
@@ -1855,6 +3871,16 @@ document.body.classList.toggle('ide-app', !IS_TERMINAL_APP);
 
 app.innerHTML = `
   <div class="shell ${IS_TERMINAL_APP ? 'terminal-shell' : 'ide-shell'}">
+    <div id="ide-glass-snapshot-stage" class="ide-glass-snapshot-stage" aria-hidden="true"></div>
+    <div id="ide-glass-container-snapshot-stage" class="ide-glass-snapshot-stage ide-glass-container-snapshot-stage inactive" aria-hidden="true">
+      <canvas id="ide-glass-container-sample-canvas" class="ide-glass-container-sample-canvas" aria-hidden="true"></canvas>
+      <div id="ide-glass-container-sample-surface" class="ide-glass-container-sample-surface"></div>
+    </div>
+    <div id="ide-glass-explorer-snapshot-stage" class="ide-glass-snapshot-stage ide-glass-explorer-snapshot-stage inactive" aria-hidden="true">
+      <canvas id="ide-glass-explorer-sample-canvas" class="ide-glass-explorer-sample-canvas" aria-hidden="true"></canvas>
+      <div id="ide-glass-explorer-sample-surface" class="ide-glass-explorer-sample-surface"></div>
+    </div>
+    <div id="ide-background-layer" class="ide-background-layer" aria-hidden="true"></div>
     <div class="window-resize-zones" aria-hidden="true">
       <div class="window-resize-zone window-resize-n" data-window-resize-direction="North"></div>
       <div class="window-resize-zone window-resize-e" data-window-resize-direction="East"></div>
@@ -1885,46 +3911,51 @@ app.innerHTML = `
       <div id="app-clock" class="app-clock" data-window-drag-region></div>
     </header>
     <section id="workspace-dock" class="workspace-tabs-bar">
+      <div id="workspace-container-glass-plane" class="workspace-container-glass-plane credit-card-glass" aria-hidden="true"></div>
       <div class="workspace-dock-header">
         <span>Workspaces</span>
-        <button id="workspace-dock-detail-toggle" class="workspace-dock-detail-toggle" type="button" aria-pressed="false" title="Toggle workspace detail dock">Detail</button>
+        <div class="workspace-dock-header-actions">
+          <button id="workspace-dock-detail-toggle" class="workspace-dock-detail-toggle" type="button" aria-pressed="false" title="Toggle workspace detail dock">Detail</button>
+        </div>
       </div>
       <div id="workspace-tabs" class="workspace-tabs" aria-label="Workspaces"></div>
-      <button id="new-workspace-tab" class="tab-add" title="New workspace">+</button>
+      <button id="new-workspace-tab" class="tab-add" title="New workspace"><span class="workspace-tab-add-glass-plane credit-card-glass" aria-hidden="true"></span><span class="workspace-tab-add-outline-plane" aria-hidden="true"></span><span class="workspace-tab-add-label">+</span></button>
       <div id="workspace-dock-detail" class="workspace-dock-detail" aria-live="polite"></div>
       <div id="workspace-dock-resizer" class="workspace-dock-resizer" role="separator" aria-orientation="vertical" title="Resize workspace dock"></div>
     </section>
     <section class="workspace-bar">
-      <div class="profile-control-stack">
-        <label>Profile <select id="profile-select"></select></label>
+      <div id="workspace-profile-primary-card" class="workspace-profile-card workspace-profile-primary-card">
+        <div class="profile-control-stack">
+          <label>Profile <select id="profile-select"></select></label>
+        </div>
+        <label>Root <input id="root-input" spellcheck="false" placeholder="select a profile first" /></label>
+        <button id="open-root">Open / Connect</button>
+        <button id="save-workspace" title="${IS_TERMINAL_APP ? 'Save the current terminal layout for later' : 'Save the current workspace layout for later'}" disabled>${IS_TERMINAL_APP ? 'Save Layout' : 'Save WS'}</button>
+        <label class="saved-workspace-control"><select id="saved-workspace-select" title="${IS_TERMINAL_APP ? 'Saved terminal layouts' : 'Saved workspaces'}" aria-label="${IS_TERMINAL_APP ? 'Saved terminal layouts' : 'Saved workspaces'}"></select></label>
+        <button id="load-saved-workspace" title="${IS_TERMINAL_APP ? 'Load the selected terminal layout' : 'Load the selected saved workspace'}" disabled>Load</button>
+        <button id="delete-saved-workspace" title="${IS_TERMINAL_APP ? 'Delete the selected terminal layout' : 'Delete the selected saved workspace'}" disabled>Del</button>
       </div>
-      <label>Root <input id="root-input" spellcheck="false" placeholder="select a profile first" /></label>
-      <button id="open-root">Open / Connect</button>
-      <button id="save-workspace" title="${IS_TERMINAL_APP ? 'Save the current terminal layout for later' : 'Save the current workspace layout for later'}" disabled>${IS_TERMINAL_APP ? 'Save Layout' : 'Save WS'}</button>
-      <label class="saved-workspace-control"><select id="saved-workspace-select" title="${IS_TERMINAL_APP ? 'Saved terminal layouts' : 'Saved workspaces'}" aria-label="${IS_TERMINAL_APP ? 'Saved terminal layouts' : 'Saved workspaces'}"></select></label>
-      <button id="load-saved-workspace" title="${IS_TERMINAL_APP ? 'Load the selected terminal layout' : 'Load the selected saved workspace'}" disabled>Load</button>
-      <button id="delete-saved-workspace" title="${IS_TERMINAL_APP ? 'Delete the selected terminal layout' : 'Delete the selected saved workspace'}" disabled>Del</button>
-      <button id="copy-current-cd" title="Copy a cd command for the current folder" disabled>Copy cd</button>
-      <button id="new-shell" disabled>+ Shell</button>
-      <button id="new-windows-shell" title="Open local Windows PowerShell at a non-user path">Win Shell</button>
-      <button data-llm="codex">Codex</button>
-      <button data-llm="claude">Claude</button>
-      <button data-llm="grok">Grok</button>
-      <button data-llm="antigravity">Antigravity</button>
-      <button class="panel-toggle" data-toggle-panel="explorer" title="Toggle Explorer" aria-pressed="false">Exp</button>
-      <button class="panel-toggle" data-toggle-panel="editor" title="Toggle Editor" aria-pressed="false">Edit</button>
-      <button class="panel-toggle" data-toggle-panel="image" title="Toggle Image Preview" aria-pressed="false">Img</button>
-      <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
-      <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
-      <button class="panel-toggle" data-toggle-panel="snippets" title="Toggle Snippets" aria-pressed="false">Snip</button>
-      <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
-      <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
-      <button id="reset-layout" title="Reset panel layout" disabled>Reset</button>
-      <div class="workspace-status-slot"><div id="status" class="status">Ready</div></div>
-      <div id="market-ticker" class="market-ticker" title="Binance USD-M Futures ticker">
-        <div id="market-ticker-list" class="market-ticker-list" aria-live="polite"></div>
-        <input id="market-symbol-input" spellcheck="false" placeholder="ETHUSDT" title="Add one Binance USD-M symbol" />
-        <button id="market-add-symbol" title="Add ticker symbol">+</button>
+      <div id="workspace-profile-actions-card" class="workspace-profile-card workspace-profile-actions-card">
+        <button id="new-shell" disabled>+ Shell</button>
+        <button id="new-windows-shell" title="Open local Windows PowerShell at a non-user path">Win Shell</button>
+        <button data-llm="codex">Codex</button>
+        <button data-llm="claude">Claude</button>
+        <button data-llm="grok">Grok</button>
+        <button data-llm="antigravity">Antigravity</button>
+        <button class="panel-toggle" data-toggle-panel="explorer" title="Toggle Explorer" aria-pressed="false">Exp</button>
+        <button class="panel-toggle" data-toggle-panel="editor" title="Toggle Editor" aria-pressed="false">Edit</button>
+        <button class="panel-toggle" data-toggle-panel="image" title="Toggle Image Preview" aria-pressed="false">Img</button>
+        <button class="panel-toggle" data-toggle-panel="browser" title="Toggle Browser" aria-pressed="false">Web</button>
+        <button class="panel-toggle" data-toggle-panel="notes" title="Toggle Notes" aria-pressed="false">Note</button>
+        <button class="panel-toggle" data-toggle-panel="snippets" title="Toggle Snippets" aria-pressed="false">Snip</button>
+        <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
+        <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
+        <div class="workspace-status-slot"><div id="status" class="status">Ready</div></div>
+        <div id="market-ticker" class="market-ticker" title="Binance USD-M Futures ticker">
+          <div id="market-ticker-list" class="market-ticker-list" aria-live="polite"></div>
+          <input id="market-symbol-input" spellcheck="false" placeholder="ETHUSDT" title="Add one Binance USD-M symbol" />
+          <button id="market-add-symbol" title="Add ticker symbol">+</button>
+        </div>
       </div>
     </section>
     <div id="status-detail" class="status-detail hidden" aria-live="polite"></div>
@@ -1938,6 +3969,7 @@ app.innerHTML = `
           <button id="refresh-explorer" class="panel-mode" title="Refresh Explorer">Refresh</button>
           <button id="export-selected" class="panel-mode" title="Export selected item for Windows drag-out">Export</button>
           <button id="toggle-explorer-open-mode" class="panel-mode" title="Toggle single/double click open">Open: 1x</button>
+          <button id="toggle-explorer-auto-editor" class="panel-mode" title="Open selected files in Editor automatically" aria-pressed="false">Auto Edit</button>
           <button id="toggle-file-sizes" class="panel-mode" title="Toggle file sizes" aria-pressed="false">Size</button>
           <button class="panel-close" data-close-panel="explorer" title="Close Explorer" aria-label="Close Explorer">x</button>
         </div>
@@ -1957,12 +3989,20 @@ app.innerHTML = `
           <label class="tab-option" title="Open unknown files in a new editor tab"><input id="editor-open-new-tab" type="checkbox" /> New tab</label>
           <label class="tab-option" title="Toggle editor word wrap"><input id="editor-word-wrap" type="checkbox" /> Wrap</label>
           <button id="editor-new-tab" class="panel-mode" title="New editor tab">+</button>
+          <button id="editor-split-right" class="panel-mode" title="Split editor right">Split R</button>
+          <button id="editor-split-down" class="panel-mode" title="Split editor down">Split D</button>
+          <button id="editor-close-split" class="panel-mode" title="Close active editor split">Close split</button>
           <button id="toggle-raw" class="hidden">Raw</button>
+          <button id="refresh-file" disabled title="Reload current file from disk">Refresh</button>
           <button id="save-file" disabled>Save</button>
           <button class="panel-close" data-close-panel="editor" title="Close Editor" aria-label="Close Editor">x</button>
         </div>
-        <div id="editor-tabs" class="widget-tabs"></div>
-        <div id="editor-body" class="editor-body empty">Open a file from Explorer.</div>
+        <div id="editor-surface" class="editor-surface">
+          <section class="editor-pane active" data-editor-pane-id="">
+            <div id="editor-tabs" class="widget-tabs editor-pane-tabs"></div>
+            <div id="editor-body" class="editor-body empty">Open a file from Explorer.</div>
+          </section>
+        </div>
       </section>
       <section class="panel notes-panel floating-panel hidden" data-panel="notes">
         <div class="panel-title panel-drag-handle">
@@ -2130,10 +4170,22 @@ app.innerHTML = `
             <input id="settings-workspace-dock-size" type="range" min="180" max="420" step="10" value="260" />
           </label>
           <label class="settings-inline-check"><input id="settings-workspace-dock-detail" type="checkbox" /> Show side dock detail</label>
+          <fieldset class="settings-widget-focus-section settings-workspace-detail-section">
+            <legend>Workspace detail content</legend>
+            <label class="settings-inline-check"><input id="settings-workspace-detail-activity" type="checkbox" /> Show activity/title line</label>
+            <label class="settings-inline-check"><input id="settings-workspace-detail-meta" type="checkbox" /> Show path/source line</label>
+            <label class="settings-inline-check"><input id="settings-workspace-detail-hide-protected" type="checkbox" /> Hide both extra lines on capture-blocked workspaces</label>
+          </fieldset>
           <fieldset class="settings-widget-focus-section">
             <legend>Active workspace indicator</legend>
             <label class="settings-inline-check"><input id="settings-workspace-focus-border" type="checkbox" /> Blue outer border</label>
             <label class="settings-inline-check"><input id="settings-workspace-focus-title" type="checkbox" /> Highlight tab title</label>
+          </fieldset>
+          <fieldset class="settings-widget-focus-section settings-glass-section">
+            <legend>IDE 배경 / Glass 테마</legend>
+            <label class="settings-inline-check"><input id="settings-app-glass-enabled" type="checkbox" /> Glass 테마 사용</label>
+            <button id="settings-glass-open" type="button">Glass 설정 열기</button>
+            <p class="hint">Glass 테마는 기본 UI를 보존한 채 titlebar, toolbar, workspace, floating widget surface에 opt-in으로 적용됩니다.</p>
           </fieldset>
           <fieldset class="settings-widget-focus-section settings-agent-alert-section">
             <legend>Agent alerts</legend>
@@ -2144,10 +4196,31 @@ app.innerHTML = `
               <button id="settings-agent-alert-test-banner" type="button">Banner</button>
               <button id="settings-agent-alert-test-sound" type="button">Sound</button>
               <button id="settings-agent-alert-test-both" type="button">Both</button>
+              <button id="settings-agent-alert-test-banner-delayed" type="button">Banner 5s</button>
             </div>
             <div id="settings-agent-alert-test-status" class="settings-alert-test-status" aria-live="polite"></div>
             <pre id="settings-agent-alert-debug-log" class="settings-alert-debug-log" aria-live="polite"></pre>
             <p class="hint">Alerts fire when an LLM session appears to need input, errors, or finishes a working turn. Banner and sound toggles are independent.</p>
+          </fieldset>
+          <fieldset class="settings-widget-focus-section settings-agent-event-section">
+            <legend>Agent event bridge</legend>
+            <label>Claude hooks <select id="settings-claude-hook-mode"></select></label>
+            <label>Grok hooks <select id="settings-grok-hook-mode"></select></label>
+            <label class="settings-text-input-label">
+              tmux env passthrough
+              <input id="settings-llm-tmux-env-passthrough" type="text" spellcheck="false" placeholder="IS_DEMO" />
+            </label>
+            <p class="hint">Claude hooks are written to the active workspace's local .claude folder. Grok hooks are written to the WSL user's global .grok/hooks folder but stay inert unless Simple Vibe IDE launches Grok with bridge env vars. Secret-like env names are ignored; default passthrough keeps IS_DEMO working inside tmux.</p>
+          </fieldset>
+          <fieldset class="settings-widget-focus-section settings-debug-log-section">
+            <legend>Diagnostics log</legend>
+            <label class="settings-inline-check"><input id="settings-debug-log-enabled" type="checkbox" /> Capture app diagnostic events</label>
+            <div class="settings-alert-test-row" aria-label="Diagnostic log actions">
+              <span id="settings-debug-log-status">No diagnostic log entries</span>
+              <button id="settings-debug-log-open" type="button">Open log</button>
+              <button id="settings-debug-log-clear" type="button">Clear</button>
+            </div>
+            <p class="hint">Keeps a local event log and a small previous-session heartbeat so forced-close/freeze cases can be diagnosed on next launch. It does not record raw terminal output, clipboard contents, tokens, or file contents.</p>
           </fieldset>
           <label class="settings-range-label">
             <span>Widget corner radius <output id="settings-widget-radius-value">8px</output></span>
@@ -2192,12 +4265,59 @@ app.innerHTML = `
     <input id="widget-opacity-range" type="range" min="45" max="100" step="5" value="100" />
     <div id="widget-opacity-note" class="widget-opacity-note">Widget opacity is saved with the current workspace.</div>
   </div>
+  <div id="glass-settings-popover" class="glass-settings-popover hidden" data-no-window-drag role="dialog" aria-label="Workspace glass settings" aria-hidden="true">
+    <div class="glass-settings-header">
+      <span>IDE 배경 / Glass 테마</span>
+      <span class="spacer"></span>
+      <button id="glass-settings-export" type="button">내보내기</button>
+      <button id="glass-settings-import" type="button">가져오기</button>
+      <button id="glass-settings-reset" type="button">초기화</button>
+      <button id="glass-settings-close" type="button" aria-label="Close glass settings">닫기</button>
+    </div>
+    <div class="glass-settings-body">
+      <input id="glass-settings-import-file" class="hidden" type="file" accept="application/json,.json" />
+      <label class="settings-inline-check glass-master-toggle"><input id="glass-workspace-enabled" type="checkbox" /> workspace tab/row liquidGL 사용</label>
+      <p id="glass-settings-status" class="hint">Glass 테마 전체 on/off는 &quot;Glass 사용 범위&quot; 섹션에서 켭니다. 이 체크박스는 workspace tab/row 렌즈 전용입니다.</p>
+      <label class="settings-file-label">
+        커스텀 IDE 배경 이미지
+        <input id="glass-background-file" type="file" accept="image/*" />
+      </label>
+      <div id="glass-settings-controls" class="glass-settings-controls"></div>
+      <fieldset class="settings-widget-focus-section glass-widget-roadmap">
+        <legend>Glass rendering notes</legend>
+        <p class="hint">터미널/xterm, 브라우저 iframe, editor 본문은 glass target이 아니라 overlay로 유지합니다. liquidGL은 surface plane/chrome에만 적용됩니다.</p>
+      </fieldset>
+    </div>
+  </div>
+  <div id="diagnostic-log-popover" class="diagnostic-log-popover hidden" data-no-window-drag role="dialog" aria-label="Diagnostic log">
+    <div class="diagnostic-log-header">
+      <span>Diagnostic log</span>
+      <span id="diagnostic-log-meta" class="diagnostic-log-meta">0 entries</span>
+      <span class="spacer"></span>
+      <button id="diagnostic-log-copy" type="button">Copy</button>
+      <button id="diagnostic-log-clear" type="button">Clear</button>
+      <button id="diagnostic-log-close" type="button" aria-label="Close diagnostic log">Close</button>
+    </div>
+    <pre id="diagnostic-log-output" class="diagnostic-log-output" aria-live="polite"></pre>
+  </div>
   <div id="context-menu" class="context-menu hidden" role="menu" aria-hidden="true"></div>
 `;
 
 const el = {
   shell: document.querySelector<HTMLElement>('.shell')!,
+  ideGlassSnapshotStage: document.querySelector<HTMLDivElement>('#ide-glass-snapshot-stage')!,
+  ideGlassContainerSnapshotStage: document.querySelector<HTMLDivElement>('#ide-glass-container-snapshot-stage')!,
+  ideGlassContainerSampleCanvas: document.querySelector<HTMLCanvasElement>('#ide-glass-container-sample-canvas')!,
+  ideGlassContainerSampleSurface: document.querySelector<HTMLDivElement>('#ide-glass-container-sample-surface')!,
+  ideGlassExplorerSnapshotStage: document.querySelector<HTMLDivElement>('#ide-glass-explorer-snapshot-stage')!,
+  ideGlassExplorerSampleCanvas: document.querySelector<HTMLCanvasElement>('#ide-glass-explorer-sample-canvas')!,
+  ideGlassExplorerSampleSurface: document.querySelector<HTMLDivElement>('#ide-glass-explorer-sample-surface')!,
+  ideBackgroundLayer: document.querySelector<HTMLDivElement>('#ide-background-layer')!,
   titlebar: document.querySelector<HTMLElement>('.titlebar')!,
+  workspaceBar: document.querySelector<HTMLElement>('.workspace-bar')!,
+  workspaceProfilePrimaryCard: document.querySelector<HTMLElement>('#workspace-profile-primary-card')!,
+  workspaceProfileActionsCard: document.querySelector<HTMLElement>('#workspace-profile-actions-card')!,
+  windowControls: document.querySelector<HTMLElement>('.window-controls')!,
   windowControlButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-window-action]')),
   windowResizeZones: Array.from(document.querySelectorAll<HTMLElement>('[data-window-resize-direction]')),
   closePanelButtons: Array.from(document.querySelectorAll<HTMLButtonElement>('[data-close-panel]')),
@@ -2209,6 +4329,7 @@ const el = {
   appClock: document.querySelector<HTMLDivElement>('#app-clock')!,
   captureFreezeFrame: document.querySelector<HTMLDivElement>('#capture-freeze-frame')!,
   workspaceDock: document.querySelector<HTMLElement>('#workspace-dock')!,
+  workspaceContainerGlassPlane: document.querySelector<HTMLDivElement>('#workspace-container-glass-plane')!,
   workspaceDockDetailToggle: document.querySelector<HTMLButtonElement>('#workspace-dock-detail-toggle')!,
   workspaceDockDetail: document.querySelector<HTMLDivElement>('#workspace-dock-detail')!,
   workspaceDockResizer: document.querySelector<HTMLDivElement>('#workspace-dock-resizer')!,
@@ -2221,10 +4342,8 @@ const el = {
   savedWorkspaceSelect: document.querySelector<HTMLSelectElement>('#saved-workspace-select')!,
   loadSavedWorkspace: document.querySelector<HTMLButtonElement>('#load-saved-workspace')!,
   deleteSavedWorkspace: document.querySelector<HTMLButtonElement>('#delete-saved-workspace')!,
-  copyCurrentCd: document.querySelector<HTMLButtonElement>('#copy-current-cd')!,
   newShell: document.querySelector<HTMLButtonElement>('#new-shell')!,
   newWindowsShell: document.querySelector<HTMLButtonElement>('#new-windows-shell')!,
-  resetLayout: document.querySelector<HTMLButtonElement>('#reset-layout')!,
   marketTickerList: document.querySelector<HTMLDivElement>('#market-ticker-list')!,
   marketSymbolInput: document.querySelector<HTMLInputElement>('#market-symbol-input')!,
   marketAddSymbol: document.querySelector<HTMLButtonElement>('#market-add-symbol')!,
@@ -2235,6 +4354,7 @@ const el = {
   exportSelected: document.querySelector<HTMLButtonElement>('#export-selected')!,
   exportList: document.querySelector<HTMLDivElement>('#export-list')!,
   explorerOpenModeToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-open-mode')!,
+  explorerAutoEditorToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-auto-editor')!,
   fileSizeToggle: document.querySelector<HTMLButtonElement>('#toggle-file-sizes')!,
   fileList: document.querySelector<HTMLDivElement>('#file-list')!,
   pathRow: document.querySelector<HTMLDivElement>('#path-row')!,
@@ -2242,12 +4362,17 @@ const el = {
   shellTabList: document.querySelector<HTMLDivElement>('#shell-tab-list')!,
   shellNewTab: document.querySelector<HTMLButtonElement>('#shell-new-tab')!,
   terminalGrid: document.querySelector<HTMLDivElement>('#terminal-grid')!,
+  editorSurface: document.querySelector<HTMLDivElement>('#editor-surface')!,
   editorTabs: document.querySelector<HTMLDivElement>('#editor-tabs')!,
   editorNewTab: document.querySelector<HTMLButtonElement>('#editor-new-tab')!,
+  editorSplitRight: document.querySelector<HTMLButtonElement>('#editor-split-right')!,
+  editorSplitDown: document.querySelector<HTMLButtonElement>('#editor-split-down')!,
+  editorCloseSplit: document.querySelector<HTMLButtonElement>('#editor-close-split')!,
   editorOpenNewTab: document.querySelector<HTMLInputElement>('#editor-open-new-tab')!,
   editorWordWrap: document.querySelector<HTMLInputElement>('#editor-word-wrap')!,
   editorLabel: document.querySelector<HTMLSpanElement>('#editor-label')!,
   editorBody: document.querySelector<HTMLDivElement>('#editor-body')!,
+  refreshFile: document.querySelector<HTMLButtonElement>('#refresh-file')!,
   saveFile: document.querySelector<HTMLButtonElement>('#save-file')!,
   toggleRaw: document.querySelector<HTMLButtonElement>('#toggle-raw')!,
   notesTabs: document.querySelector<HTMLDivElement>('#notes-tabs')!,
@@ -2333,15 +4458,28 @@ const el = {
   settingsWorkspaceDockSize: document.querySelector<HTMLInputElement>('#settings-workspace-dock-size')!,
   settingsWorkspaceDockSizeValue: document.querySelector<HTMLOutputElement>('#settings-workspace-dock-size-value')!,
   settingsWorkspaceDockDetail: document.querySelector<HTMLInputElement>('#settings-workspace-dock-detail')!,
+  settingsWorkspaceDetailActivity: document.querySelector<HTMLInputElement>('#settings-workspace-detail-activity')!,
+  settingsWorkspaceDetailMeta: document.querySelector<HTMLInputElement>('#settings-workspace-detail-meta')!,
+  settingsWorkspaceDetailHideProtected: document.querySelector<HTMLInputElement>('#settings-workspace-detail-hide-protected')!,
   settingsWorkspaceFocusBorder: document.querySelector<HTMLInputElement>('#settings-workspace-focus-border')!,
   settingsWorkspaceFocusTitle: document.querySelector<HTMLInputElement>('#settings-workspace-focus-title')!,
+  settingsAppGlassEnabled: document.querySelector<HTMLInputElement>('#settings-app-glass-enabled')!,
+  settingsGlassOpen: document.querySelector<HTMLButtonElement>('#settings-glass-open')!,
   settingsAgentNotificationBanners: document.querySelector<HTMLInputElement>('#settings-agent-notification-banners')!,
   settingsAgentAlertSound: document.querySelector<HTMLInputElement>('#settings-agent-alert-sound')!,
   settingsAgentAlertTestBanner: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-banner')!,
   settingsAgentAlertTestSound: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-sound')!,
   settingsAgentAlertTestBoth: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-both')!,
+  settingsAgentAlertTestBannerDelayed: document.querySelector<HTMLButtonElement>('#settings-agent-alert-test-banner-delayed')!,
   settingsAgentAlertTestStatus: document.querySelector<HTMLDivElement>('#settings-agent-alert-test-status')!,
   settingsAgentAlertDebugLog: document.querySelector<HTMLPreElement>('#settings-agent-alert-debug-log')!,
+  settingsClaudeHookMode: document.querySelector<HTMLSelectElement>('#settings-claude-hook-mode')!,
+  settingsGrokHookMode: document.querySelector<HTMLSelectElement>('#settings-grok-hook-mode')!,
+  settingsLlmTmuxEnvPassthrough: document.querySelector<HTMLInputElement>('#settings-llm-tmux-env-passthrough')!,
+  settingsDebugLogEnabled: document.querySelector<HTMLInputElement>('#settings-debug-log-enabled')!,
+  settingsDebugLogStatus: document.querySelector<HTMLSpanElement>('#settings-debug-log-status')!,
+  settingsDebugLogOpen: document.querySelector<HTMLButtonElement>('#settings-debug-log-open')!,
+  settingsDebugLogClear: document.querySelector<HTMLButtonElement>('#settings-debug-log-clear')!,
   settingsWidgetRadius: document.querySelector<HTMLInputElement>('#settings-widget-radius')!,
   settingsWidgetRadiusValue: document.querySelector<HTMLOutputElement>('#settings-widget-radius-value')!,
   settingsIdeScaleValue: document.querySelector<HTMLOutputElement>('#settings-ide-scale-value')!,
@@ -2357,6 +4495,22 @@ const el = {
   widgetOpacityReset: document.querySelector<HTMLButtonElement>('#widget-opacity-reset')!,
   widgetOpacityClose: document.querySelector<HTMLButtonElement>('#widget-opacity-close')!,
   widgetOpacityNote: document.querySelector<HTMLDivElement>('#widget-opacity-note')!,
+  glassSettingsPopover: document.querySelector<HTMLDivElement>('#glass-settings-popover')!,
+  glassSettingsControls: document.querySelector<HTMLDivElement>('#glass-settings-controls')!,
+  glassWorkspaceEnabled: document.querySelector<HTMLInputElement>('#glass-workspace-enabled')!,
+  glassBackgroundFile: document.querySelector<HTMLInputElement>('#glass-background-file')!,
+  glassSettingsStatus: document.querySelector<HTMLParagraphElement>('#glass-settings-status')!,
+  glassSettingsExport: document.querySelector<HTMLButtonElement>('#glass-settings-export')!,
+  glassSettingsImport: document.querySelector<HTMLButtonElement>('#glass-settings-import')!,
+  glassSettingsImportFile: document.querySelector<HTMLInputElement>('#glass-settings-import-file')!,
+  glassSettingsReset: document.querySelector<HTMLButtonElement>('#glass-settings-reset')!,
+  glassSettingsClose: document.querySelector<HTMLButtonElement>('#glass-settings-close')!,
+  diagnosticLogPopover: document.querySelector<HTMLDivElement>('#diagnostic-log-popover')!,
+  diagnosticLogMeta: document.querySelector<HTMLSpanElement>('#diagnostic-log-meta')!,
+  diagnosticLogOutput: document.querySelector<HTMLPreElement>('#diagnostic-log-output')!,
+  diagnosticLogCopy: document.querySelector<HTMLButtonElement>('#diagnostic-log-copy')!,
+  diagnosticLogClear: document.querySelector<HTMLButtonElement>('#diagnostic-log-clear')!,
+  diagnosticLogClose: document.querySelector<HTMLButtonElement>('#diagnostic-log-close')!,
   contextMenu: document.querySelector<HTMLDivElement>('#context-menu')!
 };
 
@@ -2511,7 +4665,9 @@ function setAttributeIfChanged(element: HTMLElement, name: string, value: string
 }
 
 function toggleClassIfChanged(element: HTMLElement, className: string, force: boolean) {
-  if (element.classList.contains(className) !== force) element.classList.toggle(className, force);
+  const changed = element.classList.contains(className) !== force;
+  if (changed) element.classList.toggle(className, force);
+  return changed;
 }
 
 function setElementTextIfChanged(element: HTMLElement, text: string) {
@@ -2554,6 +4710,12 @@ function handleRendererHeartbeatResponse(response: RendererHeartbeatResponse) {
 
 function handleRendererRecoveryNotice(notice: RendererRecoveryNotice) {
   rendererRecoveryNotice = notice;
+  appendDiagnosticLog(
+    'renderer',
+    `recovery kind=${notice.kind} attempts=${notice.attempts} message=${notice.message}`,
+    'warn',
+    { force: true }
+  );
   setStatus(notice.message, notice.kind === 'repeated-reload');
 }
 
@@ -2605,6 +4767,12 @@ async function init() {
   await listen<RendererRecoveryNotice>('renderer-recovery', (event) => {
     handleRendererRecoveryNotice(event.payload);
   });
+  await listen<AgentAlertDelayedResultEvent>('agent-alert-delayed-result', (event) => {
+    handleAgentAlertDelayedResult(event.payload);
+  });
+  await listen<AgentBridgeEvent>('agent-bridge-event', (event) => {
+    handleAgentBridgeEvent(event.payload);
+  });
   startRendererHeartbeat();
 
   await listen<TauriDragDropPayload>('tauri://drag-enter', (event) => {
@@ -2624,17 +4792,32 @@ async function init() {
     handleExportProgress(event.payload);
   });
   await currentWindow.onFocusChanged((event) => {
-    if (event.payload) focusActiveTerminalPaneWhenItOwnsKeyboard();
+    if (event.payload) {
+      focusActiveTerminalPaneWhenItOwnsKeyboard();
+      flushDeferredAppGlassRecapture('window-focus');
+      scheduleGlassResumeGeometry('window-focus');
+    }
   });
-  window.addEventListener('focus', focusActiveTerminalPaneWhenItOwnsKeyboard);
+  window.addEventListener('focus', () => {
+    focusActiveTerminalPaneWhenItOwnsKeyboard();
+    flushDeferredAppGlassRecapture('window-focus');
+    scheduleGlassResumeGeometry('window-focus');
+  });
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) focusActiveTerminalPaneWhenItOwnsKeyboard();
+    if (!document.hidden) {
+      focusActiveTerminalPaneWhenItOwnsKeyboard();
+      flushDeferredAppGlassRecapture('visible');
+      scheduleGlassResumeGeometry('visible');
+    }
+    else saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
   });
 
   setProfiles(await api.listProfiles());
   loadIdeSettings();
+  startDiagnosticSessionMonitor();
   await loadSnippetsStore();
   loadWorkspaceStore();
+  loadNoteMemoryStore();
   if (!IS_TERMINAL_APP) loadMarketTickerConfig();
   ensureEditorTab();
   ensureImageTab();
@@ -2665,6 +4848,7 @@ async function init() {
   if (!IS_TERMINAL_APP) scheduleEditorRuntimeWarmup();
   scheduleTerminalRuntimeWarmup();
   bindEvents();
+  startSavedWorkspaceAutoUpdateTimer();
   startAppClock();
   selectProfile('');
   setWorkspaceOpen(false);
@@ -3164,9 +5348,741 @@ function flushWorkspaceStorePersist() {
   persistWorkspaceStore();
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function normalizedHexColor(value: unknown, fallback: string) {
+  const raw = String(value ?? '').trim();
+  if (/^#[0-9a-f]{6}$/i.test(raw)) return raw.toLowerCase();
+  if (/^#[0-9a-f]{3}$/i.test(raw)) {
+    return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`.toLowerCase();
+  }
+  return fallback;
+}
+
+function normalizedFiniteNumber(value: unknown, fallback: number, min: number, max: number) {
+  const numeric = Number(value);
+  return clamp(Number.isFinite(numeric) ? numeric : fallback, min, max);
+}
+
+function stringChoice<T extends string>(value: unknown, choices: readonly T[], fallback: T): T {
+  return typeof value === 'string' && choices.includes(value as T) ? value as T : fallback;
+}
+
+function cloneIdeBackgroundLightSettings(light: IdeBackgroundLightSettings): IdeBackgroundLightSettings {
+  return { ...light };
+}
+
+function normalizeIdeBackgroundLightSettings(value: unknown, fallback: IdeBackgroundLightSettings): IdeBackgroundLightSettings {
+  const source = isPlainRecord(value) ? value : {};
+  return {
+    color: normalizedHexColor(source.color, fallback.color),
+    alpha: normalizedFiniteNumber(source.alpha, fallback.alpha, 0, 1),
+    x: normalizedFiniteNumber(source.x, fallback.x, -40, 140),
+    y: normalizedFiniteNumber(source.y, fallback.y, -40, 140),
+    size: normalizedFiniteNumber(source.size, fallback.size, 4, 160)
+  };
+}
+
+function cloneIdeBackgroundSettings(settings = DEFAULT_IDE_BACKGROUND_SETTINGS): IdeBackgroundSettings {
+  return {
+    ...settings,
+    lightA: cloneIdeBackgroundLightSettings(settings.lightA),
+    lightB: cloneIdeBackgroundLightSettings(settings.lightB),
+    lightC: cloneIdeBackgroundLightSettings(settings.lightC)
+  };
+}
+
+function normalizeIdeBackgroundSettings(value: unknown): IdeBackgroundSettings {
+  const source = isPlainRecord(value) ? value : {};
+  const fallback = cloneIdeBackgroundSettings();
+  return {
+    enabled: source.enabled === undefined ? fallback.enabled : source.enabled === true,
+    preset: stringChoice<IdeBackgroundPreset>(source.preset, ['liquid', 'procedural-demo', 'ide-default', 'ide-editor', 'ide-blue', 'custom'], fallback.preset),
+    customImageSrc: typeof source.customImageSrc === 'string' && source.customImageSrc.startsWith('data:image/') && source.customImageSrc.length < 4_200_000
+      ? source.customImageSrc
+      : '',
+    customImageName: typeof source.customImageName === 'string' ? source.customImageName.slice(0, 120) : '',
+    customImageUrl: typeof source.customImageUrl === 'string' ? source.customImageUrl.trim().slice(0, 2048) : '',
+    fit: stringChoice<IdeBackgroundFit>(source.fit, ['cover', 'contain', 'stretch'], fallback.fit),
+    wallpaperOpacity: normalizedFiniteNumber(source.wallpaperOpacity, fallback.wallpaperOpacity, 0, 1),
+    base: normalizedHexColor(source.base, fallback.base),
+    accentA: normalizedHexColor(source.accentA, fallback.accentA),
+    accentB: normalizedHexColor(source.accentB, fallback.accentB),
+    gridAlpha: normalizedFiniteNumber(source.gridAlpha, fallback.gridAlpha, 0, 0.5),
+    noiseEnabled: source.noiseEnabled === undefined ? fallback.noiseEnabled : source.noiseEnabled === true,
+    noiseOpacity: normalizedFiniteNumber(source.noiseOpacity, fallback.noiseOpacity, 0, 0.5),
+    noiseSize: normalizedFiniteNumber(source.noiseSize, fallback.noiseSize, 16, 240),
+    noiseContrast: normalizedFiniteNumber(source.noiseContrast, fallback.noiseContrast, 0, 1),
+    noiseTint: normalizedHexColor(source.noiseTint, fallback.noiseTint),
+    noiseTintAlpha: normalizedFiniteNumber(source.noiseTintAlpha, fallback.noiseTintAlpha, 0, 1),
+    lightA: normalizeIdeBackgroundLightSettings(source.lightA, fallback.lightA),
+    lightB: normalizeIdeBackgroundLightSettings(source.lightB, fallback.lightB),
+    lightC: normalizeIdeBackgroundLightSettings(source.lightC, fallback.lightC)
+  };
+}
+
+function cloneWorkspaceGlassSettings(settings = DEFAULT_WORKSPACE_GLASS_SETTINGS): WorkspaceGlassSettings {
+  return {
+    ...settings,
+    effect: { ...settings.effect },
+    containerEffect: { ...settings.containerEffect }
+  };
+}
+
+function cloneAppGlassChromeSettings(settings = DEFAULT_APP_GLASS_CHROME_SETTINGS): AppGlassChromeSettings {
+  return { ...settings };
+}
+
+function cloneAppGlassSettings(settings = DEFAULT_APP_GLASS_SETTINGS): AppGlassSettings {
+  return {
+    ...settings,
+    effect: { ...settings.effect },
+    titlebarEffect: { ...settings.titlebarEffect },
+    windowControlsEffect: { ...settings.windowControlsEffect },
+    profileActionsEffect: { ...settings.profileActionsEffect },
+    terminalWidgetsEffect: { ...settings.terminalWidgetsEffect },
+    explorerPanelEffect: { ...settings.explorerPanelEffect },
+    editorPanelEffect: { ...settings.editorPanelEffect },
+    imagePanelEffect: { ...settings.imagePanelEffect },
+    browserPanelEffect: { ...settings.browserPanelEffect },
+    notesPanelEffect: { ...settings.notesPanelEffect },
+    snippetsPanelEffect: { ...settings.snippetsPanelEffect },
+    calculatorPanelEffect: { ...settings.calculatorPanelEffect },
+    floatingPanelsEffect: { ...settings.floatingPanelsEffect },
+    notesSnippetsEffect: { ...settings.notesSnippetsEffect },
+    settingsPanelEffect: { ...settings.settingsPanelEffect },
+    explorerRowsEffect: { ...settings.explorerRowsEffect },
+    chrome: cloneAppGlassChromeSettings(settings.chrome),
+    terminalChrome: cloneAppGlassChromeSettings(settings.terminalChrome),
+    settingsChrome: cloneAppGlassChromeSettings(settings.settingsChrome),
+    profileChrome: cloneAppGlassChromeSettings(settings.profileChrome),
+    explorerChrome: cloneAppGlassChromeSettings(settings.explorerChrome),
+    editorChrome: cloneAppGlassChromeSettings(settings.editorChrome),
+    imageChrome: cloneAppGlassChromeSettings(settings.imageChrome),
+    browserChrome: cloneAppGlassChromeSettings(settings.browserChrome),
+    notesChrome: cloneAppGlassChromeSettings(settings.notesChrome),
+    snippetsChrome: cloneAppGlassChromeSettings(settings.snippetsChrome)
+  };
+}
+
+function cloneGlassEffectSettings(settings = DEFAULT_COMMON_GLASS_EFFECT_SETTINGS): WorkspaceGlassEffectSettings {
+  return { ...settings };
+}
+
+function normalizeWorkspaceGlassEffectSettings(value: unknown, fallback = DEFAULT_WORKSPACE_GLASS_SETTINGS.effect): WorkspaceGlassEffectSettings {
+  const source = isPlainRecord(value) ? value : {};
+  return {
+    radius: normalizedFiniteNumber(source.radius, fallback.radius, 0, 96),
+    outlineColor: normalizedHexColor(source.outlineColor, fallback.outlineColor),
+    outlineAlpha: normalizedFiniteNumber(source.outlineAlpha, fallback.outlineAlpha, 0, 1),
+    outlineWidth: normalizedFiniteNumber(source.outlineWidth, fallback.outlineWidth, 0, 8),
+    outlineSoftAlpha: normalizedFiniteNumber(source.outlineSoftAlpha, fallback.outlineSoftAlpha, 0, 1),
+    outlineSoftWidth: normalizedFiniteNumber(source.outlineSoftWidth, fallback.outlineSoftWidth, 0, 24),
+    refraction: normalizedFiniteNumber(source.refraction, fallback.refraction, 0, 0.2),
+    bevelDepth: normalizedFiniteNumber(source.bevelDepth, fallback.bevelDepth, 0, 0.6),
+    bevelWidth: normalizedFiniteNumber(source.bevelWidth, fallback.bevelWidth, 0, 1.2),
+    frost: normalizedFiniteNumber(source.frost, fallback.frost, 0, 8),
+    magnify: normalizedFiniteNumber(source.magnify, fallback.magnify, 0.5, 1.8),
+    shadow: source.shadow === true,
+    specular: source.specular !== false,
+    tilt: source.tilt !== false,
+    tiltFactor: normalizedFiniteNumber(source.tiltFactor, fallback.tiltFactor, 0, 50),
+    reveal: stringChoice<WorkspaceGlassReveal>(source.reveal, ['none', 'fade'], fallback.reveal)
+  };
+}
+
+function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false): WorkspaceGlassSettings {
+  const source = isPlainRecord(value) ? value : {};
+  const fallback = cloneWorkspaceGlassSettings();
+  const normalizedRowRadius = normalizedFiniteNumber(source.rowRadius, fallback.rowRadius, 0, 64);
+  const legacyContainerRadiusFallback = source.containerRadius === undefined && source.dockOutlineRadiusExtra !== undefined
+    ? normalizedFiniteNumber(
+        normalizedRowRadius + normalizedFiniteNumber(source.dockOutlineRadiusExtra, fallback.containerRadius - normalizedRowRadius, -16, 40),
+        fallback.containerRadius,
+        0,
+        96
+      )
+    : fallback.containerRadius;
+  const normalizedContainerRadius = normalizedFiniteNumber(source.containerRadius, legacyContainerRadiusFallback, 0, 96);
+  const effectFallback = {
+    ...fallback.effect,
+    radius: normalizedRowRadius,
+    outlineColor: normalizedHexColor(source.outlineBaseAccent, fallback.outlineBaseAccent),
+    outlineAlpha: normalizedFiniteNumber(source.outlineAlpha, fallback.outlineAlpha, 0, 0.7),
+    outlineWidth: normalizedFiniteNumber(source.outlineWidth, fallback.outlineWidth, 0, 8),
+    outlineSoftAlpha: normalizedFiniteNumber(source.outlineSoftAlpha, fallback.outlineSoftAlpha, 0, 0.8),
+    outlineSoftWidth: normalizedFiniteNumber(source.outlineSoftWidth, fallback.outlineSoftWidth, 0, 16)
+  };
+  const containerEffectFallback = {
+    ...fallback.containerEffect,
+    radius: normalizedContainerRadius,
+    outlineColor: '#bee0ff',
+    outlineAlpha: normalizedFiniteNumber(source.containerGlassOutlineAlpha, fallback.containerGlassOutlineAlpha, 0, 0.6),
+    outlineWidth: 1,
+    outlineSoftAlpha: 0,
+    outlineSoftWidth: 0
+  };
+  return {
+    enabled: typeof source.enabled === 'boolean' ? source.enabled : enabledFallback,
+    useCustomEffect: source.useCustomEffect === true,
+    effect: normalizeWorkspaceGlassEffectSettings(source.effect, effectFallback),
+    containerUseCustomEffect: source.containerUseCustomEffect === true,
+    containerEffect: normalizeWorkspaceGlassEffectSettings(source.containerEffect, containerEffectFallback),
+    dockPadding: normalizedFiniteNumber(source.dockPadding, fallback.dockPadding, 0, 32),
+    dockGap: normalizedFiniteNumber(source.dockGap, fallback.dockGap, 0, 32),
+    dockBgAlpha: normalizedFiniteNumber(source.dockBgAlpha, fallback.dockBgAlpha, 0, 0.95),
+    dockSurfaceOpacity: normalizedFiniteNumber(source.dockSurfaceOpacity, fallback.dockSurfaceOpacity, 0, 1),
+    dockBlur: normalizedFiniteNumber(source.dockBlur, fallback.dockBlur, 0, 40),
+    dockSaturate: normalizedFiniteNumber(source.dockSaturate, fallback.dockSaturate, 0.4, 2.4),
+    dockSideBorderAlpha: normalizedFiniteNumber(source.dockSideBorderAlpha, fallback.dockSideBorderAlpha, 0, 0.7),
+    dockOutlineAlpha: normalizedFiniteNumber(source.dockOutlineAlpha, fallback.dockOutlineAlpha, 0, 0.8),
+    dockOutlineInset: normalizedFiniteNumber(source.dockOutlineInset, fallback.dockOutlineInset, -16, 32),
+    dockShadowAlpha: normalizedFiniteNumber(source.dockShadowAlpha, fallback.dockShadowAlpha, 0, 0.7),
+    dockShadowY: normalizedFiniteNumber(source.dockShadowY, fallback.dockShadowY, -24, 72),
+    dockShadowBlur: normalizedFiniteNumber(source.dockShadowBlur, fallback.dockShadowBlur, 0, 120),
+    dockHeaderOpacity: normalizedFiniteNumber(source.dockHeaderOpacity, fallback.dockHeaderOpacity, 0, 1),
+    dockPillAlpha: normalizedFiniteNumber(source.dockPillAlpha, fallback.dockPillAlpha, 0, 0.6),
+    containerGlassEnabled: source.containerGlassEnabled === true,
+    rowSamplesContainer: source.rowSamplesContainer === true,
+    rowHoverOnly: source.rowHoverOnly === true,
+    containerRadius: normalizedContainerRadius,
+    containerGlassBgAlpha: normalizedFiniteNumber(source.containerGlassBgAlpha, fallback.containerGlassBgAlpha, 0, 0.3),
+    containerGlassOutlineAlpha: normalizedFiniteNumber(source.containerGlassOutlineAlpha, fallback.containerGlassOutlineAlpha, 0, 0.6),
+    rowRadius: normalizedRowRadius,
+    rowHeight: normalizedFiniteNumber(source.rowHeight, fallback.rowHeight, 20, 60),
+    rowPaddingX: normalizedFiniteNumber(source.rowPaddingX, fallback.rowPaddingX, 0, 30),
+    rowPaddingY: normalizedFiniteNumber(source.rowPaddingY, fallback.rowPaddingY, 0, 24),
+    rowGap: normalizedFiniteNumber(source.rowGap, fallback.rowGap, 0, 32),
+    rowBgAlpha: normalizedFiniteNumber(source.rowBgAlpha, fallback.rowBgAlpha, 0, 0.3),
+    rowShadowAlpha: normalizedFiniteNumber(source.rowShadowAlpha, fallback.rowShadowAlpha, 0, 0.5),
+    rowShadowY: normalizedFiniteNumber(source.rowShadowY, fallback.rowShadowY, -24, 64),
+    rowShadowBlur: normalizedFiniteNumber(source.rowShadowBlur, fallback.rowShadowBlur, 0, 96),
+    outlineAlpha: normalizedFiniteNumber(source.outlineAlpha, fallback.outlineAlpha, 0, 0.7),
+    outlineWidth: normalizedFiniteNumber(source.outlineWidth, fallback.outlineWidth, 0, 8),
+    outlineSoftAlpha: normalizedFiniteNumber(source.outlineSoftAlpha, fallback.outlineSoftAlpha, 0, 0.8),
+    outlineSoftWidth: normalizedFiniteNumber(source.outlineSoftWidth, fallback.outlineSoftWidth, 0, 16),
+    outlineBaseAccent: normalizedHexColor(source.outlineBaseAccent, fallback.outlineBaseAccent),
+    outlineUseStateColors: source.outlineUseStateColors === true,
+    activeOutlineAccent: normalizedHexColor(source.activeOutlineAccent, fallback.activeOutlineAccent),
+    protectedOutlineAccent: normalizedHexColor(source.protectedOutlineAccent, fallback.protectedOutlineAccent),
+    captureOutlineAccent: normalizedHexColor(source.captureOutlineAccent, fallback.captureOutlineAccent),
+    activeAccent: normalizedHexColor(source.activeAccent, fallback.activeAccent),
+    textColor: normalizedHexColor(source.textColor, fallback.textColor),
+    textSize: normalizedFiniteNumber(source.textSize, fallback.textSize, 0.5, 2),
+    textWeight: Math.round(normalizedFiniteNumber(source.textWeight, fallback.textWeight, 100, 1000)),
+    textBlend: stringChoice<WorkspaceGlassTextBlend>(source.textBlend, ['normal', 'difference'], fallback.textBlend),
+    fontScale: normalizedFiniteNumber(source.fontScale, fallback.fontScale, 0.7, 1.5),
+    headerTextUseCustom: source.headerTextUseCustom === true,
+    headerColor: normalizedHexColor(source.headerColor, fallback.headerColor),
+    headerSize: normalizedFiniteNumber(source.headerSize, fallback.headerSize, 0.4, 1.6),
+    headerWeight: Math.round(normalizedFiniteNumber(source.headerWeight, fallback.headerWeight, 100, 1000)),
+    pillColor: normalizedHexColor(source.pillColor, fallback.pillColor),
+    pillSize: normalizedFiniteNumber(source.pillSize, fallback.pillSize, 0.35, 1.2),
+    iconColor: normalizedHexColor(source.iconColor, fallback.iconColor),
+    iconSize: normalizedFiniteNumber(source.iconSize, fallback.iconSize, 8, 36),
+    controlPaddingX: normalizedFiniteNumber(source.controlPaddingX, fallback.controlPaddingX, 0, 24),
+    controlPaddingY: normalizedFiniteNumber(source.controlPaddingY, fallback.controlPaddingY, 0, 18),
+    controlSlotWidth: normalizedFiniteNumber(source.controlSlotWidth, fallback.controlSlotWidth, 14, 48),
+    lockOffIconColor: normalizedHexColor(source.lockOffIconColor, fallback.lockOffIconColor),
+    lockIconColor: normalizedHexColor(source.lockIconColor, fallback.lockIconColor),
+    captureIconColor: normalizedHexColor(source.captureIconColor, fallback.captureIconColor),
+    detailButtonUseWidgetChrome: source.detailButtonUseWidgetChrome !== false,
+    detailButtonBgAlpha: normalizedFiniteNumber(source.detailButtonBgAlpha, fallback.detailButtonBgAlpha, 0, 1),
+    detailButtonBgColor: normalizedHexColor(source.detailButtonBgColor, fallback.detailButtonBgColor),
+    detailButtonOutlineAlpha: normalizedFiniteNumber(source.detailButtonOutlineAlpha, fallback.detailButtonOutlineAlpha, 0, 1),
+    detailButtonOutlineColor: normalizedHexColor(source.detailButtonOutlineColor, fallback.detailButtonOutlineColor),
+    detailButtonOutlineWidth: normalizedFiniteNumber(source.detailButtonOutlineWidth, fallback.detailButtonOutlineWidth, 0, 4),
+    detailButtonHoverAlpha: normalizedFiniteNumber(source.detailButtonHoverAlpha, fallback.detailButtonHoverAlpha, 0, 1),
+    detailButtonHoverColor: normalizedHexColor(source.detailButtonHoverColor, fallback.detailButtonHoverColor),
+    detailButtonActiveAlpha: normalizedFiniteNumber(source.detailButtonActiveAlpha, fallback.detailButtonActiveAlpha, 0, 1),
+    detailButtonActiveColor: normalizedHexColor(source.detailButtonActiveColor, fallback.detailButtonActiveColor),
+    detailButtonRadius: normalizedFiniteNumber(source.detailButtonRadius, fallback.detailButtonRadius, 0, 28),
+    agentTextColor: normalizedHexColor(source.agentTextColor, fallback.agentTextColor),
+    agentTextWeight: Math.round(normalizedFiniteNumber(source.agentTextWeight, fallback.agentTextWeight, 100, 1000)),
+    agentTitleColor: normalizedHexColor(source.agentTitleColor, fallback.agentTitleColor),
+    agentTitleSize: normalizedFiniteNumber(source.agentTitleSize, fallback.agentTitleSize, 0.4, 1.6),
+    agentTitleWeight: Math.round(normalizedFiniteNumber(source.agentTitleWeight, fallback.agentTitleWeight, 100, 1000)),
+    agentActivityColor: normalizedHexColor(source.agentActivityColor, fallback.agentActivityColor),
+    agentActivitySize: normalizedFiniteNumber(source.agentActivitySize, fallback.agentActivitySize, 0.4, 1.4),
+    agentActivityWeight: Math.round(normalizedFiniteNumber(source.agentActivityWeight, fallback.agentActivityWeight, 100, 1000)),
+    agentMetaColor: normalizedHexColor(source.agentMetaColor, fallback.agentMetaColor),
+    agentMetaSize: normalizedFiniteNumber(source.agentMetaSize, fallback.agentMetaSize, 0.4, 1.4),
+    agentMetaWeight: Math.round(normalizedFiniteNumber(source.agentMetaWeight, fallback.agentMetaWeight, 100, 1000)),
+    detailPaddingX: normalizedFiniteNumber(source.detailPaddingX, fallback.detailPaddingX, 0, 30),
+    detailPaddingY: normalizedFiniteNumber(source.detailPaddingY, fallback.detailPaddingY, 0, 24),
+    agentGap: normalizedFiniteNumber(source.agentGap, fallback.agentGap, 0, 24),
+    agentPaddingX: normalizedFiniteNumber(source.agentPaddingX, fallback.agentPaddingX, 0, 30),
+    agentPaddingY: normalizedFiniteNumber(source.agentPaddingY, fallback.agentPaddingY, 0, 24),
+    agentBadgeSize: normalizedFiniteNumber(source.agentBadgeSize, fallback.agentBadgeSize, 0.3, 1.2),
+    agentStatusSize: normalizedFiniteNumber(source.agentStatusSize, fallback.agentStatusSize, 0.3, 1.2),
+    agentBadgeWeight: Math.round(normalizedFiniteNumber(source.agentBadgeWeight, fallback.agentBadgeWeight, 100, 1000)),
+    agentStatusWeight: Math.round(normalizedFiniteNumber(source.agentStatusWeight, fallback.agentStatusWeight, 100, 1000)),
+    agentBadgeHeight: normalizedFiniteNumber(source.agentBadgeHeight, fallback.agentBadgeHeight, 10, 34),
+    agentStatusPaddingX: normalizedFiniteNumber(source.agentStatusPaddingX, fallback.agentStatusPaddingX, 0, 32),
+    agentStatusRadius: normalizedFiniteNumber(source.agentStatusRadius, fallback.agentStatusRadius, 0, 999),
+    agentStatusBorderWidth: normalizedFiniteNumber(source.agentStatusBorderWidth, fallback.agentStatusBorderWidth, 0, 8),
+    agentStatusBgAlpha: normalizedFiniteNumber(source.agentStatusBgAlpha, fallback.agentStatusBgAlpha, 0, 1),
+    agentStatusBorderAlpha: normalizedFiniteNumber(source.agentStatusBorderAlpha, fallback.agentStatusBorderAlpha, 0, 1),
+    agentStatusIdleColor: normalizedHexColor(source.agentStatusIdleColor, fallback.agentStatusIdleColor),
+    agentStatusWorkingColor: normalizedHexColor(source.agentStatusWorkingColor, fallback.agentStatusWorkingColor),
+    agentStatusWaitingColor: normalizedHexColor(source.agentStatusWaitingColor, fallback.agentStatusWaitingColor),
+    agentStatusErrorColor: normalizedHexColor(source.agentStatusErrorColor, fallback.agentStatusErrorColor),
+    agentStatusDoneUnreadColor: normalizedHexColor(source.agentStatusDoneUnreadColor, fallback.agentStatusDoneUnreadColor),
+    agentStatusExitedColor: normalizedHexColor(source.agentStatusExitedColor, fallback.agentStatusExitedColor),
+    agentBgAlpha: normalizedFiniteNumber(source.agentBgAlpha, fallback.agentBgAlpha, 0, 0.4),
+    agentTypeBgAlpha: normalizedFiniteNumber(source.agentTypeBgAlpha, fallback.agentTypeBgAlpha, 0, 1),
+    agentTypeBorderAlpha: normalizedFiniteNumber(source.agentTypeBorderAlpha, fallback.agentTypeBorderAlpha, 0, 1),
+    agentTypeBgLeft: normalizedFiniteNumber(source.agentTypeBgLeft, fallback.agentTypeBgLeft, -160, 160),
+    agentTypeBgRight: normalizedFiniteNumber(source.agentTypeBgRight, fallback.agentTypeBgRight, -160, 160),
+    agentTypeBgTop: normalizedFiniteNumber(source.agentTypeBgTop, fallback.agentTypeBgTop, -80, 80),
+    agentTypeBgBottom: normalizedFiniteNumber(source.agentTypeBgBottom, fallback.agentTypeBgBottom, -80, 80),
+    agentTypeBgBleedLeft: normalizedFiniteNumber(source.agentTypeBgBleedLeft, fallback.agentTypeBgBleedLeft, 0, 240),
+    agentTypeBgBleedRight: normalizedFiniteNumber(source.agentTypeBgBleedRight, fallback.agentTypeBgBleedRight, 0, 240),
+    agentTypeBgWidth: normalizedFiniteNumber(source.agentTypeBgWidth, fallback.agentTypeBgWidth, 0, 240),
+    agentTypeBgRadius: normalizedFiniteNumber(source.agentTypeBgRadius, fallback.agentTypeBgRadius, 0, 80),
+    agentTypeBgOverflow: source.agentTypeBgOverflow === true,
+    agentCodexAccent: normalizedHexColor(source.agentCodexAccent, fallback.agentCodexAccent),
+    agentClaudeAccent: normalizedHexColor(source.agentClaudeAccent, fallback.agentClaudeAccent),
+    agentGrokAccent: normalizedHexColor(source.agentGrokAccent, fallback.agentGrokAccent),
+    agentAgyAccent: normalizedHexColor(source.agentAgyAccent, fallback.agentAgyAccent),
+    llmWorkingColor: normalizedHexColor(source.llmWorkingColor, fallback.llmWorkingColor),
+    llmWaitingColor: normalizedHexColor(source.llmWaitingColor, fallback.llmWaitingColor),
+    llmIdleColor: normalizedHexColor(source.llmIdleColor, fallback.llmIdleColor),
+    llmErrorColor: normalizedHexColor(source.llmErrorColor, fallback.llmErrorColor),
+    llmDoneUnreadColor: normalizedHexColor(source.llmDoneUnreadColor, fallback.llmDoneUnreadColor),
+    llmExitedColor: normalizedHexColor(source.llmExitedColor, fallback.llmExitedColor),
+    llmStatusDotLeft: normalizedFiniteNumber(source.llmStatusDotLeft, fallback.llmStatusDotLeft, -20, 60),
+    llmStatusDotTop: normalizedFiniteNumber(source.llmStatusDotTop, fallback.llmStatusDotTop, -20, 80),
+    llmStatusDotSize: normalizedFiniteNumber(source.llmStatusDotSize, fallback.llmStatusDotSize, 3, 18),
+    llmStatusDotGlow: normalizedFiniteNumber(source.llmStatusDotGlow, fallback.llmStatusDotGlow, 0, 40),
+    llmWorkingPulseEnabled: source.llmWorkingPulseEnabled !== false,
+    llmWorkingPulseDuration: normalizedFiniteNumber(source.llmWorkingPulseDuration, fallback.llmWorkingPulseDuration, 0.3, 4),
+    llmWorkingPulseDimOpacity: normalizedFiniteNumber(source.llmWorkingPulseDimOpacity, fallback.llmWorkingPulseDimOpacity, 0.15, 1),
+    llmWorkingPulseRingSize: normalizedFiniteNumber(source.llmWorkingPulseRingSize, fallback.llmWorkingPulseRingSize, 0, 16),
+    llmWorkingPulseGlowAlpha: normalizedFiniteNumber(source.llmWorkingPulseGlowAlpha, fallback.llmWorkingPulseGlowAlpha, 0, 1),
+    llmLabelPadding: normalizedFiniteNumber(source.llmLabelPadding, fallback.llmLabelPadding, 0, 56),
+    tabHighlight: source.tabHighlight === true,
+    tabHighlightAccent: normalizedHexColor(source.tabHighlightAccent, fallback.tabHighlightAccent),
+    tabHighlightOpacity: normalizedFiniteNumber(source.tabHighlightOpacity, fallback.tabHighlightOpacity, 0, 1),
+    tabHighlightStrongAlpha: normalizedFiniteNumber(source.tabHighlightStrongAlpha, fallback.tabHighlightStrongAlpha, 0, 1),
+    tabHighlightSoftAlpha: normalizedFiniteNumber(source.tabHighlightSoftAlpha, fallback.tabHighlightSoftAlpha, 0, 1),
+    tabHighlightWidth: normalizedFiniteNumber(source.tabHighlightWidth, fallback.tabHighlightWidth, 0, 240),
+    tabHighlightLeft: normalizedFiniteNumber(source.tabHighlightLeft, fallback.tabHighlightLeft, 0, 240),
+    tabHighlightRight: normalizedFiniteNumber(source.tabHighlightRight, fallback.tabHighlightRight, 0, 240),
+    tabHighlightTop: normalizedFiniteNumber(source.tabHighlightTop, fallback.tabHighlightTop, 0, 80),
+    tabHighlightBottom: normalizedFiniteNumber(source.tabHighlightBottom, fallback.tabHighlightBottom, 0, 80),
+    tabHighlightShiftX: normalizedFiniteNumber(source.tabHighlightShiftX, fallback.tabHighlightShiftX, -240, 240),
+    tabHighlightRadius: normalizedFiniteNumber(source.tabHighlightRadius, fallback.tabHighlightRadius, 0, 80),
+    selectedHighlight: source.selectedHighlight !== false,
+    selectedRail: source.selectedRail !== false,
+    selectedBadge: source.selectedBadge === true,
+    selectedRailStyle: stringChoice<WorkspaceGlassRailStyle>(source.selectedRailStyle, ['pill', 'line', 'top', 'bottom', 'outline'], fallback.selectedRailStyle),
+    selectedAccent: normalizedHexColor(source.selectedAccent, fallback.selectedAccent),
+    selectedFillAlpha: normalizedFiniteNumber(source.selectedFillAlpha, fallback.selectedFillAlpha, 0, 1),
+    selectedOutlineAlpha: normalizedFiniteNumber(source.selectedOutlineAlpha, fallback.selectedOutlineAlpha, 0, 1),
+    selectedGlowAlpha: normalizedFiniteNumber(source.selectedGlowAlpha, fallback.selectedGlowAlpha, 0, 1),
+    selectedOutlineWidth: normalizedFiniteNumber(source.selectedOutlineWidth, fallback.selectedOutlineWidth, 0, 8),
+    selectedGlowY: normalizedFiniteNumber(source.selectedGlowY, fallback.selectedGlowY, -32, 72),
+    selectedGlowBlur: normalizedFiniteNumber(source.selectedGlowBlur, fallback.selectedGlowBlur, 0, 120),
+    selectedGlowSpread: normalizedFiniteNumber(source.selectedGlowSpread, fallback.selectedGlowSpread, -32, 64),
+    selectedBadgeSize: normalizedFiniteNumber(source.selectedBadgeSize, fallback.selectedBadgeSize, 0.3, 1.2),
+    selectedHighlightAccent: normalizedHexColor(source.selectedHighlightAccent, fallback.selectedHighlightAccent),
+    selectedHighlightOpacity: normalizedFiniteNumber(source.selectedHighlightOpacity, fallback.selectedHighlightOpacity, 0, 1),
+    selectedHighlightStrongAlpha: normalizedFiniteNumber(source.selectedHighlightStrongAlpha, fallback.selectedHighlightStrongAlpha, 0, 1),
+    selectedHighlightSoftAlpha: normalizedFiniteNumber(source.selectedHighlightSoftAlpha, fallback.selectedHighlightSoftAlpha, 0, 1),
+    selectedHighlightWidth: normalizedFiniteNumber(source.selectedHighlightWidth, fallback.selectedHighlightWidth, 0, 240),
+    selectedHighlightLeft: normalizedFiniteNumber(source.selectedHighlightLeft, fallback.selectedHighlightLeft, 0, 240),
+    selectedHighlightRight: normalizedFiniteNumber(source.selectedHighlightRight, fallback.selectedHighlightRight, 0, 240),
+    selectedHighlightTop: normalizedFiniteNumber(source.selectedHighlightTop, fallback.selectedHighlightTop, 0, 80),
+    selectedHighlightBottom: normalizedFiniteNumber(source.selectedHighlightBottom, fallback.selectedHighlightBottom, 0, 80),
+    selectedHighlightShiftX: normalizedFiniteNumber(source.selectedHighlightShiftX, fallback.selectedHighlightShiftX, -240, 240),
+    selectedHighlightRadius: normalizedFiniteNumber(source.selectedHighlightRadius, fallback.selectedHighlightRadius, 0, 80),
+    selectedRailAlpha: normalizedFiniteNumber(source.selectedRailAlpha, fallback.selectedRailAlpha, 0, 1),
+    selectedRailWidth: normalizedFiniteNumber(source.selectedRailWidth, fallback.selectedRailWidth, 0, 20),
+    selectedRailInset: normalizedFiniteNumber(source.selectedRailInset, fallback.selectedRailInset, 0, 80),
+    selectedRailOffset: normalizedFiniteNumber(source.selectedRailOffset, fallback.selectedRailOffset, -80, 80),
+    selectedRailRadius: normalizedFiniteNumber(source.selectedRailRadius, fallback.selectedRailRadius, 0, 999),
+    selectedRailGlow: normalizedFiniteNumber(source.selectedRailGlow, fallback.selectedRailGlow, 0, 80)
+  };
+}
+
+function normalizeAppGlassChromeSettings(
+  value: unknown,
+  fallback = DEFAULT_APP_GLASS_CHROME_SETTINGS
+): AppGlassChromeSettings {
+  const source = isPlainRecord(value) ? value : {};
+  return {
+    surfaceAlpha: normalizedFiniteNumber(source.surfaceAlpha, fallback.surfaceAlpha, 0, 1),
+    surfaceColor: normalizedHexColor(source.surfaceColor, fallback.surfaceColor),
+    fieldAlpha: normalizedFiniteNumber(source.fieldAlpha, fallback.fieldAlpha, 0, 1),
+    fieldColor: normalizedHexColor(source.fieldColor, fallback.fieldColor),
+    fieldTextColor: normalizedHexColor(source.fieldTextColor, fallback.fieldTextColor),
+    fieldOutlineAlpha: normalizedFiniteNumber(source.fieldOutlineAlpha, fallback.fieldOutlineAlpha, 0, 1),
+    fieldOutlineColor: normalizedHexColor(source.fieldOutlineColor, fallback.fieldOutlineColor),
+    selectOptionBgColor: normalizedHexColor(source.selectOptionBgColor, fallback.selectOptionBgColor),
+    selectOptionTextColor: normalizedHexColor(source.selectOptionTextColor, fallback.selectOptionTextColor),
+    selectOptionSelectedBgColor: normalizedHexColor(source.selectOptionSelectedBgColor, fallback.selectOptionSelectedBgColor),
+    selectOptionSelectedTextColor: normalizedHexColor(source.selectOptionSelectedTextColor, fallback.selectOptionSelectedTextColor),
+    tabAlpha: normalizedFiniteNumber(source.tabAlpha, fallback.tabAlpha, 0, 1),
+    tabColor: normalizedHexColor(source.tabColor, fallback.tabColor),
+    tabActiveAlpha: normalizedFiniteNumber(source.tabActiveAlpha, fallback.tabActiveAlpha, 0, 1),
+    tabActiveColor: normalizedHexColor(source.tabActiveColor, fallback.tabActiveColor),
+    buttonAlpha: normalizedFiniteNumber(source.buttonAlpha, fallback.buttonAlpha, 0, 1),
+    buttonColor: normalizedHexColor(source.buttonColor, fallback.buttonColor),
+    buttonOutlineAlpha: normalizedFiniteNumber(source.buttonOutlineAlpha, fallback.buttonOutlineAlpha, 0, 1),
+    buttonOutlineColor: normalizedHexColor(source.buttonOutlineColor, fallback.buttonOutlineColor),
+    buttonOutlineWidth: normalizedFiniteNumber(source.buttonOutlineWidth, fallback.buttonOutlineWidth, 0, 4),
+    buttonHoverAlpha: normalizedFiniteNumber(source.buttonHoverAlpha, fallback.buttonHoverAlpha, 0, 1),
+    buttonHoverColor: normalizedHexColor(source.buttonHoverColor, fallback.buttonHoverColor),
+    buttonRadius: normalizedFiniteNumber(source.buttonRadius, fallback.buttonRadius, 0, 28),
+    itemAlpha: normalizedFiniteNumber(source.itemAlpha, fallback.itemAlpha, 0, 1),
+    itemColor: normalizedHexColor(source.itemColor, fallback.itemColor),
+    itemTextColor: normalizedHexColor(source.itemTextColor, fallback.itemTextColor),
+    itemOutlineAlpha: normalizedFiniteNumber(source.itemOutlineAlpha, fallback.itemOutlineAlpha, 0, 1),
+    itemOutlineColor: normalizedHexColor(source.itemOutlineColor, fallback.itemOutlineColor),
+    dividerAlpha: normalizedFiniteNumber(source.dividerAlpha, fallback.dividerAlpha, 0, 1),
+    dividerColor: normalizedHexColor(source.dividerColor, fallback.dividerColor),
+    paddingX: normalizedFiniteNumber(source.paddingX, fallback.paddingX, 0, 28),
+    paddingY: normalizedFiniteNumber(source.paddingY, fallback.paddingY, 0, 24)
+  };
+}
+
+function normalizeAppGlassSettings(value: unknown): AppGlassSettings {
+  const source = isPlainRecord(value) ? value : {};
+  const fallback = cloneAppGlassSettings();
+  const legacyUseCustomEffect = source.useCustomEffect === true;
+  const legacyEffect = normalizeWorkspaceGlassEffectSettings(source.effect, fallback.effect);
+  const scopedCustomEffectEnabled = (key: string) => (
+    source[key] === true || (source[key] === undefined && legacyUseCustomEffect)
+  );
+  const scopedEffectSettings = (key: string, fallbackEffect: WorkspaceGlassEffectSettings) => (
+    normalizeWorkspaceGlassEffectSettings(isPlainRecord(source[key]) ? source[key] : (legacyUseCustomEffect ? legacyEffect : undefined), fallbackEffect)
+  );
+  const legacyFloatingPanelsEnabled = source.floatingPanels !== false;
+  const legacyNotesSnippetsEnabled = source.notesSnippets !== false;
+  const hasWidgetTitleSoftness = typeof source.widgetTitleSoftness === 'number';
+  const hasWidgetTitleSelectedSoftness = typeof source.widgetTitleSelectedSoftness === 'number';
+  const normalizedExplorerRowsRadius = normalizedFiniteNumber(source.explorerRowsRadius, fallback.explorerRowsRadius, 0, 48);
+  const explorerRowsEffectFallback = {
+    ...fallback.explorerRowsEffect,
+    radius: normalizedExplorerRowsRadius
+  };
+  return {
+    enabled: source.enabled === true,
+    useCustomEffect: legacyUseCustomEffect,
+    titlebar: source.titlebar !== false,
+    windowControls: source.windowControls !== false,
+    profileActions: source.profileActions !== false,
+    profileActionsSplit: source.profileActionsSplit !== false,
+    explorerPanel: source.explorerPanel === undefined ? legacyFloatingPanelsEnabled : source.explorerPanel !== false,
+    editorPanel: source.editorPanel === undefined ? legacyFloatingPanelsEnabled : source.editorPanel !== false,
+    imagePanel: source.imagePanel === undefined ? legacyFloatingPanelsEnabled : source.imagePanel !== false,
+    browserPanel: source.browserPanel === undefined ? legacyFloatingPanelsEnabled : source.browserPanel !== false,
+    notesPanel: source.notesPanel === undefined ? legacyNotesSnippetsEnabled : source.notesPanel !== false,
+    snippetsPanel: source.snippetsPanel === undefined ? legacyNotesSnippetsEnabled : source.snippetsPanel !== false,
+    calculatorPanel: source.calculatorPanel === undefined ? legacyFloatingPanelsEnabled : source.calculatorPanel !== false,
+    floatingPanels: source.floatingPanels !== false,
+    terminalWidgets: source.terminalWidgets !== false,
+    notesSnippets: source.notesSnippets !== false,
+    settingsPanel: source.settingsPanel !== false,
+    explorerRows: source.explorerRows !== false,
+    explorerRowsHoverOnly: source.explorerRowsHoverOnly === true,
+    explorerRowsSamplePanel: source.explorerRowsSamplePanel === true,
+    effect: legacyEffect,
+    titlebarUseCustomEffect: scopedCustomEffectEnabled('titlebarUseCustomEffect'),
+    titlebarEffect: scopedEffectSettings('titlebarEffect', fallback.titlebarEffect),
+    windowControlsUseCustomEffect: scopedCustomEffectEnabled('windowControlsUseCustomEffect'),
+    windowControlsEffect: scopedEffectSettings('windowControlsEffect', fallback.windowControlsEffect),
+    profileActionsUseCustomEffect: scopedCustomEffectEnabled('profileActionsUseCustomEffect'),
+    profileActionsEffect: scopedEffectSettings('profileActionsEffect', fallback.profileActionsEffect),
+    terminalWidgetsUseCustomEffect: scopedCustomEffectEnabled('terminalWidgetsUseCustomEffect'),
+    terminalWidgetsEffect: scopedEffectSettings('terminalWidgetsEffect', fallback.terminalWidgetsEffect),
+    explorerPanelUseCustomEffect: scopedCustomEffectEnabled('explorerPanelUseCustomEffect'),
+    explorerPanelEffect: scopedEffectSettings('explorerPanelEffect', fallback.explorerPanelEffect),
+    editorPanelUseCustomEffect: scopedCustomEffectEnabled('editorPanelUseCustomEffect'),
+    editorPanelEffect: scopedEffectSettings('editorPanelEffect', fallback.editorPanelEffect),
+    imagePanelUseCustomEffect: scopedCustomEffectEnabled('imagePanelUseCustomEffect'),
+    imagePanelEffect: scopedEffectSettings('imagePanelEffect', fallback.imagePanelEffect),
+    browserPanelUseCustomEffect: scopedCustomEffectEnabled('browserPanelUseCustomEffect'),
+    browserPanelEffect: scopedEffectSettings('browserPanelEffect', fallback.browserPanelEffect),
+    notesPanelUseCustomEffect: scopedCustomEffectEnabled('notesPanelUseCustomEffect'),
+    notesPanelEffect: scopedEffectSettings('notesPanelEffect', fallback.notesPanelEffect),
+    snippetsPanelUseCustomEffect: scopedCustomEffectEnabled('snippetsPanelUseCustomEffect'),
+    snippetsPanelEffect: scopedEffectSettings('snippetsPanelEffect', fallback.snippetsPanelEffect),
+    calculatorPanelUseCustomEffect: scopedCustomEffectEnabled('calculatorPanelUseCustomEffect'),
+    calculatorPanelEffect: scopedEffectSettings('calculatorPanelEffect', fallback.calculatorPanelEffect),
+    floatingPanelsUseCustomEffect: scopedCustomEffectEnabled('floatingPanelsUseCustomEffect'),
+    floatingPanelsEffect: scopedEffectSettings('floatingPanelsEffect', fallback.floatingPanelsEffect),
+    notesSnippetsUseCustomEffect: scopedCustomEffectEnabled('notesSnippetsUseCustomEffect'),
+    notesSnippetsEffect: scopedEffectSettings('notesSnippetsEffect', fallback.notesSnippetsEffect),
+    settingsPanelUseCustomEffect: scopedCustomEffectEnabled('settingsPanelUseCustomEffect'),
+    settingsPanelEffect: scopedEffectSettings('settingsPanelEffect', fallback.settingsPanelEffect),
+    explorerRowsUseCustomEffect: scopedCustomEffectEnabled('explorerRowsUseCustomEffect'),
+    explorerRowsEffect: scopedEffectSettings('explorerRowsEffect', explorerRowsEffectFallback),
+    chrome: normalizeAppGlassChromeSettings(source.chrome, fallback.chrome),
+    terminalChromeUseCustom: source.terminalChromeUseCustom === true,
+    terminalChrome: normalizeAppGlassChromeSettings(source.terminalChrome, fallback.terminalChrome),
+    settingsChromeUseCustom: source.settingsChromeUseCustom === true,
+    settingsChrome: normalizeAppGlassChromeSettings(source.settingsChrome, fallback.settingsChrome),
+    profileChromeUseCustom: source.profileChromeUseCustom === true,
+    profileChrome: normalizeAppGlassChromeSettings(source.profileChrome, fallback.profileChrome),
+    explorerChromeUseCustom: source.explorerChromeUseCustom === true,
+    explorerChrome: normalizeAppGlassChromeSettings(source.explorerChrome, fallback.explorerChrome),
+    editorChromeUseCustom: source.editorChromeUseCustom === true,
+    editorChrome: normalizeAppGlassChromeSettings(source.editorChrome, fallback.editorChrome),
+    imageChromeUseCustom: source.imageChromeUseCustom === true,
+    imageChrome: normalizeAppGlassChromeSettings(source.imageChrome, fallback.imageChrome),
+    browserChromeUseCustom: source.browserChromeUseCustom === true,
+    browserChrome: normalizeAppGlassChromeSettings(source.browserChrome, fallback.browserChrome),
+    notesChromeUseCustom: source.notesChromeUseCustom === true,
+    notesChrome: normalizeAppGlassChromeSettings(source.notesChrome, fallback.notesChrome),
+    snippetsChromeUseCustom: source.snippetsChromeUseCustom === true,
+    snippetsChrome: normalizeAppGlassChromeSettings(source.snippetsChrome, fallback.snippetsChrome),
+    headerTextColor: normalizedHexColor(source.headerTextColor, fallback.headerTextColor),
+    headerTextSize: normalizedFiniteNumber(source.headerTextSize, fallback.headerTextSize, 0.5, 1.5),
+    headerTextWeight: Math.round(normalizedFiniteNumber(source.headerTextWeight, fallback.headerTextWeight, 100, 1000)),
+    bodyTextColor: normalizedHexColor(source.bodyTextColor, fallback.bodyTextColor),
+    mutedTextColor: normalizedHexColor(source.mutedTextColor, fallback.mutedTextColor),
+    shadowAlpha: normalizedFiniteNumber(source.shadowAlpha, fallback.shadowAlpha, 0, 0.9),
+    shadowBlur: normalizedFiniteNumber(source.shadowBlur, fallback.shadowBlur, 0, 140),
+    shadowY: normalizedFiniteNumber(source.shadowY, fallback.shadowY, -24, 80),
+    titlebarRadius: normalizedFiniteNumber(source.titlebarRadius, fallback.titlebarRadius, 0, 40),
+    titlebarAlpha: normalizedFiniteNumber(source.titlebarAlpha, fallback.titlebarAlpha, 0, 0.4),
+    titlebarOutlineAlpha: normalizedFiniteNumber(source.titlebarOutlineAlpha, fallback.titlebarOutlineAlpha, 0, 0.6),
+    titlebarBlur: normalizedFiniteNumber(source.titlebarBlur, fallback.titlebarBlur, 0, 40),
+    windowButtonSize: normalizedFiniteNumber(source.windowButtonSize, fallback.windowButtonSize, 20, 46),
+    windowButtonGap: normalizedFiniteNumber(source.windowButtonGap, fallback.windowButtonGap, 0, 16),
+    windowButtonRadius: normalizedFiniteNumber(source.windowButtonRadius, fallback.windowButtonRadius, 0, 24),
+    windowButtonBgAlpha: normalizedFiniteNumber(source.windowButtonBgAlpha, fallback.windowButtonBgAlpha, 0, 0.7),
+    windowButtonBgColor: normalizedHexColor(source.windowButtonBgColor, fallback.windowButtonBgColor),
+    windowButtonHoverAlpha: normalizedFiniteNumber(source.windowButtonHoverAlpha, fallback.windowButtonHoverAlpha, 0, 0.8),
+    windowButtonHoverColor: normalizedHexColor(source.windowButtonHoverColor, fallback.windowButtonHoverColor),
+    windowButtonCloseHoverAlpha: normalizedFiniteNumber(source.windowButtonCloseHoverAlpha, fallback.windowButtonCloseHoverAlpha, 0, 1),
+    windowButtonCloseHoverColor: normalizedHexColor(source.windowButtonCloseHoverColor, fallback.windowButtonCloseHoverColor),
+    windowButtonOutlineAlpha: normalizedFiniteNumber(source.windowButtonOutlineAlpha, fallback.windowButtonOutlineAlpha, 0, 0.8),
+    windowButtonOutlineColor: normalizedHexColor(source.windowButtonOutlineColor, fallback.windowButtonOutlineColor),
+    windowButtonIconAlpha: normalizedFiniteNumber(source.windowButtonIconAlpha, fallback.windowButtonIconAlpha, 0, 1),
+    windowButtonIconSize: normalizedFiniteNumber(source.windowButtonIconSize, fallback.windowButtonIconSize, 10, 24),
+    widgetRadius: normalizedFiniteNumber(source.widgetRadius, fallback.widgetRadius, 0, 48),
+    widgetGlassAlpha: normalizedFiniteNumber(source.widgetGlassAlpha, fallback.widgetGlassAlpha, 0, 0.2),
+    widgetOutlineAlpha: normalizedFiniteNumber(source.widgetOutlineAlpha, fallback.widgetOutlineAlpha, 0, 1),
+    widgetOutlineWidth: normalizedFiniteNumber(source.widgetOutlineWidth, fallback.widgetOutlineWidth, 0, 4),
+    widgetOutlineSoftAlpha: normalizedFiniteNumber(source.widgetOutlineSoftAlpha, fallback.widgetOutlineSoftAlpha, 0, 1),
+    widgetOutlineSoftWidth: normalizedFiniteNumber(source.widgetOutlineSoftWidth, fallback.widgetOutlineSoftWidth, 0, 12),
+    widgetChromeAlpha: normalizedFiniteNumber(source.widgetChromeAlpha, fallback.widgetChromeAlpha, 0, 1),
+    widgetHeaderDividerAlpha: normalizedFiniteNumber(source.widgetHeaderDividerAlpha, fallback.widgetHeaderDividerAlpha, 0, 1),
+    widgetGlassInsetAlpha: normalizedFiniteNumber(source.widgetGlassInsetAlpha, fallback.widgetGlassInsetAlpha, 0, 1),
+    widgetPaddingX: normalizedFiniteNumber(source.widgetPaddingX, fallback.widgetPaddingX, 0, 28),
+    widgetPaddingY: normalizedFiniteNumber(source.widgetPaddingY, fallback.widgetPaddingY, 0, 24),
+    widgetTopbarHeight: normalizedFiniteNumber(source.widgetTopbarHeight, fallback.widgetTopbarHeight, 28, 64),
+    widgetTopbarContentY: normalizedFiniteNumber(source.widgetTopbarContentY, fallback.widgetTopbarContentY, -12, 12),
+    widgetButtonBgAlpha: normalizedFiniteNumber(source.widgetButtonBgAlpha, fallback.widgetButtonBgAlpha, 0, 0.8),
+    widgetButtonBgColor: normalizedHexColor(source.widgetButtonBgColor, fallback.widgetButtonBgColor),
+    widgetButtonOutlineAlpha: normalizedFiniteNumber(source.widgetButtonOutlineAlpha, fallback.widgetButtonOutlineAlpha, 0, 0.8),
+    widgetButtonOutlineColor: normalizedHexColor(source.widgetButtonOutlineColor, fallback.widgetButtonOutlineColor),
+    widgetButtonOutlineWidth: normalizedFiniteNumber(source.widgetButtonOutlineWidth, fallback.widgetButtonOutlineWidth, 0, 4),
+    widgetButtonHoverAlpha: normalizedFiniteNumber(source.widgetButtonHoverAlpha, fallback.widgetButtonHoverAlpha, 0, 0.8),
+    widgetButtonHoverColor: normalizedHexColor(source.widgetButtonHoverColor, fallback.widgetButtonHoverColor),
+    widgetButtonActiveAlpha: normalizedFiniteNumber(source.widgetButtonActiveAlpha, fallback.widgetButtonActiveAlpha, 0, 0.8),
+    widgetButtonActiveColor: normalizedHexColor(source.widgetButtonActiveColor, fallback.widgetButtonActiveColor),
+    widgetButtonRadius: normalizedFiniteNumber(source.widgetButtonRadius, fallback.widgetButtonRadius, 0, 28),
+    widgetTitleHighlight: source.widgetTitleHighlight !== false,
+    widgetTitleColor: normalizedHexColor(source.widgetTitleColor ?? source.widgetTitleSelectedColor, fallback.widgetTitleColor),
+    widgetTitleAlpha: normalizedFiniteNumber(source.widgetTitleAlpha ?? source.widgetTitleSelectedAlpha, fallback.widgetTitleAlpha, 0, 1),
+    widgetTitleSizeX: normalizedFiniteNumber(source.widgetTitleSizeX ?? source.widgetTitleWidth, fallback.widgetTitleSizeX, 5, 260),
+    widgetTitleSizeY: normalizedFiniteNumber(source.widgetTitleSizeY, fallback.widgetTitleSizeY, 5, 260),
+    widgetTitleOriginX: normalizedFiniteNumber(source.widgetTitleOriginX, fallback.widgetTitleOriginX, -30, 130),
+    widgetTitleOriginY: normalizedFiniteNumber(source.widgetTitleOriginY, fallback.widgetTitleOriginY, -30, 130),
+    widgetTitleCoreStop: normalizedFiniteNumber(source.widgetTitleCoreStop, fallback.widgetTitleCoreStop, 0, 80),
+    widgetTitleMidStrength: normalizedFiniteNumber(hasWidgetTitleSoftness ? source.widgetTitleMidStrength : undefined, fallback.widgetTitleMidStrength, 0, 1),
+    widgetTitleEdgeStrength: normalizedFiniteNumber(hasWidgetTitleSoftness ? source.widgetTitleEdgeStrength : undefined, fallback.widgetTitleEdgeStrength, 0, 1),
+    widgetTitleSoftness: normalizedFiniteNumber(source.widgetTitleSoftness, fallback.widgetTitleSoftness, 0, 1),
+    widgetTitleSelectedColor: normalizedHexColor(source.widgetTitleSelectedColor, fallback.widgetTitleSelectedColor),
+    widgetTitleSelectedAlpha: normalizedFiniteNumber(source.widgetTitleSelectedAlpha, fallback.widgetTitleSelectedAlpha, 0, 1),
+    widgetTitleSelectedSizeX: normalizedFiniteNumber(source.widgetTitleSelectedSizeX ?? source.widgetTitleSizeX ?? source.widgetTitleWidth, fallback.widgetTitleSelectedSizeX, 5, 260),
+    widgetTitleSelectedSizeY: normalizedFiniteNumber(source.widgetTitleSelectedSizeY ?? source.widgetTitleSizeY, fallback.widgetTitleSelectedSizeY, 5, 260),
+    widgetTitleSelectedOriginX: normalizedFiniteNumber(source.widgetTitleSelectedOriginX ?? source.widgetTitleOriginX, fallback.widgetTitleSelectedOriginX, -30, 130),
+    widgetTitleSelectedOriginY: normalizedFiniteNumber(source.widgetTitleSelectedOriginY ?? source.widgetTitleOriginY, fallback.widgetTitleSelectedOriginY, -30, 130),
+    widgetTitleSelectedCoreStop: normalizedFiniteNumber(source.widgetTitleSelectedCoreStop ?? source.widgetTitleCoreStop, fallback.widgetTitleSelectedCoreStop, 0, 80),
+    widgetTitleSelectedMidStop: normalizedFiniteNumber(source.widgetTitleSelectedMidStop ?? source.widgetTitleMidStop, fallback.widgetTitleSelectedMidStop, 0, 120),
+    widgetTitleSelectedSoftStop: normalizedFiniteNumber(source.widgetTitleSelectedSoftStop ?? source.widgetTitleSoftStop, fallback.widgetTitleSelectedSoftStop, 0, 140),
+    widgetTitleSelectedFadeStop: normalizedFiniteNumber(source.widgetTitleSelectedFadeStop ?? source.widgetTitleFadeStop, fallback.widgetTitleSelectedFadeStop, 0, 160),
+    widgetTitleSelectedMidStrength: normalizedFiniteNumber(hasWidgetTitleSelectedSoftness ? (source.widgetTitleSelectedMidStrength ?? source.widgetTitleMidStrength) : undefined, fallback.widgetTitleSelectedMidStrength, 0, 1),
+    widgetTitleSelectedEdgeStrength: normalizedFiniteNumber(hasWidgetTitleSelectedSoftness ? (source.widgetTitleSelectedEdgeStrength ?? source.widgetTitleEdgeStrength) : undefined, fallback.widgetTitleSelectedEdgeStrength, 0, 1),
+    widgetTitleSelectedSoftness: normalizedFiniteNumber(source.widgetTitleSelectedSoftness ?? source.widgetTitleSoftness, fallback.widgetTitleSelectedSoftness, 0, 1),
+    widgetTitleSelectedPadX: normalizedFiniteNumber(source.widgetTitleSelectedPadX ?? source.widgetTitlePadX, fallback.widgetTitleSelectedPadX, -48, 64),
+    widgetTitleSelectedPadY: normalizedFiniteNumber(source.widgetTitleSelectedPadY ?? source.widgetTitlePadY, fallback.widgetTitleSelectedPadY, -32, 40),
+    widgetTitleSelectedShiftX: normalizedFiniteNumber(source.widgetTitleSelectedShiftX ?? source.widgetTitleShiftX, fallback.widgetTitleSelectedShiftX, -80, 80),
+    widgetTitleSelectedShiftY: normalizedFiniteNumber(source.widgetTitleSelectedShiftY ?? source.widgetTitleShiftY, fallback.widgetTitleSelectedShiftY, -48, 48),
+    widgetTitleSelectedRadius: normalizedFiniteNumber(source.widgetTitleSelectedRadius ?? source.widgetTitleRadius, fallback.widgetTitleSelectedRadius, 0, 56),
+    widgetTitleSelectedMidAlpha: normalizedFiniteNumber(source.widgetTitleSelectedMidAlpha, fallback.widgetTitleSelectedMidAlpha, 0, 1),
+    widgetTitleSelectedSoftAlpha: normalizedFiniteNumber(source.widgetTitleSelectedSoftAlpha, fallback.widgetTitleSelectedSoftAlpha, 0, 1),
+    widgetTitleSelectedTopAlpha: normalizedFiniteNumber(source.widgetTitleSelectedTopAlpha, fallback.widgetTitleSelectedTopAlpha, 0, 1),
+    widgetTitleSelectedVerticalMidAlpha: normalizedFiniteNumber(source.widgetTitleSelectedVerticalMidAlpha, fallback.widgetTitleSelectedVerticalMidAlpha, 0, 1),
+    widgetTitleSelectedBottomAlpha: normalizedFiniteNumber(source.widgetTitleSelectedBottomAlpha, fallback.widgetTitleSelectedBottomAlpha, 0, 1),
+    widgetTitleIdleColor: normalizedHexColor(source.widgetTitleIdleColor, fallback.widgetTitleIdleColor),
+    widgetTitleIdleAlpha: normalizedFiniteNumber(source.widgetTitleIdleAlpha, fallback.widgetTitleIdleAlpha, 0, 1),
+    widgetTitleIdleMidAlpha: normalizedFiniteNumber(source.widgetTitleIdleMidAlpha, fallback.widgetTitleIdleMidAlpha, 0, 1),
+    widgetTitleIdleSoftAlpha: normalizedFiniteNumber(source.widgetTitleIdleSoftAlpha, fallback.widgetTitleIdleSoftAlpha, 0, 1),
+    widgetTitleIdleTopAlpha: normalizedFiniteNumber(source.widgetTitleIdleTopAlpha, fallback.widgetTitleIdleTopAlpha, 0, 1),
+    widgetTitleIdleVerticalMidAlpha: normalizedFiniteNumber(source.widgetTitleIdleVerticalMidAlpha, fallback.widgetTitleIdleVerticalMidAlpha, 0, 1),
+    widgetTitleIdleBottomAlpha: normalizedFiniteNumber(source.widgetTitleIdleBottomAlpha, fallback.widgetTitleIdleBottomAlpha, 0, 1),
+    widgetTitleWidth: normalizedFiniteNumber(source.widgetTitleWidth, fallback.widgetTitleWidth, 16, 180),
+    widgetTitlePadX: normalizedFiniteNumber(source.widgetTitlePadX, fallback.widgetTitlePadX, -48, 64),
+    widgetTitlePadY: normalizedFiniteNumber(source.widgetTitlePadY, fallback.widgetTitlePadY, -32, 40),
+    widgetTitleShiftX: normalizedFiniteNumber(source.widgetTitleShiftX, fallback.widgetTitleShiftX, -80, 80),
+    widgetTitleShiftY: normalizedFiniteNumber(source.widgetTitleShiftY, fallback.widgetTitleShiftY, -48, 48),
+    widgetTitleRadius: normalizedFiniteNumber(source.widgetTitleRadius, fallback.widgetTitleRadius, 0, 56),
+    widgetTitleFullWidth: true,
+    widgetTitleMidStop: normalizedFiniteNumber(source.widgetTitleMidStop, fallback.widgetTitleMidStop, 0, 100),
+    widgetTitleSoftStop: normalizedFiniteNumber(source.widgetTitleSoftStop, fallback.widgetTitleSoftStop, 0, 120),
+    widgetTitleFadeStop: normalizedFiniteNumber(source.widgetTitleFadeStop, fallback.widgetTitleFadeStop, 0, 160),
+    widgetTitleVerticalMidStop: normalizedFiniteNumber(source.widgetTitleVerticalMidStop, fallback.widgetTitleVerticalMidStop, 0, 100),
+    widgetTitleVerticalSoftStop: normalizedFiniteNumber(source.widgetTitleVerticalSoftStop, fallback.widgetTitleVerticalSoftStop, 0, 120),
+    widgetTitleVerticalFadeStop: normalizedFiniteNumber(source.widgetTitleVerticalFadeStop, fallback.widgetTitleVerticalFadeStop, 0, 140),
+    widgetTitleIdleInsetAlpha: normalizedFiniteNumber(source.widgetTitleIdleInsetAlpha, fallback.widgetTitleIdleInsetAlpha, 0, 1),
+    widgetTitleSelectedInsetAlpha: normalizedFiniteNumber(source.widgetTitleSelectedInsetAlpha, fallback.widgetTitleSelectedInsetAlpha, 0, 1),
+    widgetTitleInsetWidth: normalizedFiniteNumber(source.widgetTitleInsetWidth, fallback.widgetTitleInsetWidth, 0, 4),
+    widgetTitleSelectedGlowAlpha: normalizedFiniteNumber(source.widgetTitleSelectedGlowAlpha, fallback.widgetTitleSelectedGlowAlpha, 0, 1),
+    terminalTextContrast: normalizedFiniteNumber(source.terminalTextContrast, fallback.terminalTextContrast, 0.25, 1.6),
+    terminalDimOpacity: normalizedFiniteNumber(source.terminalDimOpacity, fallback.terminalDimOpacity, 0.1, 1),
+    terminalPaneBgAlpha: normalizedFiniteNumber(source.terminalPaneBgAlpha, fallback.terminalPaneBgAlpha, 0, 0.6),
+    terminalPaneIdleBgAlpha: normalizedFiniteNumber(source.terminalPaneIdleBgAlpha ?? source.terminalPaneBgAlpha, fallback.terminalPaneIdleBgAlpha, 0, 0.8),
+    terminalPaneIdleBgColor: normalizedHexColor(source.terminalPaneIdleBgColor, fallback.terminalPaneIdleBgColor),
+    terminalPaneSelectedBgAlpha: normalizedFiniteNumber(source.terminalPaneSelectedBgAlpha, fallback.terminalPaneSelectedBgAlpha, 0, 0.8),
+    terminalPaneSelectedBgColor: normalizedHexColor(source.terminalPaneSelectedBgColor, fallback.terminalPaneSelectedBgColor),
+    terminalPaneOutlineAlpha: normalizedFiniteNumber(source.terminalPaneOutlineAlpha, fallback.terminalPaneOutlineAlpha, 0, 0.8),
+    editorPaneIdleBgAlpha: normalizedFiniteNumber(source.editorPaneIdleBgAlpha, fallback.editorPaneIdleBgAlpha, 0, 0.8),
+    editorPaneIdleBgColor: normalizedHexColor(source.editorPaneIdleBgColor, fallback.editorPaneIdleBgColor),
+    editorPaneSelectedBgAlpha: normalizedFiniteNumber(source.editorPaneSelectedBgAlpha, fallback.editorPaneSelectedBgAlpha, 0, 0.8),
+    editorPaneSelectedBgColor: normalizedHexColor(source.editorPaneSelectedBgColor, fallback.editorPaneSelectedBgColor),
+    terminalHostBgAlpha: normalizedFiniteNumber(source.terminalHostBgAlpha, fallback.terminalHostBgAlpha, 0, 0.8),
+    terminalTabbarBgAlpha: normalizedFiniteNumber(source.terminalTabbarBgAlpha, fallback.terminalTabbarBgAlpha, 0, 0.8),
+    terminalTypePadBgAlpha: normalizedFiniteNumber(source.terminalTypePadBgAlpha, fallback.terminalTypePadBgAlpha, 0, 0.8),
+    terminalInputBgAlpha: normalizedFiniteNumber(source.terminalInputBgAlpha, fallback.terminalInputBgAlpha, 0, 0.8),
+    terminalNewTabBgAlpha: normalizedFiniteNumber(source.terminalNewTabBgAlpha, fallback.terminalNewTabBgAlpha, 0, 0.8),
+    terminalNewTabBgColor: normalizedHexColor(source.terminalNewTabBgColor, fallback.terminalNewTabBgColor),
+    terminalNewTabOutlineAlpha: normalizedFiniteNumber(source.terminalNewTabOutlineAlpha, fallback.terminalNewTabOutlineAlpha, 0, 0.8),
+    terminalNewTabOutlineColor: normalizedHexColor(source.terminalNewTabOutlineColor, fallback.terminalNewTabOutlineColor),
+    terminalNewTabHoverAlpha: normalizedFiniteNumber(source.terminalNewTabHoverAlpha, fallback.terminalNewTabHoverAlpha, 0, 0.8),
+    terminalNewTabHoverColor: normalizedHexColor(source.terminalNewTabHoverColor, fallback.terminalNewTabHoverColor),
+    terminalTypePadButtonBgAlpha: normalizedFiniteNumber(source.terminalTypePadButtonBgAlpha, fallback.terminalTypePadButtonBgAlpha, 0, 0.8),
+    terminalTypePadButtonBgColor: normalizedHexColor(source.terminalTypePadButtonBgColor, fallback.terminalTypePadButtonBgColor),
+    terminalTypePadButtonOutlineAlpha: normalizedFiniteNumber(source.terminalTypePadButtonOutlineAlpha, fallback.terminalTypePadButtonOutlineAlpha, 0, 0.8),
+    terminalTypePadButtonOutlineColor: normalizedHexColor(source.terminalTypePadButtonOutlineColor, fallback.terminalTypePadButtonOutlineColor),
+    terminalTypePadButtonHoverAlpha: normalizedFiniteNumber(source.terminalTypePadButtonHoverAlpha, fallback.terminalTypePadButtonHoverAlpha, 0, 0.8),
+    terminalTypePadButtonHoverColor: normalizedHexColor(source.terminalTypePadButtonHoverColor, fallback.terminalTypePadButtonHoverColor),
+    terminalTypePadButtonDisabledAlpha: normalizedFiniteNumber(source.terminalTypePadButtonDisabledAlpha, fallback.terminalTypePadButtonDisabledAlpha, 0, 1),
+    terminalScrollbarThumbAlpha: normalizedFiniteNumber(source.terminalScrollbarThumbAlpha, fallback.terminalScrollbarThumbAlpha, 0, 1),
+    terminalScrollbarThumbHoverAlpha: normalizedFiniteNumber(source.terminalScrollbarThumbHoverAlpha, fallback.terminalScrollbarThumbHoverAlpha, 0, 1),
+    terminalScrollbarTrackAlpha: normalizedFiniteNumber(source.terminalScrollbarTrackAlpha, fallback.terminalScrollbarTrackAlpha, 0, 1),
+    terminalScrollbarWidth: normalizedFiniteNumber(source.terminalScrollbarWidth, fallback.terminalScrollbarWidth, 4, 18),
+    explorerHorizontalScrollbarBottomGap: normalizedFiniteNumber(source.explorerHorizontalScrollbarBottomGap, fallback.explorerHorizontalScrollbarBottomGap, 0, 28),
+    terminalHostOutlineAlpha: normalizedFiniteNumber(source.terminalHostOutlineAlpha, fallback.terminalHostOutlineAlpha, 0, 0.8),
+    terminalSplitResizerAlpha: normalizedFiniteNumber(source.terminalSplitResizerAlpha, fallback.terminalSplitResizerAlpha, 0, 0.8),
+    explorerRowsRadius: normalizedExplorerRowsRadius,
+    explorerHoverColor: normalizedHexColor(source.explorerHoverColor, fallback.explorerHoverColor),
+    explorerHoverAlpha: normalizedFiniteNumber(source.explorerHoverAlpha, fallback.explorerHoverAlpha, 0, 0.7),
+    explorerActiveAlpha: normalizedFiniteNumber(source.explorerActiveAlpha, fallback.explorerActiveAlpha, 0, 0.7),
+    explorerSelectedRailColor: normalizedHexColor(source.explorerSelectedRailColor, fallback.explorerSelectedRailColor),
+    explorerSelectedRailAlpha: normalizedFiniteNumber(source.explorerSelectedRailAlpha, fallback.explorerSelectedRailAlpha, 0, 1),
+    explorerSelectedRailWidth: normalizedFiniteNumber(source.explorerSelectedRailWidth, fallback.explorerSelectedRailWidth, 0, 8),
+    diagnostics: source.diagnostics === true
+  };
+}
+
+function commonGlassEffectSettings() {
+  return normalizeWorkspaceGlassEffectSettings(state.ideSettings.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS);
+}
+
+function effectiveAppGlassEffectSettings(scope = '') {
+  const appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  const common = commonGlassEffectSettings();
+  if (scope === 'titlebar') return appGlass.titlebarUseCustomEffect ? appGlass.titlebarEffect : common;
+  if (scope === 'window-controls') return appGlass.windowControlsUseCustomEffect ? appGlass.windowControlsEffect : common;
+  if (scope === 'profile-actions') return appGlass.profileActionsUseCustomEffect ? appGlass.profileActionsEffect : common;
+  if (scope === 'terminal-widgets') return appGlass.terminalWidgetsUseCustomEffect ? appGlass.terminalWidgetsEffect : common;
+  if (scope === 'explorer-panel') return appGlass.explorerPanelUseCustomEffect ? appGlass.explorerPanelEffect : common;
+  if (scope === 'editor-panel') return appGlass.editorPanelUseCustomEffect ? appGlass.editorPanelEffect : common;
+  if (scope === 'image-panel') return appGlass.imagePanelUseCustomEffect ? appGlass.imagePanelEffect : common;
+  if (scope === 'browser-panel') return appGlass.browserPanelUseCustomEffect ? appGlass.browserPanelEffect : common;
+  if (scope === 'notes-panel') return appGlass.notesPanelUseCustomEffect ? appGlass.notesPanelEffect : common;
+  if (scope === 'snippets-panel') return appGlass.snippetsPanelUseCustomEffect ? appGlass.snippetsPanelEffect : common;
+  if (scope === 'calculator-panel') return appGlass.calculatorPanelUseCustomEffect ? appGlass.calculatorPanelEffect : common;
+  if (scope === 'floating-panels') return appGlass.floatingPanelsUseCustomEffect ? appGlass.floatingPanelsEffect : common;
+  if (scope === 'notes-snippets') return appGlass.notesSnippetsUseCustomEffect ? appGlass.notesSnippetsEffect : common;
+  if (scope === 'settings-panel') return appGlass.settingsPanelUseCustomEffect ? appGlass.settingsPanelEffect : common;
+  if (scope === 'explorer-rows') return appGlass.explorerRowsUseCustomEffect ? appGlass.explorerRowsEffect : common;
+  return appGlass.useCustomEffect
+    ? appGlass.effect
+    : common;
+}
+
+function effectiveAppGlassChromeSettings(scope: AppGlassChromeScope): AppGlassChromeSettings {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  const common = glass.chrome;
+  if (scope === 'terminal') return glass.terminalChromeUseCustom ? glass.terminalChrome : common;
+  if (scope === 'settings') return glass.settingsChromeUseCustom ? glass.settingsChrome : common;
+  if (scope === 'profile') return glass.profileChromeUseCustom ? glass.profileChrome : common;
+  if (scope === 'explorer') return glass.explorerChromeUseCustom ? glass.explorerChrome : common;
+  if (scope === 'editor') return glass.editorChromeUseCustom ? glass.editorChrome : common;
+  if (scope === 'image') return glass.imageChromeUseCustom ? glass.imageChrome : common;
+  if (scope === 'browser') return glass.browserChromeUseCustom ? glass.browserChrome : common;
+  if (scope === 'notes') return glass.notesChromeUseCustom ? glass.notesChrome : common;
+  if (scope === 'snippets') return glass.snippetsChromeUseCustom ? glass.snippetsChrome : common;
+  return common;
+}
+
+function anyAppGlassMaterialShadowEnabled() {
+  const scopes = [
+    'titlebar',
+    'window-controls',
+    'profile-actions',
+    'terminal-widgets',
+    'explorer-panel',
+    'editor-panel',
+    'image-panel',
+    'browser-panel',
+    'notes-panel',
+    'snippets-panel',
+    'calculator-panel',
+    'settings-panel',
+    'explorer-rows'
+  ];
+  return scopes.some((scope) => effectiveAppGlassEffectSettings(scope).shadow === true);
+}
+
+function effectiveWorkspaceGlassEffectSettings(enabledFallback = state.ideSettings.workspaceSideDockGlass === true) {
+  const workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, enabledFallback);
+  return workspaceGlass.useCustomEffect
+    ? workspaceGlass.effect
+    : commonGlassEffectSettings();
+}
+
+function effectiveWorkspaceContainerGlassEffectSettings() {
+  const workspaceGlass = normalizeWorkspaceGlassSettings(
+    state.ideSettings.workspaceGlass,
+    state.ideSettings.workspaceSideDockGlass === true
+  );
+  const effect = workspaceGlass.containerUseCustomEffect
+    ? workspaceGlass.containerEffect
+    : commonGlassEffectSettings();
+  return {
+    ...effect,
+    tilt: false,
+    tiltFactor: 0
+  };
+}
+
 function normalizedDefaultIdeSettings(): IdeSettings {
   return {
     ...DEFAULT_IDE_SETTINGS,
+    ideBackground: cloneIdeBackgroundSettings(),
+    glassEffect: cloneGlassEffectSettings(),
+    workspaceGlass: cloneWorkspaceGlassSettings(),
+    appGlass: cloneAppGlassSettings(),
     extraMaskPatterns: [...DEFAULT_IDE_SETTINGS.extraMaskPatterns],
     widgetWrap: defaultWidgetWrapSettings()
   };
@@ -3212,6 +6128,30 @@ function terminalHistoryCacheMode(value: unknown): TerminalHistoryCacheMode {
 
 function workspaceMemorySaverMode(value: unknown): WorkspaceMemorySaverMode {
   return value === 'off' || value === 'aggressive' ? value : 'balanced';
+}
+
+function agentEventClaudeHookMode(value: unknown): AgentEventClaudeHookMode {
+  return value === 'auto' || value === 'off' ? value : 'ask';
+}
+
+function agentEventGrokHookMode(value: unknown): AgentEventGrokHookMode {
+  return value === 'auto' || value === 'off' ? value : 'ask';
+}
+
+function normalizeLlmTmuxEnvPassthrough(value: unknown) {
+  return safeLlmEnvPassthroughNames(String(value ?? DEFAULT_IDE_SETTINGS.llmTmuxEnvPassthrough)).join(', ');
+}
+
+function safeLlmEnvPassthroughNames(value: string | null | undefined) {
+  const names: string[] = [];
+  for (const item of String(value ?? '').split(/[\s,;]+/)) {
+    const name = item.trim();
+    if (!name) continue;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+    if (LLM_TMUX_ENV_DANGEROUS_PATTERN.test(name)) continue;
+    if (!names.includes(name)) names.push(name);
+  }
+  return names;
 }
 
 function workspaceDockPosition(value: unknown): WorkspaceDockPosition {
@@ -3261,6 +6201,12 @@ function widgetWrapState(target: WidgetWrapTargetId): WidgetWrapState {
 function loadIdeSettings() {
   try {
     const parsed = JSON.parse(localStorage.getItem(IDE_SETTINGS_KEY) ?? '') as Partial<IdeSettings>;
+    const workspaceGlass = normalizeWorkspaceGlassSettings(parsed.workspaceGlass, parsed.workspaceSideDockGlass === true);
+    const fallbackCommonEffect = isPlainRecord(parsed.glassEffect)
+      ? DEFAULT_COMMON_GLASS_EFFECT_SETTINGS
+      : isPlainRecord(parsed.appGlass) && isPlainRecord(parsed.appGlass.effect)
+        ? normalizeWorkspaceGlassEffectSettings(parsed.appGlass.effect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS)
+        : DEFAULT_COMMON_GLASS_EFFECT_SETTINGS;
     state.ideSettings = {
       ...DEFAULT_IDE_SETTINGS,
       ...parsed,
@@ -3272,16 +6218,28 @@ function loadIdeSettings() {
       workspaceDockPosition: workspaceDockPosition(parsed.workspaceDockPosition),
       workspaceDockSize: normalizeWorkspaceDockSize(parsed.workspaceDockSize),
       workspaceDockDetailOpen: parsed.workspaceDockDetailOpen === true,
+      workspaceDockDetailShowActivity: parsed.workspaceDockDetailShowActivity !== false,
+      workspaceDockDetailShowMeta: parsed.workspaceDockDetailShowMeta !== false,
+      workspaceDockDetailHideProtectedExtra: parsed.workspaceDockDetailHideProtectedExtra !== false,
       workspaceFocusBorder: parsed.workspaceFocusBorder !== false,
       workspaceFocusTitle: parsed.workspaceFocusTitle === true,
+      workspaceSideDockGlass: workspaceGlass.enabled,
+      ideBackground: normalizeIdeBackgroundSettings(parsed.ideBackground),
+      glassEffect: normalizeWorkspaceGlassEffectSettings(parsed.glassEffect, fallbackCommonEffect),
+      workspaceGlass,
+      appGlass: normalizeAppGlassSettings(parsed.appGlass),
       agentNotificationBanners: parsed.agentNotificationBanners === true,
       agentAlertSound: parsed.agentAlertSound === true,
+      agentEventClaudeHooks: agentEventClaudeHookMode(parsed.agentEventClaudeHooks),
+      agentEventGrokHooks: agentEventGrokHookMode(parsed.agentEventGrokHooks),
+      llmTmuxEnvPassthrough: normalizeLlmTmuxEnvPassthrough(parsed.llmTmuxEnvPassthrough),
+      debugLogEnabled: parsed.debugLogEnabled === true,
       widgetRadius: normalizeWidgetRadius(parsed.widgetRadius),
       widgetFocusBorder: parsed.widgetFocusBorder !== false,
       widgetFocusTitle: parsed.widgetFocusTitle === true,
       extraMaskPatterns: Array.isArray(parsed.extraMaskPatterns)
         ? parsed.extraMaskPatterns.map(String).filter(Boolean)
-        : DEFAULT_IDE_SETTINGS.extraMaskPatterns,
+        : [...DEFAULT_IDE_SETTINGS.extraMaskPatterns],
       widgetWrap: normalizeWidgetWrapSettings(parsed.widgetWrap)
     };
   } catch {
@@ -3291,7 +6249,19 @@ function loadIdeSettings() {
 }
 
 function persistIdeSettings() {
+  state.ideSettings.ideBackground = normalizeIdeBackgroundSettings(state.ideSettings.ideBackground);
+  state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  state.ideSettings.appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  state.ideSettings.workspaceSideDockGlass = state.ideSettings.workspaceGlass.enabled;
   localStorage.setItem(IDE_SETTINGS_KEY, JSON.stringify(state.ideSettings));
+}
+
+function schedulePersistIdeSettings(delayMs = 300) {
+  if (glassSettingsPersistTimer) window.clearTimeout(glassSettingsPersistTimer);
+  glassSettingsPersistTimer = window.setTimeout(() => {
+    glassSettingsPersistTimer = 0;
+    persistIdeSettings();
+  }, delayMs);
 }
 
 function renderSettings() {
@@ -3302,11 +6272,21 @@ function renderSettings() {
   renderChoiceOptions(el.settingsTerminalHistoryCache, TERMINAL_HISTORY_CACHE_CHOICES, state.ideSettings.terminalHistoryCache);
   renderChoiceOptions(el.settingsMemorySaver, WORKSPACE_MEMORY_SAVER_CHOICES, state.ideSettings.memorySaver);
   renderChoiceOptions(el.settingsWorkspaceDockPosition, WORKSPACE_DOCK_POSITION_CHOICES, workspaceDockPosition(state.ideSettings.workspaceDockPosition));
+  renderChoiceOptions(el.settingsClaudeHookMode, AGENT_EVENT_CLAUDE_HOOK_CHOICES, agentEventClaudeHookMode(state.ideSettings.agentEventClaudeHooks));
+  renderChoiceOptions(el.settingsGrokHookMode, AGENT_EVENT_GROK_HOOK_CHOICES, agentEventGrokHookMode(state.ideSettings.agentEventGrokHooks));
   syncWorkspaceDockSettingsForm();
+  setCheckedIfChanged(el.settingsWorkspaceDetailActivity, state.ideSettings.workspaceDockDetailShowActivity !== false);
+  setCheckedIfChanged(el.settingsWorkspaceDetailMeta, state.ideSettings.workspaceDockDetailShowMeta !== false);
+  setCheckedIfChanged(el.settingsWorkspaceDetailHideProtected, state.ideSettings.workspaceDockDetailHideProtectedExtra !== false);
   setCheckedIfChanged(el.settingsWorkspaceFocusBorder, state.ideSettings.workspaceFocusBorder !== false);
   setCheckedIfChanged(el.settingsWorkspaceFocusTitle, state.ideSettings.workspaceFocusTitle === true);
+  setCheckedIfChanged(el.settingsAppGlassEnabled, state.ideSettings.appGlass?.enabled === true);
   setCheckedIfChanged(el.settingsAgentNotificationBanners, state.ideSettings.agentNotificationBanners === true);
   setCheckedIfChanged(el.settingsAgentAlertSound, state.ideSettings.agentAlertSound === true);
+  setCheckedIfChanged(el.settingsDebugLogEnabled, state.ideSettings.debugLogEnabled === true);
+  renderDiagnosticLogStatus();
+  const envPassthrough = normalizeLlmTmuxEnvPassthrough(state.ideSettings.llmTmuxEnvPassthrough);
+  if (el.settingsLlmTmuxEnvPassthrough.value !== envPassthrough) el.settingsLlmTmuxEnvPassthrough.value = envPassthrough;
   const scrollbackRows = normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows);
   if (el.settingsTerminalScrollback.value !== String(scrollbackRows)) el.settingsTerminalScrollback.value = String(scrollbackRows);
   const widgetRadius = normalizeWidgetRadius(state.ideSettings.widgetRadius);
@@ -3418,10 +6398,22 @@ function saveSettingsFromForm() {
     workspaceDockPosition: workspaceDockPosition(el.settingsWorkspaceDockPosition.value),
     workspaceDockSize: normalizeWorkspaceDockSize(el.settingsWorkspaceDockSize.value),
     workspaceDockDetailOpen: el.settingsWorkspaceDockDetail.checked,
+    workspaceDockDetailShowActivity: el.settingsWorkspaceDetailActivity.checked,
+    workspaceDockDetailShowMeta: el.settingsWorkspaceDetailMeta.checked,
+    workspaceDockDetailHideProtectedExtra: el.settingsWorkspaceDetailHideProtected.checked,
     workspaceFocusBorder: el.settingsWorkspaceFocusBorder.checked,
     workspaceFocusTitle: el.settingsWorkspaceFocusTitle.checked,
+    workspaceSideDockGlass: state.ideSettings.workspaceGlass?.enabled === true,
+    ideBackground: normalizeIdeBackgroundSettings(state.ideSettings.ideBackground),
+    glassEffect: normalizeWorkspaceGlassEffectSettings(state.ideSettings.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS),
+    workspaceGlass: normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true),
+    appGlass: normalizeAppGlassSettings({ ...state.ideSettings.appGlass, enabled: el.settingsAppGlassEnabled.checked }),
     agentNotificationBanners: el.settingsAgentNotificationBanners.checked,
     agentAlertSound: el.settingsAgentAlertSound.checked,
+    agentEventClaudeHooks: agentEventClaudeHookMode(el.settingsClaudeHookMode.value),
+    agentEventGrokHooks: agentEventGrokHookMode(el.settingsGrokHookMode.value),
+    llmTmuxEnvPassthrough: normalizeLlmTmuxEnvPassthrough(el.settingsLlmTmuxEnvPassthrough.value),
+    debugLogEnabled: el.settingsDebugLogEnabled.checked,
     widgetRadius: normalizeWidgetRadius(el.settingsWidgetRadius.value),
     widgetFocusBorder: el.settingsWidgetFocusBorder.checked,
     widgetFocusTitle: el.settingsWidgetFocusTitle.checked,
@@ -3432,7 +6424,9 @@ function saveSettingsFromForm() {
   applyIdeSettings();
   scheduleWorkspaceDockLayoutRefresh();
   renderSettings();
-  if (state.ideSettings.agentNotificationBanners) void ensureAgentNotificationPermission();
+  if (state.ideSettings.agentNotificationBanners && AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS) {
+    void ensureAgentNotificationPermission();
+  }
   setStatus('Settings saved');
 }
 
@@ -3456,7 +6450,19 @@ function updateWorkspaceDockSettingsFromForm(options: { persist?: boolean } = {}
   state.ideSettings.workspaceDockDetailOpen = nextDetailOpen;
   applyWorkspaceDockSettings();
   syncWorkspaceDockSettingsForm();
+  if (!el.glassSettingsPopover.classList.contains('hidden')) syncGlassSettingsPopover();
   renderWorkspaceTabs();
+  if (options.persist) persistIdeSettings();
+}
+
+function updateWorkspaceDetailContentSettingsFromForm(options: { persist?: boolean } = {}) {
+  state.ideSettings.workspaceDockDetailShowActivity = el.settingsWorkspaceDetailActivity.checked;
+  state.ideSettings.workspaceDockDetailShowMeta = el.settingsWorkspaceDetailMeta.checked;
+  state.ideSettings.workspaceDockDetailHideProtectedExtra = el.settingsWorkspaceDetailHideProtected.checked;
+  workspaceTabsRenderSignature = '\0';
+  workspaceDockDetailRenderSignature = '\0';
+  renderWorkspaceTabs();
+  renderWorkspaceDockDetail();
   if (options.persist) persistIdeSettings();
 }
 
@@ -3467,19 +6473,4745 @@ function updateWorkspaceFocusSettingsFromForm(options: { persist?: boolean } = {
   if (options.persist) persistIdeSettings();
 }
 
+function updateAppGlassThemeSettingsFromForm(options: { persist?: boolean } = {}) {
+  state.ideSettings.appGlass = normalizeAppGlassSettings({
+    ...state.ideSettings.appGlass,
+    enabled: el.settingsAppGlassEnabled.checked
+  });
+  applyAppGlassSettings();
+  applyWorkspaceGlassSettings();
+  applyWorkspaceDockSettings();
+  syncGlassSettingsPopover();
+  if (options.persist) persistIdeSettings();
+}
+
 function updateAgentAlertSettingsFromForm(options: { persist?: boolean } = {}) {
   state.ideSettings.agentNotificationBanners = el.settingsAgentNotificationBanners.checked;
   state.ideSettings.agentAlertSound = el.settingsAgentAlertSound.checked;
   if (options.persist) persistIdeSettings();
-  if (state.ideSettings.agentNotificationBanners) {
+  if (state.ideSettings.agentNotificationBanners && AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS) {
     void ensureAgentNotificationPermission().then((granted) => {
       if (granted || !state.ideSettings.agentNotificationBanners) return;
-      state.ideSettings.agentNotificationBanners = false;
-      setCheckedIfChanged(el.settingsAgentNotificationBanners, false);
-      persistIdeSettings();
-      setStatus('Windows notification permission was not granted', true);
+      appendAgentAlertDebugLog('frontend notification permission was not granted; native banner fallback remains enabled', 'warn');
+      setStatus('Frontend notification permission was not granted; native banner fallback remains enabled', true);
     });
   }
+}
+
+function updateAgentEventBridgeSettingsFromForm(options: { persist?: boolean } = {}) {
+  state.ideSettings.agentEventClaudeHooks = agentEventClaudeHookMode(el.settingsClaudeHookMode.value);
+  state.ideSettings.agentEventGrokHooks = agentEventGrokHookMode(el.settingsGrokHookMode.value);
+  state.ideSettings.llmTmuxEnvPassthrough = normalizeLlmTmuxEnvPassthrough(el.settingsLlmTmuxEnvPassthrough.value);
+  if (el.settingsLlmTmuxEnvPassthrough.value !== state.ideSettings.llmTmuxEnvPassthrough) {
+    el.settingsLlmTmuxEnvPassthrough.value = state.ideSettings.llmTmuxEnvPassthrough;
+  }
+  if (options.persist) persistIdeSettings();
+}
+
+function updateDiagnosticLogSettingsFromForm(options: { persist?: boolean } = {}) {
+  const enabled = el.settingsDebugLogEnabled.checked;
+  const changed = state.ideSettings.debugLogEnabled !== enabled;
+  state.ideSettings.debugLogEnabled = enabled;
+  if (options.persist) persistIdeSettings();
+  if (changed) {
+    appendDiagnosticLog('diagnostics', enabled ? 'diagnostic log enabled' : 'diagnostic log disabled', 'info', { force: true });
+    syncTerminalTmuxFreezeProbes();
+  } else {
+    renderDiagnosticLogStatus();
+  }
+}
+
+function hexToRgb(hex: string) {
+  const value = normalizedHexColor(hex, '#000000').slice(1);
+  return {
+    r: Number.parseInt(value.slice(0, 2), 16),
+    g: Number.parseInt(value.slice(2, 4), 16),
+    b: Number.parseInt(value.slice(4, 6), 16)
+  };
+}
+
+function rgbaFromHex(hex: string, alpha: number) {
+  const rgb = hexToRgb(hex);
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${clamp(alpha, 0, 1).toFixed(3)})`;
+}
+
+function cssPercent(value: number, min: number, max: number) {
+  return `${Number(clamp(value, min, max).toFixed(2))}%`;
+}
+
+function widgetTitleHighlightGradient(options: {
+  color: string;
+  alpha: number;
+  sizeX: number;
+  sizeY: number;
+  originX: number;
+  originY: number;
+  midStrength: number;
+  edgeStrength: number;
+  softness: number;
+}) {
+  const softness = clamp(options.softness, 0, 1);
+  const nearStop = 10 + (softness * 34);
+  const midStop = 34 + (softness * 32);
+  const edgeStop = 72 + (softness * 42);
+  const fadeStop = 112 + (softness * 68);
+  const nearStrength = 0.72 - (softness * 0.18);
+  return `radial-gradient(ellipse ${cssPercent(options.sizeX, 5, 260)} ${cssPercent(options.sizeY, 5, 260)} at ${cssPercent(options.originX, -30, 130)} ${cssPercent(options.originY, -30, 130)}, ${rgbaFromHex(options.color, options.alpha)} 0%, ${rgbaFromHex(options.color, options.alpha * nearStrength)} ${cssPercent(nearStop, 0, 220)}, ${rgbaFromHex(options.color, options.alpha * options.midStrength)} ${cssPercent(midStop, 0, 220)}, ${rgbaFromHex(options.color, options.alpha * options.edgeStrength)} ${cssPercent(edgeStop, 0, 220)}, transparent ${cssPercent(fadeStop, 0, 220)})`;
+}
+
+function colorWithAlphaCss(hex: string, alpha: number) {
+  return rgbaFromHex(hex, alpha).replace(/\.?0+\)/, ')');
+}
+
+function applyIdeBackgroundPresetToSettings(preset: IdeBackgroundPreset) {
+  state.ideSettings.ideBackground = normalizeIdeBackgroundSettings(state.ideSettings.ideBackground);
+  const current = state.ideSettings.ideBackground;
+  current.preset = preset;
+  if (preset === 'custom') return;
+  const presetValues = IDE_BACKGROUND_PRESETS[preset];
+  if (!presetValues) return;
+  state.ideSettings.ideBackground = normalizeIdeBackgroundSettings({
+    ...current,
+    ...presetValues,
+    preset,
+    lightA: presetValues.lightA ?? current.lightA,
+    lightB: presetValues.lightB ?? current.lightB,
+    lightC: presetValues.lightC ?? current.lightC
+  });
+}
+
+function applyIdeBackgroundSettings() {
+  const background = normalizeIdeBackgroundSettings(state.ideSettings.ideBackground);
+  state.ideSettings.ideBackground = background;
+  const backgroundEnabled = background.enabled !== false;
+  const imageSource = backgroundEnabled ? ideBackgroundWallpaperSource(background) : '';
+  const proceduralBackgroundCss = [
+    `radial-gradient(circle at ${background.lightA.x}% ${background.lightA.y}%, ${rgbaFromHex(background.lightA.color, background.lightA.alpha)}, transparent ${background.lightA.size}%)`,
+    `radial-gradient(circle at ${background.lightB.x}% ${background.lightB.y}%, ${rgbaFromHex(background.lightB.color, background.lightB.alpha)}, transparent ${background.lightB.size}%)`,
+    `radial-gradient(circle at ${background.lightC.x}% ${background.lightC.y}%, ${rgbaFromHex(background.lightC.color, background.lightC.alpha)}, transparent ${background.lightC.size}%)`,
+    `linear-gradient(135deg, ${background.base} 0%, ${background.accentA} 48%, ${background.accentB} 100%)`
+  ].join(', ');
+  const fallbackBackgroundCss = '#080b10';
+  const backgroundCss = backgroundEnabled ? (imageSource ? '#05070b' : proceduralBackgroundCss) : fallbackBackgroundCss;
+  el.ideBackgroundLayer.style.background = backgroundEnabled ? backgroundCss : 'transparent';
+  el.ideGlassSnapshotStage.style.background = backgroundCss;
+  el.ideGlassContainerSnapshotStage.style.background = backgroundCss;
+  const noiseOpacity = backgroundEnabled && background.noiseEnabled ? background.noiseOpacity : 0;
+  const noiseTintAlpha = background.noiseTintAlpha > 0
+    ? background.noiseTintAlpha
+    : Math.max(0.02, background.noiseContrast * 0.28);
+  const noiseDotSize = 0.35 + background.noiseContrast * 1.55;
+  setRootStyleProperty('--ide-bg-grid-alpha', String(backgroundEnabled ? background.gridAlpha : 0));
+  setRootStyleProperty('--ide-bg-noise-opacity', String(noiseOpacity));
+  setRootStyleProperty('--ide-bg-noise-size', `${background.noiseSize}px`);
+  setRootStyleProperty('--ide-bg-noise-dot-size', `${noiseDotSize.toFixed(2)}px`);
+  setRootStyleProperty('--ide-bg-noise-rgba', rgbaFromHex(background.noiseTint, noiseTintAlpha));
+  setRootStyleProperty('--ide-bg-wallpaper-opacity', String(backgroundEnabled ? background.wallpaperOpacity : 0));
+  document.body.classList.toggle('ide-bg-settings-disabled', !backgroundEnabled);
+  document.body.classList.toggle('ide-bg-has-wallpaper', backgroundEnabled && Boolean(imageSource));
+  document.body.classList.toggle('ide-bg-fit-contain', backgroundEnabled && background.fit === 'contain');
+  document.body.classList.toggle('ide-bg-fit-stretch', backgroundEnabled && background.fit === 'stretch');
+  syncIdeBackgroundWallpaper(imageSource, background.fit);
+  const signature = [
+    backgroundEnabled ? '1' : '0',
+    backgroundCss,
+    imageSource,
+    background.fit,
+    background.wallpaperOpacity,
+    background.gridAlpha,
+    noiseOpacity,
+    background.noiseSize,
+    noiseDotSize.toFixed(2),
+    background.noiseTint,
+    noiseTintAlpha
+  ].join('\t');
+  if (ideBackgroundAppliedSignature !== signature) {
+    ideBackgroundAppliedSignature = signature;
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+  }
+}
+
+function ideBackgroundWallpaperSource(background: IdeBackgroundSettings) {
+  if (background.customImageSrc) return background.customImageSrc;
+  if (background.preset === 'custom' && background.customImageUrl) return background.customImageUrl;
+  if (background.preset === 'liquid') return IDE_BACKGROUND_LIQUID_IMAGES[0] ?? '';
+  return '';
+}
+
+function syncIdeBackgroundWallpaper(src: string, fit: IdeBackgroundFit) {
+  syncIdeBackgroundWallpaperElement(el.ideBackgroundLayer, src, fit);
+  syncIdeBackgroundWallpaperElement(el.ideGlassSnapshotStage, src, fit);
+  syncIdeBackgroundWallpaperElement(el.ideGlassContainerSnapshotStage, src, fit);
+  syncIdeBackgroundWallpaperElement(el.ideGlassExplorerSnapshotStage, src, fit);
+}
+
+function syncIdeBackgroundWallpaperElement(container: HTMLElement, src: string, fit: IdeBackgroundFit) {
+  let image = container.querySelector<HTMLImageElement>(':scope > .ide-background-wallpaper');
+  if (!src) {
+    image?.remove();
+    return;
+  }
+  if (!image) {
+    image = document.createElement('img');
+    image.className = 'ide-background-wallpaper';
+    image.alt = '';
+    image.decoding = 'async';
+    image.setAttribute('aria-hidden', 'true');
+    image.addEventListener('load', () => scheduleWorkspaceLiquidGlassRefresh({ recapture: true }));
+    image.addEventListener('error', () => scheduleWorkspaceLiquidGlassRefresh({ recapture: true }));
+    container.prepend(image);
+  }
+  image.classList.toggle('fit-contain', fit === 'contain');
+  image.classList.toggle('fit-stretch', fit === 'stretch');
+  if (/^https?:\/\//i.test(src)) image.crossOrigin = 'anonymous';
+  else image.removeAttribute('crossorigin');
+  if (image.getAttribute('src') !== src) image.src = src;
+}
+
+function applyWorkspaceGlassSettings() {
+  const glass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  const appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  const rowEffect = effectiveWorkspaceGlassEffectSettings(glass.enabled);
+  const containerEffect = effectiveWorkspaceContainerGlassEffectSettings();
+  const rowRadius = rowEffect.radius;
+  const containerRadius = containerEffect.radius;
+  state.ideSettings.workspaceGlass = glass;
+  state.ideSettings.workspaceSideDockGlass = glass.enabled;
+  const active = appGlassEnabled() && glass.enabled === true;
+  setRootStyleProperty('--workspace-glass-dock-padding', `${glass.dockPadding}px`);
+  setRootStyleProperty('--workspace-glass-dock-gap', `${glass.dockGap}px`);
+  setRootStyleProperty('--workspace-glass-dock-bg', `linear-gradient(180deg, rgba(10, 17, 30, ${glass.dockBgAlpha.toFixed(3)}), rgba(5, 9, 16, ${glass.dockBgAlpha.toFixed(3)}))`);
+  const dockSurfaceActive = glass.dockSurfaceOpacity > 0.001
+    && (glass.dockBgAlpha > 0.001 || glass.dockBlur > 0.001 || Math.abs(glass.dockSaturate - 1) > 0.001);
+  setRootStyleProperty('--workspace-glass-dock-surface-display', dockSurfaceActive ? 'block' : 'none');
+  setRootStyleProperty('--workspace-glass-dock-surface-opacity', String(glass.dockSurfaceOpacity));
+  setRootStyleProperty('--workspace-glass-dock-blur', `${glass.dockBlur}px`);
+  setRootStyleProperty('--workspace-glass-dock-saturate', String(glass.dockSaturate));
+  setRootStyleProperty('--workspace-glass-dock-side-border', rgbaFromHex('#1d2635', glass.dockSideBorderAlpha));
+  setRootStyleProperty('--workspace-glass-dock-outline', rgbaFromHex('#bee0ff', glass.dockOutlineAlpha));
+  setRootStyleProperty('--workspace-glass-dock-outline-inset', `${glass.dockOutlineInset}px`);
+  setRootStyleProperty('--workspace-glass-dock-shadow', `0 ${glass.dockShadowY}px ${glass.dockShadowBlur}px rgba(0, 0, 0, ${glass.dockShadowAlpha.toFixed(3)})`);
+  setRootStyleProperty('--workspace-glass-dock-header-opacity', String(glass.dockHeaderOpacity));
+  setRootStyleProperty('--workspace-glass-dock-pill-bg', rgbaFromHex('#ffffff', glass.dockPillAlpha));
+  setRootStyleProperty('--workspace-glass-container-radius', `${containerRadius}px`);
+  setRootStyleProperty('--workspace-glass-container-bg', rgbaFromHex('#ffffff', glass.containerGlassBgAlpha));
+  setRootStyleProperty('--workspace-glass-container-outline', rgbaFromHex(containerEffect.outlineColor, containerEffect.outlineAlpha));
+  setRootStyleProperty('--workspace-glass-container-inset', rgbaFromHex('#ffffff', containerEffect.specular ? 0.10 : 0));
+  setRootStyleProperty('--workspace-glass-row-radius', `${rowRadius}px`);
+  setRootStyleProperty('--workspace-glass-row-height', `${glass.rowHeight}px`);
+  setRootStyleProperty('--workspace-glass-row-pad-x', `${glass.rowPaddingX}px`);
+  setRootStyleProperty('--workspace-glass-row-pad-y', `${glass.rowPaddingY}px`);
+  setRootStyleProperty('--workspace-glass-row-gap', `${glass.rowGap}px`);
+  setRootStyleProperty('--workspace-glass-row-bg', rgbaFromHex('#ffffff', glass.rowBgAlpha));
+  setRootStyleProperty('--workspace-glass-row-shadow', `0 ${glass.rowShadowY}px ${glass.rowShadowBlur}px rgba(0, 0, 0, ${glass.rowShadowAlpha.toFixed(3)})`);
+  setRootStyleProperty('--workspace-glass-outline-width', `${rowEffect.outlineWidth}px`);
+  setRootStyleProperty('--workspace-glass-outline-soft-width', `${rowEffect.outlineSoftWidth}px`);
+  setRootStyleProperty('--workspace-glass-row-inset', rgbaFromHex('#ffffff', rowEffect.specular ? 0.10 : 0));
+  setRootStyleProperty('--workspace-glass-row-outline-inset', rgbaFromHex('#ffffff', rowEffect.specular ? 0.08 : 0));
+  setRootStyleProperty('--workspace-glass-row-active-inset', rgbaFromHex('#ffffff', rowEffect.specular ? 0.14 : 0));
+  setRootStyleProperty('--workspace-glass-row-selected-inset', rgbaFromHex('#ffffff', rowEffect.specular ? 0.18 : 0));
+  const activeOutlineAccent = glass.outlineUseStateColors ? glass.activeOutlineAccent : rowEffect.outlineColor;
+  const protectedOutlineAccent = glass.outlineUseStateColors ? glass.protectedOutlineAccent : rowEffect.outlineColor;
+  const captureOutlineAccent = glass.outlineUseStateColors ? glass.captureOutlineAccent : rowEffect.outlineColor;
+  setRootStyleProperty('--workspace-glass-outline', rgbaFromHex(rowEffect.outlineColor, rowEffect.outlineAlpha));
+  setRootStyleProperty('--workspace-glass-outline-soft', rgbaFromHex(rowEffect.outlineColor, rowEffect.outlineSoftAlpha));
+  setRootStyleProperty('--workspace-glass-active-outline', rgbaFromHex(activeOutlineAccent, rowEffect.outlineAlpha));
+  setRootStyleProperty('--workspace-glass-active-outline-soft', rgbaFromHex(activeOutlineAccent, rowEffect.outlineSoftAlpha));
+  setRootStyleProperty('--workspace-glass-protected-outline', rgbaFromHex(protectedOutlineAccent, rowEffect.outlineAlpha));
+  setRootStyleProperty('--workspace-glass-protected-outline-soft', rgbaFromHex(protectedOutlineAccent, rowEffect.outlineSoftAlpha));
+  setRootStyleProperty('--workspace-glass-capture-outline', rgbaFromHex(captureOutlineAccent, rowEffect.outlineAlpha));
+  setRootStyleProperty('--workspace-glass-capture-outline-soft', rgbaFromHex(captureOutlineAccent, rowEffect.outlineSoftAlpha));
+  setRootStyleProperty('--workspace-glass-active-accent', glass.activeAccent);
+  setRootStyleProperty('--workspace-glass-text', glass.textColor);
+  setRootStyleProperty('--workspace-glass-text-size', `${glass.textSize}em`);
+  setRootStyleProperty('--workspace-glass-text-weight', String(glass.textWeight));
+  setRootStyleProperty('--workspace-glass-text-blend', glass.textBlend);
+  setRootStyleProperty('--workspace-glass-font-scale', `${glass.fontScale}rem`);
+  setRootStyleProperty('--workspace-glass-header-color', glass.headerTextUseCustom ? glass.headerColor : appGlass.headerTextColor);
+  setRootStyleProperty('--workspace-glass-header-size', `${glass.headerTextUseCustom ? glass.headerSize : appGlass.headerTextSize}em`);
+  setRootStyleProperty('--workspace-glass-header-weight', String(glass.headerTextUseCustom ? glass.headerWeight : appGlass.headerTextWeight));
+  setRootStyleProperty('--workspace-glass-pill-color', glass.pillColor);
+  setRootStyleProperty('--workspace-glass-pill-size', `${glass.pillSize}em`);
+  setRootStyleProperty('--workspace-glass-icon', glass.iconColor);
+  setRootStyleProperty('--workspace-glass-icon-size', `${glass.iconSize}px`);
+  setRootStyleProperty('--workspace-glass-control-pad-x', `${glass.controlPaddingX}px`);
+  setRootStyleProperty('--workspace-glass-control-pad-y', `${glass.controlPaddingY}px`);
+  setRootStyleProperty('--workspace-glass-control-slot-width', `${glass.controlSlotWidth}px`);
+  setRootStyleProperty('--workspace-glass-lock-off-icon', glass.lockOffIconColor);
+  setRootStyleProperty('--workspace-glass-lock-icon', glass.lockIconColor);
+  setRootStyleProperty('--workspace-glass-capture-icon', glass.captureIconColor);
+  setRootStyleProperty('--workspace-glass-detail-button-bg', glass.detailButtonUseWidgetChrome
+    ? 'var(--app-glass-widget-button-bg)'
+    : rgbaFromHex(glass.detailButtonBgColor, glass.detailButtonBgAlpha));
+  setRootStyleProperty('--workspace-glass-detail-button-outline', glass.detailButtonUseWidgetChrome
+    ? 'var(--app-glass-widget-button-outline)'
+    : rgbaFromHex(glass.detailButtonOutlineColor, glass.detailButtonOutlineAlpha));
+  setRootStyleProperty('--workspace-glass-detail-button-outline-width', glass.detailButtonUseWidgetChrome
+    ? 'var(--app-glass-widget-button-outline-width)'
+    : `${glass.detailButtonOutlineWidth}px`);
+  setRootStyleProperty('--workspace-glass-detail-button-hover', glass.detailButtonUseWidgetChrome
+    ? 'var(--app-glass-widget-button-hover)'
+    : rgbaFromHex(glass.detailButtonHoverColor, glass.detailButtonHoverAlpha));
+  setRootStyleProperty('--workspace-glass-detail-button-active', glass.detailButtonUseWidgetChrome
+    ? 'var(--app-glass-widget-button-active)'
+    : rgbaFromHex(glass.detailButtonActiveColor, glass.detailButtonActiveAlpha));
+  setRootStyleProperty('--workspace-glass-detail-button-radius', glass.detailButtonUseWidgetChrome
+    ? 'var(--app-glass-widget-button-radius)'
+    : `${glass.detailButtonRadius}px`);
+  setRootStyleProperty('--workspace-glass-detail-pad-x', `${glass.detailPaddingX}px`);
+  setRootStyleProperty('--workspace-glass-detail-pad-y', `${glass.detailPaddingY}px`);
+  setRootStyleProperty('--workspace-glass-agent-gap', `${glass.agentGap}px`);
+  setRootStyleProperty('--workspace-glass-agent-pad-x', `${glass.agentPaddingX}px`);
+  setRootStyleProperty('--workspace-glass-agent-pad-y', `${glass.agentPaddingY}px`);
+  setRootStyleProperty('--workspace-glass-agent-bg', rgbaFromHex('#ffffff', glass.agentBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-base-tint', `rgba(18, 30, 48, ${Math.min(0.62, glass.agentBgAlpha * 9.34).toFixed(3)})`);
+  setRootStyleProperty('--workspace-glass-agent-base-border', `rgba(116, 154, 206, ${Math.min(0.36, glass.agentBgAlpha * 4.89).toFixed(3)})`);
+  setRootStyleProperty('--workspace-glass-agent-base-highlight', `rgba(255, 255, 255, ${Math.min(0.14, glass.agentBgAlpha * 1.23).toFixed(3)})`);
+  setRootStyleProperty('--workspace-glass-agent-type-highlight', `rgba(255, 255, 255, ${Math.min(0.16, glass.agentTypeBorderAlpha * 0.138).toFixed(3)})`);
+  const defaultGlass = DEFAULT_WORKSPACE_GLASS_SETTINGS;
+  const baseAgentColorChanged = glass.agentTextColor !== defaultGlass.agentTextColor;
+  const baseAgentWeightChanged = glass.agentTextWeight !== defaultGlass.agentTextWeight;
+  const agentTitleColor = baseAgentColorChanged && glass.agentTitleColor === defaultGlass.agentTitleColor ? glass.agentTextColor : glass.agentTitleColor;
+  const agentActivityColor = baseAgentColorChanged && glass.agentActivityColor === defaultGlass.agentActivityColor ? glass.agentTextColor : glass.agentActivityColor;
+  const agentMetaColor = baseAgentColorChanged && glass.agentMetaColor === defaultGlass.agentMetaColor ? glass.agentTextColor : glass.agentMetaColor;
+  const agentTitleWeight = baseAgentWeightChanged && glass.agentTitleWeight === defaultGlass.agentTitleWeight ? glass.agentTextWeight : glass.agentTitleWeight;
+  const agentActivityWeight = baseAgentWeightChanged && glass.agentActivityWeight === defaultGlass.agentActivityWeight ? glass.agentTextWeight : glass.agentActivityWeight;
+  const agentMetaWeight = baseAgentWeightChanged && glass.agentMetaWeight === defaultGlass.agentMetaWeight ? glass.agentTextWeight : glass.agentMetaWeight;
+  setRootStyleProperty('--workspace-glass-agent-text', glass.agentTextColor);
+  setRootStyleProperty('--workspace-glass-agent-text-weight', String(glass.agentTextWeight));
+  setRootStyleProperty('--workspace-glass-agent-title', agentTitleColor);
+  setRootStyleProperty('--workspace-glass-agent-title-size', `${glass.agentTitleSize}em`);
+  setRootStyleProperty('--workspace-glass-agent-title-weight', String(agentTitleWeight));
+  setRootStyleProperty('--workspace-glass-agent-activity', agentActivityColor);
+  setRootStyleProperty('--workspace-glass-agent-activity-size', `${glass.agentActivitySize}em`);
+  setRootStyleProperty('--workspace-glass-agent-activity-weight', String(agentActivityWeight));
+  setRootStyleProperty('--workspace-glass-agent-meta', agentMetaColor);
+  setRootStyleProperty('--workspace-glass-agent-meta-size', `${glass.agentMetaSize}em`);
+  setRootStyleProperty('--workspace-glass-agent-meta-weight', String(agentMetaWeight));
+  setRootStyleProperty('--workspace-glass-agent-badge-size', `${glass.agentBadgeSize}em`);
+  setRootStyleProperty('--workspace-glass-agent-status-size', `${glass.agentStatusSize}em`);
+  setRootStyleProperty('--workspace-glass-agent-badge-weight', String(glass.agentBadgeWeight));
+  setRootStyleProperty('--workspace-glass-agent-status-weight', String(glass.agentStatusWeight));
+  setRootStyleProperty('--workspace-glass-agent-badge-height', `${glass.agentBadgeHeight}px`);
+  setRootStyleProperty('--workspace-glass-agent-status-pad-x', `${glass.agentStatusPaddingX}px`);
+  setRootStyleProperty('--workspace-glass-agent-status-radius', `${glass.agentStatusRadius}px`);
+  setRootStyleProperty('--workspace-glass-agent-status-border-width', `${glass.agentStatusBorderWidth}px`);
+  setRootStyleProperty('--workspace-glass-agent-status-idle', glass.agentStatusIdleColor);
+  setRootStyleProperty('--workspace-glass-agent-status-idle-bg', rgbaFromHex(glass.agentStatusIdleColor, glass.agentStatusBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-idle-border', rgbaFromHex(glass.agentStatusIdleColor, glass.agentStatusBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-working', glass.agentStatusWorkingColor);
+  setRootStyleProperty('--workspace-glass-agent-status-working-bg', rgbaFromHex(glass.agentStatusWorkingColor, glass.agentStatusBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-working-border', rgbaFromHex(glass.agentStatusWorkingColor, glass.agentStatusBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-waiting', glass.agentStatusWaitingColor);
+  setRootStyleProperty('--workspace-glass-agent-status-waiting-bg', rgbaFromHex(glass.agentStatusWaitingColor, glass.agentStatusBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-waiting-border', rgbaFromHex(glass.agentStatusWaitingColor, glass.agentStatusBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-error', glass.agentStatusErrorColor);
+  setRootStyleProperty('--workspace-glass-agent-status-error-bg', rgbaFromHex(glass.agentStatusErrorColor, glass.agentStatusBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-error-border', rgbaFromHex(glass.agentStatusErrorColor, glass.agentStatusBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-done-unread', glass.agentStatusDoneUnreadColor);
+  setRootStyleProperty('--workspace-glass-agent-status-done-unread-bg', rgbaFromHex(glass.agentStatusDoneUnreadColor, glass.agentStatusBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-done-unread-border', rgbaFromHex(glass.agentStatusDoneUnreadColor, glass.agentStatusBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-exited', glass.agentStatusExitedColor);
+  setRootStyleProperty('--workspace-glass-agent-status-exited-bg', rgbaFromHex(glass.agentStatusExitedColor, glass.agentStatusBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-status-exited-border', rgbaFromHex(glass.agentStatusExitedColor, glass.agentStatusBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-type-bg-left', `${glass.agentTypeBgLeft}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-right', `${glass.agentTypeBgRight}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-top', `${glass.agentTypeBgTop}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-bottom', `${glass.agentTypeBgBottom}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-bleed-left', `${glass.agentTypeBgBleedLeft}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-bleed-right', `${glass.agentTypeBgBleedRight}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-width', `${glass.agentTypeBgWidth}%`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-radius', `${glass.agentTypeBgRadius}px`);
+  setRootStyleProperty('--workspace-glass-agent-codex-bg', rgbaFromHex(glass.agentCodexAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-bg', rgbaFromHex(glass.agentClaudeAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-bg', rgbaFromHex(glass.agentGrokAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-bg', rgbaFromHex(glass.agentAgyAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-codex-border', rgbaFromHex(glass.agentCodexAccent, glass.agentTypeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-border', rgbaFromHex(glass.agentClaudeAccent, glass.agentTypeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-border', rgbaFromHex(glass.agentGrokAccent, glass.agentTypeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-border', rgbaFromHex(glass.agentAgyAccent, glass.agentTypeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-llm-working', glass.llmWorkingColor);
+  setRootStyleProperty('--workspace-glass-llm-working-glow', rgbaFromHex(glass.llmWorkingColor, 0.56));
+  setRootStyleProperty('--workspace-glass-llm-working-pulse-ring', rgbaFromHex(glass.llmWorkingColor, 0.48));
+  setRootStyleProperty('--workspace-glass-llm-working-pulse-soft', rgbaFromHex(glass.llmWorkingColor, Math.min(1, glass.llmWorkingPulseGlowAlpha * 0.48)));
+  setRootStyleProperty('--workspace-glass-llm-working-pulse-strong', rgbaFromHex(glass.llmWorkingColor, glass.llmWorkingPulseGlowAlpha));
+  setRootStyleProperty('--workspace-glass-llm-waiting', glass.llmWaitingColor);
+  setRootStyleProperty('--workspace-glass-llm-waiting-glow', rgbaFromHex(glass.llmWaitingColor, 0.58));
+  setRootStyleProperty('--workspace-glass-llm-idle', glass.llmIdleColor);
+  setRootStyleProperty('--workspace-glass-llm-idle-glow', rgbaFromHex(glass.llmIdleColor, 0.28));
+  setRootStyleProperty('--workspace-glass-llm-error', glass.llmErrorColor);
+  setRootStyleProperty('--workspace-glass-llm-error-glow', rgbaFromHex(glass.llmErrorColor, 0.56));
+  setRootStyleProperty('--workspace-glass-llm-done-unread', glass.llmDoneUnreadColor);
+  setRootStyleProperty('--workspace-glass-llm-done-unread-glow', rgbaFromHex(glass.llmDoneUnreadColor, 0.58));
+  setRootStyleProperty('--workspace-glass-llm-exited', glass.llmExitedColor);
+  setRootStyleProperty('--workspace-glass-llm-exited-glow', rgbaFromHex(glass.llmExitedColor, 0.28));
+  setRootStyleProperty('--workspace-glass-status-dot-left', `${glass.llmStatusDotLeft}px`);
+  setRootStyleProperty('--workspace-glass-status-dot-top', `${glass.llmStatusDotTop}px`);
+  setRootStyleProperty('--workspace-glass-status-dot-size', `${glass.llmStatusDotSize}px`);
+  setRootStyleProperty('--workspace-glass-status-dot-glow', `${glass.llmStatusDotGlow}px`);
+  setRootStyleProperty('--workspace-glass-llm-pulse-duration', `${glass.llmWorkingPulseDuration}s`);
+  setRootStyleProperty('--workspace-glass-llm-pulse-dim-opacity', String(glass.llmWorkingPulseDimOpacity));
+  setRootStyleProperty('--workspace-glass-llm-pulse-ring-size', `${glass.llmWorkingPulseRingSize}px`);
+  setRootStyleProperty('--workspace-glass-label-status-pad', `${glass.llmLabelPadding}px`);
+  setRootStyleProperty('--workspace-glass-selected-accent', glass.selectedAccent);
+  setRootStyleProperty('--workspace-glass-selected-surface-soft', rgbaFromHex(glass.selectedAccent, glass.selectedFillAlpha));
+  setRootStyleProperty('--workspace-glass-selected-surface-strong', rgbaFromHex(glass.selectedAccent, Math.min(1, glass.selectedFillAlpha * 1.7)));
+  setRootStyleProperty('--workspace-glass-tab-highlight-soft', rgbaFromHex(glass.tabHighlightAccent, glass.tabHighlightSoftAlpha));
+  setRootStyleProperty('--workspace-glass-tab-highlight-strong', rgbaFromHex(glass.tabHighlightAccent, glass.tabHighlightStrongAlpha));
+  setRootStyleProperty('--workspace-glass-selected-highlight-soft', rgbaFromHex(glass.selectedHighlightAccent, glass.selectedHighlightSoftAlpha));
+  setRootStyleProperty('--workspace-glass-selected-highlight-strong', rgbaFromHex(glass.selectedHighlightAccent, glass.selectedHighlightStrongAlpha));
+  setRootStyleProperty('--workspace-glass-selected-outline', rgbaFromHex(glass.selectedAccent, glass.selectedOutlineAlpha));
+  setRootStyleProperty('--workspace-glass-selected-outline-width', `${glass.selectedOutlineWidth}px`);
+  setRootStyleProperty('--workspace-glass-selected-glow', rgbaFromHex(glass.selectedAccent, glass.selectedGlowAlpha));
+  setRootStyleProperty('--workspace-glass-selected-glow-y', `${glass.selectedGlowY}px`);
+  setRootStyleProperty('--workspace-glass-selected-glow-blur', `${glass.selectedGlowBlur}px`);
+  setRootStyleProperty('--workspace-glass-selected-glow-spread', `${glass.selectedGlowSpread}px`);
+  setRootStyleProperty('--workspace-glass-selected-rail', rgbaFromHex(glass.selectedAccent, glass.selectedRailAlpha));
+  setRootStyleProperty('--workspace-glass-selected-rail-width', `${glass.selectedRailWidth}px`);
+  setRootStyleProperty('--workspace-glass-selected-rail-inset', `${glass.selectedRailInset}px`);
+  setRootStyleProperty('--workspace-glass-selected-rail-offset', `${glass.selectedRailOffset}px`);
+  setRootStyleProperty('--workspace-glass-selected-rail-radius', `${glass.selectedRailRadius}px`);
+  setRootStyleProperty('--workspace-glass-selected-rail-glow', `${glass.selectedRailGlow}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-bg', glass.selectedAccent);
+  setRootStyleProperty('--workspace-glass-selected-badge-size', `${glass.selectedBadgeSize}em`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-opacity', String(glass.tabHighlightOpacity));
+  setRootStyleProperty('--workspace-glass-tab-highlight-width', `${glass.tabHighlightWidth}%`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-left', `${glass.tabHighlightLeft}px`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-right', `${glass.tabHighlightRight}px`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-top', `${glass.tabHighlightTop}px`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-bottom', `${glass.tabHighlightBottom}px`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-shift-x', `${glass.tabHighlightShiftX}px`);
+  setRootStyleProperty('--workspace-glass-tab-highlight-radius', `${glass.tabHighlightRadius}px`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-opacity', String(glass.selectedHighlightOpacity));
+  setRootStyleProperty('--workspace-glass-selected-highlight-width', `${glass.selectedHighlightWidth}%`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-left', `${glass.selectedHighlightLeft}px`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-right', `${glass.selectedHighlightRight}px`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-top', `${glass.selectedHighlightTop}px`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-bottom', `${glass.selectedHighlightBottom}px`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-shift-x', `${glass.selectedHighlightShiftX}px`);
+  setRootStyleProperty('--workspace-glass-selected-highlight-radius', `${glass.selectedHighlightRadius}px`);
+  toggleClassIfChanged(el.shell, 'workspace-glass-tab-highlight', active && glass.tabHighlight);
+  toggleClassIfChanged(el.shell, 'workspace-glass-selected-highlight', active && glass.selectedHighlight);
+  toggleClassIfChanged(el.shell, 'workspace-glass-selected-rail', active && glass.selectedRail);
+  toggleClassIfChanged(el.shell, 'workspace-glass-selected-badge', active && glass.selectedBadge);
+  toggleClassIfChanged(el.shell, 'workspace-glass-agent-bg-overflow', active && glass.agentTypeBgOverflow);
+  toggleClassIfChanged(el.shell, 'workspace-glass-container-lens', active && glass.containerGlassEnabled);
+  toggleClassIfChanged(el.shell, 'workspace-glass-row-samples-container', active && glass.containerGlassEnabled && glass.rowSamplesContainer);
+  toggleClassIfChanged(el.shell, 'workspace-glass-hover-only', active && glass.rowHoverOnly);
+  toggleClassIfChanged(el.shell, 'workspace-glass-working-pulse', active && glass.llmWorkingPulseEnabled);
+  for (const choice of WORKSPACE_GLASS_RAIL_STYLE_CHOICES) {
+    toggleClassIfChanged(el.shell, `workspace-glass-rail-${choice.id}`, active && choice.id === glass.selectedRailStyle);
+  }
+  if (active) scheduleWorkspaceLiquidGlassRefresh();
+  else removeWorkspaceLiquidGlassLenses();
+}
+
+function setAppGlassChromeCssVariables(prefix: string, chrome: AppGlassChromeSettings) {
+  setRootStyleProperty(`--app-glass-${prefix}-surface-bg`, rgbaFromHex(chrome.surfaceColor, chrome.surfaceAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-field-bg`, rgbaFromHex(chrome.fieldColor, chrome.fieldAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-field-text`, chrome.fieldTextColor);
+  setRootStyleProperty(`--app-glass-${prefix}-field-outline`, rgbaFromHex(chrome.fieldOutlineColor, chrome.fieldOutlineAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-select-option-bg`, chrome.selectOptionBgColor);
+  setRootStyleProperty(`--app-glass-${prefix}-select-option-text`, chrome.selectOptionTextColor);
+  setRootStyleProperty(`--app-glass-${prefix}-select-option-selected-bg`, chrome.selectOptionSelectedBgColor);
+  setRootStyleProperty(`--app-glass-${prefix}-select-option-selected-text`, chrome.selectOptionSelectedTextColor);
+  setRootStyleProperty(`--app-glass-${prefix}-tab-bg`, rgbaFromHex(chrome.tabColor, chrome.tabAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-tab-active-bg`, rgbaFromHex(chrome.tabActiveColor, chrome.tabActiveAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-button-bg`, rgbaFromHex(chrome.buttonColor, chrome.buttonAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-button-outline`, rgbaFromHex(chrome.buttonOutlineColor, chrome.buttonOutlineAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-button-outline-width`, `${chrome.buttonOutlineWidth}px`);
+  setRootStyleProperty(`--app-glass-${prefix}-button-hover`, rgbaFromHex(chrome.buttonHoverColor, chrome.buttonHoverAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-button-radius`, `${chrome.buttonRadius}px`);
+  setRootStyleProperty(`--app-glass-${prefix}-item-bg`, rgbaFromHex(chrome.itemColor, chrome.itemAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-item-text`, chrome.itemTextColor);
+  setRootStyleProperty(`--app-glass-${prefix}-item-outline`, rgbaFromHex(chrome.itemOutlineColor, chrome.itemOutlineAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-divider`, rgbaFromHex(chrome.dividerColor, chrome.dividerAlpha));
+  setRootStyleProperty(`--app-glass-${prefix}-padding-x`, `${chrome.paddingX}px`);
+  setRootStyleProperty(`--app-glass-${prefix}-padding-y`, `${chrome.paddingY}px`);
+}
+
+function setAppGlassMaterialRadiusCssVariables() {
+  const scopes: Array<[string, string]> = [
+    ['titlebar', 'titlebar'],
+    ['window-controls', 'window-controls'],
+    ['profile-actions', 'profile-actions'],
+    ['terminal-widgets', 'terminal-widgets'],
+    ['explorer-panel', 'explorer-panel'],
+    ['editor-panel', 'editor-panel'],
+    ['image-panel', 'image-panel'],
+    ['browser-panel', 'browser-panel'],
+    ['notes-panel', 'notes-panel'],
+    ['snippets-panel', 'snippets-panel'],
+    ['calculator-panel', 'calculator-panel'],
+    ['settings-panel', 'settings-panel'],
+    ['floating-panels', 'floating-panels'],
+    ['notes-snippets', 'notes-snippets'],
+    ['explorer-rows', 'explorer-row']
+  ];
+  for (const [scope, variableSuffix] of scopes) {
+    const effect = effectiveAppGlassEffectSettings(scope);
+    setRootStyleProperty(`--app-glass-${variableSuffix}-radius`, `${effect.radius}px`);
+    setRootStyleProperty(`--app-glass-${variableSuffix}-outline`, rgbaFromHex(effect.outlineColor, effect.outlineAlpha));
+    setRootStyleProperty(`--app-glass-${variableSuffix}-outline-width`, `${effect.outlineWidth}px`);
+    setRootStyleProperty(`--app-glass-${variableSuffix}-outline-soft`, rgbaFromHex(effect.outlineColor, effect.outlineSoftAlpha));
+    setRootStyleProperty(`--app-glass-${variableSuffix}-outline-soft-width`, `${effect.outlineSoftWidth}px`);
+  }
+}
+
+function applyAppGlassSettings() {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  state.ideSettings.appGlass = glass;
+  const commonEffect = commonGlassEffectSettings();
+  const enabled = !IS_TERMINAL_APP && glass.enabled === true;
+  const topologySignature = [
+    enabled ? '1' : '0',
+    glass.titlebar ? '1' : '0',
+    glass.windowControls ? '1' : '0',
+    glass.profileActions ? '1' : '0',
+    glass.profileActionsSplit ? '1' : '0',
+    glass.terminalWidgets ? '1' : '0',
+    glass.explorerPanel ? '1' : '0',
+    glass.editorPanel ? '1' : '0',
+    glass.imagePanel ? '1' : '0',
+    glass.browserPanel ? '1' : '0',
+    glass.notesPanel ? '1' : '0',
+    glass.snippetsPanel ? '1' : '0',
+    glass.calculatorPanel ? '1' : '0',
+    glass.settingsPanel ? '1' : '0',
+  ].join('');
+  const topologyChanged = appGlassAppliedTopologySignature !== topologySignature;
+  appGlassAppliedTopologySignature = topologySignature;
+  toggleClassIfChanged(document.body, 'glass-mode-on', enabled);
+  toggleClassIfChanged(el.shell, 'app-glass-mode-on', enabled);
+  toggleClassIfChanged(el.shell, 'app-glass-titlebar-on', enabled && glass.titlebar);
+  toggleClassIfChanged(el.shell, 'app-glass-window-controls-on', enabled && glass.windowControls);
+  toggleClassIfChanged(el.shell, 'app-glass-profile-actions-on', enabled && glass.profileActions);
+  toggleClassIfChanged(el.shell, 'app-glass-profile-actions-split-on', enabled && glass.profileActions && glass.profileActionsSplit);
+  toggleClassIfChanged(el.shell, 'app-glass-terminal-widgets-on', enabled && glass.terminalWidgets);
+  toggleClassIfChanged(el.shell, 'app-glass-explorer-panel-on', enabled && glass.explorerPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-editor-panel-on', enabled && glass.editorPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-image-panel-on', enabled && glass.imagePanel);
+  toggleClassIfChanged(el.shell, 'app-glass-browser-panel-on', enabled && glass.browserPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-notes-panel-on', enabled && glass.notesPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-snippets-panel-on', enabled && glass.snippetsPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-calculator-panel-on', enabled && glass.calculatorPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-floating-panels-on', false);
+  toggleClassIfChanged(el.shell, 'app-glass-notes-snippets-on', false);
+  toggleClassIfChanged(el.shell, 'app-glass-settings-panel-on', enabled && glass.settingsPanel);
+  toggleClassIfChanged(el.shell, 'app-glass-explorer-rows-on', enabled && glass.explorerRows);
+  toggleClassIfChanged(el.shell, 'app-glass-explorer-rows-hover-only', enabled && glass.explorerRows && glass.explorerRowsHoverOnly);
+  toggleClassIfChanged(el.shell, 'app-glass-explorer-rows-samples-panel', enabled && glass.explorerRows && glass.explorerPanel && glass.explorerRowsSamplePanel);
+  if (enabled) hideWidgetOpacityPopover();
+  setAppGlassChromeCssVariables('chrome', glass.chrome);
+  setAppGlassChromeCssVariables('terminal', effectiveAppGlassChromeSettings('terminal'));
+  setAppGlassChromeCssVariables('settings', effectiveAppGlassChromeSettings('settings'));
+  setAppGlassChromeCssVariables('profile', effectiveAppGlassChromeSettings('profile'));
+  setAppGlassChromeCssVariables('explorer', effectiveAppGlassChromeSettings('explorer'));
+  setAppGlassChromeCssVariables('editor', effectiveAppGlassChromeSettings('editor'));
+  setAppGlassChromeCssVariables('image', effectiveAppGlassChromeSettings('image'));
+  setAppGlassChromeCssVariables('browser', effectiveAppGlassChromeSettings('browser'));
+  setAppGlassChromeCssVariables('notes', effectiveAppGlassChromeSettings('notes'));
+  setAppGlassChromeCssVariables('snippets', effectiveAppGlassChromeSettings('snippets'));
+  setAppGlassMaterialRadiusCssVariables();
+  const appShadowEnabled = anyAppGlassMaterialShadowEnabled();
+  const appShadow = appShadowEnabled
+    ? `0 ${glass.shadowY}px ${glass.shadowBlur}px rgba(0, 0, 0, ${glass.shadowAlpha.toFixed(3)}), 0 0 ${Math.round(glass.shadowBlur * 0.42)}px rgba(122, 174, 255, ${(glass.shadowAlpha * 0.18).toFixed(3)})`
+    : 'none';
+  const appControlShadow = appShadowEnabled
+    ? `0 ${Math.max(2, Math.round(glass.shadowY * 0.34))}px ${Math.max(10, Math.round(glass.shadowBlur * 0.32))}px rgba(0, 0, 0, ${(glass.shadowAlpha * 0.78).toFixed(3)}), 0 0 ${Math.max(8, Math.round(glass.shadowBlur * 0.18))}px rgba(122, 174, 255, ${(glass.shadowAlpha * 0.14).toFixed(3)})`
+    : '0 0 0 0 rgba(0, 0, 0, 0)';
+  setRootStyleProperty('--app-glass-panel-shadow', appShadow);
+  setRootStyleProperty('--app-glass-control-shadow', appControlShadow);
+  setRootStyleProperty('--app-glass-header-text-color', glass.headerTextColor);
+  setRootStyleProperty('--app-glass-header-text-size', `${glass.headerTextSize}em`);
+  setRootStyleProperty('--app-glass-header-text-weight', String(glass.headerTextWeight));
+  setRootStyleProperty('--app-glass-body-text-color', glass.bodyTextColor);
+  setRootStyleProperty('--app-glass-muted-text-color', glass.mutedTextColor);
+  const titlebarSurfaceAlpha = Math.max(glass.chrome.surfaceAlpha, glass.titlebarAlpha, 0.055);
+  const titlebarShellAlpha = Math.max(Math.min(titlebarSurfaceAlpha * 0.58, 0.07), 0.028);
+  const profileSurfaceAlpha = Math.max(glass.chrome.surfaceAlpha, 0.05);
+  const profileShellAlpha = Math.max(Math.min(profileSurfaceAlpha * 0.58, 0.07), 0.028);
+  setRootStyleProperty('--app-glass-titlebar-shell-bg', rgbaFromHex(glass.chrome.surfaceColor, titlebarShellAlpha));
+  setRootStyleProperty('--app-glass-titlebar-bg', rgbaFromHex(glass.chrome.surfaceColor, titlebarSurfaceAlpha));
+  setRootStyleProperty('--app-glass-titlebar-blur', `${glass.titlebarBlur}px`);
+  setRootStyleProperty('--app-glass-profile-shell-bg', rgbaFromHex(glass.chrome.surfaceColor, profileShellAlpha));
+  setRootStyleProperty('--app-glass-profile-plane-bg', rgbaFromHex(glass.chrome.surfaceColor, profileSurfaceAlpha));
+  setRootStyleProperty('--app-glass-profile-plane-outline', 'var(--app-glass-profile-actions-outline)');
+  setRootStyleProperty('--app-glass-window-button-size', `${glass.windowButtonSize}px`);
+  setRootStyleProperty('--app-glass-window-button-gap', `${glass.windowButtonGap}px`);
+  setRootStyleProperty('--app-glass-window-button-bg', 'var(--app-glass-chrome-button-bg)');
+  setRootStyleProperty('--app-glass-window-button-hover', 'var(--app-glass-chrome-button-hover)');
+  setRootStyleProperty('--app-glass-window-button-close-hover', rgbaFromHex(glass.windowButtonCloseHoverColor, glass.windowButtonCloseHoverAlpha));
+  setRootStyleProperty('--app-glass-window-button-outline', 'var(--app-glass-window-controls-outline)');
+  setRootStyleProperty('--app-glass-window-button-icon-alpha', String(glass.windowButtonIconAlpha));
+  setRootStyleProperty('--app-glass-window-button-icon-size', `${glass.windowButtonIconSize}px`);
+  setRootStyleProperty('--app-glass-widget-radius', `${commonEffect.radius}px`);
+  setRootStyleProperty('--app-glass-widget-bg', rgbaFromHex('#ffffff', glass.widgetGlassAlpha));
+  setRootStyleProperty('--app-glass-widget-outline', rgbaFromHex(commonEffect.outlineColor, commonEffect.outlineAlpha));
+  setRootStyleProperty('--app-glass-widget-outline-width', `${commonEffect.outlineWidth}px`);
+  setRootStyleProperty('--app-glass-widget-outline-soft', rgbaFromHex(commonEffect.outlineColor, commonEffect.outlineSoftAlpha));
+  setRootStyleProperty('--app-glass-widget-outline-soft-width', `${commonEffect.outlineSoftWidth}px`);
+  setRootStyleProperty('--app-glass-widget-chrome-alpha', String(glass.widgetChromeAlpha));
+  setRootStyleProperty('--app-glass-widget-header-divider', rgbaFromHex('#7aaeff', glass.widgetHeaderDividerAlpha));
+  setRootStyleProperty('--app-glass-widget-plane-inset', rgbaFromHex('#ffffff', glass.widgetGlassInsetAlpha));
+  setRootStyleProperty('--app-glass-widget-padding-x', `${glass.widgetPaddingX}px`);
+  setRootStyleProperty('--app-glass-widget-padding-y', `${glass.widgetPaddingY}px`);
+  setRootStyleProperty('--app-glass-widget-topbar-height', `${glass.widgetTopbarHeight}px`);
+  setRootStyleProperty('--app-glass-widget-topbar-content-y', `${glass.widgetTopbarContentY}px`);
+  setRootStyleProperty('--app-glass-widget-button-bg', 'var(--app-glass-chrome-button-bg)');
+  setRootStyleProperty('--app-glass-widget-button-outline', 'var(--app-glass-chrome-button-outline)');
+  setRootStyleProperty('--app-glass-widget-button-outline-width', 'var(--app-glass-chrome-button-outline-width)');
+  setRootStyleProperty('--app-glass-widget-button-hover', 'var(--app-glass-chrome-button-hover)');
+  setRootStyleProperty('--app-glass-widget-button-active', 'var(--app-glass-chrome-button-hover)');
+  setRootStyleProperty('--app-glass-widget-button-radius', 'var(--app-glass-chrome-button-radius)');
+  setRootStyleProperty('--app-glass-widget-title-display', glass.widgetTitleHighlight ? 'block' : 'none');
+  const widgetTitleGradient = widgetTitleHighlightGradient({
+    color: glass.widgetTitleColor,
+    alpha: glass.widgetTitleAlpha,
+    sizeX: glass.widgetTitleSizeX,
+    sizeY: glass.widgetTitleSizeY,
+    originX: glass.widgetTitleOriginX,
+    originY: glass.widgetTitleOriginY,
+    midStrength: glass.widgetTitleMidStrength,
+    edgeStrength: glass.widgetTitleEdgeStrength,
+    softness: glass.widgetTitleSoftness
+  });
+  const widgetTitleSelectedGradient = widgetTitleHighlightGradient({
+    color: glass.widgetTitleSelectedColor,
+    alpha: glass.widgetTitleSelectedAlpha,
+    sizeX: glass.widgetTitleSelectedSizeX,
+    sizeY: glass.widgetTitleSelectedSizeY,
+    originX: glass.widgetTitleSelectedOriginX,
+    originY: glass.widgetTitleSelectedOriginY,
+    midStrength: glass.widgetTitleSelectedMidStrength,
+    edgeStrength: glass.widgetTitleSelectedEdgeStrength,
+    softness: glass.widgetTitleSelectedSoftness
+  });
+  setRootStyleProperty('--app-glass-widget-title-color', rgbaFromHex(glass.widgetTitleColor, glass.widgetTitleAlpha));
+  setRootStyleProperty('--app-glass-widget-title-color-soft', rgbaFromHex(glass.widgetTitleColor, glass.widgetTitleAlpha * glass.widgetTitleMidStrength));
+  setRootStyleProperty('--app-glass-widget-title-color-faint', rgbaFromHex(glass.widgetTitleColor, glass.widgetTitleAlpha * glass.widgetTitleEdgeStrength));
+  setRootStyleProperty('--app-glass-widget-title-gradient', widgetTitleGradient);
+  setRootStyleProperty('--app-glass-widget-title-size-x', `${glass.widgetTitleSizeX}%`);
+  setRootStyleProperty('--app-glass-widget-title-size-y', `${glass.widgetTitleSizeY}%`);
+  setRootStyleProperty('--app-glass-widget-title-left', `${glass.widgetTitlePadX}px`);
+  setRootStyleProperty('--app-glass-widget-title-right', `${glass.widgetTitlePadX}px`);
+  setRootStyleProperty('--app-glass-widget-title-width', 'auto');
+  setRootStyleProperty('--app-glass-widget-title-pad-y', `${glass.widgetTitlePadY}px`);
+  setRootStyleProperty('--app-glass-widget-title-shift-x', `${glass.widgetTitleShiftX}px`);
+  setRootStyleProperty('--app-glass-widget-title-shift-y', `${glass.widgetTitleShiftY}px`);
+  setRootStyleProperty('--app-glass-widget-title-radius', `${glass.widgetTitleRadius}px`);
+  setRootStyleProperty('--app-glass-widget-title-selected-color', rgbaFromHex(glass.widgetTitleSelectedColor, glass.widgetTitleSelectedAlpha));
+  setRootStyleProperty('--app-glass-widget-title-selected-color-soft', rgbaFromHex(glass.widgetTitleSelectedColor, glass.widgetTitleSelectedAlpha * glass.widgetTitleSelectedMidStrength));
+  setRootStyleProperty('--app-glass-widget-title-selected-color-faint', rgbaFromHex(glass.widgetTitleSelectedColor, glass.widgetTitleSelectedAlpha * glass.widgetTitleSelectedEdgeStrength));
+  setRootStyleProperty('--app-glass-widget-title-selected-gradient', widgetTitleSelectedGradient);
+  setRootStyleProperty('--app-glass-widget-title-selected-size-x', `${glass.widgetTitleSelectedSizeX}%`);
+  setRootStyleProperty('--app-glass-widget-title-selected-size-y', `${glass.widgetTitleSelectedSizeY}%`);
+  setRootStyleProperty('--app-glass-widget-title-selected-left', `${glass.widgetTitleSelectedPadX}px`);
+  setRootStyleProperty('--app-glass-widget-title-selected-right', `${glass.widgetTitleSelectedPadX}px`);
+  setRootStyleProperty('--app-glass-widget-title-selected-pad-y', `${glass.widgetTitleSelectedPadY}px`);
+  setRootStyleProperty('--app-glass-widget-title-selected-shift-x', `${glass.widgetTitleSelectedShiftX}px`);
+  setRootStyleProperty('--app-glass-widget-title-selected-shift-y', `${glass.widgetTitleSelectedShiftY}px`);
+  setRootStyleProperty('--app-glass-widget-title-selected-radius', `${glass.widgetTitleSelectedRadius}px`);
+  setRootStyleProperty('--app-glass-terminal-text-contrast', String(glass.terminalTextContrast));
+  setRootStyleProperty('--app-glass-terminal-dim-opacity', String(glass.terminalDimOpacity));
+  setRootStyleProperty('--app-glass-terminal-pane-bg', rgbaFromHex('#ffffff', glass.terminalPaneBgAlpha));
+  setRootStyleProperty('--app-glass-terminal-pane-idle-bg', rgbaFromHex(glass.terminalPaneIdleBgColor, glass.terminalPaneIdleBgAlpha));
+  setRootStyleProperty('--app-glass-terminal-pane-selected-bg', rgbaFromHex(glass.terminalPaneSelectedBgColor, glass.terminalPaneSelectedBgAlpha));
+  setRootStyleProperty('--app-glass-terminal-pane-outline', rgbaFromHex('#7aaeff', glass.terminalPaneOutlineAlpha));
+  setRootStyleProperty('--app-glass-editor-pane-idle-bg', rgbaFromHex(glass.editorPaneIdleBgColor, glass.editorPaneIdleBgAlpha));
+  setRootStyleProperty('--app-glass-editor-pane-selected-bg', rgbaFromHex(glass.editorPaneSelectedBgColor, glass.editorPaneSelectedBgAlpha));
+  setRootStyleProperty('--app-glass-terminal-host-bg', rgbaFromHex('#050a12', glass.terminalHostBgAlpha));
+  setRootStyleProperty('--app-glass-terminal-tabbar-bg', 'var(--app-glass-terminal-surface-bg)');
+  setRootStyleProperty('--app-glass-terminal-typepad-bg', 'var(--app-glass-terminal-surface-bg)');
+  setRootStyleProperty('--app-glass-terminal-input-bg', 'var(--app-glass-terminal-field-bg)');
+  setRootStyleProperty('--app-glass-terminal-new-tab-bg', 'var(--app-glass-terminal-button-bg)');
+  setRootStyleProperty('--app-glass-terminal-new-tab-outline', 'var(--app-glass-terminal-button-outline)');
+  setRootStyleProperty('--app-glass-terminal-new-tab-hover', 'var(--app-glass-terminal-button-hover)');
+  setRootStyleProperty('--app-glass-terminal-typepad-button-bg', 'var(--app-glass-terminal-button-bg)');
+  setRootStyleProperty('--app-glass-terminal-typepad-button-outline', 'var(--app-glass-terminal-button-outline)');
+  setRootStyleProperty('--app-glass-terminal-typepad-button-hover', 'var(--app-glass-terminal-button-hover)');
+  setRootStyleProperty('--app-glass-terminal-typepad-button-disabled', String(glass.terminalTypePadButtonDisabledAlpha));
+  setRootStyleProperty('--app-glass-terminal-scroll-thumb', rgbaFromHex('#7fb0ff', glass.terminalScrollbarThumbAlpha));
+  setRootStyleProperty('--app-glass-terminal-scroll-thumb-hover', rgbaFromHex('#a0c6ff', glass.terminalScrollbarThumbHoverAlpha));
+  setRootStyleProperty('--app-glass-terminal-scroll-track', rgbaFromHex('#050a12', glass.terminalScrollbarTrackAlpha));
+  setRootStyleProperty('--app-glass-terminal-scroll-width', `${glass.terminalScrollbarWidth}px`);
+  setRootStyleProperty('--app-glass-explorer-horizontal-scrollbar-gap', `${glass.explorerHorizontalScrollbarBottomGap}px`);
+  setRootStyleProperty('--app-glass-terminal-host-outline', rgbaFromHex('#7fb0ff', glass.terminalHostOutlineAlpha));
+  setRootStyleProperty('--app-glass-terminal-split-resizer-bg', rgbaFromHex('#4d8dff', glass.terminalSplitResizerAlpha));
+  const explorerRowsEffect = effectiveAppGlassEffectSettings('explorer-rows');
+  setRootStyleProperty('--app-glass-explorer-row-radius', `${explorerRowsEffect.radius}px`);
+  setRootStyleProperty('--app-glass-explorer-row-bg', rgbaFromHex('#ffffff', explorerRowsEffect.specular ? 0.035 : 0));
+  setRootStyleProperty('--app-glass-explorer-row-inset', rgbaFromHex('#ffffff', explorerRowsEffect.specular ? 0.10 : 0));
+  setRootStyleProperty('--app-glass-explorer-row-outline-inset', rgbaFromHex('#ffffff', explorerRowsEffect.specular ? 0.08 : 0));
+  setRootStyleProperty('--app-glass-explorer-hover', rgbaFromHex(glass.explorerHoverColor, glass.explorerHoverAlpha));
+  setRootStyleProperty('--app-glass-explorer-active', rgbaFromHex(glass.explorerHoverColor, glass.explorerActiveAlpha));
+  setRootStyleProperty('--app-glass-explorer-selected-rail', rgbaFromHex(glass.explorerSelectedRailColor, glass.explorerSelectedRailAlpha));
+  setRootStyleProperty('--app-glass-explorer-selected-rail-width', `${glass.explorerSelectedRailWidth}px`);
+  applyTerminalThemeForAllPanes();
+  ensureAppGlassStructures();
+  syncAppGlassTargets();
+  if (topologyChanged && (enabled || appGlassRenderers.size > 0)) {
+    scheduleAppGlassRefresh({ reason: 'settings-topology' });
+  }
+  if (!enabled || !glass.explorerRows) removeExplorerLiquidGlass();
+  else if (topologyChanged) scheduleExplorerLiquidGlassRefresh({ recapture: true });
+}
+
+function terminalBackgroundForCurrentGlassMode() {
+  if (!appGlassEnabled() || !state.ideSettings.appGlass?.terminalWidgets) return '#080b10';
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  return rgbaFromHex('#080b10', glass.terminalHostBgAlpha);
+}
+
+function applyTerminalThemeForAllPanes() {
+  const background = terminalBackgroundForCurrentGlassMode();
+  for (const pane of state.terminals) {
+    pane.term.options.theme = {
+      ...(pane.term.options.theme ?? {}),
+      background,
+      foreground: '#d8e0ea'
+    };
+    pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
+  }
+}
+
+function readGlassSettingsSectionOpenState() {
+  if (glassSettingsSectionOpenState) return glassSettingsSectionOpenState;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(GLASS_SETTINGS_SECTION_OPEN_STORE_KEY) ?? '{}') as unknown;
+    glassSettingsSectionOpenState = isPlainRecord(parsed)
+      ? Object.fromEntries(Object.entries(parsed).filter(([, value]) => typeof value === 'boolean')) as Record<string, boolean>
+      : {};
+  } catch {
+    glassSettingsSectionOpenState = {};
+  }
+  return glassSettingsSectionOpenState;
+}
+
+function glassSettingsSectionIsOpen(label: string) {
+  return readGlassSettingsSectionOpenState()[label] !== false;
+}
+
+function setGlassSettingsSectionOpen(label: string, open: boolean) {
+  const state = readGlassSettingsSectionOpenState();
+  state[label] = open;
+  try {
+    localStorage.setItem(GLASS_SETTINGS_SECTION_OPEN_STORE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore local UI preference persistence failures.
+  }
+}
+
+function createGlassSettingsGroup(label: string) {
+  const group = document.createElement('details');
+  group.className = 'glass-settings-group';
+  group.open = glassSettingsSectionIsOpen(label);
+  group.dataset.glassSection = label;
+  const summary = document.createElement('summary');
+  summary.className = 'glass-settings-section';
+  const title = document.createElement('span');
+  title.className = 'glass-settings-section-title';
+  title.textContent = label;
+  const action = document.createElement('span');
+  action.className = 'glass-settings-section-action';
+  action.textContent = '접기/펼치기';
+  summary.append(title, action);
+  const content = document.createElement('div');
+  content.className = 'glass-settings-group-content';
+  group.append(summary, content);
+  group.addEventListener('toggle', () => setGlassSettingsSectionOpen(label, group.open));
+  return { group, content };
+}
+
+function renderGlassSettingsControls() {
+  if (glassSettingsControlsRendered) return;
+  glassSettingsControlsRendered = true;
+  const fragment = document.createDocumentFragment();
+  let currentContainer: DocumentFragment | HTMLElement = fragment;
+  let workspaceRowMasterToggleInserted = false;
+  let backgroundFileInputInserted = false;
+  for (const control of GLASS_SETTINGS_CONTROLS) {
+    if (control.type === 'section') {
+      const { group, content } = createGlassSettingsGroup(control.label);
+      fragment.append(group);
+      currentContainer = content;
+      if (control.label === '배경 / 조명') {
+        const fileLabel = el.glassBackgroundFile.closest('label');
+        if (fileLabel instanceof HTMLLabelElement) {
+          content.append(fileLabel);
+          backgroundFileInputInserted = true;
+        }
+      }
+      continue;
+    }
+    if (control.type === 'action') {
+      const row = document.createElement('div');
+      row.className = 'glass-settings-control glass-control-action';
+      const title = document.createElement('span');
+      const titleText = document.createElement('strong');
+      titleText.textContent = control.label;
+      title.append(titleText);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = '상속';
+      button.dataset.glassAction = control.action;
+      button.dataset.glassSourcePath = control.sourcePath;
+      button.dataset.glassTargetPath = control.targetPath;
+      button.dataset.glassCustomPath = control.customPath;
+      if (control.recapture) button.dataset.glassRecapture = '1';
+      button.addEventListener('click', handleGlassSettingsActionClick);
+      row.append(title, button);
+      currentContainer.append(row);
+      continue;
+    }
+    if (control.path === 'workspaceGlass.useCustomEffect' && !workspaceRowMasterToggleInserted) {
+      const toggleLabel = el.glassWorkspaceEnabled.closest('label');
+      if (toggleLabel instanceof HTMLLabelElement) {
+        currentContainer.append(toggleLabel);
+        currentContainer.append(el.glassSettingsStatus);
+        workspaceRowMasterToggleInserted = true;
+      }
+    }
+    const label = document.createElement('label');
+    label.className = `glass-settings-control glass-control-${control.type}`;
+    const title = document.createElement('span');
+    const titleText = document.createElement('strong');
+    titleText.textContent = control.label;
+    title.append(titleText);
+    let output: HTMLInputElement | null = null;
+    if (control.type === 'range') {
+      output = document.createElement('input');
+      output.type = 'text';
+      output.className = 'glass-settings-value-input';
+      output.inputMode = 'decimal';
+      output.spellcheck = false;
+      output.setAttribute('aria-label', `${control.label} value`);
+      output.dataset.glassOutputFor = control.path;
+      output.dataset.glassOutputUnit = control.unit ?? '';
+      output.addEventListener('keydown', handleGlassRangeOutputKeydown);
+      output.addEventListener('blur', handleGlassRangeOutputBlur);
+      output.addEventListener('focus', handleGlassRangeOutputFocus);
+      title.append(output);
+    }
+    label.append(title);
+    let input: HTMLInputElement | HTMLSelectElement;
+    if (control.type === 'select') {
+      const select = document.createElement('select');
+      for (const choice of control.choices) {
+        const option = document.createElement('option');
+        option.value = choice.id;
+        option.textContent = choice.label;
+        select.append(option);
+      }
+      input = select;
+    } else {
+      const field = document.createElement('input');
+      field.type = control.type === 'checkbox' ? 'checkbox' : control.type;
+      if (control.type === 'range') {
+        field.min = String(control.min);
+        field.max = String(control.max);
+        field.step = String(control.step);
+      } else if (control.type === 'text') {
+        field.placeholder = control.placeholder ?? '';
+        field.spellcheck = false;
+      }
+      input = field;
+    }
+    input.dataset.glassPath = control.path;
+    input.dataset.glassType = control.type;
+    if (output) {
+      const outputId = `glass-output-${control.path.replace(/[^\w-]+/g, '-')}`;
+      input.dataset.outputId = outputId;
+      output.id = outputId;
+    }
+    input.addEventListener('input', handleGlassSettingsControlChange);
+    input.addEventListener('change', handleGlassSettingsControlChange);
+    label.append(input);
+    currentContainer.append(label);
+  }
+  if (!backgroundFileInputInserted) {
+    const fileLabel = el.glassBackgroundFile.closest('label');
+    if (fileLabel instanceof HTMLLabelElement) fragment.prepend(fileLabel);
+  }
+  if (!workspaceRowMasterToggleInserted) {
+    const toggleLabel = el.glassWorkspaceEnabled.closest('label');
+    if (toggleLabel instanceof HTMLLabelElement) {
+      fragment.append(toggleLabel);
+      fragment.append(el.glassSettingsStatus);
+    }
+  }
+  el.glassSettingsControls.replaceChildren(fragment);
+}
+
+function openGlassSettingsPopover() {
+  renderGlassSettingsControls();
+  syncGlassSettingsPopover();
+  el.glassSettingsPopover.classList.remove('hidden');
+  el.glassSettingsPopover.setAttribute('aria-hidden', 'false');
+}
+
+function closeGlassSettingsPopover() {
+  el.glassSettingsPopover.classList.add('hidden');
+  el.glassSettingsPopover.setAttribute('aria-hidden', 'true');
+}
+
+function appGlassEffectControlDisabled(inputPath: string) {
+  const glass = state.ideSettings.appGlass;
+  const pairs: Array<[string, boolean]> = [
+    ['appGlass.effect.', glass.useCustomEffect === true],
+    ['appGlass.titlebarEffect.', glass.titlebarUseCustomEffect === true],
+    ['appGlass.windowControlsEffect.', glass.windowControlsUseCustomEffect === true],
+    ['appGlass.profileActionsEffect.', glass.profileActionsUseCustomEffect === true],
+    ['appGlass.terminalWidgetsEffect.', glass.terminalWidgetsUseCustomEffect === true],
+    ['appGlass.explorerPanelEffect.', glass.explorerPanelUseCustomEffect === true],
+    ['appGlass.editorPanelEffect.', glass.editorPanelUseCustomEffect === true],
+    ['appGlass.imagePanelEffect.', glass.imagePanelUseCustomEffect === true],
+    ['appGlass.browserPanelEffect.', glass.browserPanelUseCustomEffect === true],
+    ['appGlass.notesPanelEffect.', glass.notesPanelUseCustomEffect === true],
+    ['appGlass.snippetsPanelEffect.', glass.snippetsPanelUseCustomEffect === true],
+    ['appGlass.calculatorPanelEffect.', glass.calculatorPanelUseCustomEffect === true],
+    ['appGlass.floatingPanelsEffect.', glass.floatingPanelsUseCustomEffect === true],
+    ['appGlass.notesSnippetsEffect.', glass.notesSnippetsUseCustomEffect === true],
+    ['appGlass.settingsPanelEffect.', glass.settingsPanelUseCustomEffect === true],
+    ['appGlass.explorerRowsEffect.', glass.explorerRowsUseCustomEffect === true],
+    ['appGlass.terminalChrome.', glass.terminalChromeUseCustom === true],
+    ['appGlass.settingsChrome.', glass.settingsChromeUseCustom === true],
+    ['appGlass.profileChrome.', glass.profileChromeUseCustom === true],
+    ['appGlass.explorerChrome.', glass.explorerChromeUseCustom === true],
+    ['appGlass.editorChrome.', glass.editorChromeUseCustom === true],
+    ['appGlass.imageChrome.', glass.imageChromeUseCustom === true],
+    ['appGlass.browserChrome.', glass.browserChromeUseCustom === true],
+    ['appGlass.notesChrome.', glass.notesChromeUseCustom === true],
+    ['appGlass.snippetsChrome.', glass.snippetsChromeUseCustom === true]
+  ];
+  const match = pairs.find(([prefix]) => inputPath.startsWith(prefix));
+  return match ? !match[1] : false;
+}
+
+function syncGlassSettingsPopover() {
+  state.ideSettings.ideBackground = normalizeIdeBackgroundSettings(state.ideSettings.ideBackground);
+  state.ideSettings.glassEffect = normalizeWorkspaceGlassEffectSettings(state.ideSettings.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS);
+  state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  state.ideSettings.appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  setCheckedIfChanged(el.settingsAppGlassEnabled, state.ideSettings.appGlass.enabled === true);
+  const appGlassShadowEnabled = anyAppGlassMaterialShadowEnabled();
+  const workspaceCustomEffect = state.ideSettings.workspaceGlass.useCustomEffect === true;
+  const workspaceContainerCustomEffect = state.ideSettings.workspaceGlass.containerUseCustomEffect === true;
+  setCheckedIfChanged(el.glassWorkspaceEnabled, state.ideSettings.workspaceGlass.enabled);
+  setDisabledIfChanged(el.glassWorkspaceEnabled, false);
+  el.glassSettingsStatus.textContent = workspaceDockIsSide()
+    ? 'Glass 테마 전체 on/off는 `Glass 사용 범위` 섹션에서 켭니다. 이 체크박스는 왼쪽/오른쪽 workspace row liquidGL 렌즈 전용입니다.'
+    : 'Glass 테마 전체 on/off는 `Glass 사용 범위` 섹션에서 켭니다. 이 체크박스는 top/bottom workspace tab liquidGL 렌즈 전용입니다.';
+  for (const input of Array.from(el.glassSettingsControls.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-glass-path]'))) {
+    const control = glassControlForPath(input.dataset.glassPath || '');
+    if (!control) continue;
+    const value = settingValueAtPath(input.dataset.glassPath || '');
+    if (input instanceof HTMLInputElement && input.type === 'checkbox') {
+      setCheckedIfChanged(input, Boolean(value));
+    } else {
+      setInputValueIfChanged(input, value === undefined || value === null ? '' : String(value));
+    }
+    const inputPath = input.dataset.glassPath || '';
+    const disabled = (
+      appGlassEffectControlDisabled(inputPath)
+      || (inputPath.startsWith('workspaceGlass.effect.') && !workspaceCustomEffect)
+      || (inputPath === 'workspaceGlass.rowRadius' && !workspaceCustomEffect)
+      || (inputPath.startsWith('workspaceGlass.containerEffect.') && !workspaceContainerCustomEffect)
+      || (inputPath === 'workspaceGlass.containerRadius' && !workspaceContainerCustomEffect)
+      || ((inputPath === 'workspaceGlass.headerColor'
+        || inputPath === 'workspaceGlass.headerSize'
+        || inputPath === 'workspaceGlass.headerWeight')
+        && !state.ideSettings.workspaceGlass.headerTextUseCustom)
+      || (inputPath.startsWith('workspaceGlass.detailButton')
+        && inputPath !== 'workspaceGlass.detailButtonUseWidgetChrome'
+        && state.ideSettings.workspaceGlass.detailButtonUseWidgetChrome)
+      || (inputPath === 'workspaceGlass.rowHoverOnly' && !state.ideSettings.workspaceGlass.enabled)
+      || (inputPath === 'appGlass.explorerRowsSamplePanel' && !state.ideSettings.appGlass.explorerPanel)
+      || ((inputPath === 'appGlass.explorerRowsHoverOnly'
+        || inputPath === 'appGlass.explorerRowsSamplePanel'
+        || inputPath === 'appGlass.explorerHoverColor'
+        || inputPath === 'appGlass.explorerHoverAlpha'
+        || inputPath === 'appGlass.explorerActiveAlpha'
+        || inputPath === 'appGlass.explorerSelectedRailColor'
+        || inputPath === 'appGlass.explorerSelectedRailAlpha'
+        || inputPath === 'appGlass.explorerSelectedRailWidth')
+        && !state.ideSettings.appGlass.explorerRows)
+      || (inputPath === 'appGlass.explorerRowsRadius'
+        && (!state.ideSettings.appGlass.explorerRows || !state.ideSettings.appGlass.explorerRowsUseCustomEffect))
+      || ((inputPath === 'appGlass.shadowAlpha'
+        || inputPath === 'appGlass.shadowY'
+        || inputPath === 'appGlass.shadowBlur')
+      && !appGlassShadowEnabled)
+    );
+    setDisabledIfChanged(input, disabled);
+    input.closest('.glass-settings-control')?.classList.toggle('control-disabled', disabled);
+    syncGlassControlOutput(input, control);
+  }
+}
+
+function glassControlForPath(path: string) {
+  return GLASS_SETTINGS_CONTROLS.find((control): control is GlassInputControl => (
+    control.type !== 'section'
+    && control.type !== 'action'
+    && control.path === path
+  ));
+}
+
+function settingValueAtPath(path: string): unknown {
+  const segments = path.split('.');
+  let current: unknown = state.ideSettings;
+  for (const segment of segments) {
+    if (!isPlainRecord(current)) return undefined;
+    current = current[segment];
+  }
+  return current;
+}
+
+function setSettingValueAtPath(path: string, value: unknown) {
+  const segments = path.split('.');
+  let current: Record<string, unknown> = state.ideSettings as unknown as Record<string, unknown>;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index];
+    const child = current[segment];
+    if (!isPlainRecord(child)) {
+      current[segment] = {};
+    }
+    current = current[segment] as Record<string, unknown>;
+  }
+  current[segments[segments.length - 1]] = value;
+}
+
+function valueFromGlassControl(input: HTMLInputElement | HTMLSelectElement, control: GlassInputControl) {
+  if (control.type === 'checkbox') return input instanceof HTMLInputElement && input.checked;
+  if (control.type === 'range') return Number(input.value);
+  return input.value;
+}
+
+function glassRangeInputForOutput(output: HTMLInputElement) {
+  const path = output.dataset.glassOutputFor || '';
+  return Array.from(el.glassSettingsControls.querySelectorAll<HTMLInputElement>('input[data-glass-path]'))
+    .find((input) => input.dataset.glassPath === path && input.type === 'range') ?? null;
+}
+
+function roundedGlassRangeValue(value: number, control: Extract<GlassSettingsControl, { type: 'range' }>) {
+  const step = control.step > 0 ? control.step : 1;
+  const stepped = control.min + Math.round((value - control.min) / step) * step;
+  const precision = Math.min(6, Math.max(0, (String(step).split('.')[1] ?? '').length + 1));
+  return Number(clamp(stepped, control.min, control.max).toFixed(precision));
+}
+
+function commitGlassRangeOutput(output: HTMLInputElement) {
+  const input = glassRangeInputForOutput(output);
+  const path = output.dataset.glassOutputFor || '';
+  const control = glassControlForPath(path);
+  if (!input || !control || control.type !== 'range') {
+    return;
+  }
+  const raw = output.value.trim().replace(',', '.');
+  const unit = output.dataset.glassOutputUnit || '';
+  const unitless = unit && raw.endsWith(unit) ? raw.slice(0, -unit.length) : raw;
+  const numericText = unitless.replace(/[^\d+\-.eE]/g, '');
+  const numeric = Number.parseFloat(numericText);
+  if (!Number.isFinite(numeric)) {
+    syncGlassControlOutput(input, control);
+    return;
+  }
+  const next = roundedGlassRangeValue(numeric, control);
+  const previous = input.value;
+  setInputValueIfChanged(input, String(next));
+  output.value = `${next}${unit}`;
+  if (input.value !== previous) {
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+function handleGlassRangeOutputKeydown(event: KeyboardEvent) {
+  const output = event.currentTarget;
+  if (!(output instanceof HTMLInputElement)) return;
+  event.stopPropagation();
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    commitGlassRangeOutput(output);
+    output.blur();
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    const input = glassRangeInputForOutput(output);
+    if (input) {
+      output.value = `${input.value}${output.dataset.glassOutputUnit || ''}`;
+    }
+    output.blur();
+  }
+}
+
+function handleGlassRangeOutputBlur(event: FocusEvent) {
+  const output = event.currentTarget;
+  if (output instanceof HTMLInputElement) commitGlassRangeOutput(output);
+}
+
+function handleGlassRangeOutputFocus(event: FocusEvent) {
+  const output = event.currentTarget;
+  if (!(output instanceof HTMLInputElement)) return;
+  window.setTimeout(() => {
+    if (document.activeElement === output) output.select();
+  }, 0);
+}
+
+function syncWorkspaceGlassBaseAgentTextSetting(path: string, value: unknown) {
+  if (path === 'workspaceGlass.agentTextColor' && typeof value === 'string') {
+    setSettingValueAtPath('workspaceGlass.agentTitleColor', value);
+    setSettingValueAtPath('workspaceGlass.agentActivityColor', value);
+    setSettingValueAtPath('workspaceGlass.agentMetaColor', value);
+  }
+  if (path === 'workspaceGlass.agentTextWeight' && typeof value === 'number' && Number.isFinite(value)) {
+    setSettingValueAtPath('workspaceGlass.agentTitleWeight', value);
+    setSettingValueAtPath('workspaceGlass.agentActivityWeight', value);
+    setSettingValueAtPath('workspaceGlass.agentMetaWeight', value);
+  }
+}
+
+function cloneGlassSettingForInheritance(action: string, sourcePath: string) {
+  const source = settingValueAtPath(sourcePath);
+  if (action === 'inherit-glass-effect') {
+    return cloneGlassEffectSettings(normalizeWorkspaceGlassEffectSettings(source, state.ideSettings.glassEffect));
+  }
+  if (action === 'inherit-glass-chrome') {
+    return cloneAppGlassChromeSettings(normalizeAppGlassChromeSettings(source, state.ideSettings.appGlass.chrome));
+  }
+  return cloneJson(source);
+}
+
+function syncGlassRadiusForEffectInheritance(sourcePath: string, targetPath: string) {
+  const inherited = normalizeWorkspaceGlassEffectSettings(settingValueAtPath(sourcePath), state.ideSettings.glassEffect);
+  if (targetPath === 'workspaceGlass.effect') {
+    setSettingValueAtPath('workspaceGlass.rowRadius', inherited.radius);
+  } else if (targetPath === 'workspaceGlass.containerEffect') {
+    setSettingValueAtPath('workspaceGlass.containerRadius', inherited.radius);
+  } else if (targetPath === 'appGlass.explorerRowsEffect') {
+    setSettingValueAtPath('appGlass.explorerRowsRadius', inherited.radius);
+  }
+}
+
+function handleGlassSettingsActionClick(event: MouseEvent) {
+  const button = event.currentTarget;
+  if (!(button instanceof HTMLButtonElement)) return;
+  const action = button.dataset.glassAction || '';
+  const sourcePath = button.dataset.glassSourcePath || '';
+  const targetPath = button.dataset.glassTargetPath || '';
+  const customPath = button.dataset.glassCustomPath || '';
+  if (!action || !sourcePath || !targetPath) return;
+  const affectsWorkspaceGlass = targetPath.startsWith('workspaceGlass.');
+  const affectsAppGlass = targetPath.startsWith('appGlass.');
+  setSettingValueAtPath(targetPath, cloneGlassSettingForInheritance(action, sourcePath));
+  if (customPath) setSettingValueAtPath(customPath, true);
+  if (action === 'inherit-glass-effect') {
+    syncGlassRadiusForEffectInheritance(sourcePath, targetPath);
+    state.ideSettings.glassEffect = normalizeWorkspaceGlassEffectSettings(state.ideSettings.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS);
+    state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+    state.ideSettings.appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+    if (affectsWorkspaceGlass) updateWorkspaceLiquidGlassEffectOptions();
+    if (targetPath === 'appGlass.explorerRowsEffect') updateExplorerLiquidGlassEffectOptions();
+    const appEffectScope = appGlassEffectScopeForControlPath(targetPath);
+    if (appEffectScope !== null) updateAppLiquidGlassEffectOptions(appEffectScope || null);
+  } else if (action === 'inherit-glass-chrome') {
+    state.ideSettings.appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  }
+  applyIdeSettings();
+  syncGlassSettingsPopover();
+  schedulePersistIdeSettings(80);
+  setStatus('Global glass 값을 개별 설정으로 복사했습니다');
+  if (button.dataset.glassRecapture === '1') {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+    scheduleExplorerLiquidGlassRefresh({ recapture: true });
+  }
+  if (affectsWorkspaceGlass) scheduleWorkspaceLiquidGlassRefresh();
+  if (targetPath === 'appGlass.explorerRowsEffect') scheduleExplorerLiquidGlassRefresh();
+  if (affectsAppGlass && isAppGlassTopologyControlPath(customPath || targetPath)) {
+    scheduleAppGlassRefresh({ reason: 'glass-topology' });
+  }
+}
+
+function handleGlassSettingsControlChange(event: Event) {
+  const input = event.currentTarget;
+  if (!(input instanceof HTMLInputElement || input instanceof HTMLSelectElement)) return;
+  const path = input.dataset.glassPath || '';
+  const control = glassControlForPath(path);
+  if (!control) return;
+  const value = valueFromGlassControl(input, control);
+  if (path === 'ideBackground.preset') {
+    applyIdeBackgroundPresetToSettings(stringChoice<IdeBackgroundPreset>(value, ['liquid', 'procedural-demo', 'ide-default', 'ide-editor', 'ide-blue', 'custom'], 'custom'));
+  } else {
+    setSettingValueAtPath(path, value);
+    syncWorkspaceGlassBaseAgentTextSetting(path, value);
+    if ('markCustomBackground' in control && control.markCustomBackground) {
+      state.ideSettings.ideBackground = {
+        ...normalizeIdeBackgroundSettings(state.ideSettings.ideBackground),
+        preset: 'custom'
+      };
+    }
+  }
+  if (
+    path.startsWith('glassEffect.')
+    || path.startsWith('workspaceGlass.effect.')
+    || path === 'workspaceGlass.useCustomEffect'
+    || path.startsWith('workspaceGlass.containerEffect.')
+    || path === 'workspaceGlass.containerUseCustomEffect'
+  ) {
+    updateWorkspaceLiquidGlassEffectOptions();
+  }
+  if (path.startsWith('glassEffect.')) {
+    updateExplorerLiquidGlassEffectOptions();
+  }
+  if (path === 'workspaceGlass.rowHoverOnly') {
+    setWorkspaceHoverOnlyTarget(null);
+    renderWorkspaceHoverOnlyNow();
+  }
+  if (path === 'appGlass.explorerRowsHoverOnly') {
+    setExplorerHoverOnlyTarget(null);
+    renderExplorerHoverOnlyNow();
+  }
+  applyIdeSettings();
+  syncGlassSettingsPopover();
+  schedulePersistIdeSettings(event.type === 'change' ? 80 : 360);
+  setStatus('Glass settings saved');
+  const ideBackgroundChanged = path.startsWith('ideBackground.');
+  const commonMaterialChanged = path.startsWith('glassEffect.');
+  const workspaceGlassPath = path.startsWith('workspaceGlass.');
+  const explorerRowsPath = isExplorerRowsGlassControlPath(path);
+  const appEffectScope = appGlassEffectScopeForControlPath(path);
+  if (ideBackgroundChanged || (control.recapture === true && workspaceGlassPath)) {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+  } else if (
+    path === 'workspaceGlass.rowRadius'
+    || path === 'workspaceGlass.containerRadius'
+    || path === 'workspaceGlass.useCustomEffect'
+    || path === 'workspaceGlass.containerUseCustomEffect'
+    || commonMaterialChanged
+  ) {
+    scheduleWorkspaceLiquidGlassRefresh();
+  }
+  if (
+    ideBackgroundChanged
+    || path === 'appGlass.enabled'
+    || path === 'appGlass.explorerPanel'
+    || path === 'appGlass.explorerRows'
+    || path === 'appGlass.explorerRowsSamplePanel'
+  ) {
+    scheduleExplorerLiquidGlassRefresh({ recapture: true });
+  } else if (
+    commonMaterialChanged
+    || path === 'appGlass.explorerRowsUseCustomEffect'
+    || path === 'appGlass.explorerRowsRadius'
+    || path === 'appGlass.explorerRowsEffect'
+    || path.startsWith('appGlass.explorerRowsEffect.')
+  ) {
+    scheduleExplorerLiquidGlassRefresh();
+  }
+  if (ideBackgroundChanged) {
+    scheduleAppGlassRefresh({ recapture: true, reason: 'background-setting' });
+  } else if (commonMaterialChanged) {
+    updateAppLiquidGlassEffectOptions(null);
+  } else if (appEffectScope !== null) {
+    updateAppLiquidGlassEffectOptions(appEffectScope || null);
+  } else if (isAppGlassTopologyControlPath(path)) {
+    // applyAppGlassSettings already schedules the required topology refresh.
+  } else if (explorerRowsPath) {
+    // Explorer row glass has its own renderer; do not refresh every app-glass owner.
+  }
+}
+
+function syncGlassControlOutput(input: HTMLInputElement | HTMLSelectElement, control: GlassInputControl) {
+  if (control.type !== 'range' || !(input instanceof HTMLInputElement)) return;
+  const outputId = input.dataset.outputId || '';
+  const output = outputId ? document.getElementById(outputId) : null;
+  if (!(output instanceof HTMLInputElement)) return;
+  setDisabledIfChanged(output, input.disabled);
+  if (document.activeElement === output) return;
+  output.value = `${input.value}${control.unit ?? ''}`;
+}
+
+function currentGlassSettingsSnapshot() {
+  const workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  return {
+    ideBackground: normalizeIdeBackgroundSettings(state.ideSettings.ideBackground),
+    glassEffect: normalizeWorkspaceGlassEffectSettings(state.ideSettings.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS),
+    workspaceGlass,
+    workspaceSideDockGlass: workspaceGlass.enabled,
+    appGlass: normalizeAppGlassSettings(state.ideSettings.appGlass)
+  };
+}
+
+function glassSettingsExportFilename() {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `simple-vibe-glass-settings-${timestamp}.json`;
+}
+
+function downloadTextFile(filename: string, text: string, mimeType = 'application/json') {
+  const blob = new Blob([text], { type: `${mimeType};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.rel = 'noopener';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportGlassSettings() {
+  const payload = {
+    kind: 'simple-vibe-ide-glass-settings',
+    version: 1,
+    app: 'Simple Vibe IDE',
+    exportedAt: new Date().toISOString(),
+    settings: currentGlassSettingsSnapshot()
+  };
+  downloadTextFile(glassSettingsExportFilename(), JSON.stringify(payload, null, 2));
+  setStatus('Glass settings exported');
+}
+
+function glassSettingsImportSource(payload: unknown) {
+  if (!isPlainRecord(payload)) throw new Error('JSON object expected');
+  const source = isPlainRecord(payload.settings) ? payload.settings : payload;
+  const knownKeys = ['ideBackground', 'glassEffect', 'workspaceGlass', 'workspaceSideDockGlass', 'appGlass'];
+  if (!knownKeys.some((key) => key in source)) {
+    throw new Error('No glass settings found in JSON');
+  }
+  return source;
+}
+
+function applyImportedGlassSettings(payload: unknown) {
+  const source = glassSettingsImportSource(payload);
+  const importedWorkspaceSideDockGlass = typeof source.workspaceSideDockGlass === 'boolean'
+    ? source.workspaceSideDockGlass
+    : state.ideSettings.workspaceSideDockGlass === true;
+
+  if ('ideBackground' in source) {
+    state.ideSettings.ideBackground = normalizeIdeBackgroundSettings(source.ideBackground);
+  }
+  if ('glassEffect' in source) {
+    state.ideSettings.glassEffect = normalizeWorkspaceGlassEffectSettings(source.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS);
+  }
+  if ('workspaceGlass' in source) {
+    state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings(source.workspaceGlass, importedWorkspaceSideDockGlass);
+  } else if ('workspaceSideDockGlass' in source) {
+    state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings({
+      ...state.ideSettings.workspaceGlass,
+      enabled: importedWorkspaceSideDockGlass
+    }, importedWorkspaceSideDockGlass);
+  }
+  if ('appGlass' in source) {
+    state.ideSettings.appGlass = normalizeAppGlassSettings(source.appGlass);
+  }
+  state.ideSettings.workspaceSideDockGlass = state.ideSettings.workspaceGlass.enabled;
+
+  applyIdeSettings();
+  renderSettings();
+  syncGlassSettingsPopover();
+  persistIdeSettings();
+  scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+  scheduleExplorerLiquidGlassRefresh({ recapture: true });
+  scheduleAppGlassRefresh({ recapture: true, reason: 'glass-import' });
+}
+
+async function importGlassSettingsFile(file: File) {
+  try {
+    el.glassSettingsStatus.textContent = 'Glass 설정 JSON을 가져오는 중...';
+    const text = await readFileAsText(file);
+    applyImportedGlassSettings(JSON.parse(text));
+    setStatus('Glass settings imported');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Glass settings import failed: ${message}`, true);
+    el.glassSettingsStatus.textContent = `가져오기 실패: ${message}`;
+  } finally {
+    el.glassSettingsImportFile.value = '';
+  }
+}
+
+function chooseGlassSettingsImportFile() {
+  el.glassSettingsImportFile.value = '';
+  el.glassSettingsImportFile.click();
+}
+
+function handleGlassSettingsImportFileChange() {
+  const file = el.glassSettingsImportFile.files?.[0];
+  if (file) void importGlassSettingsFile(file);
+}
+
+function resetGlassSettings() {
+  state.ideSettings.ideBackground = cloneIdeBackgroundSettings();
+  state.ideSettings.glassEffect = cloneGlassEffectSettings();
+  state.ideSettings.workspaceGlass = cloneWorkspaceGlassSettings();
+  state.ideSettings.appGlass = cloneAppGlassSettings();
+  state.ideSettings.workspaceSideDockGlass = false;
+  applyIdeSettings();
+  syncGlassSettingsPopover();
+  persistIdeSettings();
+  setStatus('Glass settings reset');
+}
+
+function updateWorkspaceGlassEnabled(enabled: boolean) {
+  state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  state.ideSettings.workspaceGlass.enabled = enabled;
+  state.ideSettings.workspaceSideDockGlass = enabled;
+  applyIdeSettings();
+  syncGlassSettingsPopover();
+  persistIdeSettings();
+  setStatus(`Workspace glass ${enabled ? 'enabled' : 'disabled'}`);
+}
+
+async function loadGlassBackgroundFile(file: File) {
+  try {
+    el.glassSettingsStatus.textContent = '커스텀 배경 이미지를 처리하는 중...';
+    const dataUrl = await shrinkImageFileForSettings(file);
+    state.ideSettings.ideBackground = {
+      ...normalizeIdeBackgroundSettings(state.ideSettings.ideBackground),
+      preset: 'custom',
+      customImageSrc: dataUrl,
+      customImageName: file.name,
+      customImageUrl: ''
+    };
+    applyIdeSettings();
+    syncGlassSettingsPopover();
+    persistIdeSettings();
+    setStatus('Custom IDE background saved');
+  } catch (error) {
+    setStatus(`Custom background failed: ${String(error)}`, true);
+  } finally {
+    el.glassBackgroundFile.value = '';
+  }
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('File read failed'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function readFileAsText(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('File read failed'));
+    reader.readAsText(file);
+  });
+}
+
+async function shrinkImageFileForSettings(file: File) {
+  const dataUrl = await readFileAsDataUrl(file);
+  if (file.type === 'image/svg+xml') return dataUrl;
+  const image = new Image();
+  image.decoding = 'async';
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error('Image decode failed'));
+    image.src = dataUrl;
+  });
+  const sourceW = image.naturalWidth || 1;
+  const sourceH = image.naturalHeight || 1;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { alpha: true });
+  if (!ctx) return dataUrl;
+  let output = dataUrl;
+  for (const maxSide of [1920, 1600, 1280, 1024]) {
+    const scale = Math.min(1, maxSide / Math.max(sourceW, sourceH));
+    const width = Math.max(1, Math.round(sourceW * scale));
+    const height = Math.max(1, Math.round(sourceH * scale));
+    canvas.width = width;
+    canvas.height = height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(image, 0, 0, width, height);
+    output = canvas.toDataURL('image/webp', maxSide >= 1600 ? 0.84 : 0.8);
+    if (output.length < 3_600_000) break;
+  }
+  return output;
+}
+
+function workspaceLiquidGlassEligible() {
+  return !IS_TERMINAL_APP
+    && appGlassEnabled()
+    && state.ideSettings.workspaceGlass?.enabled === true
+    && el.workspaceTabs.childElementCount > 0;
+}
+
+function workspaceGlassUsesContainerSnapshot() {
+  if (!workspaceLiquidGlassEligible()) return false;
+  const glass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, true);
+  return glass.containerGlassEnabled === true && glass.rowSamplesContainer === true;
+}
+
+function workspaceGlassHoverOnlyEnabled() {
+  if (!workspaceLiquidGlassEligible()) return false;
+  const glass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, true);
+  return glass.rowHoverOnly === true;
+}
+
+function isWorkspaceHoverOnlyLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement
+    && (
+      lens.el.classList.contains('workspace-tab-glass-plane')
+      || lens.el.classList.contains('workspace-tab-add-glass-plane')
+      || lens.el.classList.contains('workspace-tab')
+      || lens.el.classList.contains('workspace-glass-add')
+    )
+    && lens.el.dataset.workspaceGlassLens === 'liquidgl';
+}
+
+function activeWorkspaceHoverOnlyGlassElements() {
+  if (!workspaceGlassHoverOnlyEnabled()) return null;
+  const hovered = document.querySelector<HTMLElement>('.workspace-tab:hover, #new-workspace-tab:hover');
+  const target = workspaceLiquidGlassHoverOnlyTarget?.isConnected
+    ? workspaceLiquidGlassHoverOnlyTarget
+    : hovered;
+  if (!(target instanceof HTMLElement) || !target.isConnected) return new Set<HTMLElement>();
+  if (target === el.newWorkspaceTab) {
+    return new Set<HTMLElement>([ensureWorkspaceAddGlassPlane()]);
+  }
+  if (target.classList.contains('workspace-tab')) return new Set<HTMLElement>([ensureWorkspaceTabGlassPlane(target)]);
+  return new Set<HTMLElement>();
+}
+
+function resetHoverOnlyLiquidGlassLens(lens: LiquidGLLensLike) {
+  try {
+    lens._destroyMirrorCanvas?.();
+    lens._tiltActive = false;
+    lens._tiltInteracting = false;
+    lens.tiltX = 0;
+    lens.tiltY = 0;
+    if (lens.el instanceof HTMLElement) {
+      lens.el.style.transform = '';
+      lens.el.style.transformOrigin = '50% 50%';
+    }
+    if (lens._shadowEl instanceof HTMLElement) {
+      lens._shadowEl.style.transform = '';
+    }
+  } catch {
+    // Best effort reset for inactive hover-only lenses.
+  }
+}
+
+function resetInactiveWorkspaceHoverOnlyLenses(active = activeWorkspaceHoverOnlyGlassElements()) {
+  const renderer = window.__liquidGLRenderer__;
+  if (!renderer?.lenses) return;
+  for (const lens of renderer.lenses) {
+    if (!isWorkspaceHoverOnlyLens(lens) || active?.has(lens.el as HTMLElement)) continue;
+    resetHoverOnlyLiquidGlassLens(lens);
+  }
+}
+
+function installWorkspaceHoverOnlyRenderFilter() {
+  const renderer = window.__liquidGLRenderer__;
+  if (!renderer || renderer._sviWorkspaceHoverOnlyFilterInstalled) return;
+  const originalRender = renderer.render?.bind(renderer);
+  if (typeof originalRender !== 'function') return;
+  renderer._sviWorkspaceHoverOnlyOriginalRender = originalRender;
+  renderer.render = () => {
+    if (!workspaceGlassHoverOnlyEnabled()) return originalRender();
+    const active = activeWorkspaceHoverOnlyGlassElements();
+    const all = renderer.lenses ?? [];
+    renderer.lenses = all.filter((lens) => !isWorkspaceHoverOnlyLens(lens) || active?.has(lens.el as HTMLElement));
+    try {
+      return originalRender();
+    } finally {
+      renderer.lenses = all;
+    }
+  };
+  renderer._sviWorkspaceHoverOnlyFilterInstalled = true;
+}
+
+function renderWorkspaceHoverOnlyNow() {
+  const renderer = window.__liquidGLRenderer__;
+  if (!renderer) return;
+  installWorkspaceHoverOnlyRenderFilter();
+  if (workspaceGlassHoverOnlyEnabled()) resetInactiveWorkspaceHoverOnlyLenses();
+  renderer.render?.();
+}
+
+function workspaceHoverOnlyTargetFromEventTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) return null;
+  return target.closest<HTMLElement>('.workspace-tab, #new-workspace-tab');
+}
+
+function setWorkspaceHoverOnlyTarget(target: HTMLElement | null) {
+  if (!workspaceGlassHoverOnlyEnabled()) {
+    workspaceLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+    workspaceLiquidGlassHoverOnlyTarget = null;
+    renderWorkspaceHoverOnlyNow();
+    return;
+  }
+  const next = target instanceof HTMLElement && target.isConnected ? target : null;
+  if (workspaceLiquidGlassHoverOnlyTarget === next) return;
+  workspaceLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+  workspaceLiquidGlassHoverOnlyTarget = next;
+  workspaceLiquidGlassHoverOnlyTarget?.classList.add('glass-hover-active');
+  renderWorkspaceHoverOnlyNow();
+}
+
+function handleWorkspaceHoverOnlyPointerOver(event: PointerEvent) {
+  if (!workspaceGlassHoverOnlyEnabled()) return;
+  const target = workspaceHoverOnlyTargetFromEventTarget(event.target);
+  if (target) setWorkspaceHoverOnlyTarget(target);
+}
+
+function handleWorkspaceHoverOnlyPointerOut(event: PointerEvent) {
+  if (!workspaceGlassHoverOnlyEnabled()) return;
+  const target = workspaceHoverOnlyTargetFromEventTarget(event.target);
+  if (!target || target !== workspaceLiquidGlassHoverOnlyTarget) return;
+  const related = workspaceHoverOnlyTargetFromEventTarget(event.relatedTarget);
+  if (related === target) return;
+  setWorkspaceHoverOnlyTarget(related);
+}
+
+function handleWorkspaceHoverOnlyPointerMove(event: PointerEvent) {
+  if (!workspaceGlassHoverOnlyEnabled()) return;
+  const hit = document.elementFromPoint(event.clientX, event.clientY);
+  const target = workspaceHoverOnlyTargetFromEventTarget(hit);
+  if (target !== workspaceLiquidGlassHoverOnlyTarget) setWorkspaceHoverOnlyTarget(target);
+}
+
+function workspaceContainerLiquidGlassRenderer() {
+  return window.__sviWorkspaceContainerLiquidGLRenderer__ ?? undefined;
+}
+
+function createIsolatedWorkspaceLiquidGL(options: Record<string, unknown>): { result: unknown; renderer: LiquidGLRendererLike | undefined } {
+  const previousRenderer = window.__liquidGLRenderer__;
+  window.__liquidGLRenderer__ = undefined;
+  try {
+    const result = window.liquidGL?.(options);
+    const renderer = window.__liquidGLRenderer__;
+    return { result, renderer };
+  } finally {
+    window.__liquidGLRenderer__ = previousRenderer;
+  }
+}
+
+function workspaceLiquidGlassSnapshotSelector() {
+  return workspaceGlassUsesContainerSnapshot()
+    ? '#ide-glass-container-snapshot-stage'
+    : '#ide-glass-snapshot-stage';
+}
+
+function workspaceLiquidGlassSnapshotTargetElement() {
+  return workspaceGlassUsesContainerSnapshot()
+    ? el.ideGlassContainerSnapshotStage
+    : el.ideGlassSnapshotStage;
+}
+
+function syncWorkspaceGlassSnapshotStage() {
+  const enabled = workspaceLiquidGlassEligible() || appGlassEnabled();
+  const useContainerSnapshot = workspaceGlassUsesContainerSnapshot();
+  const useExplorerPanelSnapshot = explorerRowsUsePanelSnapshot();
+  // Keep the base stage visible while row sampling uses the container result:
+  // the isolated container renderer still captures this safe background stage.
+  el.ideGlassSnapshotStage.classList.toggle('inactive', !enabled);
+  el.ideGlassContainerSnapshotStage.classList.toggle('inactive', !useContainerSnapshot);
+  el.ideGlassExplorerSnapshotStage.classList.toggle('inactive', !useExplorerPanelSnapshot);
+  if (useContainerSnapshot) syncWorkspaceGlassContainerSnapshotSurface();
+  if (useExplorerPanelSnapshot) syncExplorerGlassPanelSnapshotSurface();
+}
+
+function syncWorkspaceGlassRendererSnapshotTarget() {
+  const renderer = window.__liquidGLRenderer__;
+  if (!renderer) return;
+  const target = workspaceLiquidGlassSnapshotTargetElement();
+  if (renderer.snapshotTarget !== target) {
+    renderer.snapshotTarget = target;
+  }
+}
+
+function syncWorkspaceGlassContainerSnapshotSurface() {
+  const shellRect = el.shell.getBoundingClientRect();
+  const dockRect = el.workspaceDock.getBoundingClientRect();
+  const style = el.ideGlassContainerSampleSurface.style;
+  style.left = `${dockRect.left - shellRect.left}px`;
+  style.top = `${dockRect.top - shellRect.top}px`;
+  style.width = `${dockRect.width}px`;
+  style.height = `${dockRect.height}px`;
+  const renderer = workspaceContainerLiquidGlassRenderer();
+  const source = renderer?.staticSnapshotCanvas;
+  const rendererCanvas = renderer?.canvas;
+  const canvas = el.ideGlassContainerSampleCanvas;
+  const scale = Math.max(0.1, Number(renderer?.scaleFactor) || window.devicePixelRatio || 1);
+  const width = Math.max(1, Math.round(shellRect.width * scale));
+  const height = Math.max(1, Math.round(shellRect.height * scale));
+  canvas.style.width = `${shellRect.width}px`;
+  canvas.style.height = `${shellRect.height}px`;
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  const ctx = canvas.getContext('2d', { alpha: true });
+  if (!ctx || !(rendererCanvas instanceof HTMLCanvasElement)) {
+    el.shell.classList.remove('workspace-glass-container-sample-canvas-ready');
+    return false;
+  }
+  ctx.clearRect(0, 0, width, height);
+  try {
+    if (source instanceof HTMLCanvasElement && source.width > 0 && source.height > 0) {
+      ctx.drawImage(source, 0, 0, source.width, source.height, 0, 0, width, height);
+    }
+    const canvasRect = rendererCanvas.getBoundingClientRect();
+    const scaleX = rendererCanvas.width / Math.max(1, canvasRect.width);
+    const scaleY = rendererCanvas.height / Math.max(1, canvasRect.height);
+    const sx = Math.max(0, Math.round((shellRect.left - canvasRect.left) * scaleX));
+    const sy = Math.max(0, Math.round((shellRect.top - canvasRect.top) * scaleY));
+    const sw = Math.min(rendererCanvas.width - sx, Math.round(shellRect.width * scaleX));
+    const sh = Math.min(rendererCanvas.height - sy, Math.round(shellRect.height * scaleY));
+    if (sw > 0 && sh > 0) ctx.drawImage(rendererCanvas, sx, sy, sw, sh, 0, 0, width, height);
+  } catch (error) {
+    ctx.clearRect(0, 0, width, height);
+    el.shell.classList.remove('workspace-glass-container-sample-canvas-ready');
+    console.warn('workspace glass container composite failed', error);
+    return false;
+  }
+  el.shell.classList.add('workspace-glass-container-sample-canvas-ready');
+  return true;
+}
+
+async function refreshWorkspaceContainerGlassComposite() {
+  const renderer = workspaceContainerLiquidGlassRenderer();
+  if (!renderer) {
+    syncWorkspaceGlassContainerSnapshotSurface();
+    return false;
+  }
+  await renderer.captureSnapshot?.().catch(() => undefined);
+  renderer.render?.();
+  return syncWorkspaceGlassContainerSnapshotSurface();
+}
+
+function explorerRowsUsePanelSnapshot() {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  const panel = getPanel('explorer');
+  return appGlassEnabled()
+    && glass.explorerRows === true
+    && glass.explorerRowsSamplePanel === true
+    && glass.explorerPanel === true
+    && panel.isConnected
+    && !panel.classList.contains('hidden');
+}
+
+function explorerPanelAppGlassRenderer() {
+  const panel = getPanel('explorer');
+  const plane = appGlassPlanesForOwner(panel).find((candidate) => candidate.dataset.appGlassScope === 'explorer-panel');
+  const id = plane?.dataset.appGlassId || '';
+  return id ? appGlassRenderers.get(id) : undefined;
+}
+
+function explorerLiquidGlassSnapshotSelector() {
+  return explorerRowsUsePanelSnapshot()
+    ? '#ide-glass-explorer-snapshot-stage'
+    : '#ide-glass-snapshot-stage';
+}
+
+function syncExplorerGlassPanelSnapshotSurface() {
+  const shellRect = el.shell.getBoundingClientRect();
+  const panel = getPanel('explorer');
+  const panelRect = panel.getBoundingClientRect();
+  const style = el.ideGlassExplorerSampleSurface.style;
+  style.left = `${panelRect.left - shellRect.left}px`;
+  style.top = `${panelRect.top - shellRect.top}px`;
+  style.width = `${panelRect.width}px`;
+  style.height = `${panelRect.height}px`;
+  const renderer = explorerPanelAppGlassRenderer();
+  const source = renderer?.staticSnapshotCanvas;
+  const rendererCanvas = renderer?.canvas;
+  const canvas = el.ideGlassExplorerSampleCanvas;
+  const scale = Math.max(0.1, Number(renderer?.scaleFactor) || window.devicePixelRatio || 1);
+  const width = Math.max(1, Math.round(shellRect.width * scale));
+  const height = Math.max(1, Math.round(shellRect.height * scale));
+  canvas.style.width = `${shellRect.width}px`;
+  canvas.style.height = `${shellRect.height}px`;
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  const ctx = canvas.getContext('2d', { alpha: true });
+  if (!ctx || !(rendererCanvas instanceof HTMLCanvasElement)) {
+    el.shell.classList.remove('app-glass-explorer-sample-canvas-ready');
+    return false;
+  }
+  ctx.clearRect(0, 0, width, height);
+  try {
+    if (source instanceof HTMLCanvasElement && source.width > 0 && source.height > 0) {
+      ctx.drawImage(source, 0, 0, source.width, source.height, 0, 0, width, height);
+    }
+    const canvasRect = rendererCanvas.getBoundingClientRect();
+    const scaleX = rendererCanvas.width / Math.max(1, canvasRect.width);
+    const scaleY = rendererCanvas.height / Math.max(1, canvasRect.height);
+    const sx = Math.max(0, Math.round((shellRect.left - canvasRect.left) * scaleX));
+    const sy = Math.max(0, Math.round((shellRect.top - canvasRect.top) * scaleY));
+    const sw = Math.min(rendererCanvas.width - sx, Math.round(shellRect.width * scaleX));
+    const sh = Math.min(rendererCanvas.height - sy, Math.round(shellRect.height * scaleY));
+    if (sw > 0 && sh > 0) ctx.drawImage(rendererCanvas, sx, sy, sw, sh, 0, 0, width, height);
+  } catch (error) {
+    ctx.clearRect(0, 0, width, height);
+    el.shell.classList.remove('app-glass-explorer-sample-canvas-ready');
+    console.warn('explorer glass panel composite failed', error);
+    return false;
+  }
+  el.shell.classList.add('app-glass-explorer-sample-canvas-ready');
+  return true;
+}
+
+async function refreshExplorerPanelGlassComposite() {
+  const renderer = explorerPanelAppGlassRenderer();
+  if (!renderer) {
+    syncExplorerGlassPanelSnapshotSurface();
+    return false;
+  }
+  await renderer.captureSnapshot?.().catch(() => undefined);
+  renderer.render?.();
+  return syncExplorerGlassPanelSnapshotSurface();
+}
+
+function scheduleWorkspaceLiquidGlassRefresh(options: { recapture?: boolean; delay?: number } = {}) {
+  if (workspaceLiquidGlassRefreshTimer) window.clearTimeout(workspaceLiquidGlassRefreshTimer);
+  workspaceLiquidGlassRefreshRecapture = workspaceLiquidGlassRefreshRecapture || options.recapture === true;
+  workspaceLiquidGlassRefreshTimer = window.setTimeout(() => {
+    const recapture = workspaceLiquidGlassRefreshRecapture;
+    workspaceLiquidGlassRefreshTimer = 0;
+    workspaceLiquidGlassRefreshRecapture = false;
+    void applyWorkspaceLiquidGlass(recapture);
+  }, options.delay ?? (options.recapture ? 160 : 60));
+}
+
+function workspaceLiquidGlassRendererContextLost(renderer: LiquidGLRendererLike | undefined) {
+  return appGlassRendererContextLost(renderer);
+}
+
+function bindWorkspaceLiquidGlassContextEvents(renderer: LiquidGLRendererLike | undefined, layer: 'rows' | 'container') {
+  const canvas = renderer?.canvas;
+  if (!(canvas instanceof HTMLCanvasElement)) return;
+  const boundKey = layer === 'rows' ? 'workspaceGlassRowsContextBound' : 'workspaceGlassContainerContextBound';
+  if (canvas.dataset[boundKey] === '1') return;
+  canvas.dataset[boundKey] = '1';
+  canvas.addEventListener('webglcontextlost', (event) => {
+    if (canvas.dataset.workspaceGlassDisposing === '1') return;
+    event.preventDefault();
+    canvas.style.opacity = '0';
+    canvas.style.visibility = 'hidden';
+    appendDiagnosticLog(
+      'glass',
+      `workspace glass context-lost layer=${layer} app=${appGlassContextSummary()} rowLenses=${window.__liquidGLRenderer__?.lenses?.filter(isWorkspaceLiquidGlassLens).length ?? 0} container=${workspaceContainerLiquidGlassRenderer() ? '1' : '0'}`,
+      'warn',
+      { force: true }
+    );
+    if (layer === 'container') {
+      removeWorkspaceContainerGlassLenses();
+    } else {
+      removeWorkspaceLiquidGlassLenses();
+      try {
+        canvas.dataset.workspaceGlassDisposing = '1';
+        renderer?.dispose?.();
+      } catch {
+        // Best-effort cleanup after WebGL context loss.
+      }
+      if (renderer?.canvas instanceof HTMLElement) renderer.canvas.remove();
+      if (window.__liquidGLRenderer__ === renderer) window.__liquidGLRenderer__ = undefined;
+    }
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: 1800 });
+  }, { passive: false });
+}
+
+async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
+  if (workspaceLiquidGlassApplying) {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: recaptureSnapshot });
+    return;
+  }
+  workspaceLiquidGlassApplying = true;
+  try {
+    removeWorkspaceDetailButtonGlassMarkers();
+    if (!workspaceLiquidGlassEligible()) {
+      removeWorkspaceLiquidGlassLenses();
+      return;
+    }
+    await loadLiquidGLScripts();
+    cleanupLegacyWorkspaceLiquidGlassChildLenses();
+    cleanupLegacyWorkspaceTabTargetLenses();
+    cleanupDetachedWorkspaceLiquidGlassLenses();
+    removeWorkspaceContainerGlassLensesFromRowRenderer();
+    syncWorkspaceGlassSnapshotStage();
+    syncWorkspaceGlassRendererSnapshotTarget();
+    const rowSnapshotSelector = workspaceLiquidGlassSnapshotSelector();
+    const wantsContainerSnapshot = workspaceGlassUsesContainerSnapshot();
+    const pendingContainer = workspaceGlassContainerPendingTarget();
+    const pendingTargets = workspaceGlassTargetTabs()
+      .filter((tab) => tab.dataset.workspaceGlassLens !== 'liquidgl' && tab.dataset.workspaceGlassLens !== 'css');
+    pendingTargets.forEach((tab) => {
+      tab.classList.add('credit-card-glass', 'workspace-glass-pending');
+      tab.dataset.workspaceGlassLens = 'pending';
+    });
+    const pendingAddButton = workspaceGlassAddButtonPendingTarget();
+    const effect = effectiveWorkspaceGlassEffectSettings(true);
+    if (pendingContainer && window.liquidGL) {
+      const containerEffect = effectiveWorkspaceContainerGlassEffectSettings();
+      let result: unknown;
+      let containerRenderer: LiquidGLRendererLike | undefined;
+      try {
+        const isolated = createIsolatedWorkspaceLiquidGL({
+          snapshot: '#ide-glass-snapshot-stage',
+          target: '#workspace-container-glass-plane.workspace-glass-pending',
+          resolution: 1,
+          refraction: containerEffect.refraction,
+          bevelDepth: containerEffect.bevelDepth,
+          bevelWidth: containerEffect.bevelWidth,
+          frost: containerEffect.frost,
+          magnify: containerEffect.magnify,
+          shadow: containerEffect.shadow,
+          specular: containerEffect.specular,
+          reveal: containerEffect.reveal,
+          tilt: containerEffect.tilt,
+          tiltFactor: containerEffect.tiltFactor,
+          overlayContainer: el.workspaceDock,
+          preserveTargetOpacity: true,
+          preservePointerEvents: true
+        });
+        result = isolated.result;
+        containerRenderer = isolated.renderer;
+        window.__sviWorkspaceContainerLiquidGLRenderer__ = containerRenderer ?? null;
+      } catch (error) {
+        markWorkspaceGlassTargetCssFallback(pendingContainer);
+        throw error;
+      }
+      const lenses = liquidLensArray(result);
+      if (lenses.length) {
+        for (const lens of lenses) {
+          const target = lens.el instanceof HTMLElement ? lens.el : null;
+          if (!target) continue;
+          target.classList.add('credit-card-glass', 'workspace-container-glass-plane');
+          target.classList.remove('workspace-glass-pending');
+          target.dataset.workspaceGlassLens = 'liquidgl';
+          applyWorkspaceGlassLensOptions(lens, containerEffect);
+        }
+      } else {
+        markWorkspaceGlassTargetCssFallback(pendingContainer);
+      }
+      ensureWorkspaceLiquidGlassCanvasLayer();
+      if (wantsContainerSnapshot) {
+        syncWorkspaceGlassSnapshotStage();
+        syncWorkspaceGlassRendererSnapshotTarget();
+        await refreshWorkspaceContainerGlassComposite();
+      } else {
+        await refreshWorkspaceContainerGlassComposite();
+      }
+    } else if (wantsContainerSnapshot) {
+      await refreshWorkspaceContainerGlassComposite();
+    }
+    if (pendingTargets.length && window.liquidGL) {
+      let result: unknown;
+      try {
+        result = window.liquidGL({
+          snapshot: rowSnapshotSelector,
+          target: '.workspace-tab-glass-plane.credit-card-glass.workspace-glass-pending',
+          resolution: 1,
+          refraction: effect.refraction,
+          bevelDepth: effect.bevelDepth,
+          bevelWidth: effect.bevelWidth,
+          frost: effect.frost,
+          magnify: effect.magnify,
+          shadow: effect.shadow,
+          specular: effect.specular,
+          reveal: effect.reveal,
+          tilt: effect.tilt,
+          tiltFactor: effect.tiltFactor,
+          overlayContainer: el.workspaceDock,
+          preserveTargetOpacity: true,
+          preservePointerEvents: true
+        });
+      } catch (error) {
+        pendingTargets.forEach((tab) => markWorkspaceGlassTargetCssFallback(tab));
+        throw error;
+      }
+      const lenses = liquidLensArray(result);
+      if (lenses.length) {
+        for (const lens of lenses) {
+          const target = lens.el instanceof HTMLElement ? lens.el : null;
+          if (!target) continue;
+          target.classList.add('credit-card-glass');
+          target.classList.remove('workspace-glass-pending');
+          target.dataset.workspaceGlassLens = 'liquidgl';
+          applyWorkspaceGlassLensOptions(lens, effect);
+        }
+      } else {
+        pendingTargets.forEach((tab) => markWorkspaceGlassTargetCssFallback(tab));
+      }
+    }
+    ensureWorkspaceLiquidGlassCanvasLayer();
+    if (pendingAddButton && window.liquidGL) {
+      let result: unknown;
+      try {
+        result = window.liquidGL({
+          snapshot: rowSnapshotSelector,
+          target: '#new-workspace-tab .workspace-tab-add-glass-plane.credit-card-glass.workspace-glass-pending',
+          resolution: 1,
+          refraction: effect.refraction,
+          bevelDepth: effect.bevelDepth,
+          bevelWidth: effect.bevelWidth,
+          frost: effect.frost,
+          magnify: effect.magnify,
+          shadow: effect.shadow,
+          specular: effect.specular,
+          reveal: effect.reveal,
+          tilt: effect.tilt,
+          tiltFactor: effect.tiltFactor,
+          overlayContainer: el.workspaceDock,
+          preserveTargetOpacity: true,
+          preservePointerEvents: true
+        });
+      } catch (error) {
+        markWorkspaceGlassTargetCssFallback(pendingAddButton);
+        throw error;
+      }
+      const lenses = liquidLensArray(result);
+      if (lenses.length) {
+        for (const lens of lenses) {
+          const target = lens.el instanceof HTMLElement ? lens.el : null;
+          if (!target) continue;
+          target.classList.add('credit-card-glass', 'workspace-glass-add');
+          target.classList.remove('workspace-glass-pending');
+          target.dataset.workspaceGlassLens = 'liquidgl';
+          applyWorkspaceGlassLensOptions(lens, effect);
+        }
+      } else {
+        markWorkspaceGlassTargetCssFallback(pendingAddButton);
+      }
+    }
+    updateWorkspaceLiquidGlassEffectOptions();
+    ensureWorkspaceLiquidGlassCanvasLayer();
+    const renderer = window.__liquidGLRenderer__;
+    if (workspaceLiquidGlassRendererContextLost(renderer)) {
+      appendDiagnosticLog('glass', 'workspace glass rows renderer already lost before render; scheduling rebuild', 'warn', { force: true });
+      if (renderer?.canvas instanceof HTMLElement) {
+        renderer.canvas.style.opacity = '0';
+        renderer.canvas.style.visibility = 'hidden';
+      }
+      removeWorkspaceLiquidGlassLenses();
+      if (renderer?.canvas instanceof HTMLElement) renderer.canvas.remove();
+      if (window.__liquidGLRenderer__ === renderer) window.__liquidGLRenderer__ = undefined;
+      scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: 1800 });
+      return;
+    }
+    renderer?.lenses?.forEach((lens) => {
+      if (isWorkspaceLiquidGlassLens(lens)) lens.updateMetrics?.();
+    });
+    if (recaptureSnapshot && renderer?.captureSnapshot) {
+      syncWorkspaceGlassSnapshotStage();
+      syncWorkspaceGlassRendererSnapshotTarget();
+      if (workspaceGlassUsesContainerSnapshot()) await refreshWorkspaceContainerGlassComposite();
+      await renderer.captureSnapshot().catch(() => undefined);
+    }
+    renderer?.render?.();
+    appendWorkspaceLiquidGlassDiagnostic(recaptureSnapshot ? 'apply/recapture' : 'apply');
+  } finally {
+    workspaceLiquidGlassApplying = false;
+  }
+}
+
+function liquidLensArray(value: unknown): LiquidGLLensLike[] {
+  const list = Array.isArray(value) ? value : value ? [value] : [];
+  return list.filter((item): item is LiquidGLLensLike => Boolean(item && typeof item === 'object' && 'el' in item));
+}
+
+function workspaceGlassTargetTabs() {
+  const tabs = Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab'));
+  return tabs.map((tab) => {
+    cleanupLegacyWorkspaceTabTargetState(tab);
+    const plane = ensureWorkspaceTabGlassPlane(tab);
+    ensureWorkspaceTabOutlinePlane(tab);
+    return plane;
+  });
+}
+
+function workspaceGlassAddButtonPendingTarget() {
+  const button = el.newWorkspaceTab;
+  button.classList.add('credit-card-glass', 'workspace-glass-add');
+  cleanupLegacyWorkspaceAddButtonGlassTarget();
+  const plane = ensureWorkspaceAddGlassPlane();
+  if (plane.dataset.workspaceGlassLens === 'liquidgl' || plane.dataset.workspaceGlassLens === 'css') return null;
+  plane.classList.add('workspace-glass-pending');
+  plane.dataset.workspaceGlassLens = 'pending';
+  return plane;
+}
+
+function cleanupLegacyWorkspaceAddButtonGlassTarget() {
+  const renderer = window.__liquidGLRenderer__;
+  if (renderer?.lenses) {
+    renderer.lenses = renderer.lenses.filter((lens) => {
+      if (lens.el !== el.newWorkspaceTab) return true;
+      cleanupWorkspaceLiquidGlassLens(lens);
+      return false;
+    });
+  }
+  el.newWorkspaceTab.classList.remove('workspace-glass-pending');
+  delete el.newWorkspaceTab.dataset.workspaceGlassLens;
+  clearWorkspaceLiquidGlassInlineStyles(el.newWorkspaceTab);
+}
+
+function cleanupLegacyWorkspaceTabTargetState(tab: HTMLElement) {
+  if (!tab.dataset.workspaceGlassLens && !tab.classList.contains('workspace-glass-pending')) return;
+  tab.classList.remove('workspace-glass-pending');
+  delete tab.dataset.workspaceGlassLens;
+  delete tab.dataset.workspaceGlassFallbackReason;
+  clearWorkspaceLiquidGlassInlineStyles(tab);
+}
+
+function ensureWorkspaceAddGlassPlane() {
+  let plane = el.newWorkspaceTab.querySelector<HTMLElement>(':scope > .workspace-tab-add-glass-plane');
+  if (!plane) {
+    plane = document.createElement('span');
+    plane.className = 'workspace-tab-add-glass-plane credit-card-glass';
+    plane.setAttribute('aria-hidden', 'true');
+    el.newWorkspaceTab.prepend(plane);
+  }
+  plane.classList.add('credit-card-glass');
+  ensureWorkspaceAddOutlinePlane();
+  let label = el.newWorkspaceTab.querySelector<HTMLElement>(':scope > .workspace-tab-add-label');
+  if (!label) {
+    label = document.createElement('span');
+    label.className = 'workspace-tab-add-label';
+    label.textContent = '+';
+    const textNodes = Array.from(el.newWorkspaceTab.childNodes).filter((node) => (
+      node.nodeType === Node.TEXT_NODE && (node.textContent ?? '').trim()
+    ));
+    for (const node of textNodes) node.remove();
+    el.newWorkspaceTab.append(label);
+  }
+  return plane;
+}
+
+function ensureWorkspaceAddOutlinePlane() {
+  let outline = el.newWorkspaceTab.querySelector<HTMLElement>(':scope > .workspace-tab-add-outline-plane');
+  if (!outline) {
+    outline = document.createElement('span');
+    outline.className = 'workspace-tab-add-outline-plane';
+    outline.setAttribute('aria-hidden', 'true');
+    const plane = el.newWorkspaceTab.querySelector<HTMLElement>(':scope > .workspace-tab-add-glass-plane');
+    if (plane?.nextSibling) el.newWorkspaceTab.insertBefore(outline, plane.nextSibling);
+    else if (plane) el.newWorkspaceTab.append(outline);
+    else el.newWorkspaceTab.prepend(outline);
+  }
+  return outline;
+}
+
+function workspaceGlassContainerPendingTarget() {
+  const glass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, true);
+  const plane = el.workspaceContainerGlassPlane;
+  if (!glass.containerGlassEnabled) {
+    removeWorkspaceContainerGlassLenses();
+    cleanupWorkspaceContainerGlassPlane();
+    return null;
+  }
+  plane.classList.add('credit-card-glass', 'workspace-container-glass-plane');
+  if (plane.dataset.workspaceGlassLens === 'liquidgl' || plane.dataset.workspaceGlassLens === 'css') return null;
+  plane.classList.add('workspace-glass-pending');
+  plane.dataset.workspaceGlassLens = 'pending';
+  return plane;
+}
+
+function markWorkspaceGlassTargetCssFallback(tab: HTMLElement) {
+  tab.classList.add('credit-card-glass');
+  tab.classList.remove('workspace-glass-pending');
+  tab.dataset.workspaceGlassLens = 'css';
+  clearWorkspaceLiquidGlassInlineStyles(tab);
+}
+
+function workspaceLiquidGlassCanvasElement() {
+  return window.__liquidGLRenderer__?.canvas
+    ?? document.querySelector<HTMLElement>('canvas[data-workspace-glass-layer="rows"]')
+    ?? document.querySelector<HTMLElement>('canvas[data-liquid-ignore]');
+}
+
+function ensureWorkspaceLiquidGlassCanvasLayer() {
+  const applyCanvasLayer = (renderer: LiquidGLRendererLike | undefined, label: 'container' | 'rows', zIndex: string) => {
+    const canvas = renderer?.canvas;
+    if (!(canvas instanceof HTMLElement)) return;
+    bindWorkspaceLiquidGlassContextEvents(renderer, label);
+    const container = el.workspaceDock;
+    if (canvas.parentElement !== container) container.append(canvas);
+    canvas.dataset.workspaceGlassCanvas = '1';
+    canvas.dataset.workspaceGlassLayer = label;
+    positionAppGlassViewportLayer(canvas, container, zIndex);
+  };
+  const applyLensOverlayLayer = (
+    renderer: LiquidGLRendererLike | undefined,
+    predicate: (lens: LiquidGLLensLike) => boolean,
+    mirrorZ: string,
+    shadowZ: string
+  ) => {
+    renderer?.lenses?.forEach((lens) => {
+      if (!predicate(lens)) return;
+      const lensIsWorkspaceRow = lens.el instanceof HTMLElement && (
+        lens.el.classList.contains('workspace-tab-glass-plane')
+        || lens.el.classList.contains('workspace-tab-add-glass-plane')
+      );
+      const overlayContainer = el.workspaceDock;
+      if (lensIsWorkspaceRow) {
+        installAppGlassTiltFollowers(lens);
+        patchAppGlassMirrorCreation(lens, overlayContainer);
+      }
+      if (lens._mirror instanceof HTMLElement) {
+        if (lens._mirror.parentElement !== overlayContainer) overlayContainer.append(lens._mirror);
+        lens._mirror.style.pointerEvents = 'none';
+        lens._mirror.style.zIndex = mirrorZ;
+        positionAppGlassViewportLayer(lens._mirror, overlayContainer, mirrorZ);
+      }
+      if (lens._shadowEl instanceof HTMLElement) {
+        if (lens._shadowEl.parentElement !== overlayContainer) overlayContainer.append(lens._shadowEl);
+        lens._shadowEl.style.pointerEvents = 'none';
+        positionAppGlassShadowLayer(lens._shadowEl, lens.el as HTMLElement, overlayContainer, lens);
+        lens._shadowEl.style.zIndex = shadowZ;
+      }
+    });
+  };
+  applyCanvasLayer(workspaceContainerLiquidGlassRenderer(), 'container', '1');
+  applyCanvasLayer(window.__liquidGLRenderer__, 'rows', '1');
+  applyLensOverlayLayer(workspaceContainerLiquidGlassRenderer(), isWorkspaceContainerLiquidGlassLens, '1', '0');
+  applyLensOverlayLayer(window.__liquidGLRenderer__, isWorkspaceLiquidGlassLens, '1', '0');
+  installWorkspaceHoverOnlyRenderFilter();
+}
+
+function glassDiagnosticElementName(element: Element | null) {
+  if (!element) return 'none';
+  if (element === workspaceLiquidGlassCanvasElement()) return 'liquid-canvas';
+  const id = element.id ? `#${element.id}` : '';
+  const classes = element instanceof HTMLElement
+    ? Array.from(element.classList).slice(0, 3).map((item) => `.${item}`).join('')
+    : '';
+  return `${element.tagName.toLowerCase()}${id}${classes}` || element.tagName.toLowerCase();
+}
+
+function appendWorkspaceLiquidGlassDiagnostic(reason: string, options: { force?: boolean } = {}) {
+  const appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  if (!options.force && !appGlass.diagnostics && state.ideSettings.debugLogEnabled !== true) return;
+  const now = performance.now();
+  if (!options.force && now - workspaceLiquidGlassLastDiagnosticAt < 2500) return;
+  workspaceLiquidGlassLastDiagnosticAt = now;
+  const renderer = window.__liquidGLRenderer__;
+  const canvas = workspaceLiquidGlassCanvasElement();
+  const target = el.workspaceTabs.querySelector<HTMLElement>('.workspace-tab.credit-card-glass');
+  const lens = renderer?.lenses?.find(isWorkspaceLiquidGlassLens);
+  const mirror = lens?._mirror instanceof HTMLElement ? lens._mirror : null;
+  const shadow = lens?._shadowEl instanceof HTMLElement ? lens._shadowEl : null;
+  const shellStyle = window.getComputedStyle(el.shell);
+  const dockStyle = window.getComputedStyle(el.workspaceDock);
+  const canvasStyle = canvas ? window.getComputedStyle(canvas) : null;
+  const mirrorStyle = mirror ? window.getComputedStyle(mirror) : null;
+  const targetStyle = target ? window.getComputedStyle(target) : null;
+  const targetRect = target?.getBoundingClientRect();
+  const tabsRect = el.workspaceTabs.getBoundingClientRect();
+  const addRect = el.newWorkspaceTab.getBoundingClientRect();
+  const label = target?.querySelector<HTMLElement>('.workspace-tab-label') ?? null;
+  const labelStyle = label ? window.getComputedStyle(label) : null;
+  const labelRect = label?.getBoundingClientRect();
+  const labelHit = labelRect && labelRect.width > 0 && labelRect.height > 0
+    ? document.elementFromPoint(labelRect.left + labelRect.width / 2, labelRect.top + labelRect.height / 2)
+    : null;
+  appendDiagnosticLog(
+    'glass',
+    [
+      `workspace glass ${reason}`,
+      `ok=${workspaceLiquidGlassEligible() ? '1' : '0'}`,
+      `app=${appGlassContextSummary()}`,
+      `lost=${workspaceLiquidGlassRendererContextLost(renderer) ? '1' : '0'}`,
+      `clost=${workspaceLiquidGlassRendererContextLost(workspaceContainerLiquidGlassRenderer()) ? '1' : '0'}`,
+      `container=${el.shell.classList.contains('workspace-glass-container-lens') ? '1' : '0'}`,
+      `hoverOnly=${workspaceGlassHoverOnlyEnabled() ? '1' : '0'}`,
+      `hoverActive=${workspaceLiquidGlassHoverOnlyTarget?.isConnected ? '1' : '0'}`,
+      `topSamples=${workspaceGlassUsesContainerSnapshot() ? '1' : '0'}`,
+      `snap=${(renderer?.snapshotTarget as HTMLElement | undefined)?.id || 'none'}`,
+      `t=${workspaceGlassTargetTabs().length}`,
+      `l=${renderer?.lenses?.length ?? 0}`,
+      `hit=${glassDiagnosticElementName(labelHit)}`,
+      `cz=${canvasStyle?.zIndex ?? 'none'}`,
+      `cp=${canvas?.parentElement === el.shell ? 'shell' : canvas?.parentElement === el.workspaceDock ? 'dock' : canvas?.parentElement === el.workspaceTabs ? 'tabs' : canvas?.parentElement?.tagName.toLowerCase() ?? 'none'}`,
+      `dz=${dockStyle.zIndex}`,
+      `sz=${shellStyle.zIndex}`,
+      `m=${mirror ? '1' : '0'}`,
+      `mp=${mirror?.parentElement === el.shell ? 'shell' : mirror?.parentElement?.tagName.toLowerCase() ?? 'none'}`,
+      `mz=${mirrorStyle?.zIndex ?? 'none'}`,
+      `shadow=${shadow ? '1' : '0'}`,
+      `to=${targetStyle?.opacity ?? 'none'}`,
+      `ti=${target?.style.opacity || 'empty'}`,
+      `tz=${targetStyle?.zIndex ?? 'none'}`,
+      `tw=${targetRect ? Math.round(targetRect.width) : 'none'}`,
+      `listw=${Math.round(tabsRect.width)}`,
+      `addw=${Math.round(addRect.width)}`,
+      `ld=${labelStyle?.display ?? 'none'}`,
+      `lc=${labelStyle?.color ?? 'none'}`
+    ].join(' '),
+    'info',
+    { force: options.force === true || appGlass.diagnostics === true }
+  );
+}
+
+function scheduleWorkspaceGlassHoverDiagnostic(target: HTMLElement) {
+  if (state.ideSettings.debugLogEnabled !== true) return;
+  if (target.dataset.workspaceGlassLens !== 'liquidgl') return;
+  const now = performance.now();
+  if (now - workspaceLiquidGlassLastHoverDiagnosticAt < 900) return;
+  workspaceLiquidGlassLastHoverDiagnosticAt = now;
+  window.requestAnimationFrame(() => {
+    ensureWorkspaceLiquidGlassCanvasLayer();
+    if (target.isConnected) keepWorkspaceGlassTargetContentVisible(target);
+    appendWorkspaceLiquidGlassDiagnostic('hover', { force: true });
+  });
+}
+
+function loadLiquidGLScripts() {
+  if (window.liquidGL) return Promise.resolve();
+  if (liquidGLScriptsPromise) return liquidGLScriptsPromise;
+  liquidGLScriptsPromise = LIQUIDGL_VENDOR_SCRIPTS.reduce((promise, src) => (
+    promise.then(() => loadScriptOnce(src))
+  ), Promise.resolve()).then(() => undefined);
+  return liquidGLScriptsPromise;
+}
+
+function loadScriptOnce(src: string) {
+  return new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>(`script[data-svide-script="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') resolve();
+      else {
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener('error', () => reject(new Error(`Script load failed: ${src}`)), { once: true });
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = false;
+    script.dataset.svideScript = src;
+    script.addEventListener('load', () => {
+      script.dataset.loaded = '1';
+      resolve();
+    }, { once: true });
+    script.addEventListener('error', () => reject(new Error(`Script load failed: ${src}`)), { once: true });
+    document.head.append(script);
+  });
+}
+
+function isWorkspaceLiquidGlassLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement
+    && (
+      lens.el.classList.contains('workspace-tab-glass-plane')
+      || lens.el.classList.contains('workspace-tab-add-glass-plane')
+      || lens.el.classList.contains('workspace-tab')
+      || lens.el.classList.contains('workspace-glass-add')
+      || lens.el.classList.contains('workspace-container-glass-plane')
+    )
+    && lens.el.dataset.workspaceGlassLens === 'liquidgl';
+}
+
+function isWorkspaceContainerLiquidGlassLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement
+    && lens.el.classList.contains('workspace-container-glass-plane')
+    && lens.el.dataset.workspaceGlassLens === 'liquidgl';
+}
+
+function isLegacyWorkspaceLiquidGlassChildLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement
+    && lens.el.classList.contains('workspace-tab-glass-lens')
+    && lens.el.dataset.workspaceGlassLens === 'liquidgl';
+}
+
+function isWorkspaceDetailGlassTarget(element: Element | null | undefined) {
+  return element instanceof HTMLElement
+    && (
+      element.classList.contains('workspace-dock-detail-toggle')
+      || element.classList.contains('workspace-tab-detail-toggle')
+    );
+}
+
+function removeWorkspaceDetailButtonGlassMarkers() {
+  const renderer = window.__liquidGLRenderer__;
+  if (renderer?.lenses) {
+    renderer.lenses = renderer.lenses.filter((lens) => {
+      if (!isWorkspaceDetailGlassTarget(lens.el as Element | null | undefined)) return true;
+      cleanupWorkspaceLiquidGlassLens(lens);
+      return false;
+    });
+  }
+  const targets = [
+    el.workspaceDockDetailToggle,
+    ...Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab-detail-toggle'))
+  ];
+  for (const target of targets) {
+    target.classList.remove('credit-card-glass', 'workspace-glass-add', 'workspace-glass-pending');
+    delete target.dataset.workspaceGlassLens;
+    clearWorkspaceLiquidGlassInlineStyles(target);
+  }
+  renderer?.render?.();
+}
+
+function cleanupDetachedWorkspaceLiquidGlassLenses() {
+  const renderer = window.__liquidGLRenderer__;
+  if (!renderer?.lenses) return;
+  renderer.lenses = renderer.lenses.filter((lens) => {
+    if (!isWorkspaceLiquidGlassLens(lens)) return true;
+    if (lens.el instanceof HTMLElement && lens.el.isConnected) return true;
+    cleanupWorkspaceLiquidGlassLens(lens);
+    return false;
+  });
+}
+
+function removeWorkspaceLiquidGlassLenses() {
+  workspaceLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+  workspaceLiquidGlassHoverOnlyTarget = null;
+  removeWorkspaceDetailButtonGlassMarkers();
+  cleanupLegacyWorkspaceLiquidGlassChildLenses();
+  const renderer = window.__liquidGLRenderer__;
+  if (renderer?.lenses) {
+    renderer.lenses = renderer.lenses.filter((lens) => {
+      if (!isWorkspaceLiquidGlassLens(lens)) return true;
+      cleanupWorkspaceLiquidGlassLens(lens);
+      return false;
+    });
+    renderer.render?.();
+  }
+  for (const target of Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab-glass-plane, .workspace-tab.credit-card-glass, .workspace-tab[data-workspace-glass-lens]'))) {
+    if (target.classList.contains('workspace-tab')) target.classList.remove('credit-card-glass', 'workspace-glass-pending');
+    else target.classList.remove('workspace-glass-pending');
+    delete target.dataset.workspaceGlassLens;
+    clearWorkspaceLiquidGlassInlineStyles(target);
+  }
+  const addPlane = el.newWorkspaceTab.querySelector<HTMLElement>(':scope > .workspace-tab-add-glass-plane');
+  addPlane?.classList.remove('workspace-glass-pending', 'workspace-glass-add');
+  if (addPlane) {
+    delete addPlane.dataset.workspaceGlassLens;
+    clearWorkspaceLiquidGlassInlineStyles(addPlane);
+  }
+  el.newWorkspaceTab.classList.remove('credit-card-glass', 'workspace-glass-add', 'workspace-glass-pending');
+  delete el.newWorkspaceTab.dataset.workspaceGlassLens;
+  clearWorkspaceLiquidGlassInlineStyles(el.newWorkspaceTab);
+  removeWorkspaceContainerGlassLenses();
+  cleanupWorkspaceContainerGlassPlane();
+  for (const lensElement of Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab-glass-lens[data-workspace-glass-lens]'))) {
+    lensElement.classList.remove('workspace-glass-pending');
+    delete lensElement.dataset.workspaceGlassLens;
+    clearWorkspaceLiquidGlassInlineStyles(lensElement);
+  }
+  appendWorkspaceLiquidGlassDiagnostic('remove');
+}
+
+function removeWorkspaceContainerGlassLenses() {
+  const renderer = workspaceContainerLiquidGlassRenderer();
+  if (renderer?.lenses) {
+    renderer.lenses = renderer.lenses.filter((lens) => {
+      if (!isWorkspaceContainerLiquidGlassLens(lens)) return true;
+      cleanupWorkspaceLiquidGlassLens(lens);
+      return false;
+    });
+    renderer.render?.();
+  }
+  try {
+    if (renderer?.canvas instanceof HTMLCanvasElement) renderer.canvas.dataset.workspaceGlassDisposing = '1';
+    renderer?.dispose?.();
+  } catch {
+    // Best-effort cleanup for vendored liquidGL renderers.
+  }
+  if (renderer?.canvas instanceof HTMLElement) renderer.canvas.remove();
+  window.__sviWorkspaceContainerLiquidGLRenderer__ = null;
+  el.shell.classList.remove('workspace-glass-container-sample-canvas-ready');
+  const ctx = el.ideGlassContainerSampleCanvas.getContext('2d', { alpha: true });
+  ctx?.clearRect(0, 0, el.ideGlassContainerSampleCanvas.width, el.ideGlassContainerSampleCanvas.height);
+}
+
+function removeWorkspaceContainerGlassLensesFromRowRenderer() {
+  const renderer = window.__liquidGLRenderer__;
+  if (!renderer?.lenses) return;
+  renderer.lenses = renderer.lenses.filter((lens) => {
+    if (!isWorkspaceContainerLiquidGlassLens(lens)) return true;
+    cleanupWorkspaceLiquidGlassLens(lens);
+    return false;
+  });
+  renderer.render?.();
+}
+
+function cleanupWorkspaceLiquidGlassLens(lens: LiquidGLLensLike) {
+  try {
+    lens.setTilt?.(false);
+    lens.setShadow?.(false);
+    lens._destroyMirrorCanvas?.();
+    lens._shadowEl?.remove();
+    lens._sizeObs?.disconnect?.();
+  } catch {
+    // Best effort cleanup for the third-party lens object.
+  }
+  if (lens.el instanceof HTMLElement) {
+    lens.el.classList.remove('credit-card-glass', 'workspace-glass-pending');
+    delete lens.el.dataset.workspaceGlassLens;
+    clearWorkspaceLiquidGlassInlineStyles(lens.el);
+  }
+}
+
+function cleanupWorkspaceContainerGlassPlane() {
+  const plane = el.workspaceContainerGlassPlane;
+  plane.classList.remove('credit-card-glass', 'workspace-glass-pending');
+  delete plane.dataset.workspaceGlassLens;
+  clearWorkspaceLiquidGlassInlineStyles(plane);
+}
+
+function cleanupLegacyWorkspaceLiquidGlassChildLenses() {
+  const renderer = window.__liquidGLRenderer__;
+  if (renderer?.lenses) {
+    renderer.lenses = renderer.lenses.filter((lens) => {
+      if (!isLegacyWorkspaceLiquidGlassChildLens(lens)) return true;
+      cleanupWorkspaceLiquidGlassLens(lens);
+      return false;
+    });
+  }
+  for (const lensElement of Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab-glass-lens'))) {
+    lensElement.remove();
+  }
+}
+
+function cleanupLegacyWorkspaceTabTargetLenses() {
+  const renderer = window.__liquidGLRenderer__;
+  if (renderer?.lenses) {
+    renderer.lenses = renderer.lenses.filter((lens) => {
+      const target = lens.el instanceof HTMLElement ? lens.el : null;
+      if (!target?.classList.contains('workspace-tab')) return true;
+      cleanupWorkspaceLiquidGlassLens(lens);
+      return false;
+    });
+  }
+  for (const tab of Array.from(el.workspaceTabs.querySelectorAll<HTMLElement>('.workspace-tab'))) {
+    cleanupLegacyWorkspaceTabTargetState(tab);
+  }
+}
+
+function clearWorkspaceLiquidGlassInlineStyles(element: HTMLElement) {
+  element.style.opacity = '';
+  element.style.transition = '';
+  element.style.boxShadow = '';
+  element.style.pointerEvents = '';
+  element.style.transform = '';
+  element.style.transformStyle = '';
+  element.style.transformOrigin = '';
+  element.style.background = '';
+  element.style.backgroundColor = '';
+  element.style.backgroundImage = '';
+  element.style.backdropFilter = '';
+  element.style.removeProperty('-webkit-backdrop-filter');
+}
+
+function updateWorkspaceLiquidGlassEffectOptions() {
+  const effect = effectiveWorkspaceGlassEffectSettings(state.ideSettings.workspaceSideDockGlass === true);
+  const renderer = window.__liquidGLRenderer__;
+  ensureWorkspaceLiquidGlassCanvasLayer();
+  if (renderer?.lenses) {
+    for (const lens of renderer.lenses) {
+      if (!isWorkspaceLiquidGlassLens(lens)) continue;
+      applyWorkspaceGlassLensOptions(lens, effect);
+      lens.updateMetrics?.();
+    }
+    renderer.render?.();
+  }
+  const containerRenderer = workspaceContainerLiquidGlassRenderer();
+  if (containerRenderer?.lenses) {
+    const containerEffect = effectiveWorkspaceContainerGlassEffectSettings();
+    for (const lens of containerRenderer.lenses) {
+      if (!isWorkspaceContainerLiquidGlassLens(lens)) continue;
+      applyWorkspaceGlassLensOptions(lens, containerEffect);
+      lens.updateMetrics?.();
+    }
+    containerRenderer.render?.();
+  }
+}
+
+function applyWorkspaceGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlassEffectSettings) {
+  const target = lens.el instanceof HTMLElement ? lens.el : null;
+  const overlayContainer = target && (
+    target.classList.contains('workspace-tab-glass-plane')
+    || target.classList.contains('workspace-tab-add-glass-plane')
+    || target.classList.contains('workspace-glass-add')
+    || target.classList.contains('workspace-container-glass-plane')
+  )
+    ? el.workspaceDock
+    : el.shell;
+  lens.options = {
+    ...(lens.options ?? {}),
+    refraction: effect.refraction,
+    bevelDepth: effect.bevelDepth,
+    bevelWidth: effect.bevelWidth,
+    frost: effect.frost,
+    magnify: effect.magnify,
+    shadow: effect.shadow,
+    specular: effect.specular,
+    reveal: effect.reveal,
+    tilt: effect.tilt,
+    tiltFactor: effect.tiltFactor,
+    overlayContainer,
+    preserveTargetOpacity: true,
+    preservePointerEvents: true
+  };
+  lens.setShadow?.(effect.shadow);
+  lens.setTilt?.(effect.tilt);
+  if (target && (
+    target.classList.contains('workspace-tab-glass-plane')
+    || target.classList.contains('workspace-tab-add-glass-plane')
+  )) {
+    installAppGlassTiltFollowers(lens);
+  } else if (target && (target.classList.contains('workspace-tab') || target.classList.contains('workspace-glass-add'))) {
+    keepWorkspaceGlassTargetContentVisible(target);
+  }
+}
+
+function keepWorkspaceGlassTargetContentVisible(target: HTMLElement) {
+  const restore = () => {
+    if (!target.isConnected || target.dataset.workspaceGlassLens !== 'liquidgl') return;
+    target.style.opacity = '1';
+    target.style.pointerEvents = 'auto';
+  };
+  restore();
+  if (target.dataset.workspaceGlassDiagBound !== '1') {
+    target.dataset.workspaceGlassDiagBound = '1';
+    target.addEventListener('mouseenter', () => scheduleWorkspaceGlassHoverDiagnostic(target), { passive: true });
+  }
+  window.requestAnimationFrame(restore);
+  window.setTimeout(restore, 350);
+  window.setTimeout(restore, 1200);
+  window.setTimeout(restore, 2600);
+}
+
+function appGlassEnabled() {
+  return !IS_TERMINAL_APP && state.ideSettings.appGlass?.enabled === true;
+}
+
+function appGlassScopeEnabled(scope: string) {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  if (!appGlassEnabled()) return false;
+  if (scope === 'titlebar') return glass.titlebar;
+  if (scope === 'window-controls') return glass.windowControls;
+  if (scope === 'profile-actions') return glass.profileActions;
+  if (scope === 'terminal-widgets') return glass.terminalWidgets;
+  if (scope === 'explorer-panel') return glass.explorerPanel;
+  if (scope === 'editor-panel') return glass.editorPanel;
+  if (scope === 'image-panel') return glass.imagePanel;
+  if (scope === 'browser-panel') return glass.browserPanel;
+  if (scope === 'notes-panel') return glass.notesPanel;
+  if (scope === 'snippets-panel') return glass.snippetsPanel;
+  if (scope === 'calculator-panel') return glass.calculatorPanel;
+  if (scope === 'notes-snippets') return glass.notesSnippets;
+  if (scope === 'settings-panel') return glass.settingsPanel;
+  if (scope === 'floating-panels') return glass.floatingPanels;
+  return false;
+}
+
+const APP_GLASS_TOPOLOGY_CONTROL_PATHS = new Set([
+  'appGlass.enabled',
+  'appGlass.titlebar',
+  'appGlass.windowControls',
+  'appGlass.profileActions',
+  'appGlass.profileActionsSplit',
+  'appGlass.terminalWidgets',
+  'appGlass.explorerPanel',
+  'appGlass.editorPanel',
+  'appGlass.imagePanel',
+  'appGlass.browserPanel',
+  'appGlass.notesPanel',
+  'appGlass.snippetsPanel',
+  'appGlass.calculatorPanel',
+  'appGlass.settingsPanel',
+  'appGlass.floatingPanels',
+  'appGlass.notesSnippets'
+]);
+
+const APP_GLASS_EFFECT_CONTROL_SCOPES: Array<{ prefix: string; scope: string }> = [
+  { prefix: 'appGlass.titlebar', scope: 'titlebar' },
+  { prefix: 'appGlass.windowControls', scope: 'window-controls' },
+  { prefix: 'appGlass.profileActions', scope: 'profile-actions' },
+  { prefix: 'appGlass.terminalWidgets', scope: 'terminal-widgets' },
+  { prefix: 'appGlass.explorerPanel', scope: 'explorer-panel' },
+  { prefix: 'appGlass.editorPanel', scope: 'editor-panel' },
+  { prefix: 'appGlass.imagePanel', scope: 'image-panel' },
+  { prefix: 'appGlass.browserPanel', scope: 'browser-panel' },
+  { prefix: 'appGlass.notesPanel', scope: 'notes-panel' },
+  { prefix: 'appGlass.snippetsPanel', scope: 'snippets-panel' },
+  { prefix: 'appGlass.calculatorPanel', scope: 'calculator-panel' },
+  { prefix: 'appGlass.settingsPanel', scope: 'settings-panel' },
+  { prefix: 'appGlass.floatingPanels', scope: 'floating-panels' },
+  { prefix: 'appGlass.notesSnippets', scope: 'notes-snippets' }
+];
+
+function isAppGlassTopologyControlPath(path: string) {
+  return APP_GLASS_TOPOLOGY_CONTROL_PATHS.has(path);
+}
+
+function isExplorerRowsGlassControlPath(path: string) {
+  return path === 'appGlass.explorerRows'
+    || path === 'appGlass.explorerRowsHoverOnly'
+    || path === 'appGlass.explorerRowsSamplePanel'
+    || path === 'appGlass.explorerRowsUseCustomEffect'
+    || path === 'appGlass.explorerRowsRadius'
+    || path === 'appGlass.explorerHoverColor'
+    || path === 'appGlass.explorerHoverAlpha'
+    || path === 'appGlass.explorerActiveAlpha'
+    || path === 'appGlass.explorerSelectedRailColor'
+    || path === 'appGlass.explorerSelectedRailAlpha'
+    || path === 'appGlass.explorerSelectedRailWidth'
+    || path === 'appGlass.explorerRowsEffect'
+    || path.startsWith('appGlass.explorerRowsEffect.');
+}
+
+function appGlassEffectScopeForControlPath(path: string): string | null {
+  if (path === 'appGlass.useCustomEffect' || path === 'appGlass.effect' || path.startsWith('appGlass.effect.')) return '';
+  for (const { prefix, scope } of APP_GLASS_EFFECT_CONTROL_SCOPES) {
+    if (path === `${prefix}UseCustomEffect` || path === `${prefix}Effect` || path.startsWith(`${prefix}Effect.`)) {
+      return scope;
+    }
+  }
+  return null;
+}
+
+function appGlassProfileActionsUseSplit() {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  return appGlassEnabled() && glass.profileActions && glass.profileActionsSplit;
+}
+
+function appGlassPlaneAllowedForCurrentLayout(plane: HTMLElement) {
+  const scope = plane.dataset.appGlassScope || '';
+  if (scope !== 'profile-actions') return true;
+  const owner = plane.parentElement;
+  const split = appGlassProfileActionsUseSplit();
+  const ownerIsSplitCard = owner === el.workspaceProfilePrimaryCard || owner === el.workspaceProfileActionsCard;
+  if (split) return ownerIsSplitCard;
+  return owner === el.workspaceBar;
+}
+
+function ensureAppGlassStructures() {
+  ensureAppGlassPlane(el.titlebar, 'titlebar');
+  ensureAppGlassPlane(el.workspaceBar, 'profile-actions');
+  ensureAppGlassPlane(el.workspaceProfilePrimaryCard, 'profile-actions');
+  ensureAppGlassPlane(el.workspaceProfileActionsCard, 'profile-actions');
+  for (const button of el.windowControlButtons) {
+    ensureAppGlassPlane(button, 'window-controls');
+  }
+  for (const id of FLOATING_PANELS) {
+    const panel = getPanel(id);
+    ensureAppGlassPlane(panel, APP_GLASS_PANEL_SCOPES[id]);
+  }
+  for (const card of Array.from(el.mainGrid.querySelectorAll<HTMLElement>('.terminal-card.panel'))) {
+    ensureAppGlassPlane(card, 'terminal-widgets');
+  }
+}
+
+function ensureAppGlassPlane(owner: HTMLElement, scope: string) {
+  owner.classList.add('app-glass-shell');
+  owner.dataset.appGlassScope = scope;
+  let plane = owner.querySelector<HTMLElement>(':scope > .app-glass-plane');
+  if (!plane) {
+    plane = document.createElement('div');
+    plane.className = `app-glass-plane credit-card-glass app-glass-${scope}-plane`;
+    plane.setAttribute('aria-hidden', 'true');
+    owner.prepend(plane);
+  }
+  plane.dataset.appGlassScope = scope;
+  if (!plane.dataset.appGlassId) {
+    plane.dataset.appGlassId = `ag-${crypto.randomUUID().replace(/[^a-z0-9-]/gi, '').slice(0, 18)}`;
+  }
+  return plane;
+}
+
+function syncAppGlassTargets() {
+  ensureAppGlassStructures();
+  for (const plane of appGlassPlaneElements()) {
+    syncAppGlassTarget(plane);
+  }
+}
+
+function syncAppGlassOwnerTargets(owner: HTMLElement) {
+  const planes = appGlassPlanesForOwner(owner);
+  for (const plane of planes) {
+    syncAppGlassTarget(plane);
+  }
+  return planes;
+}
+
+function syncAppGlassTarget(plane: HTMLElement) {
+  const scope = plane.dataset.appGlassScope || '';
+  const owner = plane.parentElement as HTMLElement | null;
+  const active = appGlassEnabled()
+    && owner !== null
+    && appGlassScopeEnabled(scope)
+    && appGlassPlaneAllowedForCurrentLayout(plane)
+    && appGlassOwnerVisible(owner);
+  plane.dataset.appGlassActive = active ? '1' : '0';
+  plane.classList.toggle('app-glass-active', active);
+  owner?.classList.toggle('app-glass-active-shell', active);
+  if (active && owner) ensureAppGlassOwnerAboveSharedLayer(owner);
+  if (!active) {
+    cleanupAppGlassTarget(plane);
+  }
+  return active;
+}
+
+function ensureAppGlassOwnerAboveSharedLayer(owner: HTMLElement) {
+  if (!owner.classList.contains('floating-panel') && !owner.classList.contains('terminal-card')) return;
+  const current = Number.parseInt(owner.style.zIndex || '', 10);
+  if (Number.isFinite(current) && current > 1) return;
+  owner.style.zIndex = '2';
+}
+
+function appGlassOwnerVisible(owner: HTMLElement) {
+  if (!owner.isConnected) return false;
+  if (owner.classList.contains('hidden')) return false;
+  const hiddenAncestor = owner.closest<HTMLElement>('.hidden');
+  if (hiddenAncestor && hiddenAncestor !== owner) return false;
+  return true;
+}
+
+function appGlassPlaneElements() {
+  return Array.from(el.shell.querySelectorAll<HTMLElement>('.app-glass-plane[data-app-glass-id]'))
+    .concat(Array.from(el.windowControls.querySelectorAll<HTMLElement>('.app-glass-plane[data-app-glass-id]')));
+}
+
+function appGlassPlanesForOwner(owner: HTMLElement) {
+  return Array.from(owner.querySelectorAll<HTMLElement>(':scope > .app-glass-plane[data-app-glass-id]'));
+}
+
+function appGlassActiveTargets() {
+  return appGlassPlaneElements().filter((plane) => plane.dataset.appGlassActive === '1');
+}
+
+function appGlassActiveOwners() {
+  const owners: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  for (const plane of appGlassActiveTargets()) {
+    const owner = plane.parentElement;
+    if (!(owner instanceof HTMLElement) || seen.has(owner)) continue;
+    seen.add(owner);
+    owners.push(owner);
+  }
+  return owners;
+}
+
+function appGlassTargetPriority(target: HTMLElement) {
+  const scope = target.dataset.appGlassScope || '';
+  const owner = target.parentElement;
+  if (scope === 'terminal-widgets') return 0;
+  if (owner?.classList.contains('keyboard-target')) return 1;
+  if (scope === 'profile-actions') return 2;
+  if (scope === 'titlebar') return 3;
+  if (scope === 'settings-panel') return 4;
+  if (scope === 'explorer-panel') return 5;
+  if (scope === 'editor-panel') return 6;
+  if (scope === 'image-panel') return 7;
+  if (scope === 'browser-panel') return 8;
+  if (scope === 'notes-panel') return 9;
+  if (scope === 'snippets-panel') return 10;
+  if (scope === 'calculator-panel') return 11;
+  if (scope === 'window-controls') return 12;
+  return 20;
+}
+
+function prioritizedAppGlassTargets(targets: HTMLElement[]) {
+  return targets
+    .map((target, index) => ({ target, index, priority: appGlassTargetPriority(target) }))
+    .sort((a, b) => a.priority - b.priority || a.index - b.index)
+    .map((item) => item.target);
+}
+
+function appGlassOverlayContainerForTarget(target: HTMLElement) {
+  return target.parentElement instanceof HTMLElement ? target.parentElement : el.shell;
+}
+
+function appGlassRendererLayerContainer(renderer: LiquidGLRendererLike | undefined, target?: HTMLElement | null) {
+  return appGlassRendererUsesSharedLayer(renderer)
+    ? el.shell
+    : target instanceof HTMLElement
+      ? appGlassOverlayContainerForTarget(target)
+      : el.shell;
+}
+
+function appGlassTargetForLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement && lens.el.classList.contains('app-glass-plane')
+    ? lens.el
+    : null;
+}
+
+function appGlassTargetIdForLens(lens: LiquidGLLensLike) {
+  return appGlassTargetForLens(lens)?.dataset.appGlassId || '';
+}
+
+function uniqueAppGlassRenderers() {
+  return Array.from(new Set(appGlassRenderers.values()));
+}
+
+function appGlassTargetsForRenderer(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer?.lenses) return [];
+  return renderer.lenses
+    .map(appGlassTargetForLens)
+    .filter((target): target is HTMLElement => target instanceof HTMLElement);
+}
+
+function appGlassRendererUsesSharedLayer(renderer: LiquidGLRendererLike | undefined) {
+  return renderer === appGlassSharedRenderer || appGlassTargetsForRenderer(renderer).length > 1;
+}
+
+function appGlassRendererForTarget(target: HTMLElement) {
+  const id = target.dataset.appGlassId;
+  return id ? appGlassRenderers.get(id) : undefined;
+}
+
+function appGlassRendererForLens(lens: LiquidGLLensLike) {
+  for (const renderer of uniqueAppGlassRenderers()) {
+    if (renderer.lenses?.includes(lens)) return renderer;
+  }
+  return undefined;
+}
+
+function appGlassRendererContextLost(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer) return false;
+  try {
+    return renderer.gl?.isContextLost?.() === true;
+  } catch {
+    return false;
+  }
+}
+
+function appGlassRendererNeedsRebuild(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer) return true;
+  if (!(renderer.canvas instanceof HTMLCanvasElement) || !renderer.canvas.isConnected) return true;
+  return appGlassRendererContextLost(renderer);
+}
+
+function createSharedAppLiquidGL(options: Record<string, unknown>): { result: unknown; renderer: LiquidGLRendererLike | undefined } {
+  if (appGlassSharedRenderer && appGlassRendererNeedsRebuild(appGlassSharedRenderer)) {
+    disposeAppGlassRendererInstance(appGlassSharedRenderer);
+  }
+  const previousRenderer = window.__liquidGLRenderer__;
+  window.__liquidGLRenderer__ = appGlassSharedRenderer;
+  try {
+    const result = window.liquidGL?.(options);
+    const renderer = window.__liquidGLRenderer__;
+    if (renderer) appGlassSharedRenderer = renderer;
+    return { result, renderer };
+  } finally {
+    window.__liquidGLRenderer__ = previousRenderer;
+  }
+}
+
+function appGlassInitFailedTargets() {
+  return appGlassPlaneElements().filter((plane) => (
+    plane.dataset.appGlassLens === 'css'
+    && appGlassRecoverableFallbackReason(plane.dataset.appGlassFallbackReason)
+  ));
+}
+
+function appGlassRecoverableFallbackReason(reason: string | undefined) {
+  return reason === 'init-failed' || reason === 'context-lost';
+}
+
+function appGlassLostRendererCount() {
+  let count = 0;
+  for (const renderer of uniqueAppGlassRenderers()) {
+    if (appGlassRendererContextLost(renderer)) count += 1;
+  }
+  return count;
+}
+
+function appGlassContextSummary() {
+  return `active=${appGlassActiveTargets().length} renderers=${uniqueAppGlassRenderers().length} initFailed=${appGlassInitFailedTargets().length} lost=${appGlassLostRendererCount()}`;
+}
+
+function appGlassOwnerDebugName(owner: HTMLElement | null) {
+  if (!owner) return 'none';
+  if (owner === el.titlebar) return 'titlebar';
+  if (owner === el.workspaceBar) return 'profile-bar';
+  if (owner === el.workspaceProfilePrimaryCard) return 'profile-left';
+  if (owner === el.workspaceProfileActionsCard) return 'profile-right';
+  if (owner === el.windowControls) return 'window-controls';
+  if (owner.classList.contains('terminal-card')) return 'terminal';
+  const panel = owner.dataset.panel;
+  if (panel) return `panel-${panel}`;
+  return owner.id || owner.classList.item(0) || owner.tagName.toLowerCase();
+}
+
+function appGlassPlaneDebugName(target: HTMLElement) {
+  const owner = target.parentElement instanceof HTMLElement ? target.parentElement : null;
+  return `scope=${target.dataset.appGlassScope || 'default'} owner=${appGlassOwnerDebugName(owner)}`;
+}
+
+function scheduleAppGlassInitFailedRetry(reason: string, delay = 1200) {
+  if (!appGlassEnabled() || window.__liquidGLNoWebGL__) return;
+  if (!appGlassInitFailedTargets().length) return;
+  const wait = Math.max(240, Math.min(8000, delay));
+  const dueAt = performance.now() + wait;
+  if (appGlassInitFailedRetryTimer && appGlassInitFailedRetryDueAt <= dueAt) return;
+  if (appGlassInitFailedRetryTimer) window.clearTimeout(appGlassInitFailedRetryTimer);
+  appGlassInitFailedRetryDueAt = dueAt;
+  appGlassInitFailedRetryTimer = window.setTimeout(() => {
+    appGlassInitFailedRetryTimer = 0;
+    appGlassInitFailedRetryDueAt = 0;
+    if (!appGlassEnabled() || window.__liquidGLNoWebGL__ || !appGlassInitFailedTargets().length) return;
+    scheduleAppGlassRefresh({ delay: 0, reason: `init-failed-retry-${reason}` });
+  }, wait);
+}
+
+function prepareAppGlassInitFailedRetry(target: HTMLElement) {
+  if (window.__liquidGLNoWebGL__) return false;
+  const retryAt = Number(target.dataset.appGlassRetryAt || 0) || 0;
+  const now = performance.now();
+  if (retryAt > now) {
+    scheduleAppGlassInitFailedRetry('backoff', retryAt - now + 40);
+    return false;
+  }
+  const retryCount = Number(target.dataset.appGlassRetryCount || 0) || 0;
+  delete target.dataset.appGlassLens;
+  delete target.dataset.appGlassFallbackReason;
+  delete target.dataset.appGlassRetryAt;
+  target.classList.remove('app-glass-pending');
+  clearAppGlassInlineStyles(target);
+  appendDiagnosticLog(
+    'glass',
+    `app glass retry-init-failed ${appGlassPlaneDebugName(target)} retry=${retryCount} ${appGlassContextSummary()}`,
+    'warn',
+    { force: true }
+  );
+  return true;
+}
+
+function liquidGlassRendererForLens(lens: LiquidGLLensLike) {
+  return appGlassRendererForLens(lens)
+    ?? (explorerLiquidGlassRenderer?.lenses?.includes(lens) ? explorerLiquidGlassRenderer : undefined);
+}
+
+function ownerContainsLiquidGlassLens(owner: HTMLElement, lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement && (lens.el === owner || owner.contains(lens.el));
+}
+
+function liquidGlassLensesForOwner(owner: HTMLElement) {
+  const lenses: LiquidGLLensLike[] = [];
+  const seen = new Set<LiquidGLLensLike>();
+  const collect = (renderer: LiquidGLRendererLike | undefined) => {
+    renderer?.lenses?.forEach((lens) => {
+      if (seen.has(lens) || !ownerContainsLiquidGlassLens(owner, lens)) return;
+      seen.add(lens);
+      lenses.push(lens);
+    });
+  };
+  for (const renderer of uniqueAppGlassRenderers()) collect(renderer);
+  collect(explorerLiquidGlassRenderer);
+  return lenses;
+}
+
+function liquidGlassRenderersForOwner(owner: HTMLElement) {
+  const renderers = new Set<LiquidGLRendererLike>();
+  for (const renderer of uniqueAppGlassRenderers()) {
+    if (renderer.lenses?.some((lens) => ownerContainsLiquidGlassLens(owner, lens))) renderers.add(renderer);
+  }
+  if (explorerLiquidGlassRenderer?.lenses?.some((lens) => ownerContainsLiquidGlassLens(owner, lens))) {
+    renderers.add(explorerLiquidGlassRenderer);
+  }
+  return renderers;
+}
+
+function resetLiquidGlassLensTilt(lens: LiquidGLLensLike) {
+  lens._tiltActive = false;
+  lens._tiltInteracting = false;
+  lens.tiltX = 0;
+  lens.tiltY = 0;
+  lens._baseRect = null;
+  try {
+    lens._destroyMirrorCanvas?.();
+  } catch {
+    // Best effort cleanup for the vendored lens mirror.
+  }
+  if (lens.el instanceof HTMLElement) {
+    lens.el.style.transition = 'none';
+    lens.el.style.transform = '';
+    lens.el.style.transformOrigin = '50% 50%';
+    syncAppGlassTiltOwnerState(lens, false);
+  }
+  if (lens._shadowEl instanceof HTMLElement) {
+    lens._shadowEl.style.transition = 'none';
+    lens._shadowEl.style.transform = '';
+    lens._shadowEl.style.transformOrigin = '50% 50%';
+  }
+  restoreAppGlassTiltFollowers(lens);
+  lens.updateMetrics?.();
+}
+
+function suspendLiquidGlassTiltForOwner(owner: HTMLElement) {
+  return liquidGlassLensesForOwner(owner).map((lens): AppGlassTiltSuspension => {
+    const tiltEnabled = lens.options?.tilt === true;
+    if (tiltEnabled) lens.setTilt?.(false);
+    resetLiquidGlassLensTilt(lens);
+    return { lens, tiltEnabled };
+  });
+}
+
+function restoreLiquidGlassTiltSuspension(suspensions: AppGlassTiltSuspension[]) {
+  const renderers = new Set<LiquidGLRendererLike>();
+  for (const suspension of suspensions) {
+    if (suspension.lens.el instanceof HTMLElement) {
+      suspension.lens.el.style.transition = suspension.lens.originalTransition || '';
+    }
+    if (suspension.lens._shadowEl instanceof HTMLElement) {
+      suspension.lens._shadowEl.style.transition = '';
+    }
+    if (suspension.tiltEnabled) suspension.lens.setTilt?.(true);
+    if (suspension.lens.el instanceof HTMLElement && suspension.lens.el.classList.contains('app-glass-plane')) {
+      installAppGlassTiltFollowers(suspension.lens);
+    }
+    suspension.lens.updateMetrics?.();
+    const renderer = liquidGlassRendererForLens(suspension.lens);
+    if (renderer) renderers.add(renderer);
+  }
+  for (const renderer of renderers) {
+    if (renderer === explorerLiquidGlassRenderer) ensureExplorerLiquidGlassCanvasLayer();
+    else ensureAppGlassRendererLayer(renderer);
+    renderer.render?.();
+    if (renderer === explorerLiquidGlassRenderer) syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+  }
+}
+
+function restoreLiquidGlassTiltAfterPointerRelease(suspensions: AppGlassTiltSuspension[], fallbackMs = 1600) {
+  if (!suspensions.length) return;
+  let restored = false;
+  let fallbackTimer = 0;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    if (fallbackTimer) window.clearTimeout(fallbackTimer);
+    document.removeEventListener('mouseup', restore, true);
+    document.removeEventListener('pointerup', restore, true);
+    document.removeEventListener('pointercancel', restore, true);
+    restoreLiquidGlassTiltSuspension(suspensions);
+  };
+  document.addEventListener('mouseup', restore, { capture: true, once: true });
+  document.addEventListener('pointerup', restore, { capture: true, once: true });
+  document.addEventListener('pointercancel', restore, { capture: true, once: true });
+  fallbackTimer = window.setTimeout(restore, fallbackMs);
+}
+
+function refreshLiquidGlassGeometryForOwner(owner: HTMLElement) {
+  if (!appGlassEnabled()) return;
+  for (const renderer of liquidGlassRenderersForOwner(owner)) {
+    if (renderer === explorerLiquidGlassRenderer) ensureExplorerLiquidGlassCanvasLayer();
+    else ensureAppGlassRendererLayer(renderer);
+    renderer.render?.();
+    if (renderer === explorerLiquidGlassRenderer) syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+  }
+  appendAppGlassDiagnostic('local');
+}
+
+function scheduleLiquidGlassGeometryForOwner(owner: HTMLElement) {
+  if (!appGlassEnabled()) return;
+  if (appGlassOwnerGeometryFrames.get(owner)) return;
+  const frame = window.requestAnimationFrame(() => {
+    appGlassOwnerGeometryFrames.delete(owner);
+    refreshLiquidGlassGeometryForOwner(owner);
+  });
+  appGlassOwnerGeometryFrames.set(owner, frame);
+}
+
+function appGlassCanCaptureSnapshotNow() {
+  if (document.hidden || document.visibilityState === 'hidden') return false;
+  if (window.innerWidth < 64 || window.innerHeight < 64) return false;
+  const rect = el.shell.getBoundingClientRect();
+  return rect.width >= 64 && rect.height >= 64;
+}
+
+function scheduleGlassResumeGeometry(reason: string) {
+  if (appGlassEnabled()) scheduleAppGlassRefresh({ delay: 90, reason });
+  if (workspaceLiquidGlassEligible()) scheduleWorkspaceLiquidGlassRefresh();
+  if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) scheduleExplorerLiquidGlassRefresh({ delay: 110 });
+}
+
+function deferAppGlassRecapture(reason = 'deferred') {
+  appGlassDeferredRecapture = true;
+  appendAppGlassDiagnostic(`recapture-deferred/${reason}`);
+}
+
+function scheduleAppGlassActiveOwnerRecaptures(reason: string, options: { delay?: number; stagger?: number } = {}) {
+  syncAppGlassTargets();
+  const owners = appGlassActiveOwners();
+  if (!owners.length) return false;
+  const baseDelay = options.delay ?? 90;
+  const stagger = options.stagger ?? 24;
+  owners.forEach((owner, index) => {
+    scheduleAppGlassOwnerRefresh(owner, {
+      recapture: true,
+      delay: baseDelay + index * stagger,
+      reason
+    });
+  });
+  if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) {
+    scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: baseDelay + 30 });
+  }
+  if (workspaceLiquidGlassEligible()) {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: baseDelay + 30 });
+  }
+  return true;
+}
+
+function flushDeferredAppGlassRecapture(reason = 'visible') {
+  if (!appGlassDeferredRecapture || !appGlassCanCaptureSnapshotNow()) return;
+  appGlassDeferredRecapture = false;
+  if (!scheduleAppGlassActiveOwnerRecaptures(`deferred-${reason}`)) {
+    scheduleAppGlassRefresh({ recapture: true, delay: 140, reason });
+    return;
+  }
+  appendAppGlassDiagnostic(`owner-recapture/${reason}`);
+}
+
+function scheduleAppGlassRefresh(options: { recapture?: boolean; delay?: number; reason?: string } = {}) {
+  if (appGlassRefreshTimer) window.clearTimeout(appGlassRefreshTimer);
+  appGlassRefreshRecapture = appGlassRefreshRecapture || options.recapture === true;
+  appGlassRefreshTimer = window.setTimeout(() => {
+    const recapture = appGlassRefreshRecapture;
+    appGlassRefreshTimer = 0;
+    appGlassRefreshRecapture = false;
+    if (recapture && !appGlassCanCaptureSnapshotNow()) {
+      deferAppGlassRecapture(options.reason ?? 'scheduled');
+      return;
+    }
+    void applyAppLiquidGlass(recapture);
+    appendAppGlassDiagnostic(recapture ? `recapture/${options.reason ?? 'scheduled'}` : `topology/${options.reason ?? 'scheduled'}`);
+  }, options.delay ?? (options.recapture ? 180 : 70));
+}
+
+function scheduleAppGlassOwnerRefresh(
+  owner: HTMLElement,
+  options: { recapture?: boolean; delay?: number; reason?: string } = {}
+) {
+  const existing = appGlassOwnerRefreshTimers.get(owner);
+  if (existing) window.clearTimeout(existing);
+  appGlassOwnerRefreshRecapture.set(owner, (appGlassOwnerRefreshRecapture.get(owner) ?? false) || options.recapture === true);
+  const timer = window.setTimeout(() => {
+    appGlassOwnerRefreshTimers.delete(owner);
+    const recapture = appGlassOwnerRefreshRecapture.get(owner) ?? false;
+    appGlassOwnerRefreshRecapture.delete(owner);
+    void applyAppLiquidGlassForOwner(owner, recapture, options.reason ?? 'owner');
+  }, options.delay ?? (options.recapture ? 140 : 70));
+  appGlassOwnerRefreshTimers.set(owner, timer);
+}
+
+async function applyAppLiquidGlassForOwner(owner: HTMLElement, recaptureSnapshot = false, reason = 'owner') {
+  const targets = syncAppGlassOwnerTargets(owner);
+  if (!targets.length) return;
+  if (appGlassApplying) {
+    scheduleAppGlassOwnerRefresh(owner, { recapture: recaptureSnapshot, delay: 90, reason: `${reason}-pending` });
+    return;
+  }
+  if (!appGlassEnabled()) {
+    cleanupAppGlassOwner(owner);
+    return;
+  }
+  syncWorkspaceGlassSnapshotStage();
+  const activeTargets = prioritizedAppGlassTargets(targets.filter((target) => syncAppGlassTarget(target)));
+  if (!activeTargets.length) {
+    appendAppGlassDiagnostic(`local/${reason}`);
+    return;
+  }
+  await loadLiquidGLScripts();
+  for (const target of activeTargets) {
+    const id = target.dataset.appGlassId;
+    if (!id) continue;
+    const effect = effectiveAppGlassEffectSettings(target.dataset.appGlassScope || '');
+    let renderer = appGlassRenderers.get(id);
+    if (renderer && appGlassRendererNeedsRebuild(renderer)) {
+      appendAppGlassDiagnostic(`rebuild/${target.dataset.appGlassScope || 'default'}`);
+      disposeAppGlassRendererInstance(renderer);
+      renderer = undefined;
+    }
+    const rendererExists = Boolean(renderer);
+    const lensState = target.dataset.appGlassLens;
+    if (lensState === 'css') {
+      if (appGlassRecoverableFallbackReason(target.dataset.appGlassFallbackReason) && !prepareAppGlassInitFailedRetry(target)) continue;
+      delete target.dataset.appGlassLens;
+      delete target.dataset.appGlassFallbackReason;
+    }
+    if (!rendererExists || target.dataset.appGlassLens !== 'liquidgl') {
+      await createAppGlassRendererForTarget(target, effect);
+      continue;
+    }
+    applyAppGlassLensOptionsForRenderer(renderer, effect, target);
+    renderer?.lenses?.forEach((lens) => lens.updateMetrics?.());
+    if (recaptureSnapshot) await renderer?.captureSnapshot?.().catch(() => undefined);
+    renderer?.render?.();
+  }
+  appendAppGlassDiagnostic(recaptureSnapshot ? `local-recapture/${reason}` : `local/${reason}`);
+}
+
+async function applyAppLiquidGlass(recaptureSnapshot = false) {
+  if (appGlassApplying) {
+    scheduleAppGlassRefresh({ recapture: recaptureSnapshot, reason: 'apply-pending' });
+    return;
+  }
+  if (recaptureSnapshot && !appGlassCanCaptureSnapshotNow()) {
+    deferAppGlassRecapture('apply-hidden');
+    return;
+  }
+  appGlassApplying = true;
+  try {
+    syncAppGlassTargets();
+    syncWorkspaceGlassSnapshotStage();
+    if (!appGlassEnabled()) {
+      removeAppLiquidGlass();
+      return;
+    }
+    const targets = prioritizedAppGlassTargets(appGlassActiveTargets());
+    const activeIds = new Set(targets.map((target) => target.dataset.appGlassId || '').filter(Boolean));
+    for (const id of Array.from(appGlassRenderers.keys())) {
+      if (!activeIds.has(id)) removeAppGlassRenderer(id);
+    }
+    if (!targets.length) return;
+    await loadLiquidGLScripts();
+  for (const target of targets) {
+    const id = target.dataset.appGlassId;
+    if (!id) continue;
+    const effect = effectiveAppGlassEffectSettings(target.dataset.appGlassScope || '');
+    let renderer = appGlassRenderers.get(id);
+    if (renderer && appGlassRendererNeedsRebuild(renderer)) {
+      appendAppGlassDiagnostic(`rebuild/${target.dataset.appGlassScope || 'default'}`);
+      disposeAppGlassRendererInstance(renderer);
+      renderer = undefined;
+    }
+    const rendererExists = Boolean(renderer);
+    const lensState = target.dataset.appGlassLens;
+    if (lensState === 'css') {
+      if (appGlassRecoverableFallbackReason(target.dataset.appGlassFallbackReason) && !prepareAppGlassInitFailedRetry(target)) continue;
+        delete target.dataset.appGlassLens;
+        delete target.dataset.appGlassFallbackReason;
+      }
+    if (!rendererExists || target.dataset.appGlassLens !== 'liquidgl') {
+      await createAppGlassRendererForTarget(target, effect);
+    } else {
+      applyAppGlassLensOptionsForRenderer(renderer, effect, target);
+      if (recaptureSnapshot) {
+          renderer?.lenses?.forEach((lens) => lens.updateMetrics?.());
+          await renderer?.captureSnapshot?.().catch(() => undefined);
+        }
+        renderer?.render?.();
+      }
+    }
+    appendAppGlassDiagnostic(recaptureSnapshot ? 'apply/recapture' : 'apply');
+  } finally {
+    appGlassApplying = false;
+  }
+}
+
+async function createAppGlassRendererForTarget(target: HTMLElement, effect: WorkspaceGlassEffectSettings) {
+  const id = target.dataset.appGlassId;
+  if (!id || !window.liquidGL) return;
+  syncWorkspaceGlassSnapshotStage();
+  removeAppGlassRenderer(id);
+  target.classList.add('app-glass-pending', 'credit-card-glass');
+  target.dataset.appGlassLens = 'pending';
+  delete target.dataset.appGlassFallbackReason;
+  delete target.dataset.appGlassRetryAt;
+  try {
+    const isolated = createSharedAppLiquidGL({
+      snapshot: '#ide-glass-snapshot-stage',
+      target: `[data-app-glass-id="${id}"]`,
+      resolution: 1,
+      refraction: effect.refraction,
+      bevelDepth: effect.bevelDepth,
+      bevelWidth: effect.bevelWidth,
+      frost: effect.frost,
+      magnify: effect.magnify,
+      shadow: effect.shadow,
+      specular: effect.specular,
+      reveal: effect.reveal,
+      tilt: effect.tilt,
+      tiltFactor: effect.tiltFactor,
+      overlayContainer: el.shell,
+      preserveTargetOpacity: true,
+      preservePointerEvents: true
+    });
+    const renderer = isolated.renderer;
+    const lenses = liquidLensArray(isolated.result);
+    if (!renderer || !lenses.length) {
+      markAppGlassTargetCssFallback(target, 'init-failed');
+      return;
+    }
+    appGlassRenderers.set(id, renderer);
+    for (const lens of lenses) {
+      const lensTarget = lens.el instanceof HTMLElement ? lens.el : null;
+      if (!lensTarget || lensTarget.dataset.appGlassId !== id) continue;
+      lensTarget.classList.remove('app-glass-pending');
+      lensTarget.dataset.appGlassLens = 'liquidgl';
+      delete lensTarget.dataset.appGlassFallbackReason;
+      delete lensTarget.dataset.appGlassRetryCount;
+      delete lensTarget.dataset.appGlassRetryAt;
+      applyAppGlassLensOptions(lens, effect);
+    }
+    ensureAppGlassRendererLayer(renderer);
+    await renderer.captureSnapshot?.().catch(() => undefined);
+    renderer.render?.();
+  } catch (error) {
+    markAppGlassTargetCssFallback(target, 'init-failed');
+    console.warn('app glass target failed', error);
+  }
+}
+
+function applyAppGlassLensOptionsForRenderer(
+  renderer: LiquidGLRendererLike | undefined,
+  effect: WorkspaceGlassEffectSettings,
+  targetFilter?: HTMLElement
+) {
+  renderer?.lenses?.forEach((lens) => {
+    if (lens.el instanceof HTMLElement && lens.el.classList.contains('app-glass-plane') && (!targetFilter || lens.el === targetFilter)) {
+      applyAppGlassLensOptions(lens, effect);
+    }
+  });
+  if (renderer) ensureAppGlassRendererLayer(renderer);
+}
+
+function applyAppGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlassEffectSettings) {
+  const target = lens.el instanceof HTMLElement ? lens.el : null;
+  const owner = target?.parentElement instanceof HTMLElement ? target.parentElement : null;
+  const tiltEnabled = effect.tilt && !owner?.classList.contains('dragging') && !owner?.classList.contains('resizing');
+  lens.options = {
+    ...(lens.options ?? {}),
+    refraction: effect.refraction,
+    bevelDepth: effect.bevelDepth,
+    bevelWidth: effect.bevelWidth,
+    frost: effect.frost,
+    magnify: effect.magnify,
+    shadow: effect.shadow,
+    specular: effect.specular,
+    reveal: effect.reveal,
+    tilt: tiltEnabled,
+    tiltFactor: effect.tiltFactor,
+    overlayContainer: target ? appGlassOverlayContainerForTarget(target) : el.shell,
+    preserveTargetOpacity: true,
+    preservePointerEvents: true
+  };
+  lens.setShadow?.(effect.shadow);
+  lens.setTilt?.(tiltEnabled);
+}
+
+function updateAppLiquidGlassEffectOptions(scopeFilter: string | null = null) {
+  if (!appGlassEnabled()) return;
+  let changed = false;
+  for (const renderer of uniqueAppGlassRenderers()) {
+    let rendererChanged = false;
+    renderer.lenses?.forEach((lens) => {
+      const target = lens.el instanceof HTMLElement ? lens.el : null;
+      if (!target?.classList.contains('app-glass-plane')) return;
+      const scope = target.dataset.appGlassScope || '';
+      if (scopeFilter !== null && scope !== scopeFilter) return;
+      applyAppGlassLensOptions(lens, effectiveAppGlassEffectSettings(scope));
+      lens.updateMetrics?.();
+      rendererChanged = true;
+    });
+    if (!rendererChanged) continue;
+    ensureAppGlassRendererLayer(renderer);
+    renderer.render?.();
+    changed = true;
+  }
+  if (changed) appendAppGlassDiagnostic(scopeFilter === null ? 'effect/all' : `effect/${scopeFilter || 'default'}`);
+}
+
+function bindAppGlassRendererContextEvents(renderer: LiquidGLRendererLike | undefined) {
+  const canvas = renderer?.canvas;
+  if (!(canvas instanceof HTMLCanvasElement) || canvas.dataset.appGlassContextBound === '1') return;
+  canvas.dataset.appGlassContextBound = '1';
+  canvas.addEventListener('webglcontextlost', (event) => {
+    if (canvas.dataset.appGlassDisposing === '1') return;
+    event.preventDefault();
+    canvas.style.opacity = '0';
+    canvas.style.visibility = 'hidden';
+    const targets = appGlassTargetsForRenderer(renderer);
+    const targetElement = targets[0];
+    if (!(targetElement instanceof HTMLElement)) return;
+    appendDiagnosticLog(
+      'glass',
+      `app glass context-lost ${appGlassPlaneDebugName(targetElement)} affected=${targets.length} ${appGlassContextSummary()}`,
+      'warn',
+      { force: true }
+    );
+    disposeAppGlassRendererInstance(renderer);
+    if (appGlassEnabled()) {
+      for (const target of targets) {
+        if (target.isConnected) markAppGlassTargetCssFallback(target, 'context-lost');
+      }
+      scheduleAppGlassInitFailedRetry('context-lost', 1800);
+    }
+  }, { passive: false });
+}
+
+function disableAppGlassRendererInternalObservers(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer) return;
+  if (typeof renderer._rafId === 'number') {
+    window.cancelAnimationFrame(renderer._rafId);
+    renderer._rafId = null;
+  }
+  renderer.useExternalTicker = true;
+  if (typeof renderer._scrollRafId === 'number') {
+    window.cancelAnimationFrame(renderer._scrollRafId);
+    renderer._scrollRafId = null;
+  }
+  if (typeof renderer._scrollTimeout === 'number') {
+    window.clearTimeout(renderer._scrollTimeout);
+    renderer._scrollTimeout = null;
+  }
+  renderer._isScrolling = false;
+  if (renderer._resizeHandler) {
+    window.removeEventListener('resize', renderer._resizeHandler);
+    renderer._resizeHandler = null;
+  }
+  if (renderer._resizeObserver) {
+    renderer._resizeObserver.disconnect();
+    renderer._resizeObserver = null;
+  }
+}
+
+function resizeAppGlassRendererCanvasForViewport(renderer: LiquidGLRendererLike) {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const signature = `${window.innerWidth}x${window.innerHeight}@${dpr}`;
+  if (appGlassRendererViewportSignatures.get(renderer) === signature) return;
+  renderer._resizeCanvas?.();
+  appGlassRendererViewportSignatures.set(renderer, signature);
+}
+
+function appGlassLocalViewportMetrics(container: HTMLElement) {
+  const rect = container.getBoundingClientRect();
+  const scaleX = rect.width > 0 && container.offsetWidth > 0
+    ? rect.width / container.offsetWidth
+    : 1;
+  const scaleY = rect.height > 0 && container.offsetHeight > 0
+    ? rect.height / container.offsetHeight
+    : scaleX;
+  return {
+    rect,
+    scaleX: Number.isFinite(scaleX) && scaleX > 0 ? scaleX : 1,
+    scaleY: Number.isFinite(scaleY) && scaleY > 0 ? scaleY : 1
+  };
+}
+
+function positionAppGlassViewportLayer(layer: HTMLElement, container: HTMLElement, zIndex: string) {
+  const { rect, scaleX, scaleY } = appGlassLocalViewportMetrics(container);
+  layer.style.position = 'absolute';
+  layer.style.top = `${-rect.top / scaleY - container.clientTop + container.scrollTop}px`;
+  layer.style.left = `${-rect.left / scaleX - container.clientLeft + container.scrollLeft}px`;
+  layer.style.width = `${window.innerWidth / scaleX}px`;
+  layer.style.height = `${window.innerHeight / scaleY}px`;
+  layer.style.zIndex = zIndex;
+  layer.style.pointerEvents = 'none';
+}
+
+function appGlassLensStableMirrorRect(lens: LiquidGLLensLike, target: HTMLElement) {
+  const targetTransform = target.style.transform || '';
+  const tiltTransformActive = appGlassTiltTransformIsActive(targetTransform);
+  const baseRect = lens._mirrorActive
+    && lens._baseRect
+    && (lens._tiltActive === true || lens._tiltInteracting === true || tiltTransformActive)
+    ? lens._baseRect
+    : null;
+  if (baseRect && baseRect.width > 0 && baseRect.height > 0) return baseRect;
+  return target.getBoundingClientRect();
+}
+
+function appGlassViewportMirrorPivot(lens: LiquidGLLensLike, targetRect: DOMRect, scaleX: number, scaleY: number) {
+  const origin = typeof lens._pivotOrigin === 'string' ? lens._pivotOrigin : '';
+  const match = origin.match(/^\s*(-?\d+(?:\.\d+)?)px\s+(-?\d+(?:\.\d+)?)px\s*$/);
+  const pivotX = match ? Number(match[1]) : targetRect.left + targetRect.width / 2;
+  const pivotY = match ? Number(match[2]) : targetRect.top + targetRect.height / 2;
+  return `${pivotX / scaleX}px ${pivotY / scaleY}px`;
+}
+
+function clipAppGlassViewportMirror(lens: LiquidGLLensLike, mirror: HTMLElement, target: HTMLElement, container: HTMLElement) {
+  const targetRect = appGlassLensStableMirrorRect(lens, target);
+  const { scaleX, scaleY } = appGlassLocalViewportMetrics(container);
+  const radius = window.getComputedStyle(target).borderTopLeftRadius || '0px';
+  const clip = `inset(${targetRect.top / scaleY}px `
+    + `${(window.innerWidth - targetRect.right) / scaleX}px `
+    + `${(window.innerHeight - targetRect.bottom) / scaleY}px `
+    + `${targetRect.left / scaleX}px round ${radius})`;
+  mirror.style.clipPath = clip;
+  mirror.style.setProperty('-webkit-clip-path', clip);
+  mirror.style.transformOrigin = appGlassViewportMirrorPivot(lens, targetRect, scaleX, scaleY);
+}
+
+function ownAppGlassMirrorLayer(lens: LiquidGLLensLike, container: HTMLElement) {
+  if (!(lens.el instanceof HTMLElement) || !(lens._mirror instanceof HTMLElement)) return;
+  if (lens._mirror.parentElement !== container) container.append(lens._mirror);
+  lens._mirror.dataset.appGlassMirror = '1';
+  if (lens._mirrorClipUpdater) window.removeEventListener('resize', lens._mirrorClipUpdater);
+  lens._mirrorClipUpdater = () => {
+    if (lens._mirror instanceof HTMLElement && lens.el instanceof HTMLElement) {
+      clipAppGlassViewportMirror(lens, lens._mirror, lens.el, container);
+    }
+  };
+  positionAppGlassViewportLayer(lens._mirror, container, '1');
+  clipAppGlassViewportMirror(lens, lens._mirror, lens.el, container);
+}
+
+function appGlassMirrorContainerForLens(lens: LiquidGLLensLike, fallback: HTMLElement) {
+  if (!(lens.el instanceof HTMLElement)) return fallback;
+  if (lens.el.classList.contains('app-glass-plane')) return appGlassOverlayContainerForTarget(lens.el);
+  if (lens.el.classList.contains('file-row-glass') && lens.el.parentElement instanceof HTMLElement) {
+    return lens.el.parentElement;
+  }
+  return fallback;
+}
+
+function patchAppGlassMirrorCreation(lens: LiquidGLLensLike, container: HTMLElement) {
+  if (!lens._appGlassMirrorCreatePatched && typeof lens._createMirrorCanvas === 'function') {
+    const createMirrorCanvas = lens._createMirrorCanvas.bind(lens);
+    lens._createMirrorCanvas = () => {
+      createMirrorCanvas();
+      ownAppGlassMirrorLayer(lens, appGlassMirrorContainerForLens(lens, container));
+    };
+    lens._appGlassMirrorCreatePatched = true;
+  }
+  if (!lens._appGlassMirrorDestroyPatched && typeof lens._destroyMirrorCanvas === 'function') {
+    const destroyMirrorCanvas = lens._destroyMirrorCanvas.bind(lens);
+    lens._destroyMirrorCanvas = () => {
+      destroyMirrorCanvas();
+      if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
+        if (lens.el instanceof HTMLElement && lens.el.classList.contains('file-row-glass')) {
+          const visible = !explorerGlassHoverOnlyEnabled()
+            || activeExplorerHoverOnlyGlassElements()?.has(lens.el) === true;
+          lens._appGlassLocalMirror.style.opacity = visible ? '1' : '0';
+        } else {
+          lens._appGlassLocalMirror.style.opacity = '1';
+        }
+      }
+      lens._baseRect = null;
+      lens.updateMetrics?.();
+      if (lens.el instanceof HTMLElement && lens.el.classList.contains('app-glass-plane')) {
+        syncAppGlassTiltFollowers(lens);
+      }
+      window.requestAnimationFrame(() => {
+        lens.updateMetrics?.();
+        if (lens.el instanceof HTMLElement && lens.el.classList.contains('app-glass-plane')) {
+          const owner = lens.el.parentElement instanceof HTMLElement ? lens.el.parentElement : null;
+          if (owner) syncAppGlassTiltOwnerState(lens, appGlassTiltTransformIsActive(lens.el.style.transform || ''));
+        }
+        const appRenderer = appGlassRendererForLens(lens);
+        appRenderer?.render?.();
+        if (explorerLiquidGlassRenderer?.lenses?.includes(lens)) {
+          explorerLiquidGlassRenderer.render?.();
+          syncExplorerLiquidGlassLocalMirrorsFromRenderer(explorerLiquidGlassRenderer);
+        }
+      });
+    };
+    lens._appGlassMirrorDestroyPatched = true;
+  }
+}
+
+function clearAppGlassLocalMirror(lens: LiquidGLLensLike) {
+  lens._appGlassLocalMirror?.remove();
+  lens._appGlassLocalMirror = null;
+  lens._appGlassLocalMirrorCtx = null;
+  delete lens._sviAfterRenderLens;
+}
+
+function ensureAppGlassLocalMirror(lens: LiquidGLLensLike) {
+  const target = appGlassTargetForLens(lens);
+  const owner = target?.parentElement instanceof HTMLElement ? target.parentElement : null;
+  if (!target || !owner) {
+    clearAppGlassLocalMirror(lens);
+    return;
+  }
+  let mirror = lens._appGlassLocalMirror;
+  if (!(mirror instanceof HTMLCanvasElement) || !mirror.isConnected) {
+    mirror = document.createElement('canvas');
+    mirror.dataset.appGlassMirror = '1';
+    mirror.dataset.appGlassLocalMirror = '1';
+    mirror.setAttribute('data-liquid-ignore', '');
+    mirror.setAttribute('aria-hidden', 'true');
+    mirror.style.position = 'absolute';
+    mirror.style.pointerEvents = 'none';
+    mirror.style.zIndex = '1';
+    mirror.style.willChange = 'transform, width, height';
+    lens._appGlassLocalMirror = mirror;
+    lens._appGlassLocalMirrorCtx = mirror.getContext('2d');
+  }
+  if (mirror.parentElement !== owner) owner.append(mirror);
+  lens._sviAfterRenderLens = (renderer) => syncAppGlassLocalMirror(lens, renderer);
+}
+
+function syncAppGlassLocalMirror(lens: LiquidGLLensLike, renderer: LiquidGLRendererLike) {
+  const target = appGlassTargetForLens(lens);
+  const owner = target?.parentElement instanceof HTMLElement ? target.parentElement : null;
+  const source = renderer.canvas;
+  if (!target || !owner || !(source instanceof HTMLCanvasElement)) return;
+  ensureAppGlassLocalMirror(lens);
+  const mirror = lens._appGlassLocalMirror;
+  const ctx = lens._appGlassLocalMirrorCtx ?? mirror?.getContext('2d');
+  if (!(mirror instanceof HTMLCanvasElement) || !ctx) return;
+  lens._appGlassLocalMirrorCtx = ctx;
+  const targetRect = target.getBoundingClientRect();
+  const { rect: ownerRect, scaleX, scaleY } = appGlassLocalViewportMetrics(owner);
+  const canvasRect = source.getBoundingClientRect();
+  const sxScale = source.width / Math.max(1, canvasRect.width || window.innerWidth);
+  const syScale = source.height / Math.max(1, canvasRect.height || window.innerHeight);
+  const bleed = 2;
+  const cssWidth = Math.max(1, targetRect.width + bleed * 2);
+  const cssHeight = Math.max(1, targetRect.height + bleed * 2);
+  const pixelWidth = Math.max(1, Math.round(cssWidth * sxScale));
+  const pixelHeight = Math.max(1, Math.round(cssHeight * syScale));
+  if (mirror.width !== pixelWidth) mirror.width = pixelWidth;
+  if (mirror.height !== pixelHeight) mirror.height = pixelHeight;
+  mirror.style.left = `${(targetRect.left - ownerRect.left) / scaleX - owner.clientLeft + owner.scrollLeft - bleed / scaleX}px`;
+  mirror.style.top = `${(targetRect.top - ownerRect.top) / scaleY - owner.clientTop + owner.scrollTop - bleed / scaleY}px`;
+  mirror.style.width = `${cssWidth / scaleX}px`;
+  mirror.style.height = `${cssHeight / scaleY}px`;
+  const radius = window.getComputedStyle(target).borderTopLeftRadius || '0px';
+  const clip = `inset(0 round ${radius})`;
+  mirror.style.borderRadius = radius;
+  mirror.style.clipPath = clip;
+  mirror.style.setProperty('-webkit-clip-path', clip);
+  mirror.style.opacity = lens._mirrorActive ? '0' : '1';
+  ctx.clearRect(0, 0, mirror.width, mirror.height);
+  const desiredSw = Math.round(cssWidth * sxScale);
+  const desiredSh = Math.round(cssHeight * syScale);
+  const rawSx = Math.round((targetRect.left - canvasRect.left - bleed) * sxScale);
+  const rawSy = Math.round((targetRect.top - canvasRect.top - bleed) * syScale);
+  const sx = Math.max(0, rawSx);
+  const sy = Math.max(0, rawSy);
+  const sw = Math.min(source.width, rawSx + desiredSw) - sx;
+  const sh = Math.min(source.height, rawSy + desiredSh) - sy;
+  if (sw <= 0 || sh <= 0) return;
+  const dx = Math.max(0, sx - rawSx);
+  const dy = Math.max(0, sy - rawSy);
+  ctx.drawImage(source, sx, sy, sw, sh, dx, dy, sw, sh);
+}
+
+function positionAppGlassShadowLayer(shadow: HTMLElement, target: HTMLElement, container: HTMLElement, lens?: LiquidGLLensLike) {
+  const targetRect = lens ? appGlassLensStableMirrorRect(lens, target) : target.getBoundingClientRect();
+  const { rect: containerRect, scaleX, scaleY } = appGlassLocalViewportMetrics(container);
+  shadow.style.position = 'absolute';
+  shadow.style.left = `${(targetRect.left - containerRect.left) / scaleX - container.clientLeft + container.scrollLeft}px`;
+  shadow.style.top = `${(targetRect.top - containerRect.top) / scaleY - container.clientTop + container.scrollTop}px`;
+  shadow.style.width = `${targetRect.width / scaleX}px`;
+  shadow.style.height = `${targetRect.height / scaleY}px`;
+  shadow.style.zIndex = '0';
+  shadow.style.pointerEvents = 'none';
+}
+
+function appGlassTiltFollowersForTarget(target: HTMLElement) {
+  const owner = target.parentElement;
+  if (!(owner instanceof HTMLElement)) return [];
+  const directFollowers = () => Array.from(owner.children).filter((child): child is HTMLElement => {
+    if (!(child instanceof HTMLElement)) return false;
+    if (child === target) return false;
+    if (child.classList.contains('app-glass-plane')) return false;
+    if (child.classList.contains('panel-resize-grip')) return false;
+    if (child.dataset.appGlassCanvas === '1') return false;
+    if (child.dataset.appGlassMirror === '1') return false;
+    if (child.dataset.appGlassShadow === '1') return false;
+    return true;
+  });
+  if (owner === el.titlebar) {
+    const followers = directFollowers();
+    if (state.ideSettings.appGlass?.windowControls !== false) followers.push(el.windowControls);
+    return followers;
+  }
+  if (owner === el.workspaceBar && !appGlassProfileActionsUseSplit()) {
+    return [el.workspaceProfilePrimaryCard, el.workspaceProfileActionsCard]
+      .flatMap((card) => Array.from(card.children))
+      .filter((child): child is HTMLElement => child instanceof HTMLElement && !child.classList.contains('app-glass-plane'));
+  }
+  return directFollowers();
+}
+
+function rememberAppGlassTiltFollowerStyle(follower: HTMLElement) {
+  if (appGlassTiltFollowerOriginalStyles.has(follower)) return;
+  appGlassTiltFollowerOriginalStyles.set(follower, {
+    transform: follower.style.transform,
+    transition: follower.style.transition,
+    transformOrigin: follower.style.transformOrigin,
+    transformStyle: follower.style.transformStyle,
+    transformBox: follower.style.getPropertyValue('transform-box'),
+    backfaceVisibility: follower.style.backfaceVisibility,
+    willChange: follower.style.willChange
+  });
+}
+
+function appGlassTiltTransformIsActive(transform: string) {
+  const normalized = transform.trim();
+  if (!normalized || normalized === 'none') return false;
+  return !/rotateX\(\s*0(?:\.0+)?deg\s*\)\s*rotateY\(\s*0(?:\.0+)?deg\s*\)/i.test(normalized);
+}
+
+function syncAppGlassTiltOwnerState(lens: LiquidGLLensLike, active: boolean) {
+  const owner = lens.el instanceof HTMLElement && lens.el.parentElement instanceof HTMLElement
+    ? lens.el.parentElement
+    : null;
+  owner?.classList.toggle('app-glass-tilting', active);
+}
+
+function syncAppGlassTiltFollowers(lens: LiquidGLLensLike) {
+  if (!(lens.el instanceof HTMLElement)) return;
+  const followers = lens._appGlassTiltFollowers ?? [];
+  if (!followers.length) return;
+  const transform = lens.el.style.transform || '';
+  const transition = lens.el.style.transition || '';
+  syncAppGlassTiltOwnerState(lens, appGlassTiltTransformIsActive(transform));
+  const owner = lens.el.parentElement instanceof HTMLElement ? lens.el.parentElement : null;
+  const metrics = owner ? appGlassLocalViewportMetrics(owner) : null;
+  const targetRect = lens.el.getBoundingClientRect();
+  const centerX = targetRect.left + targetRect.width / 2;
+  const centerY = targetRect.top + targetRect.height / 2;
+  followers.forEach((follower) => {
+    rememberAppGlassTiltFollowerStyle(follower);
+    const followerRect = follower.getBoundingClientRect();
+    const originX = metrics ? (centerX - followerRect.left) / metrics.scaleX : followerRect.width / 2;
+    const originY = metrics ? (centerY - followerRect.top) / metrics.scaleY : followerRect.height / 2;
+    follower.style.transform = transform;
+    follower.style.transition = transition;
+    follower.style.transformOrigin = Number.isFinite(originX) && Number.isFinite(originY)
+      ? `${originX}px ${originY}px`
+      : '50% 50%';
+    follower.style.transformStyle = 'preserve-3d';
+    follower.style.setProperty('transform-box', 'border-box');
+    follower.style.backfaceVisibility = 'hidden';
+    follower.style.willChange = 'transform';
+    follower.dataset.appGlassTiltFollower = '1';
+  });
+}
+
+function restoreAppGlassTiltFollowers(lens: LiquidGLLensLike) {
+  lens._appGlassTiltObserver?.disconnect?.();
+  lens._appGlassTiltObserver = null;
+  syncAppGlassTiltOwnerState(lens, false);
+  const followers = lens._appGlassTiltFollowers ?? [];
+  for (const follower of followers) {
+    const original = appGlassTiltFollowerOriginalStyles.get(follower);
+    if (original) {
+      follower.style.transform = original.transform;
+      follower.style.transition = original.transition;
+      follower.style.transformOrigin = original.transformOrigin;
+      follower.style.transformStyle = original.transformStyle;
+      if (original.transformBox) follower.style.setProperty('transform-box', original.transformBox);
+      else follower.style.removeProperty('transform-box');
+      follower.style.backfaceVisibility = original.backfaceVisibility;
+      follower.style.willChange = original.willChange;
+      appGlassTiltFollowerOriginalStyles.delete(follower);
+    } else {
+      follower.style.transform = '';
+      follower.style.transition = '';
+      follower.style.transformOrigin = '';
+      follower.style.transformStyle = '';
+      follower.style.removeProperty('transform-box');
+      follower.style.backfaceVisibility = '';
+      follower.style.willChange = '';
+    }
+    delete follower.dataset.appGlassTiltFollower;
+  }
+  lens._appGlassTiltFollowers = [];
+}
+
+function installAppGlassTiltFollowers(lens: LiquidGLLensLike) {
+  if (!(lens.el instanceof HTMLElement)) return;
+  if (lens.options?.tilt !== true) {
+    restoreAppGlassTiltFollowers(lens);
+    return;
+  }
+  const followers = appGlassTiltFollowersForTarget(lens.el);
+  const previous = new Set(lens._appGlassTiltFollowers ?? []);
+  const next = new Set(followers);
+  previous.forEach((follower) => {
+    if (!next.has(follower)) {
+      const original = appGlassTiltFollowerOriginalStyles.get(follower);
+      if (original) {
+        follower.style.transform = original.transform;
+        follower.style.transition = original.transition;
+        follower.style.transformOrigin = original.transformOrigin;
+        follower.style.transformStyle = original.transformStyle;
+        if (original.transformBox) follower.style.setProperty('transform-box', original.transformBox);
+        else follower.style.removeProperty('transform-box');
+        follower.style.backfaceVisibility = original.backfaceVisibility;
+        follower.style.willChange = original.willChange;
+        appGlassTiltFollowerOriginalStyles.delete(follower);
+      }
+      delete follower.dataset.appGlassTiltFollower;
+    }
+  });
+  lens._appGlassTiltFollowers = followers;
+  if (!followers.length) {
+    lens._appGlassTiltObserver?.disconnect?.();
+    lens._appGlassTiltObserver = null;
+    syncAppGlassTiltOwnerState(lens, false);
+    return;
+  }
+  syncAppGlassTiltFollowers(lens);
+  if (!lens._appGlassTiltObserver) {
+    const observer = new MutationObserver(() => syncAppGlassTiltFollowers(lens));
+    observer.observe(lens.el, { attributes: true, attributeFilter: ['style'] });
+    lens._appGlassTiltObserver = observer;
+  }
+}
+
+function ensureAppGlassRendererLayer(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer) return;
+  disableAppGlassRendererInternalObservers(renderer);
+  bindAppGlassRendererContextEvents(renderer);
+  resizeAppGlassRendererCanvasForViewport(renderer);
+  sortAppGlassRendererLensesForPaintOrder(renderer);
+  const target = renderer.lenses?.find((lens) => (
+    lens.el instanceof HTMLElement
+    && lens.el.classList.contains('app-glass-plane')
+  ))?.el;
+  const overlayContainer = appGlassRendererLayerContainer(renderer, target instanceof HTMLElement ? target : null);
+  const canvas = renderer.canvas;
+  if (canvas instanceof HTMLElement) {
+    if (canvas.parentElement !== overlayContainer) overlayContainer.append(canvas);
+    canvas.dataset.appGlassCanvas = '1';
+    canvas.dataset.appGlassSharedCanvas = appGlassRendererUsesSharedLayer(renderer) ? '1' : '0';
+    if (appGlassRendererUsesSharedLayer(renderer)) {
+      canvas.style.visibility = 'hidden';
+    } else {
+      // App-glass normally uses the shared hidden render source above. This
+      // branch is kept for isolated/non-shared renderers only; multi-widget
+      // app glass must stay on owner-local mirrors to preserve stacking order.
+      canvas.style.visibility = '';
+    }
+    positionAppGlassViewportLayer(canvas, overlayContainer, '1');
+  }
+  renderer.lenses?.forEach((lens) => {
+    if (!(lens.el instanceof HTMLElement) || !lens.el.classList.contains('app-glass-plane')) return;
+    const lensOverlayContainer = appGlassOverlayContainerForTarget(lens.el);
+    installAppGlassTiltFollowers(lens);
+    patchAppGlassMirrorCreation(lens, lensOverlayContainer);
+    if (appGlassRendererUsesSharedLayer(renderer)) {
+      ensureAppGlassLocalMirror(lens);
+    } else {
+      clearAppGlassLocalMirror(lens);
+    }
+    if (lens._mirror instanceof HTMLElement) {
+      ownAppGlassMirrorLayer(lens, lensOverlayContainer);
+    }
+    if (lens._shadowEl instanceof HTMLElement) {
+      if (lens._shadowEl.parentElement !== lensOverlayContainer) lensOverlayContainer.append(lens._shadowEl);
+      lens._shadowEl.dataset.appGlassShadow = '1';
+      positionAppGlassShadowLayer(lens._shadowEl, lens.el, lensOverlayContainer, lens);
+    }
+  });
+}
+
+function appGlassLensOwnerZ(lens: LiquidGLLensLike) {
+  const owner = appGlassTargetForLens(lens)?.parentElement;
+  if (!(owner instanceof HTMLElement)) return 0;
+  const inlineZ = Number.parseInt(owner.style.zIndex || '', 10);
+  if (Number.isFinite(inlineZ)) return inlineZ;
+  const computedZ = Number.parseInt(window.getComputedStyle(owner).zIndex || '', 10);
+  return Number.isFinite(computedZ) ? computedZ : 0;
+}
+
+function sortAppGlassRendererLensesForPaintOrder(renderer: LiquidGLRendererLike) {
+  if (!renderer.lenses?.length) return;
+  renderer.lenses = renderer.lenses
+    .map((lens, index) => {
+      const target = appGlassTargetForLens(lens);
+      return {
+        lens,
+        index,
+        z: appGlassLensOwnerZ(lens),
+        priority: target ? appGlassTargetPriority(target) : 999
+      };
+    })
+    .sort((a, b) => a.z - b.z || a.priority - b.priority || a.index - b.index)
+    .map((item) => item.lens);
+}
+
+function markAppGlassTargetCssFallback(target: HTMLElement, reason = 'fallback') {
+  target.classList.remove('app-glass-pending');
+  target.dataset.appGlassLens = 'css';
+  target.dataset.appGlassFallbackReason = reason;
+  if (appGlassRecoverableFallbackReason(reason)) {
+    const retryCount = Math.min(99, (Number(target.dataset.appGlassRetryCount || 0) || 0) + 1);
+    const retryDelay = window.__liquidGLNoWebGL__
+      ? 0
+      : Math.min(8000, 800 + retryCount * 650);
+    target.dataset.appGlassRetryCount = String(retryCount);
+    if (retryDelay > 0) {
+      target.dataset.appGlassRetryAt = String(performance.now() + retryDelay);
+      scheduleAppGlassInitFailedRetry('mark', retryDelay + 40);
+    } else {
+      delete target.dataset.appGlassRetryAt;
+    }
+    appendDiagnosticLog(
+      'glass',
+      `app glass ${reason} ${appGlassPlaneDebugName(target)} retry=${retryCount} nextMs=${Math.round(retryDelay)} ${appGlassContextSummary()}`,
+      'warn',
+      { force: true }
+    );
+  } else {
+    delete target.dataset.appGlassRetryCount;
+    delete target.dataset.appGlassRetryAt;
+  }
+  clearAppGlassInlineStyles(target);
+}
+
+function cleanupAppGlassTarget(target: HTMLElement) {
+  const id = target.dataset.appGlassId;
+  if (id) removeAppGlassRenderer(id);
+  target.classList.remove('app-glass-pending');
+  if (target.dataset.appGlassLens !== 'css') {
+    delete target.dataset.appGlassLens;
+    delete target.dataset.appGlassFallbackReason;
+  }
+  delete target.dataset.appGlassRetryCount;
+  delete target.dataset.appGlassRetryAt;
+  clearAppGlassInlineStyles(target);
+}
+
+function cleanupAppGlassOwner(owner: HTMLElement) {
+  const timer = appGlassOwnerRefreshTimers.get(owner);
+  if (timer) window.clearTimeout(timer);
+  appGlassOwnerRefreshTimers.delete(owner);
+  appGlassOwnerRefreshRecapture.delete(owner);
+  for (const plane of appGlassPlanesForOwner(owner)) {
+    plane.classList.remove('app-glass-active');
+    delete plane.dataset.appGlassActive;
+    cleanupAppGlassTarget(plane);
+  }
+  owner.classList.remove('app-glass-active-shell');
+}
+
+function removeAppLiquidGlass() {
+  if (appGlassGeometryFrame) {
+    window.cancelAnimationFrame(appGlassGeometryFrame);
+    appGlassGeometryFrame = 0;
+  }
+  if (appGlassInitFailedRetryTimer) {
+    window.clearTimeout(appGlassInitFailedRetryTimer);
+    appGlassInitFailedRetryTimer = 0;
+    appGlassInitFailedRetryDueAt = 0;
+  }
+  for (const renderer of uniqueAppGlassRenderers()) disposeAppGlassRendererInstance(renderer);
+  for (const plane of appGlassPlaneElements()) {
+    plane.classList.remove('app-glass-pending', 'app-glass-active');
+    delete plane.dataset.appGlassLens;
+    delete plane.dataset.appGlassActive;
+    delete plane.dataset.appGlassFallbackReason;
+    delete plane.dataset.appGlassRetryCount;
+    delete plane.dataset.appGlassRetryAt;
+    clearAppGlassInlineStyles(plane);
+    plane.parentElement?.classList.remove('app-glass-active-shell');
+  }
+  appendAppGlassDiagnostic('remove', { force: true });
+}
+
+function cleanupAppGlassLens(lens: LiquidGLLensLike) {
+  try {
+    clearAppGlassLocalMirror(lens);
+    restoreAppGlassTiltFollowers(lens);
+    lens.setTilt?.(false);
+    lens.setShadow?.(false);
+    lens._destroyMirrorCanvas?.();
+    lens._shadowEl?.remove();
+    lens._sizeObs?.disconnect?.();
+  } catch {
+    // Best effort cleanup for third-party lens internals.
+  }
+  const target = appGlassTargetForLens(lens);
+  if (target) {
+    target.classList.remove('app-glass-pending');
+    if (target.dataset.appGlassLens === 'liquidgl') delete target.dataset.appGlassLens;
+    delete target.dataset.appGlassFallbackReason;
+    delete target.dataset.appGlassRetryCount;
+    delete target.dataset.appGlassRetryAt;
+    clearAppGlassInlineStyles(target);
+  }
+}
+
+function forgetAppGlassRendererMappings(renderer: LiquidGLRendererLike) {
+  for (const [id, mapped] of Array.from(appGlassRenderers.entries())) {
+    if (mapped === renderer) appGlassRenderers.delete(id);
+  }
+  if (appGlassSharedRenderer === renderer) appGlassSharedRenderer = undefined;
+}
+
+function disposeAppGlassRendererInstance(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer) return;
+  if (renderer.canvas instanceof HTMLCanvasElement) renderer.canvas.dataset.appGlassDisposing = '1';
+  const lenses = [...(renderer.lenses ?? [])];
+  for (const lens of lenses) cleanupAppGlassLens(lens);
+  try {
+    renderer.dispose?.();
+  } catch {
+    // Best effort dispose for vendored renderer.
+  }
+  if (renderer.canvas instanceof HTMLElement) renderer.canvas.remove();
+  renderer.lenses = [];
+  forgetAppGlassRendererMappings(renderer);
+}
+
+function removeAppGlassRenderer(id: string) {
+  const renderer = appGlassRenderers.get(id);
+  if (!renderer) return;
+  const lenses = [...(renderer.lenses ?? [])];
+  const remaining: LiquidGLLensLike[] = [];
+  for (const lens of lenses) {
+    if (appGlassTargetIdForLens(lens) === id) cleanupAppGlassLens(lens);
+    else remaining.push(lens);
+  }
+  renderer.lenses = remaining;
+  appGlassRenderers.delete(id);
+  if (!appGlassTargetsForRenderer(renderer).length) {
+    disposeAppGlassRendererInstance(renderer);
+  } else {
+    ensureAppGlassRendererLayer(renderer);
+    renderer.render?.();
+  }
+  scheduleAppGlassInitFailedRetry('renderer-removed', 360);
+}
+
+function clearAppGlassInlineStyles(element: HTMLElement) {
+  element.style.opacity = '';
+  element.style.transition = '';
+  element.style.boxShadow = '';
+  element.style.pointerEvents = '';
+  element.style.transform = '';
+  element.style.transformStyle = '';
+  element.style.transformOrigin = '';
+  element.style.background = '';
+  element.style.backgroundColor = '';
+  element.style.backgroundImage = '';
+  element.style.backdropFilter = '';
+  element.style.removeProperty('-webkit-backdrop-filter');
+}
+
+function explorerLiquidGlassTargets() {
+  return Array.from(el.fileList.querySelectorAll<HTMLElement>('.file-row:not(.loading) > .file-row-glass'));
+}
+
+function explorerLiquidGlassPanelElement() {
+  return el.fileList.closest<HTMLElement>('.explorer') ?? el.fileList;
+}
+
+function ensureExplorerLiquidGlassOverlayHost() {
+  const panel = explorerLiquidGlassPanelElement();
+  if (!explorerLiquidGlassOverlayHost || !explorerLiquidGlassOverlayHost.isConnected) {
+    explorerLiquidGlassOverlayHost = document.createElement('div');
+    explorerLiquidGlassOverlayHost.className = 'explorer-liquid-glass-overlay';
+    explorerLiquidGlassOverlayHost.dataset.explorerGlassOverlay = '1';
+  }
+  if (explorerLiquidGlassOverlayHost.parentElement !== panel) panel.append(explorerLiquidGlassOverlayHost);
+  positionExplorerLiquidGlassOverlayHost();
+  return explorerLiquidGlassOverlayHost;
+}
+
+function positionExplorerLiquidGlassOverlayHost() {
+  const host = explorerLiquidGlassOverlayHost;
+  if (!host?.isConnected) return;
+  const panel = explorerLiquidGlassPanelElement();
+  const panelRect = panel.getBoundingClientRect();
+  const listRect = el.fileList.getBoundingClientRect();
+  host.style.left = `${listRect.left - panelRect.left + el.fileList.clientLeft}px`;
+  host.style.top = `${listRect.top - panelRect.top + el.fileList.clientTop}px`;
+  host.style.width = `${Math.max(0, el.fileList.clientWidth)}px`;
+  host.style.height = `${Math.max(0, el.fileList.clientHeight)}px`;
+}
+
+function explorerLiquidGlassOverlayContainer() {
+  return ensureExplorerLiquidGlassOverlayHost();
+}
+
+function explorerLiquidGlassTargetForLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement && lens.el.classList.contains('file-row-glass')
+    ? lens.el
+    : null;
+}
+
+function clearExplorerLiquidGlassLocalMirror(lens: LiquidGLLensLike) {
+  lens._appGlassLocalMirror?.remove();
+  lens._appGlassLocalMirror = null;
+  lens._appGlassLocalMirrorCtx = null;
+  delete lens._sviAfterRenderLens;
+}
+
+function removeExplorerLiquidGlassLocalMirrorsForTarget(target: HTMLElement) {
+  const row = target.parentElement;
+  if (!(row instanceof HTMLElement)) return;
+  row.querySelectorAll<HTMLElement>(':scope > canvas[data-explorer-glass-local-mirror="1"]').forEach((mirror) => mirror.remove());
+}
+
+function ensureExplorerLiquidGlassLocalMirror(lens: LiquidGLLensLike) {
+  const target = explorerLiquidGlassTargetForLens(lens);
+  const row = target?.parentElement instanceof HTMLElement ? target.parentElement : null;
+  if (!target?.isConnected || !row?.isConnected) {
+    clearExplorerLiquidGlassLocalMirror(lens);
+    return;
+  }
+  let mirror = lens._appGlassLocalMirror;
+  if (!(mirror instanceof HTMLCanvasElement) || !mirror.isConnected) {
+    mirror = document.createElement('canvas');
+    mirror.dataset.appGlassMirror = '1';
+    mirror.dataset.explorerGlassMirror = '1';
+    mirror.dataset.explorerGlassLocalMirror = '1';
+    mirror.setAttribute('data-liquid-ignore', '');
+    mirror.setAttribute('aria-hidden', 'true');
+    mirror.style.position = 'absolute';
+    mirror.style.pointerEvents = 'none';
+    mirror.style.zIndex = '1';
+    mirror.style.willChange = 'transform, width, height';
+    lens._appGlassLocalMirror = mirror;
+    lens._appGlassLocalMirrorCtx = mirror.getContext('2d');
+  }
+  if (mirror.parentElement !== row) row.append(mirror);
+  lens._sviAfterRenderLens = (renderer) => syncExplorerLiquidGlassLocalMirror(lens, renderer);
+}
+
+function syncExplorerLiquidGlassLocalMirror(lens: LiquidGLLensLike, renderer: LiquidGLRendererLike) {
+  const target = explorerLiquidGlassTargetForLens(lens);
+  const row = target?.parentElement instanceof HTMLElement ? target.parentElement : null;
+  const source = renderer.canvas;
+  if (!target?.isConnected || !row?.isConnected || !(source instanceof HTMLCanvasElement)) {
+    clearExplorerLiquidGlassLocalMirror(lens);
+    return;
+  }
+  ensureExplorerLiquidGlassLocalMirror(lens);
+  const mirror = lens._appGlassLocalMirror;
+  const ctx = lens._appGlassLocalMirrorCtx ?? mirror?.getContext('2d');
+  if (!(mirror instanceof HTMLCanvasElement) || !ctx) return;
+  lens._appGlassLocalMirrorCtx = ctx;
+  const targetRect = target.getBoundingClientRect();
+  const { rect: rowRect, scaleX, scaleY } = appGlassLocalViewportMetrics(row);
+  const canvasRect = source.getBoundingClientRect();
+  const sxScale = source.width / Math.max(1, canvasRect.width || window.innerWidth);
+  const syScale = source.height / Math.max(1, canvasRect.height || window.innerHeight);
+  const bleed = 2;
+  const cssWidth = Math.max(1, targetRect.width + bleed * 2);
+  const cssHeight = Math.max(1, targetRect.height + bleed * 2);
+  const pixelWidth = Math.max(1, Math.round(cssWidth * sxScale));
+  const pixelHeight = Math.max(1, Math.round(cssHeight * syScale));
+  if (mirror.width !== pixelWidth) mirror.width = pixelWidth;
+  if (mirror.height !== pixelHeight) mirror.height = pixelHeight;
+  mirror.style.left = `${(targetRect.left - rowRect.left) / scaleX - row.clientLeft + row.scrollLeft - bleed / scaleX}px`;
+  mirror.style.top = `${(targetRect.top - rowRect.top) / scaleY - row.clientTop + row.scrollTop - bleed / scaleY}px`;
+  mirror.style.width = `${cssWidth / scaleX}px`;
+  mirror.style.height = `${cssHeight / scaleY}px`;
+  const radius = window.getComputedStyle(target).borderTopLeftRadius || '0px';
+  const clip = `inset(0 round ${radius})`;
+  mirror.style.borderRadius = radius;
+  mirror.style.clipPath = clip;
+  mirror.style.setProperty('-webkit-clip-path', clip);
+  const hoverOnlyActive = !explorerGlassHoverOnlyEnabled() || activeExplorerHoverOnlyGlassElements()?.has(target) === true;
+  mirror.style.opacity = lens._mirrorActive || !hoverOnlyActive ? '0' : '1';
+  ctx.clearRect(0, 0, mirror.width, mirror.height);
+  const desiredSw = Math.round(cssWidth * sxScale);
+  const desiredSh = Math.round(cssHeight * syScale);
+  const rawSx = Math.round((targetRect.left - canvasRect.left - bleed) * sxScale);
+  const rawSy = Math.round((targetRect.top - canvasRect.top - bleed) * syScale);
+  const sx = Math.max(0, rawSx);
+  const sy = Math.max(0, rawSy);
+  const sw = Math.min(source.width, rawSx + desiredSw) - sx;
+  const sh = Math.min(source.height, rawSy + desiredSh) - sy;
+  if (sw <= 0 || sh <= 0) return;
+  const dx = Math.max(0, sx - rawSx);
+  const dy = Math.max(0, sy - rawSy);
+  ctx.drawImage(source, sx, sy, sw, sh, dx, dy, sw, sh);
+}
+
+function explorerLiquidGlassEligible() {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  const panel = getPanel('explorer');
+  return appGlassEnabled()
+    && glass.explorerRows === true
+    && panel.isConnected
+    && !panel.classList.contains('hidden')
+    && explorerLiquidGlassTargets().length > 0;
+}
+
+function explorerGlassHoverOnlyEnabled() {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  return explorerLiquidGlassEligible() && glass.explorerRowsHoverOnly === true;
+}
+
+function activeExplorerHoverOnlyGlassElements() {
+  if (!explorerGlassHoverOnlyEnabled()) return null;
+  const hovered = el.fileList.querySelector<HTMLElement>('.file-row:hover');
+  const row = explorerLiquidGlassHoverOnlyTarget?.isConnected
+    ? explorerLiquidGlassHoverOnlyTarget
+    : hovered;
+  if (!(row instanceof HTMLElement) || !row.isConnected) return new Set<HTMLElement>();
+  const glass = row.querySelector<HTMLElement>(':scope > .file-row-glass');
+  return new Set<HTMLElement>(glass ? [glass] : []);
+}
+
+function isExplorerHoverOnlyLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement
+    && lens.el.classList.contains('file-row-glass')
+    && lens.el.dataset.explorerGlassLens === 'liquidgl';
+}
+
+function resetInactiveExplorerHoverOnlyLenses(active = activeExplorerHoverOnlyGlassElements()) {
+  const renderer = explorerLiquidGlassRenderer;
+  if (!renderer?.lenses) return;
+  for (const lens of renderer.lenses) {
+    if (!isExplorerHoverOnlyLens(lens) || active?.has(lens.el as HTMLElement)) continue;
+    resetHoverOnlyLiquidGlassLens(lens);
+    if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
+      lens._appGlassLocalMirror.style.opacity = '0';
+    }
+  }
+}
+
+function syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer: LiquidGLRendererLike | undefined = explorerLiquidGlassRenderer) {
+  if (!renderer?.lenses) return;
+  const hoverOnly = explorerGlassHoverOnlyEnabled();
+  const active = hoverOnly ? activeExplorerHoverOnlyGlassElements() : null;
+  for (const lens of renderer.lenses) {
+    if (!isExplorerLiquidGlassLens(lens)) continue;
+    const target = explorerLiquidGlassTargetForLens(lens);
+    if (hoverOnly && (!target || active?.has(target) !== true)) {
+      if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
+        lens._appGlassLocalMirror.style.opacity = '0';
+      }
+      continue;
+    }
+    syncExplorerLiquidGlassLocalMirror(lens, renderer);
+  }
+}
+
+function installExplorerHoverOnlyRenderFilter() {
+  const renderer = explorerLiquidGlassRenderer;
+  if (!renderer || renderer._sviExplorerHoverOnlyFilterInstalled) return;
+  const originalRender = renderer.render?.bind(renderer);
+  if (typeof originalRender !== 'function') return;
+  renderer._sviExplorerHoverOnlyOriginalRender = originalRender;
+  renderer.render = () => {
+    if (!explorerGlassHoverOnlyEnabled()) return originalRender();
+    const active = activeExplorerHoverOnlyGlassElements();
+    const all = renderer.lenses ?? [];
+    renderer.lenses = all.filter((lens) => !isExplorerHoverOnlyLens(lens) || active?.has(lens.el as HTMLElement));
+    try {
+      return originalRender();
+    } finally {
+      renderer.lenses = all;
+    }
+  };
+  renderer._sviExplorerHoverOnlyFilterInstalled = true;
+}
+
+function renderExplorerHoverOnlyNow() {
+  const renderer = explorerLiquidGlassRenderer;
+  if (!renderer) return;
+  installExplorerHoverOnlyRenderFilter();
+  if (explorerGlassHoverOnlyEnabled()) resetInactiveExplorerHoverOnlyLenses();
+  renderer.render?.();
+  syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+}
+
+function setExplorerHoverOnlyTarget(row: HTMLElement | null) {
+  if (!explorerGlassHoverOnlyEnabled()) {
+    explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+    explorerLiquidGlassHoverOnlyTarget = null;
+    renderExplorerHoverOnlyNow();
+    return;
+  }
+  const next = row instanceof HTMLElement && row.isConnected ? row : null;
+  if (explorerLiquidGlassHoverOnlyTarget === next) return;
+  explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+  explorerLiquidGlassHoverOnlyTarget = next;
+  explorerLiquidGlassHoverOnlyTarget?.classList.add('glass-hover-active');
+  renderExplorerHoverOnlyNow();
+}
+
+function explorerLiquidGlassSignature(targets = explorerLiquidGlassTargets()) {
+  return targets
+    .map((target) => target.parentElement instanceof HTMLElement
+      ? target.parentElement.dataset.pathKey || target.parentElement.dataset.path || ''
+      : '')
+    .join('\n');
+}
+
+function isExplorerLiquidGlassLens(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement
+    && lens.el.classList.contains('file-row-glass')
+    && lens.el.dataset.explorerGlassLens === 'liquidgl';
+}
+
+function clearExplorerLiquidGlassInlineStyles(element: HTMLElement) {
+  element.style.opacity = '';
+  element.style.transition = '';
+  element.style.boxShadow = '';
+  element.style.pointerEvents = '';
+  element.style.transform = '';
+  element.style.transformStyle = '';
+  element.style.transformOrigin = '';
+  element.style.background = '';
+  element.style.backgroundColor = '';
+  element.style.backgroundImage = '';
+  element.style.backdropFilter = '';
+  element.style.removeProperty('-webkit-backdrop-filter');
+}
+
+function cleanupExplorerLiquidGlassTarget(target: HTMLElement) {
+  target.classList.remove('credit-card-glass', 'explorer-glass-pending');
+  delete target.dataset.explorerGlassLens;
+  delete target.dataset.explorerGlassFallbackReason;
+  removeExplorerLiquidGlassLocalMirrorsForTarget(target);
+  clearExplorerLiquidGlassInlineStyles(target);
+}
+
+function cleanupExplorerLiquidGlassLens(lens: LiquidGLLensLike) {
+  try {
+    clearExplorerLiquidGlassLocalMirror(lens);
+    lens.setTilt?.(false);
+    lens.setShadow?.(false);
+    lens._destroyMirrorCanvas?.();
+    lens._shadowEl?.remove();
+    lens._sizeObs?.disconnect?.();
+  } catch {
+    // Best effort cleanup for the third-party lens object.
+  }
+  if (lens.el instanceof HTMLElement) cleanupExplorerLiquidGlassTarget(lens.el);
+}
+
+function disposeExplorerLiquidGlassRenderer() {
+  const renderer = explorerLiquidGlassRenderer;
+  if (!renderer) return;
+  if (renderer.canvas instanceof HTMLCanvasElement) renderer.canvas.dataset.explorerGlassDisposing = '1';
+  const lenses = [...(renderer.lenses ?? [])];
+  for (const lens of lenses) {
+    if (isExplorerLiquidGlassLens(lens) || lens.el instanceof HTMLElement && lens.el.classList.contains('file-row-glass')) {
+      cleanupExplorerLiquidGlassLens(lens);
+    }
+  }
+  try {
+    renderer.dispose?.();
+  } catch {
+    // Best effort dispose for vendored renderer.
+  }
+  if (renderer.canvas instanceof HTMLElement) renderer.canvas.remove();
+  explorerLiquidGlassRenderer = undefined;
+  explorerLiquidGlassTargetSignature = '';
+}
+
+function removeExplorerLiquidGlass() {
+  explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+  explorerLiquidGlassHoverOnlyTarget = null;
+  el.shell.classList.remove('app-glass-explorer-sample-canvas-ready');
+  if (explorerLiquidGlassRefreshTimer) {
+    window.clearTimeout(explorerLiquidGlassRefreshTimer);
+    explorerLiquidGlassRefreshTimer = 0;
+    explorerLiquidGlassRefreshRecapture = false;
+  }
+  if (explorerLiquidGlassScrollFrame) {
+    window.cancelAnimationFrame(explorerLiquidGlassScrollFrame);
+    explorerLiquidGlassScrollFrame = 0;
+  }
+  disposeExplorerLiquidGlassRenderer();
+  explorerLiquidGlassOverlayHost?.remove();
+  explorerLiquidGlassOverlayHost = null;
+  for (const target of explorerLiquidGlassTargets()) cleanupExplorerLiquidGlassTarget(target);
+}
+
+function markExplorerGlassTargetCssFallback(target: HTMLElement, reason = 'fallback') {
+  target.classList.add('credit-card-glass');
+  target.classList.remove('explorer-glass-pending');
+  target.dataset.explorerGlassLens = 'css';
+  target.dataset.explorerGlassFallbackReason = reason;
+  clearExplorerLiquidGlassInlineStyles(target);
+}
+
+function markExplorerGlassTargetsCssFallback(reason = 'fallback') {
+  for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, reason);
+}
+
+function applyExplorerGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlassEffectSettings) {
+  const target = lens.el instanceof HTMLElement ? lens.el : null;
+  const panel = getPanel('explorer');
+  const tiltEnabled = effect.tilt && !panel.classList.contains('dragging') && !panel.classList.contains('resizing');
+  lens.options = {
+    ...(lens.options ?? {}),
+    refraction: effect.refraction,
+    bevelDepth: effect.bevelDepth,
+    bevelWidth: effect.bevelWidth,
+    frost: effect.frost,
+    magnify: effect.magnify,
+    shadow: effect.shadow,
+    specular: effect.specular,
+    reveal: effect.reveal,
+    tilt: tiltEnabled,
+    tiltFactor: effect.tiltFactor,
+    overlayContainer: explorerLiquidGlassOverlayContainer(),
+    preserveTargetOpacity: true,
+    preservePointerEvents: true
+  };
+  lens.setShadow?.(effect.shadow);
+  lens.setTilt?.(tiltEnabled);
+  if (target) {
+    target.style.pointerEvents = 'none';
+  }
+}
+
+function explorerLiquidGlassRendererContextLost(renderer: LiquidGLRendererLike | undefined = explorerLiquidGlassRenderer) {
+  return appGlassRendererContextLost(renderer);
+}
+
+function bindExplorerLiquidGlassContextEvents(renderer: LiquidGLRendererLike | undefined) {
+  const canvas = renderer?.canvas;
+  if (!(canvas instanceof HTMLCanvasElement) || canvas.dataset.explorerGlassContextBound === '1') return;
+  canvas.dataset.explorerGlassContextBound = '1';
+  canvas.addEventListener('webglcontextlost', (event) => {
+    if (canvas.dataset.explorerGlassDisposing === '1') return;
+    event.preventDefault();
+    canvas.style.opacity = '0';
+    canvas.style.visibility = 'hidden';
+    appendDiagnosticLog(
+      'glass',
+      `explorer glass context-lost app=${appGlassContextSummary()} lenses=${renderer?.lenses?.filter(isExplorerLiquidGlassLens).length ?? 0}`,
+      'warn',
+      { force: true }
+    );
+    disposeExplorerLiquidGlassRenderer();
+    markExplorerGlassTargetsCssFallback('context-lost');
+    scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 1800 });
+  }, { passive: false });
+}
+
+function ensureExplorerLiquidGlassCanvasLayer() {
+  const renderer = explorerLiquidGlassRenderer;
+  if (!renderer) return;
+  disableAppGlassRendererInternalObservers(renderer);
+  bindExplorerLiquidGlassContextEvents(renderer);
+  resizeAppGlassRendererCanvasForViewport(renderer);
+  const overlayContainer = explorerLiquidGlassOverlayContainer();
+  positionExplorerLiquidGlassOverlayHost();
+  const canvas = renderer.canvas;
+  if (canvas instanceof HTMLElement) {
+    if (canvas.parentElement !== overlayContainer) overlayContainer.append(canvas);
+    canvas.dataset.explorerGlassCanvas = '1';
+    canvas.style.visibility = 'hidden';
+    canvas.style.opacity = '0';
+    positionAppGlassViewportLayer(canvas, overlayContainer, '1');
+  }
+  renderer.lenses?.forEach((lens) => {
+    if (!(lens.el instanceof HTMLElement) || !lens.el.classList.contains('file-row-glass')) return;
+    patchAppGlassMirrorCreation(lens, overlayContainer);
+    ensureExplorerLiquidGlassLocalMirror(lens);
+    if (lens._mirror instanceof HTMLElement) {
+      ownAppGlassMirrorLayer(lens, appGlassMirrorContainerForLens(lens, overlayContainer));
+      lens._mirror.dataset.explorerGlassMirror = '1';
+    }
+    if (lens._shadowEl instanceof HTMLElement) {
+      const shadowContainer = appGlassMirrorContainerForLens(lens, overlayContainer);
+      if (lens._shadowEl.parentElement !== shadowContainer) {
+        lens._shadowEl.remove();
+        shadowContainer.append(lens._shadowEl);
+      }
+      lens._shadowEl.dataset.explorerGlassShadow = '1';
+      lens._shadowEl.setAttribute('data-liquid-ignore', '');
+      positionAppGlassShadowLayer(lens._shadowEl, lens.el, shadowContainer, lens);
+    }
+  });
+  installExplorerHoverOnlyRenderFilter();
+}
+
+function updateExplorerLiquidGlassEffectOptions() {
+  const renderer = explorerLiquidGlassRenderer;
+  if (!renderer?.lenses) return;
+  if (explorerLiquidGlassRendererContextLost(renderer)) {
+    if (renderer.canvas instanceof HTMLElement) {
+      renderer.canvas.style.opacity = '0';
+      renderer.canvas.style.visibility = 'hidden';
+    }
+    appendDiagnosticLog('glass', 'explorer glass renderer already lost before effect update; scheduling rebuild', 'warn', { force: true });
+    disposeExplorerLiquidGlassRenderer();
+    markExplorerGlassTargetsCssFallback('context-lost');
+    scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 1800 });
+    return;
+  }
+  if (explorerRowsUsePanelSnapshot()) syncExplorerGlassPanelSnapshotSurface();
+  const effect = effectiveAppGlassEffectSettings('explorer-rows');
+  for (const lens of renderer.lenses) {
+    if (!isExplorerLiquidGlassLens(lens)) continue;
+    applyExplorerGlassLensOptions(lens, effect);
+    lens.updateMetrics?.();
+  }
+  ensureExplorerLiquidGlassCanvasLayer();
+  renderer.render?.();
+  syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+}
+
+function scheduleExplorerLiquidGlassRefresh(options: { recapture?: boolean; delay?: number } = {}) {
+  if (explorerLiquidGlassRefreshTimer) window.clearTimeout(explorerLiquidGlassRefreshTimer);
+  explorerLiquidGlassRefreshRecapture = explorerLiquidGlassRefreshRecapture || options.recapture === true;
+  const scrollingDelay = Date.now() < explorerScrollingUntil ? Math.max(120, explorerScrollingUntil - Date.now() + 60) : 70;
+  explorerLiquidGlassRefreshTimer = window.setTimeout(() => {
+    const recapture = explorerLiquidGlassRefreshRecapture;
+    explorerLiquidGlassRefreshTimer = 0;
+    explorerLiquidGlassRefreshRecapture = false;
+    void applyExplorerLiquidGlass(recapture);
+  }, options.delay ?? (options.recapture ? 160 : scrollingDelay));
+}
+
+function scheduleExplorerLiquidGlassScrollRender() {
+  if (!explorerLiquidGlassRenderer || !explorerLiquidGlassEligible()) return;
+  if (explorerLiquidGlassScrollFrame) return;
+  explorerLiquidGlassScrollFrame = window.requestAnimationFrame(() => {
+    explorerLiquidGlassScrollFrame = 0;
+    const renderer = explorerLiquidGlassRenderer;
+    if (!renderer) return;
+    if (explorerLiquidGlassRendererContextLost(renderer)) {
+      if (renderer.canvas instanceof HTMLElement) {
+        renderer.canvas.style.opacity = '0';
+        renderer.canvas.style.visibility = 'hidden';
+      }
+      appendDiagnosticLog('glass', 'explorer glass renderer already lost before scroll render; scheduling rebuild', 'warn', { force: true });
+      disposeExplorerLiquidGlassRenderer();
+      markExplorerGlassTargetsCssFallback('context-lost');
+      scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 1800 });
+      return;
+    }
+    ensureExplorerLiquidGlassCanvasLayer();
+    renderer.lenses?.forEach((lens) => {
+      if (isExplorerLiquidGlassLens(lens)) lens.updateMetrics?.();
+    });
+    renderer.render?.();
+    syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+  });
+}
+
+async function applyExplorerLiquidGlass(recaptureSnapshot = false) {
+  if (explorerLiquidGlassApplying) {
+    scheduleExplorerLiquidGlassRefresh({ recapture: recaptureSnapshot });
+    return;
+  }
+  explorerLiquidGlassApplying = true;
+  try {
+    syncWorkspaceGlassSnapshotStage();
+    if (!explorerLiquidGlassEligible()) {
+      removeExplorerLiquidGlass();
+      return;
+    }
+    if (explorerRowsUsePanelSnapshot()) {
+      await refreshExplorerPanelGlassComposite();
+    }
+    await loadLiquidGLScripts();
+    if (!window.liquidGL) {
+      for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, 'unavailable');
+      return;
+    }
+    const targets = explorerLiquidGlassTargets();
+    const signature = explorerLiquidGlassSignature(targets);
+    const effect = effectiveAppGlassEffectSettings('explorer-rows');
+    if (explorerLiquidGlassRendererContextLost(explorerLiquidGlassRenderer)) {
+      if (explorerLiquidGlassRenderer?.canvas instanceof HTMLElement) {
+        explorerLiquidGlassRenderer.canvas.style.opacity = '0';
+        explorerLiquidGlassRenderer.canvas.style.visibility = 'hidden';
+      }
+      appendDiagnosticLog('glass', 'explorer glass renderer already lost before apply; scheduling rebuild', 'warn', { force: true });
+      disposeExplorerLiquidGlassRenderer();
+      markExplorerGlassTargetsCssFallback('context-lost');
+      scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 1800 });
+      return;
+    }
+    if (explorerLiquidGlassRenderer && explorerLiquidGlassTargetSignature === signature && !recaptureSnapshot) {
+      updateExplorerLiquidGlassEffectOptions();
+      return;
+    }
+    disposeExplorerLiquidGlassRenderer();
+    for (const target of targets) {
+      target.classList.add('credit-card-glass', 'explorer-glass-pending');
+      target.dataset.explorerGlassLens = 'pending';
+      delete target.dataset.explorerGlassFallbackReason;
+      clearExplorerLiquidGlassInlineStyles(target);
+    }
+    const isolated = createIsolatedWorkspaceLiquidGL({
+      snapshot: explorerLiquidGlassSnapshotSelector(),
+      target: '.file-row-glass.explorer-glass-pending',
+      resolution: 1,
+      refraction: effect.refraction,
+      bevelDepth: effect.bevelDepth,
+      bevelWidth: effect.bevelWidth,
+      frost: effect.frost,
+      magnify: effect.magnify,
+      shadow: effect.shadow,
+      specular: effect.specular,
+      reveal: effect.reveal,
+      tilt: effect.tilt,
+      tiltFactor: effect.tiltFactor,
+      overlayContainer: el.fileList,
+      preserveTargetOpacity: true,
+      preservePointerEvents: true
+    });
+    const renderer = isolated.renderer;
+    const lenses = liquidLensArray(isolated.result);
+    if (!renderer || !lenses.length) {
+      for (const target of targets) markExplorerGlassTargetCssFallback(target, 'init-failed');
+      return;
+    }
+    explorerLiquidGlassRenderer = renderer;
+    explorerLiquidGlassTargetSignature = signature;
+    for (const lens of lenses) {
+      const target = lens.el instanceof HTMLElement ? lens.el : null;
+      if (!target || !target.classList.contains('file-row-glass')) continue;
+      target.classList.remove('explorer-glass-pending');
+      target.dataset.explorerGlassLens = 'liquidgl';
+      delete target.dataset.explorerGlassFallbackReason;
+      applyExplorerGlassLensOptions(lens, effect);
+    }
+    ensureExplorerLiquidGlassCanvasLayer();
+    await renderer.captureSnapshot?.().catch(() => undefined);
+    renderer.render?.();
+    syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+  } catch (error) {
+    for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, 'init-failed');
+    console.warn('explorer row liquid glass failed', error);
+  } finally {
+    explorerLiquidGlassApplying = false;
+  }
+}
+
+function scheduleAppGlassGeometryRefresh(options: { recapture?: boolean } = {}) {
+  if (!appGlassEnabled()) return;
+  if (appGlassGeometryFrame) return;
+  appGlassGeometryFrame = window.requestAnimationFrame(() => {
+    appGlassGeometryFrame = 0;
+    refreshAppGlassGeometry(options);
+  });
+}
+
+function refreshAppGlassGeometry(options: { recapture?: boolean } = {}) {
+  if (!appGlassEnabled()) return;
+  syncAppGlassTargets();
+  for (const renderer of uniqueAppGlassRenderers()) {
+    renderer.lenses?.forEach((lens) => lens.updateMetrics?.());
+    ensureAppGlassRendererLayer(renderer);
+    if (options.recapture) void renderer.captureSnapshot?.().catch(() => undefined);
+    renderer.render?.();
+  }
+  if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) {
+    scheduleExplorerLiquidGlassRefresh({ recapture: options.recapture });
+  }
+  if (workspaceLiquidGlassEligible()) {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: options.recapture });
+  }
+  if (options.recapture) appendAppGlassDiagnostic('geometry-recapture');
+}
+
+function appendAppGlassDiagnostic(reason: string, options: { force?: boolean } = {}) {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  if (!options.force && !glass.diagnostics && state.ideSettings.debugLogEnabled !== true) return;
+  const now = performance.now();
+  if (!options.force && now - appGlassLastDiagnosticAt < 2500) return;
+  appGlassLastDiagnosticAt = now;
+  const activeTargetCount = appGlassActiveTargets().length;
+  const targets = appGlassPlaneElements()
+    .filter((plane) => plane.dataset.appGlassActive === '1')
+    .slice(0, 14)
+    .map((plane) => {
+      const owner = plane.parentElement instanceof HTMLElement ? plane.parentElement : null;
+      const renderer = plane.dataset.appGlassId ? appGlassRenderers.get(plane.dataset.appGlassId) : undefined;
+      const canvas = renderer?.canvas;
+      return [
+        appGlassOwnerDebugName(owner),
+        plane.dataset.appGlassLens || 'none',
+        renderer ? 'r1' : 'r0',
+        canvas?.isConnected ? 'c1' : 'c0',
+        appGlassRendererContextLost(renderer) ? 'lost' : ''
+      ].filter(Boolean).join(':');
+    }).join(',');
+  appendDiagnosticLog(
+    'glass',
+    `app glass ${reason} enabled=${appGlassEnabled() ? '1' : '0'} ${appGlassContextSummary()} liquidTargets=${activeTargetCount} states=${targets || 'none'}`,
+    'info',
+    { force: options.force === true || glass.diagnostics === true }
+  );
 }
 
 function ideScaleLabel() {
@@ -3492,6 +11224,11 @@ function syncIdeScaleSettings() {
 }
 
 function applyIdeSettings() {
+  state.ideSettings.ideBackground = normalizeIdeBackgroundSettings(state.ideSettings.ideBackground);
+  state.ideSettings.glassEffect = normalizeWorkspaceGlassEffectSettings(state.ideSettings.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS);
+  state.ideSettings.workspaceGlass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  state.ideSettings.appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  state.ideSettings.workspaceSideDockGlass = state.ideSettings.workspaceGlass.enabled;
   const uiFont = fontChoice(UI_FONT_CHOICES, state.ideSettings.uiFont).stack;
   const monoFont = fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack;
   setRootStyleProperty('--ui-font', uiFont);
@@ -3499,6 +11236,9 @@ function applyIdeSettings() {
   setRootStyleProperty('--widget-radius', `${normalizeWidgetRadius(state.ideSettings.widgetRadius)}px`);
   document.body.classList.toggle('widget-focus-border-off', state.ideSettings.widgetFocusBorder === false);
   document.body.classList.toggle('widget-focus-title-on', state.ideSettings.widgetFocusTitle === true);
+  applyIdeBackgroundSettings();
+  applyWorkspaceGlassSettings();
+  applyAppGlassSettings();
   applyWorkspaceFocusSettings();
   applyWorkspaceDockSettings({ skipLayoutRefresh: true });
   applyEditorTheme(state.ideSettings.editorTheme);
@@ -3574,22 +11314,32 @@ function applyWorkspaceDockSettings(options: { skipLayoutRefresh?: boolean } = {
   const position = workspaceDockPosition(state.ideSettings.workspaceDockPosition);
   const savedSize = normalizeWorkspaceDockSize(state.ideSettings.workspaceDockSize);
   const appliedSize = workspaceDockAppliedSize(savedSize);
+  const side = workspaceDockIsSide(position);
+  const glassSettings = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, state.ideSettings.workspaceSideDockGlass === true);
+  state.ideSettings.workspaceGlass = glassSettings;
+  state.ideSettings.workspaceSideDockGlass = glassSettings.enabled;
+  const glass = appGlassEnabled() && glassSettings.enabled === true;
   state.ideSettings.workspaceDockPosition = position;
   state.ideSettings.workspaceDockSize = savedSize;
 
   const previousSignature = workspaceDockAppliedSignature;
-  const detailOpen = workspaceDockIsSide(position) && workspaceDockDetailsAreAllOpen();
-  const signature = `${position}\t${appliedSize}\t${detailOpen ? '1' : '0'}`;
+  const detailOpen = side && workspaceDockDetailsAreAllOpen();
+  const signature = `${position}\t${appliedSize}\t${detailOpen ? '1' : '0'}\t${glass ? '1' : '0'}`;
   workspaceDockAppliedSignature = signature;
 
   for (const choice of WORKSPACE_DOCK_POSITION_CHOICES) {
     el.shell.classList.toggle(`workspace-dock-${choice.id}`, choice.id === position);
   }
-  el.shell.classList.toggle('workspace-dock-side', workspaceDockIsSide(position));
+  el.shell.classList.toggle('workspace-dock-side', side);
+  el.shell.classList.toggle('workspace-side-glass', glass);
+  el.shell.classList.toggle('workspace-glass-active', glass);
   el.workspaceDock.classList.toggle('detail-open', detailOpen);
   syncWorkspaceDockDetailToggle();
   setRootStyleProperty('--workspace-dock-size', `${appliedSize}px`);
   renderWorkspaceDockDetail();
+  if (glass && signature !== previousSignature) {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+  }
 
   if (!options.skipLayoutRefresh && signature !== previousSignature) {
     scheduleWorkspaceDockLayoutRefresh();
@@ -4184,6 +11934,7 @@ function renderWorkspaceTabs() {
   const signature = workspaceTabsSignature();
   if (workspaceTabsRenderSignature === signature) {
     renderWorkspaceDockDetail();
+    scheduleWorkspaceLiquidGlassRefresh();
     return;
   }
   const orderSignature = workspaceTabsOrderSignature();
@@ -4196,6 +11947,7 @@ function renderWorkspaceTabs() {
       updateWorkspaceTabElement(workspaceTabElement(workspace.id), workspace);
     }
     renderWorkspaceDockDetail();
+    scheduleWorkspaceLiquidGlassRefresh();
     return;
   }
 
@@ -4211,6 +11963,7 @@ function renderWorkspaceTabs() {
   el.workspaceTabs.replaceChildren(fragment);
   pruneWorkspaceTabElementCache(seen);
   renderWorkspaceDockDetail();
+  scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
 }
 
 function renderWorkspaceTabActivation(previousActiveId: string, activeWorkspace: WorkspaceSnapshot) {
@@ -4234,6 +11987,7 @@ function renderWorkspaceTabActivation(previousActiveId: string, activeWorkspace:
   updateWorkspaceTabElement(activeTab, activeWorkspace);
   workspaceTabsRenderSignature = workspaceTabsSignature();
   renderWorkspaceDockDetail();
+  scheduleWorkspaceLiquidGlassRefresh();
 }
 
 function renderWorkspaceDockDetail() {
@@ -4281,7 +12035,7 @@ function renderWorkspaceTabDetail(tab: HTMLElement, workspace: WorkspaceSnapshot
     return;
   }
   const progressSignature = workspaceAgentProgressSignature(workspace.id);
-  const signature = `${workspace.id}\t${workspaceDisplayLabel(workspace)}\t${progressSignature}`;
+  const signature = `${workspace.id}\t${workspaceDisplayLabel(workspace)}\t${progressSignature}\t${workspaceDetailContentSignature(workspace)}`;
   if (detail.dataset.renderSignature === signature) return;
   detail.dataset.renderSignature = signature;
   const list = document.createElement('div');
@@ -4294,18 +12048,34 @@ function renderWorkspaceTabDetail(tab: HTMLElement, workspace: WorkspaceSnapshot
     list.append(empty);
   } else {
     for (const session of sessions) {
-      list.append(workspaceAgentSessionElement(session));
+      list.append(workspaceAgentSessionElement(session, workspace));
     }
   }
   detail.replaceChildren(list);
 }
 
-function workspaceAgentSessionElement(session: AgentSessionProgress) {
+function workspaceDetailContentVisibility(workspace: WorkspaceSnapshot) {
+  const hideForProtected = Boolean(workspace.captureProtected) && state.ideSettings.workspaceDockDetailHideProtectedExtra !== false;
+  return {
+    showActivity: !hideForProtected && state.ideSettings.workspaceDockDetailShowActivity !== false,
+    showMeta: !hideForProtected && state.ideSettings.workspaceDockDetailShowMeta !== false,
+    compactForProtected: hideForProtected
+  };
+}
+
+function workspaceDetailContentSignature(workspace: WorkspaceSnapshot) {
+  const visibility = workspaceDetailContentVisibility(workspace);
+  return `${visibility.showActivity ? 'a' : '-'}${visibility.showMeta ? 'm' : '-'}${visibility.compactForProtected ? 'p' : '-'}`;
+}
+
+function workspaceAgentSessionElement(session: AgentSessionProgress, workspace: WorkspaceSnapshot) {
   const status = effectiveAgentSessionStatus(session);
+  const visibility = workspaceDetailContentVisibility(workspace);
+  const compact = !visibility.showActivity && !visibility.showMeta;
   const item = document.createElement('button');
-  item.className = `workspace-agent-card status-${status}`;
+  item.className = `workspace-agent-card agent-${session.agentId} status-${status}${compact ? ' compact' : ''}${visibility.compactForProtected ? ' protected-compact' : ''}`;
   item.type = 'button';
-  item.title = `${session.agentId} · ${status} · ${session.cwd}`;
+  item.title = `${session.agentId} · ${status}${visibility.showActivity ? ` · ${session.title}` : ''}${visibility.showMeta && session.cwd ? ` · ${session.cwd}` : ''}`;
   item.addEventListener('click', () => {
     void focusWorkspaceAgentSession(session);
   });
@@ -4322,14 +12092,20 @@ function workspaceAgentSessionElement(session: AgentSessionProgress) {
   statusChip.className = `workspace-agent-status status-${status}`;
   statusChip.textContent = agentStatusLabel(status);
   header.append(badge, title, statusChip);
+  item.append(header);
 
-  const activity = document.createElement('span');
-  activity.className = 'workspace-agent-activity';
-  activity.textContent = session.activity || defaultAgentActivityForStatus(status);
-  const meta = document.createElement('span');
-  meta.className = 'workspace-agent-meta';
-  meta.textContent = `${session.cwd || 'cwd unknown'} · ${session.source}`;
-  item.append(header, activity, meta);
+  if (visibility.showActivity) {
+    const activity = document.createElement('span');
+    activity.className = 'workspace-agent-activity';
+    activity.textContent = session.activity || defaultAgentActivityForStatus(status);
+    item.append(activity);
+  }
+  if (visibility.showMeta) {
+    const meta = document.createElement('span');
+    meta.className = 'workspace-agent-meta';
+    meta.textContent = `${session.cwd || 'cwd unknown'} · ${session.source}`;
+    item.append(meta);
+  }
   return item;
 }
 
@@ -4342,6 +12118,7 @@ function agentStatusLabel(status: AgentSessionStatus) {
   if (status === 'waiting') return '대기';
   if (status === 'working') return '작업';
   if (status === 'error') return '오류';
+  if (status === 'done-unread') return '완료';
   if (status === 'exited') return '종료';
   return 'idle';
 }
@@ -4349,6 +12126,8 @@ function agentStatusLabel(status: AgentSessionStatus) {
 async function focusWorkspaceAgentSession(session: AgentSessionProgress) {
   if (session.workspaceId !== state.activeWorkspaceId || !state.workspaceOpen) {
     await activateWorkspaceTab(session.workspaceId);
+  } else {
+    acknowledgeWorkspaceDoneUnread(session.workspaceId);
   }
   const pane = terminalPaneById.get(session.paneId);
   if (!pane || pane.workspaceId !== state.activeWorkspaceId) return;
@@ -4368,6 +12147,14 @@ function workspaceTabElement(id: string) {
   const tab = document.createElement('div');
   tab.className = 'workspace-tab';
   tab.draggable = false;
+  const glass = document.createElement('div');
+  glass.className = 'workspace-tab-glass-plane credit-card-glass';
+  glass.setAttribute('aria-hidden', 'true');
+  const outline = document.createElement('div');
+  outline.className = 'workspace-tab-outline-plane';
+  outline.setAttribute('aria-hidden', 'true');
+  const head = document.createElement('div');
+  head.className = 'workspace-tab-head';
   const label = document.createElement('button');
   label.className = 'workspace-tab-label';
   label.type = 'button';
@@ -4408,9 +12195,11 @@ function workspaceTabElement(id: string) {
   close.textContent = 'x';
   const detail = document.createElement('div');
   detail.className = 'workspace-tab-detail';
-  tab.append(label, detailToggle, security, copy, close, input, detail);
-  const parts = { label, input, detailToggle, detail, security, copy, close };
+  head.append(label, detailToggle, security, copy, close, input);
+  tab.append(glass, outline, head, detail);
+  const parts = { glass, label, input, detailToggle, detail, security, copy, close };
   workspaceTabPartCache.set(tab, parts);
+  parts.glass.draggable = false;
   parts.label.draggable = false;
   parts.input.draggable = false;
   parts.detailToggle.draggable = false;
@@ -4500,7 +12289,9 @@ function workspaceTabSvgIcon(children: Array<['path' | 'rect', Record<string, st
 function workspaceTabParts(tab: HTMLElement) {
   const cached = workspaceTabPartCache.get(tab);
   if (cached) return cached;
+  const glass = ensureWorkspaceTabGlassPlane(tab);
   const parts = {
+    glass,
     label: tab.querySelector<HTMLButtonElement>('.workspace-tab-label')!,
     input: tab.querySelector<HTMLInputElement>('.workspace-tab-name-input')!,
     detailToggle: tab.querySelector<HTMLButtonElement>('.workspace-tab-detail-toggle')!,
@@ -4509,8 +12300,43 @@ function workspaceTabParts(tab: HTMLElement) {
     copy: tab.querySelector<HTMLButtonElement>('.workspace-tab-copy')!,
     close: tab.querySelector<HTMLButtonElement>('.workspace-tab-close')!
   };
+  parts.glass.draggable = false;
   workspaceTabPartCache.set(tab, parts);
   return parts;
+}
+
+function ensureWorkspaceTabGlassPlane(tab: HTMLElement) {
+  cleanupLegacyWorkspaceTabTargetState(tab);
+  let glass = tab.querySelector<HTMLDivElement>(':scope > .workspace-tab-glass-plane');
+  if (!glass) {
+    glass = tab.querySelector<HTMLDivElement>(':scope > .workspace-tab-glass-outline');
+    if (glass) glass.className = 'workspace-tab-glass-plane credit-card-glass';
+  }
+  if (!glass) {
+    glass = document.createElement('div');
+    glass.className = 'workspace-tab-glass-plane credit-card-glass';
+    glass.setAttribute('aria-hidden', 'true');
+    tab.prepend(glass);
+  }
+  glass.classList.add('credit-card-glass');
+  glass.draggable = false;
+  ensureWorkspaceTabOutlinePlane(tab);
+  return glass;
+}
+
+function ensureWorkspaceTabOutlinePlane(tab: HTMLElement) {
+  let outline = tab.querySelector<HTMLDivElement>(':scope > .workspace-tab-outline-plane');
+  if (!outline) {
+    outline = document.createElement('div');
+    outline.className = 'workspace-tab-outline-plane';
+    outline.setAttribute('aria-hidden', 'true');
+    const glass = tab.querySelector<HTMLElement>(':scope > .workspace-tab-glass-plane');
+    if (glass?.nextSibling) tab.insertBefore(outline, glass.nextSibling);
+    else if (glass) tab.append(outline);
+    else tab.prepend(outline);
+  }
+  outline.draggable = false;
+  return outline;
 }
 
 function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapshot) {
@@ -4523,23 +12349,32 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
   const llmState = workspaceLlmIndicatorState(workspace.id);
   const displayLabel = workspaceDisplayLabel(workspace);
   const detailOpen = workspaceDockDetailIsOpen(workspace.id);
-  const detailSignature = detailOpen ? workspaceAgentProgressSignature(workspace.id) : '';
+  const detailSignature = detailOpen ? `${workspaceAgentProgressSignature(workspace.id)}\t${workspaceDetailContentSignature(workspace)}` : '';
   const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}\t${sessionEnabled ? '1' : '0'}\t${appliedWorkspace ? '1' : '0'}\t${llmState}\t${keepLive ? '1' : '0'}\t${sleeping ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
   tab.dataset.workspaceId = workspace.id;
   if (tab.dataset.renderSignature === signature) return;
   tab.dataset.renderSignature = signature;
-  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${appliedWorkspace ? ' capture-applied' : ''}${keepLive ? ' keep-live' : ''}${sleeping ? ' memory-slept' : ''}${detailOpen ? ' detail-open' : ''}${llmState !== 'none' ? ' llm-present' : ''}${llmState === 'working' ? ' llm-working' : ''}${llmState === 'waiting' ? ' llm-waiting' : ''}${llmState === 'error' ? ' llm-error' : ''}${llmState === 'exited' ? ' llm-exited' : ''}`;
+  const llmDisplayState = llmState === 'none' ? 'idle' : llmState;
+  const wasRenaming = tab.classList.contains('renaming');
+  const wasDragging = tab.classList.contains('dragging');
+  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${appliedWorkspace ? ' capture-applied' : ''}${keepLive ? ' keep-live' : ''}${sleeping ? ' memory-slept' : ''}${detailOpen ? ' detail-open' : ''}${wasRenaming ? ' renaming' : ''}${wasDragging ? ' dragging' : ''} llm-present llm-${llmDisplayState}`;
+  if (workspaceLiquidGlassEligible() || tab.dataset.workspaceGlassLens) {
+    tab.classList.add('credit-card-glass');
+    if (tab.dataset.workspaceGlassLens === 'pending') tab.classList.add('workspace-glass-pending');
+  }
   const llmTitle = llmState === 'waiting'
     ? ' - LLM waiting for your response'
     : llmState === 'error'
       ? ' - LLM session error'
       : llmState === 'working'
         ? ' - LLM working'
-        : llmState === 'exited'
-          ? ' - LLM session exited'
-          : llmState === 'idle'
-            ? ' - LLM session present'
-            : '';
+        : llmState === 'done-unread'
+          ? ' - LLM finished; click workspace to clear'
+          : llmState === 'exited'
+            ? ' - LLM session exited'
+            : llmState === 'idle'
+              ? ' - LLM session present'
+              : '';
   const captureTitle = appliedWorkspace
     ? ' - capture block active now'
     : protectedWorkspace && sessionEnabled
@@ -4695,6 +12530,51 @@ function normalizedSavedWorkspaceRootForCompare(root: string | undefined, kind?:
   return kind === 'windows' ? normalized.toLowerCase() : normalized;
 }
 
+function savedWorkspaceAutoUpdateEntryIndex(snapshot: WorkspaceSnapshot) {
+  if (snapshot.savedWorkspaceId) {
+    const index = state.savedWorkspaces.findIndex((entry) => entry.id === snapshot.savedWorkspaceId);
+    if (index >= 0) return index;
+  }
+  const savedName = normalizeSavedWorkspaceName(workspaceDisplayLabel(snapshot), snapshot);
+  return state.savedWorkspaces.findIndex((entry) => savedWorkspaceMatchesTabNameAndTarget(entry, savedName, snapshot));
+}
+
+function linkSnapshotToSavedWorkspace(snapshot: WorkspaceSnapshot, savedWorkspaceId: string) {
+  if (!savedWorkspaceId || snapshot.savedWorkspaceId === savedWorkspaceId) return false;
+  snapshot.savedWorkspaceId = savedWorkspaceId;
+  return true;
+}
+
+function autoUpdateSavedWorkspaceFromSnapshot(snapshot: WorkspaceSnapshot | null | undefined) {
+  if (!snapshot?.profileId || !snapshot.root || !state.savedWorkspaces.length) return false;
+  const entryIndex = savedWorkspaceAutoUpdateEntryIndex(snapshot);
+  if (entryIndex < 0) return false;
+  const entry = state.savedWorkspaces[entryIndex];
+  linkSnapshotToSavedWorkspace(snapshot, entry.id);
+  const savedProfile = profileForId(snapshot.profileId);
+  const nextSnapshot = cloneWorkspaceSnapshotForSavedStore(snapshot);
+  nextSnapshot.savedWorkspaceId = entry.id;
+  if (workspaceSnapshotSignature(nextSnapshot) === workspaceSnapshotSignature(entry.snapshot)) return false;
+  state.savedWorkspaces[entryIndex] = {
+    ...entry,
+    savedAt: new Date().toISOString(),
+    profileKind: savedProfile?.kind ?? entry.profileKind,
+    profileLabel: savedProfile?.label ?? entry.profileLabel,
+    snapshot: nextSnapshot
+  };
+  savedWorkspaceSelectRenderSignature = '\0';
+  persistSavedWorkspaceStore();
+  return true;
+}
+
+function startSavedWorkspaceAutoUpdateTimer() {
+  if (savedWorkspaceAutoUpdateTimer) return;
+  savedWorkspaceAutoUpdateTimer = window.setInterval(() => {
+    if (document.hidden) return;
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  }, SAVED_WORKSPACE_AUTO_UPDATE_INTERVAL_MS);
+}
+
 function selectedSavedWorkspaceEntry() {
   const id = el.savedWorkspaceSelect.value;
   if (!id) return null;
@@ -4718,14 +12598,23 @@ async function saveCurrentWorkspaceForLater() {
   const savedName = normalizeSavedWorkspaceName(workspaceDisplayLabel(snapshot), snapshot);
   const existingIndex = state.savedWorkspaces.findIndex((entry) => savedWorkspaceMatchesTabNameAndTarget(entry, savedName, snapshot));
   const existing = existingIndex >= 0 ? state.savedWorkspaces[existingIndex] : null;
+  const savedId = existing?.id ?? crypto.randomUUID();
+  linkSnapshotToSavedWorkspace(snapshot, savedId);
   const saved: SavedWorkspaceEntry = {
-    id: existing?.id ?? crypto.randomUUID(),
+    id: savedId,
     name: savedName,
     savedAt: new Date().toISOString(),
     profileKind: savedProfile?.kind,
     profileLabel: savedProfile?.label,
     snapshot: cloneWorkspaceSnapshotForSavedStore(snapshot)
   };
+  saved.snapshot.savedWorkspaceId = saved.id;
+  const activeIndex = workspaceSnapshotIndexById(snapshot.id);
+  if (activeIndex >= 0) {
+    workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+    replaceWorkspaceSnapshot(activeIndex, snapshot);
+    persistWorkspaceStore();
+  }
   state.savedWorkspaces = [
     saved,
     ...state.savedWorkspaces.filter((entry, index) => index !== existingIndex && entry.id !== saved.id)
@@ -4803,6 +12692,8 @@ function cloneWorkspaceSnapshotForSavedStore(source: WorkspaceSnapshot): Workspa
     terminals: cloneTerminalSnapshotsForSavedWorkspace(source.terminals),
     terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
+    editorPanes: cloneEditorPaneSnapshots(source.editorPanes),
+    editorSplitLayout: cloneEditorSplitSnapshot(source.editorSplitLayout),
     imageTabs: cloneImageTabSnapshotsForSavedWorkspace(source.imageTabs),
     noteTabs: cloneNoteTabSnapshots(source.noteTabs),
     browserTabs: cloneBrowserTabSnapshots(source.browserTabs),
@@ -4815,6 +12706,7 @@ function cloneWorkspaceSnapshotForSavedLoad(saved: SavedWorkspaceEntry): Workspa
   const source = saved.snapshot;
   const snapshot = cloneWorkspaceSnapshotForSavedStore(source);
   snapshot.id = crypto.randomUUID();
+  snapshot.savedWorkspaceId = saved.id;
   snapshot.customLabel = saved.name;
   snapshot.updatedAt = new Date().toISOString();
   snapshot.terminals = cloneTerminalSnapshotsForSavedWorkspace(source.terminals).map((terminal) => ({
@@ -4899,7 +12791,9 @@ function markWorkspaceLlmActivityForPane(pane: TerminalPane, durationMs = WORKSP
     status: 'working',
     source: pane.llmId ? 'launcher' : 'heuristic',
     activity: 'Working',
-    expiresAt: Date.now() + durationMs
+    expiresAt: Date.now() + durationMs,
+    doneAlertEligible: false,
+    doneAlertOnExpire: false
   });
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
@@ -4907,12 +12801,15 @@ function markWorkspaceLlmActivityForPane(pane: TerminalPane, durationMs = WORKSP
 function markWorkspaceLlmUserActivityForPane(pane: TerminalPane, durationMs = WORKSPACE_LLM_INPUT_ACTIVE_MS) {
   if (!terminalPaneLlmId(pane) || !pane.workspaceId) return;
   pane.llmWaitingSuppressUntil = performance.now() + WORKSPACE_LLM_WAITING_AFTER_INPUT_SUPPRESS_MS;
+  resetWorkspaceLlmTitleStatusTracker(pane);
   clearWorkspaceLlmWaitingForPane(pane);
   updateAgentSessionProgressForPane(pane, {
     status: 'working',
-    source: 'heuristic',
+    source: terminalPaneUsesHookLlmStatus(pane) ? 'hook' : 'heuristic',
     activity: 'Prompt sent',
-    expiresAt: Date.now() + durationMs
+    expiresAt: Date.now() + durationMs,
+    doneAlertEligible: false,
+    doneAlertOnExpire: false
   });
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
@@ -4925,21 +12822,27 @@ function markWorkspaceLlmOutputActivityForPane(
   const llmId = terminalPaneLlmId(pane)
     ?? setDetectedTerminalLlmId(pane, llmIdFromTerminalOutputText(data));
   if (!llmId || !pane.workspaceId) return;
-  // Resize/focus on workspace activation can make some PTYs repaint a prompt. Generic output only
-  // extends an already-working window, but explicit Claude/Codex progress status text can start one.
-  if (!workspaceLlmActivityIsActive(pane.workspaceId) && !llmOutputLooksLikeActiveWork(llmId, data)) {
-    const meaningful = normalizeTerminalOutputForLlmWaitingDetection(data).trim();
-    if (
-      terminalPaneVisibility(pane) !== 'background'
-      || !meaningful
-      || llmOutputLooksClearlyNotWaiting(meaningful)
-    ) {
-      return;
-    }
-  }
+  if (llmUsesTitleOnlyStatus(llmId)) return;
   const now = Date.now();
   const expiresAt = now + durationMs;
   const previousProgress = agentSessionProgressByPaneId.get(pane.paneId);
+  const previousStatus = previousProgress?.agentId === llmId ? effectiveAgentSessionStatus(previousProgress) : null;
+  const looksActive = llmOutputLooksLikeActiveWork(llmId, data);
+  // Resize/focus/background workspace checks can make PTYs repaint a prompt or status footer.
+  // Ambiguous output may extend this pane's existing working window, but only explicit
+  // active-work text/title signals may start a new working state.
+  if (!looksActive && previousStatus !== 'working') return;
+  if (!looksActive && previousStatus === 'working' && llmOutputLooksLikeTurnFinished(data)) {
+    clearWorkspaceLlmWaitingForPane(pane);
+    updateAgentSessionProgressForPane(pane, {
+      agentId: llmId,
+      status: 'idle',
+      source: 'output',
+      activity: agentActivityFromTerminalText(data, 'Idle'),
+      doneAlertEligible: true
+    });
+    return;
+  }
   if (
     previousProgress?.agentId === llmId
     && previousProgress.status === 'working'
@@ -4956,7 +12859,9 @@ function markWorkspaceLlmOutputActivityForPane(
     status: 'working',
     source: 'output',
     activity: agentActivityFromTerminalText(data, 'Working'),
-    expiresAt
+    expiresAt,
+    doneAlertEligible: true,
+    doneAlertOnExpire: looksActive || previousProgress?.doneAlertOnExpire === true
   });
   markWorkspaceLlmActivity(pane.workspaceId, durationMs);
 }
@@ -5052,6 +12957,25 @@ function effectiveAgentSessionStatus(progress: AgentSessionProgress): AgentSessi
   return progress.status;
 }
 
+function workspaceIsUserActive(workspaceId: string) {
+  return state.workspaceOpen && workspaceId === state.activeWorkspaceId;
+}
+
+function agentSessionCompletionStatusForWorkspace(
+  pane: TerminalPane,
+  previous: AgentSessionProgress | null | undefined,
+  requestedStatus: AgentSessionStatus
+): AgentSessionStatus {
+  if (requestedStatus !== 'idle' && requestedStatus !== 'exited') return requestedStatus;
+  if (previous?.status === 'done-unread') {
+    return workspaceIsUserActive(pane.workspaceId) ? requestedStatus : 'done-unread';
+  }
+  if (!previous || effectiveAgentSessionStatus(previous) !== 'working') return requestedStatus;
+  if (!previousAgentProgressCanTriggerDoneAlert(previous)) return requestedStatus;
+  if (workspaceIsUserActive(pane.workspaceId)) return requestedStatus;
+  return 'done-unread';
+}
+
 function updateAgentSessionProgressForPane(
   pane: TerminalPane,
   patch: {
@@ -5062,6 +12986,8 @@ function updateAgentSessionProgressForPane(
     activity?: string;
     source?: AgentSessionSource;
     expiresAt?: number;
+    doneAlertEligible?: boolean;
+    doneAlertOnExpire?: boolean;
     redacted?: boolean;
   } = {}
 ) {
@@ -5069,7 +12995,11 @@ function updateAgentSessionProgressForPane(
   if (!agentId || !pane.workspaceId) return null;
   const previous = agentSessionProgressByPaneId.get(pane.paneId);
   const previousSignature = agentProgressPatchSignature(previous);
-  const status = patch.status ?? previous?.status ?? (pane.backendId ? 'idle' : 'exited');
+  const requestedStatus = patch.status ?? previous?.status ?? (pane.backendId ? 'idle' : 'exited');
+  const status = agentSessionCompletionStatusForWorkspace(pane, previous, requestedStatus);
+  const activity = status === 'done-unread' && requestedStatus !== 'done-unread'
+    ? defaultAgentActivityForStatus(status)
+    : (patch.activity ?? previous?.activity ?? defaultAgentActivityForStatus(status));
   const next: AgentSessionProgress = {
     paneId: pane.paneId,
     workspaceId: pane.workspaceId,
@@ -5078,9 +13008,11 @@ function updateAgentSessionProgressForPane(
     status,
     title: sanitizeAgentProgressText(patch.title ?? previous?.title ?? terminalPaneLabel(pane), AGENT_SESSION_TITLE_MAX_CHARS),
     cwd: sanitizeAgentProgressText(patch.cwd ?? previous?.cwd ?? pane.cwd, AGENT_SESSION_CWD_MAX_CHARS),
-    activity: sanitizeAgentProgressText(patch.activity ?? previous?.activity ?? defaultAgentActivityForStatus(status), AGENT_SESSION_ACTIVITY_MAX_CHARS),
+    activity: sanitizeAgentProgressText(activity, AGENT_SESSION_ACTIVITY_MAX_CHARS),
     source: patch.source ?? previous?.source ?? 'heuristic',
     updatedAt: Date.now(),
+    doneAlertEligible: patch.doneAlertEligible ?? previous?.doneAlertEligible,
+    doneAlertOnExpire: patch.doneAlertOnExpire ?? previous?.doneAlertOnExpire,
     redacted: patch.redacted ?? previous?.redacted
   };
   if (status === 'working') {
@@ -5090,6 +13022,14 @@ function updateAgentSessionProgressForPane(
   scheduleAgentSessionProgressExpiry(next);
   if (agentProgressSignature(next) !== previousSignature) {
     renderWorkspaceLlmActivityTab(pane.workspaceId);
+    const previousStatus = previous ? effectiveAgentSessionStatus(previous) : 'none';
+    const nextStatus = effectiveAgentSessionStatus(next);
+    if (previousStatus !== nextStatus || previous?.source !== next.source) {
+      appendDiagnosticLog(
+        'agent',
+        `${next.agentId} ${previousStatus}->${nextStatus} source=${next.source} pane=${pane.paneId.slice(0, 6)} eligible=${next.doneAlertEligible === true ? 'yes' : 'no'} activity=${next.activity}`
+      );
+    }
     maybeSendAgentProgressAlert(pane, previous, next);
   }
   return next;
@@ -5099,8 +13039,31 @@ function defaultAgentActivityForStatus(status: AgentSessionStatus) {
   if (status === 'waiting') return 'Waiting for your response';
   if (status === 'working') return 'Working';
   if (status === 'error') return 'Error';
+  if (status === 'done-unread') return 'Finished';
   if (status === 'exited') return 'Exited';
   return 'Idle';
+}
+
+function acknowledgeWorkspaceDoneUnread(workspaceId: string) {
+  if (!workspaceId) return false;
+  let changed = false;
+  for (const [paneId, progress] of agentSessionProgressByPaneId) {
+    if (progress.workspaceId !== workspaceId || progress.status !== 'done-unread') continue;
+    const nextStatus: AgentSessionStatus = progress.backendId ? 'idle' : 'exited';
+    agentSessionProgressByPaneId.set(paneId, {
+      ...progress,
+      status: nextStatus,
+      activity: defaultAgentActivityForStatus(nextStatus),
+      updatedAt: Date.now(),
+      expiresAt: undefined
+    });
+    changed = true;
+  }
+  if (changed) {
+    appendDiagnosticLog('agent', `workspace done-unread acknowledged workspace=${workspaceId.slice(0, 8)}`);
+    renderWorkspaceLlmActivityTab(workspaceId);
+  }
+  return changed;
 }
 
 function maybeSendAgentProgressAlert(
@@ -5109,22 +13072,92 @@ function maybeSendAgentProgressAlert(
   next: AgentSessionProgress
 ) {
   if (!state.ideSettings.agentNotificationBanners && !state.ideSettings.agentAlertSound) return;
-  const previousStatus = previous ? effectiveAgentSessionStatus(previous) : 'none';
+  const previousStatus = previousAgentSessionStatusForAlert(previous, next);
   const nextStatus = effectiveAgentSessionStatus(next);
+  if (agentProgressResetsWaitingAlert(next)) {
+    agentWaitingAlertSignatureByPaneId.delete(pane.paneId);
+  }
   let kind: AgentAlertKind | null = null;
   if (nextStatus === 'waiting' && previousStatus !== 'waiting') kind = 'waiting';
   else if (nextStatus === 'error' && previousStatus !== 'error') kind = 'error';
-  else if ((nextStatus === 'idle' || nextStatus === 'exited') && previousStatus === 'working') kind = 'done';
+  else if ((nextStatus === 'idle' || nextStatus === 'done-unread' || nextStatus === 'exited') && previousStatus === 'working') kind = 'done';
   if (!kind) return;
+  if (kind === 'waiting') {
+    const signature = agentWaitingAlertSignature(next);
+    if (agentWaitingAlertSignatureByPaneId.get(pane.paneId) === signature) {
+      appendAgentAlertDebugLog(
+        `real alert suppressed: same waiting prompt agent=${agentAlertAgentLabel(next.agentId)} pane=${pane.paneId}`
+      );
+      appendDiagnosticLog(
+        'alert',
+        `same waiting prompt suppressed agent=${next.agentId} pane=${pane.paneId.slice(0, 6)}`
+      );
+      return;
+    }
+  }
   const now = Date.now();
   const last = agentAlertLastByPaneId.get(pane.paneId);
-  if (last?.kind === kind && now - last.at < AGENT_ALERT_MIN_INTERVAL_MS) return;
+  if (last?.kind === kind && now - last.at < AGENT_ALERT_MIN_INTERVAL_MS) {
+    appendAgentAlertDebugLog(
+      `real alert throttled: kind=${kind} agent=${agentAlertAgentLabel(next.agentId)} pane=${pane.paneId}`
+    );
+    return;
+  }
+  if (kind === 'waiting') {
+    agentWaitingAlertSignatureByPaneId.set(pane.paneId, agentWaitingAlertSignature(next));
+  }
   agentAlertLastByPaneId.set(pane.paneId, { kind, at: now });
   const payload = agentAlertPayload(kind, next);
   void sendAgentSystemAlert(payload.title, payload.body, {
     showBanner: state.ideSettings.agentNotificationBanners,
     playSound: state.ideSettings.agentAlertSound
+  }, {
+    kind,
+    agent: agentAlertAgentLabel(next.agentId),
+    paneId: pane.paneId,
+    workspaceId: next.workspaceId
   });
+}
+
+function agentProgressResetsWaitingAlert(progress: AgentSessionProgress) {
+  const status = effectiveAgentSessionStatus(progress);
+  if (status === 'error' || status === 'done-unread' || status === 'exited') return true;
+  if (status !== 'working') return false;
+  if (/^prompt sent$/i.test(progress.activity.trim())) return false;
+  if (progress.doneAlertEligible === false) return false;
+  return progress.source === 'title' || progress.source === 'output' || progress.source === 'hook';
+}
+
+function agentWaitingAlertSignature(progress: AgentSessionProgress) {
+  // Intentionally do not include the selected row/activity text. In Codex/Claude
+  // interactive menus, arrow keys and multi-select toggles repaint the same prompt with
+  // tiny text changes; treating those as a new prompt causes repeated "needs input" alerts.
+  return `${progress.workspaceId}\t${progress.backendId ?? ''}\t${progress.agentId}`;
+}
+
+function previousAgentSessionStatusForAlert(
+  previous: AgentSessionProgress | null | undefined,
+  next: AgentSessionProgress
+): AgentSessionStatus | 'none' {
+  if (!previous) return 'none';
+  const nextStatus = effectiveAgentSessionStatus(next);
+  if ((nextStatus === 'idle' || nextStatus === 'done-unread' || nextStatus === 'exited') && previous.status === 'working') {
+    if (!previousAgentProgressCanTriggerDoneAlert(previous)) return 'idle';
+    const expired = Boolean(previous.expiresAt && previous.expiresAt <= Date.now());
+    if (!expired) return 'working';
+    const expiredRecently = (previous.expiresAt ?? 0) >= Date.now() - AGENT_ALERT_DONE_EXPIRE_GRACE_MS;
+    if (previous.doneAlertOnExpire && expiredRecently) return 'working';
+    return 'idle';
+  }
+  return effectiveAgentSessionStatus(previous);
+}
+
+function previousAgentProgressCanTriggerDoneAlert(previous: AgentSessionProgress) {
+  if (previous.doneAlertEligible === false) return false;
+  if (/^prompt sent$/i.test(previous.activity.trim())) return false;
+  if (previous.source === 'launcher' || previous.source === 'heuristic') return false;
+  if (previous.source === 'hook' || previous.source === 'title' || previous.source === 'output') return true;
+  return previous.doneAlertEligible === true;
 }
 
 function agentAlertPayload(kind: AgentAlertKind, progress: AgentSessionProgress) {
@@ -5136,12 +13169,9 @@ function agentAlertPayload(kind: AgentAlertKind, progress: AgentSessionProgress)
     : kind === 'error'
       ? `${agent} needs attention`
       : `${agent} finished`;
-  const activity = progress.activity && progress.activity !== '—'
-    ? ` · ${progress.activity}`
-    : '';
   return {
     title,
-    body: truncateAgentProgressText(`${workspaceName} · ${progress.title}${activity}`, AGENT_SESSION_ACTIVITY_MAX_CHARS)
+    body: truncateAgentProgressText(workspaceName, AGENT_SESSION_ACTIVITY_MAX_CHARS)
   };
 }
 
@@ -5169,20 +13199,111 @@ async function ensureAgentNotificationPermission() {
   return agentNotificationPermissionPromise;
 }
 
+async function focusAgentAlertTarget(target: { workspaceId?: string; paneId?: string }) {
+  await currentWindow.unminimize().catch(() => undefined);
+  await currentWindow.show().catch(() => undefined);
+  await currentWindow.setFocus().catch(() => undefined);
+  if (target.paneId) {
+    const progress = agentSessionProgressByPaneId.get(target.paneId);
+    if (progress) {
+      await focusWorkspaceAgentSession(progress);
+      return;
+    }
+  }
+  if (target.workspaceId && target.workspaceId !== state.activeWorkspaceId) {
+    await activateWorkspaceTab(target.workspaceId);
+  }
+  if (target.paneId) {
+    const pane = terminalPaneById.get(target.paneId);
+    if (pane && pane.workspaceId === state.activeWorkspaceId) {
+      const widget = terminalWidgetForPane(pane);
+      if (widget) bringPanelToFront(widget.element);
+      setActivePane(pane.paneId);
+    }
+  }
+}
+
+async function showClickableAgentNotification(
+  title: string,
+  body: string,
+  context: { kind?: AgentAlertKind; agent?: string; paneId?: string; workspaceId?: string },
+  debugId: string
+) {
+  if (!('Notification' in window)) return false;
+  const granted = await ensureAgentNotificationPermission();
+  if (!granted) return false;
+  try {
+    const notification = new Notification(title || APP_PRODUCT_NAME, {
+      body,
+      icon: APP_NOTIFICATION_ICON_URL,
+      tag: `svi-agent-${context.paneId ?? 'workspace'}-${context.kind ?? 'alert'}`,
+      data: {
+        source: 'simple-vibe-ide-agent-alert',
+        kind: context.kind ?? '',
+        paneId: context.paneId ?? '',
+        workspaceId: context.workspaceId ?? '',
+        debugId
+      },
+      silent: true
+    });
+    notification.onclick = (event) => {
+      event.preventDefault();
+      notification.close();
+      void focusAgentAlertTarget({
+        workspaceId: context.workspaceId,
+        paneId: context.paneId
+      }).catch((error) => {
+        appendDiagnosticLog('alert', `click focus failed kind=${context.kind ?? 'unknown'} ${String(error)}`, 'warn');
+        setStatus(`Failed to open alert target: ${String(error)}`, true);
+      });
+    };
+    appendDiagnosticLog('alert', `frontend clickable banner shown kind=${context.kind ?? 'unknown'} pane=${context.paneId?.slice(0, 6) ?? 'n/a'}`);
+    return true;
+  } catch (error) {
+    appendDiagnosticLog('alert', `frontend clickable banner failed kind=${context.kind ?? 'unknown'} ${String(error)}`, 'warn');
+    return false;
+  }
+}
+
 async function sendAgentSystemAlert(
   title: string,
   body: string,
-  options: { showBanner: boolean; playSound: boolean }
+  options: { showBanner: boolean; playSound: boolean },
+  context?: { kind?: AgentAlertKind; agent?: string; paneId?: string; workspaceId?: string }
 ) {
   if (!options.showBanner && !options.playSound) return;
+  const debugId = Date.now().toString(36).slice(-5);
+  if (context) {
+    appendAgentAlertDebugLog(
+      `#${debugId} real alert request: kind=${context.kind ?? 'unknown'} agent=${context.agent ?? 'agent'} banner=${options.showBanner} sound=${options.playSound}`
+    );
+    appendDiagnosticLog(
+      'alert',
+      `request kind=${context.kind ?? 'unknown'} agent=${context.agent ?? 'agent'} pane=${context.paneId?.slice(0, 6) ?? 'n/a'} banner=${options.showBanner ? 'on' : 'off'} sound=${options.playSound ? 'on' : 'off'}`
+    );
+  }
   try {
-    await api.sendAgentAlert({
+    const frontendBannerOk = options.showBanner && context && AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS
+      ? await showClickableAgentNotification(title, body, context, debugId)
+      : false;
+    const result = await api.sendAgentAlert({
       title,
       body,
-      showBanner: options.showBanner,
-      playSound: options.playSound
+      showBanner: options.showBanner && !frontendBannerOk,
+      playSound: options.playSound,
+      debugId
     });
+    if (context) {
+      const frontendState = AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS
+        ? (frontendBannerOk ? 'ok' : 'skip/fail')
+        : 'disabled';
+      appendAgentAlertDebugLog(`#${debugId} real alert OK (frontend=${frontendState}, ${agentAlertResultSummary(result)})`);
+      appendDiagnosticLog('alert', `OK kind=${context.kind ?? 'unknown'} frontend=${frontendState} ${agentAlertResultSummary(result)}`);
+      if (result.bannerError) appendAgentAlertDebugLog(`#${debugId} real alert note: ${result.bannerError}`, 'warn');
+    }
   } catch (error) {
+    if (context) appendAgentAlertDebugLog(`#${debugId} real alert FAILED: ${String(error)}`, 'warn');
+    if (context) appendDiagnosticLog('alert', `FAILED kind=${context.kind ?? 'unknown'} ${String(error)}`, 'warn');
     console.warn('Failed to send agent alert', error);
   }
 }
@@ -5199,31 +13320,349 @@ function appendAgentAlertDebugLog(message: string, severity: 'info' | 'warn' = '
   else console.info(`[agent-alert-test] ${message}`);
 }
 
-async function sendAgentAlertTest(kind: 'banner' | 'sound' | 'both') {
+function appendDiagnosticLog(
+  category: string,
+  message: string,
+  severity: DiagnosticLogSeverity = 'info',
+  options: { force?: boolean } = {}
+) {
+  if (!options.force && state.ideSettings.debugLogEnabled !== true) return;
+  const entry: DiagnosticLogEntry = {
+    at: Date.now(),
+    category: sanitizeDiagnosticLogPart(category, 32) || 'app',
+    message: sanitizeDiagnosticLogPart(message, DIAGNOSTIC_LOG_MESSAGE_MAX_CHARS) || 'event',
+    severity
+  };
+  diagnosticLogEntries.unshift(entry);
+  if (diagnosticLogEntries.length > DIAGNOSTIC_LOG_MAX) diagnosticLogEntries.length = DIAGNOSTIC_LOG_MAX;
+  diagnosticLastEventAt = entry.at;
+  diagnosticLastEventCategory = entry.category;
+  diagnosticLastEventMessage = entry.message;
+  persistDiagnosticSessionSnapshot();
+  renderDiagnosticLogStatus();
+  renderDiagnosticLogPanel();
+  const consoleMessage = `[diag:${entry.category}] ${entry.message}`;
+  if (severity === 'error') console.error(consoleMessage);
+  else if (severity === 'warn') console.warn(consoleMessage);
+  else console.info(consoleMessage);
+}
+
+function sanitizeDiagnosticLogPart(value: string, maxChars: number) {
+  return String(value ?? '')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+/g, ' ')
+    .replace(/\b(?:token|secret|password|passwd|api[_-]?key|authorization)\s*[:=]\s*["']?[^\s"']+/gi, (match) => {
+      const key = match.split(/[:=]/)[0]?.trim() || 'secret';
+      return `${key}=[redacted]`;
+    })
+    .replace(/\b[A-Za-z0-9_=-]{40,}\b/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxChars);
+}
+
+function readDiagnosticSessionSnapshot(): DiagnosticSessionSnapshot | null {
+  try {
+    const raw = localStorage.getItem(DIAGNOSTIC_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<DiagnosticSessionSnapshot>;
+    if (parsed.version !== 1 || typeof parsed.sessionId !== 'string') return null;
+    return {
+      version: 1,
+      sessionId: parsed.sessionId,
+      startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : 0,
+      heartbeatAt: typeof parsed.heartbeatAt === 'number' ? parsed.heartbeatAt : 0,
+      cleanShutdown: parsed.cleanShutdown === true,
+      endedAt: typeof parsed.endedAt === 'number' ? parsed.endedAt : undefined,
+      lastEventAt: typeof parsed.lastEventAt === 'number' ? parsed.lastEventAt : undefined,
+      lastEventCategory: typeof parsed.lastEventCategory === 'string' ? parsed.lastEventCategory : undefined,
+      lastEventMessage: typeof parsed.lastEventMessage === 'string' ? parsed.lastEventMessage : undefined,
+      entries: Array.isArray(parsed.entries)
+        ? parsed.entries.filter(isDiagnosticLogEntry).slice(0, DIAGNOSTIC_LOG_PERSIST_MAX)
+        : undefined
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isDiagnosticLogEntry(value: unknown): value is DiagnosticLogEntry {
+  if (!value || typeof value !== 'object') return false;
+  const entry = value as Partial<DiagnosticLogEntry>;
+  return (
+    typeof entry.at === 'number' &&
+    typeof entry.category === 'string' &&
+    typeof entry.message === 'string' &&
+    (entry.severity === 'info' || entry.severity === 'warn' || entry.severity === 'error')
+  );
+}
+
+function persistDiagnosticSessionSnapshot(options: { cleanShutdown?: boolean } = {}) {
+  try {
+    const now = Date.now();
+    const snapshot: DiagnosticSessionSnapshot = {
+      version: 1,
+      sessionId: diagnosticSessionId,
+      startedAt: diagnosticSessionStartedAt,
+      heartbeatAt: now,
+      cleanShutdown: options.cleanShutdown === true,
+      endedAt: options.cleanShutdown === true ? now : undefined,
+      lastEventAt: diagnosticLastEventAt || undefined,
+      lastEventCategory: diagnosticLastEventCategory || undefined,
+      lastEventMessage: diagnosticLastEventMessage || undefined,
+      entries: diagnosticLogEntries.slice(0, DIAGNOSTIC_LOG_PERSIST_MAX)
+    };
+    localStorage.setItem(DIAGNOSTIC_SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Best-effort breadcrumbs only; never let diagnostics break the IDE.
+  }
+}
+
+function startDiagnosticSessionMonitor() {
+  const previous = readDiagnosticSessionSnapshot();
+  diagnosticSessionStartedAt = Date.now();
+  if (previous && previous.sessionId !== diagnosticSessionId && previous.cleanShutdown !== true) {
+    restorePreviousUncleanDiagnosticSession(previous);
+  }
+  persistDiagnosticSessionSnapshot();
+  if (!diagnosticSessionHeartbeatTimer) {
+    diagnosticSessionHeartbeatTimer = window.setInterval(() => {
+      persistDiagnosticSessionSnapshot();
+    }, DIAGNOSTIC_SESSION_HEARTBEAT_MS);
+  }
+}
+
+function restorePreviousUncleanDiagnosticSession(previous: DiagnosticSessionSnapshot) {
+  const previousEntries = previous.entries?.slice(0, DIAGNOSTIC_LOG_PERSIST_MAX) ?? [];
+  for (let index = previousEntries.length - 1; index >= 0; index -= 1) {
+    const entry = previousEntries[index];
+    diagnosticLogEntries.unshift({
+      at: entry.at,
+      category: sanitizeDiagnosticLogPart(`prev:${entry.category}`, 32) || 'prev',
+      message: sanitizeDiagnosticLogPart(entry.message, DIAGNOSTIC_LOG_MESSAGE_MAX_CHARS) || 'event',
+      severity: entry.severity
+    });
+  }
+  if (diagnosticLogEntries.length > DIAGNOSTIC_LOG_MAX) diagnosticLogEntries.length = DIAGNOSTIC_LOG_MAX;
+  const lastAt = previous.lastEventAt || previous.heartbeatAt || previous.startedAt;
+  const lastLabel = lastAt ? formatDiagnosticLogDateTime(lastAt) : 'unknown';
+  const lastEvent = previous.lastEventCategory
+    ? ` lastEvent=${previous.lastEventCategory}:${previous.lastEventMessage ?? ''}`
+    : '';
+  appendDiagnosticLog(
+    'diagnostics',
+    `previous session did not shut down cleanly; last heartbeat/event at ${lastLabel}.${lastEvent}`,
+    'warn',
+    { force: true }
+  );
+}
+
+function markDiagnosticSessionClean() {
+  if (diagnosticSessionHeartbeatTimer) {
+    window.clearInterval(diagnosticSessionHeartbeatTimer);
+    diagnosticSessionHeartbeatTimer = 0;
+  }
+  persistDiagnosticSessionSnapshot({ cleanShutdown: true });
+}
+
+function formatDiagnosticLogDateTime(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return 'unknown';
+  try {
+    return new Date(value).toLocaleString();
+  } catch {
+    return 'unknown';
+  }
+}
+
+function renderDiagnosticLogStatus() {
+  const count = diagnosticLogEntries.length;
+  setTextContentIfChanged(
+    el.settingsDebugLogStatus,
+    count ? `${count} diagnostic event${count === 1 ? '' : 's'}` : 'No diagnostic log entries'
+  );
+}
+
+function diagnosticLogText() {
+  if (!diagnosticLogEntries.length) return 'No diagnostic log entries.';
+  return diagnosticLogEntries.map((entry) => {
+    const timestamp = new Date(entry.at).toLocaleTimeString();
+    const severity = entry.severity === 'info' ? 'info' : entry.severity;
+    return `[${timestamp}] ${severity} ${entry.category}: ${entry.message}`;
+  }).join('\n');
+}
+
+function renderDiagnosticLogPanel() {
+  if (el.diagnosticLogPopover.classList.contains('hidden')) return;
+  const text = diagnosticLogText();
+  if (diagnosticLogRenderSignature !== text) {
+    diagnosticLogRenderSignature = text;
+    setTextContentIfChanged(el.diagnosticLogOutput, text);
+    el.diagnosticLogOutput.scrollTop = 0;
+  }
+  const count = diagnosticLogEntries.length;
+  setTextContentIfChanged(el.diagnosticLogMeta, `${count}/${DIAGNOSTIC_LOG_MAX} entries`);
+}
+
+function openDiagnosticLogPanel() {
+  el.diagnosticLogPopover.classList.remove('hidden');
+  diagnosticLogRenderSignature = '\0';
+  renderDiagnosticLogPanel();
+}
+
+function closeDiagnosticLogPanel() {
+  el.diagnosticLogPopover.classList.add('hidden');
+}
+
+function clearDiagnosticLog() {
+  diagnosticLogEntries.length = 0;
+  diagnosticLogRenderSignature = '\0';
+  diagnosticLastEventAt = 0;
+  diagnosticLastEventCategory = '';
+  diagnosticLastEventMessage = '';
+  persistDiagnosticSessionSnapshot();
+  renderDiagnosticLogStatus();
+  renderDiagnosticLogPanel();
+}
+
+async function copyDiagnosticLog() {
+  try {
+    await writeText(diagnosticLogText());
+    setStatus('Diagnostic log copied');
+  } catch (error) {
+    setStatus(`Failed to copy diagnostic log: ${String(error)}`, true);
+  }
+}
+
+function diagnosticPaneLabel(pane: TerminalPane) {
+  const agent = terminalPaneLlmId(pane) ?? 'shell';
+  return `${agent}#${pane.paneId.slice(0, 6)}`;
+}
+
+function agentAlertResultSummary(result: AgentAlertResult) {
+  if (result.scheduledDelayMs && result.scheduledDelayMs > 0) {
+    return `scheduled native delay=${result.scheduledDelayMs}ms`;
+  }
+  return `plugin=${result.notificationPluginOk ? 'ok' : 'skip/fail'}, tray=${result.trayBalloonOk ? 'ok' : 'skip/fail'}`;
+}
+
+function handleAgentAlertDelayedResult(event: AgentAlertDelayedResultEvent) {
+  const requestId = event.debugId || 'native';
+  if (event.result) {
+    appendAgentAlertDebugLog(`#${requestId} native delayed fire OK (${agentAlertResultSummary(event.result)})`);
+    if (event.result.bannerError) {
+      appendAgentAlertDebugLog(`#${requestId} native delayed note: ${event.result.bannerError}`, 'warn');
+    }
+  } else {
+    appendAgentAlertDebugLog(`#${requestId} native delayed fire FAILED: ${event.error || 'unknown error'}`, 'warn');
+  }
+}
+
+function handleAgentBridgeEvent(event: AgentBridgeEvent) {
+  const pane = paneForAgentBridgeEvent(event);
+  if (!pane || !isTerminalPaneAlive(pane)) return;
+  const agentId = normalizeTerminalLlmId(event.agentId) ?? terminalPaneLlmId(pane);
+  if (!agentId) return;
+  appendDiagnosticLog(
+    'hook',
+    `${agentId} event=${event.rawEventName || 'unknown'} status=${event.status || 'none'} pane=${pane.paneId.slice(0, 6)}`
+  );
+  pane.llmHookActive = true;
+  pane.llmBridgeSessionId = event.sessionId || pane.llmBridgeSessionId;
+  if (!pane.llmId) setDetectedTerminalLlmId(pane, agentId);
+  const status = agentSessionStatusFromBridgeStatus(event.status);
+  if (!status) {
+    updateAgentSessionProgressForPane(pane, {
+      agentId,
+      source: 'hook',
+      activity: sanitizeAgentProgressText(event.activity ?? event.rawEventName, AGENT_SESSION_ACTIVITY_MAX_CHARS)
+    });
+    return;
+  }
+  const activity = sanitizeAgentProgressText(
+    event.activity ?? defaultAgentActivityForStatus(status),
+    AGENT_SESSION_ACTIVITY_MAX_CHARS
+  );
+  if (status === 'waiting') {
+    clearWorkspaceLlmTitleActivityForPane(pane);
+    updateAgentSessionProgressForPane(pane, {
+      agentId,
+      status,
+      source: 'hook',
+      activity
+    });
+    workspaceLlmWaitingByPaneId.set(pane.paneId, {
+      workspaceId: pane.workspaceId,
+      llmId: agentId,
+      detectedAt: Date.now()
+    });
+    renderWorkspaceLlmActivityTab(pane.workspaceId);
+    return;
+  }
+  clearWorkspaceLlmWaitingForPane(pane);
+  if (status !== 'working') clearWorkspaceLlmTitleActivityForPane(pane);
+  updateAgentSessionProgressForPane(pane, {
+    agentId,
+    status,
+    source: 'hook',
+    activity,
+    expiresAt: status === 'working' ? Date.now() + WORKSPACE_LLM_HOOK_ACTIVE_MS : undefined,
+    doneAlertEligible: status === 'working' ? true : undefined,
+    doneAlertOnExpire: status === 'working' ? false : undefined
+  });
+  if (status === 'working') markWorkspaceLlmActivity(pane.workspaceId, WORKSPACE_LLM_HOOK_ACTIVE_MS);
+}
+
+function paneForAgentBridgeEvent(event: AgentBridgeEvent) {
+  if (event.paneId) {
+    const pane = terminalPaneById.get(event.paneId);
+    if (pane) return pane;
+  }
+  if (!event.sessionId) return null;
+  for (const pane of state.terminals) {
+    if (pane.llmBridgeSessionId === event.sessionId) return pane;
+  }
+  return null;
+}
+
+function agentSessionStatusFromBridgeStatus(value: string | null | undefined): AgentSessionStatus | null {
+  if (value === 'idle' || value === 'working' || value === 'waiting' || value === 'error' || value === 'exited') return value;
+  return null;
+}
+
+async function sendAgentAlertTest(
+  kind: 'banner' | 'sound' | 'both',
+  options: { requestId?: string; labelOverride?: string; scheduled?: boolean; delayMs?: number } = {}
+) {
   const showBanner = kind === 'banner' || kind === 'both';
   const playSound = kind === 'sound' || kind === 'both';
-  const label = kind === 'both' ? 'banner + sound' : kind;
+  const label = options.labelOverride ?? (kind === 'both' ? 'banner + sound' : kind);
   const now = new Date().toLocaleTimeString();
-  const requestId = Date.now().toString(36).slice(-5);
-  appendAgentAlertDebugLog(`#${requestId} click: ${label} test (banner=${showBanner}, sound=${playSound})`);
+  const requestId = options.requestId ?? Date.now().toString(36).slice(-5);
+  appendAgentAlertDebugLog(`#${requestId} ${options.scheduled ? 'fire' : 'click'}: ${label} test (banner=${showBanner}, sound=${playSound})`);
   setTextContentIfChanged(el.settingsAgentAlertTestStatus, `Sending ${label} test...`);
-  if (showBanner) {
+  if (showBanner && AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS) {
     appendAgentAlertDebugLog(`#${requestId} checking frontend notification permission`);
     const permissionGranted = await ensureAgentNotificationPermission();
     appendAgentAlertDebugLog(`#${requestId} frontend notification permission: ${permissionGranted ? 'granted' : 'not granted'}`, permissionGranted ? 'info' : 'warn');
+  } else if (showBanner) {
+    appendAgentAlertDebugLog(`#${requestId} frontend clickable notification path disabled; using backend native banner path`);
   }
   try {
     const startedAt = performance.now();
-    await api.sendAgentAlert({
+    const result = await api.sendAgentAlert({
       title: `Simple Vibe IDE ${label} test`,
       body: `Native alert path test sent at ${now}.`,
       showBanner,
-      playSound
+      playSound,
+      delayMs: options.delayMs,
+      debugId: requestId
     });
     const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
-    appendAgentAlertDebugLog(`#${requestId} backend send_agent_alert OK (${elapsed}ms)`);
+    appendAgentAlertDebugLog(`#${requestId} backend send_agent_alert OK (${elapsed}ms, ${agentAlertResultSummary(result)})`);
+    if (result.bannerError) {
+      appendAgentAlertDebugLog(`#${requestId} banner fallback note: ${result.bannerError}`, 'warn');
+    }
     if (showBanner) {
-      appendAgentAlertDebugLog(`#${requestId} if no banner appeared, Windows/Tauri notification surface likely hid or blocked it`, 'warn');
+      appendAgentAlertDebugLog(`#${requestId} if no banner appeared, Windows notification surface likely hid or blocked both plugin and tray paths`, 'warn');
     }
     const message = `Native alert test sent: ${label}`;
     setTextContentIfChanged(el.settingsAgentAlertTestStatus, message);
@@ -5234,6 +13673,22 @@ async function sendAgentAlertTest(kind: 'banner' | 'sound' | 'both') {
     setTextContentIfChanged(el.settingsAgentAlertTestStatus, message);
     setStatus(message, true);
   }
+}
+
+function scheduleAgentAlertBackgroundBannerTest() {
+  const requestId = Date.now().toString(36).slice(-5);
+  appendAgentAlertDebugLog(`#${requestId} request: backend-native background banner fires in 5s; switch to another app now`);
+  setTextContentIfChanged(el.settingsAgentAlertTestStatus, 'Backend-native background banner test scheduled for 5s...');
+  setStatus('Switch to another app now; native banner test fires in 5s');
+  el.settingsAgentAlertTestBannerDelayed.disabled = true;
+  void sendAgentAlertTest('banner', {
+    requestId,
+    labelOverride: 'background banner',
+    scheduled: true,
+    delayMs: AGENT_ALERT_BACKGROUND_TEST_DELAY_MS
+  }).finally(() => {
+    el.settingsAgentAlertTestBannerDelayed.disabled = false;
+  });
 }
 
 function scheduleAgentSessionProgressExpiry(progress: AgentSessionProgress) {
@@ -5260,10 +13715,27 @@ function expireAgentSessionProgress(paneId: string) {
   }
   const pane = terminalPaneById.get(paneId);
   if (!pane?.backendId || pane.workspaceId !== progress.workspaceId) return;
+  if (progress.source === 'title') {
+    const suppressUntil = workspaceLlmTitleDoneSuppressUntil(pane);
+    if (suppressUntil > Date.now()) {
+      const deferred: AgentSessionProgress = {
+        ...progress,
+        expiresAt: suppressUntil
+      };
+      agentSessionProgressByPaneId.set(paneId, deferred);
+      appendDiagnosticLog(
+        'agent',
+        `deferred title expiry after tmux scroll pane=${paneId.slice(0, 6)} until=${new Date(suppressUntil).toISOString()}`
+      );
+      scheduleAgentSessionProgressExpiry(deferred);
+      return;
+    }
+  }
+  const nextStatus = agentSessionCompletionStatusForWorkspace(pane, progress, 'idle');
   const next: AgentSessionProgress = {
     ...progress,
-    status: 'idle',
-    activity: 'Idle',
+    status: nextStatus,
+    activity: defaultAgentActivityForStatus(nextStatus),
     updatedAt: Date.now(),
     expiresAt: undefined
   };
@@ -5279,6 +13751,7 @@ function deleteAgentSessionProgressForPane(pane: TerminalPane) {
   agentSessionProgressTimers.delete(pane.paneId);
   agentSessionProgressByPaneId.delete(pane.paneId);
   agentAlertLastByPaneId.delete(pane.paneId);
+  agentWaitingAlertSignatureByPaneId.delete(pane.paneId);
   if (progress) renderWorkspaceLlmActivityTab(progress.workspaceId);
 }
 
@@ -5288,9 +13761,16 @@ function agentSessionProgressForWorkspace(workspaceId: string) {
     if (progress.workspaceId === workspaceId) sessions.push(progress);
   }
   return sessions.sort((left, right) => (
-    agentStatusPriority(effectiveAgentSessionStatus(left)) - agentStatusPriority(effectiveAgentSessionStatus(right))
+    workspaceAgentCardOrder(left.agentId) - workspaceAgentCardOrder(right.agentId)
+    || agentStatusPriority(effectiveAgentSessionStatus(left)) - agentStatusPriority(effectiveAgentSessionStatus(right))
     || right.updatedAt - left.updatedAt
+    || left.paneId.localeCompare(right.paneId)
   ));
+}
+
+function workspaceAgentCardOrder(agentId: string) {
+  const normalized = agentId === 'agy' ? 'antigravity' : agentId.toLowerCase();
+  return WORKSPACE_AGENT_CARD_ORDER_INDEX.get(normalized) ?? WORKSPACE_AGENT_CARD_ORDER.length;
 }
 
 function workspaceAgentAggregateState(workspaceId: string): WorkspaceLlmIndicatorState {
@@ -5313,8 +13793,9 @@ function agentStatusPriority(status: AgentSessionStatus) {
   if (status === 'waiting') return 0;
   if (status === 'error') return 1;
   if (status === 'working') return 2;
-  if (status === 'idle') return 3;
-  return 4;
+  if (status === 'done-unread') return 3;
+  if (status === 'idle') return 4;
+  return 5;
 }
 
 function workspaceAgentProgressSignature(workspaceId: string) {
@@ -5359,6 +13840,18 @@ function terminalPaneLlmId(pane: TerminalPane | null | undefined) {
   return normalizeTerminalLlmId(pane?.llmId) ?? normalizeTerminalLlmId(pane?.detectedLlmId);
 }
 
+function llmUsesTitleOnlyStatus(llmId: string | null | undefined) {
+  return normalizeTerminalLlmId(llmId) === 'codex';
+}
+
+function terminalPaneUsesTitleOnlyLlmStatus(pane: TerminalPane | null | undefined) {
+  return llmUsesTitleOnlyStatus(terminalPaneLlmId(pane));
+}
+
+function terminalPaneUsesHookLlmStatus(pane: TerminalPane | null | undefined) {
+  return pane?.llmHookActive === true;
+}
+
 function setDetectedTerminalLlmId(pane: TerminalPane, llmId: string | null | undefined) {
   const normalized = normalizeTerminalLlmId(llmId);
   if (!normalized || pane.llmId) return terminalPaneLlmId(pane);
@@ -5384,22 +13877,30 @@ function llmIdFromLauncherCommandText(text: string | null | undefined) {
 }
 
 function llmIdFromTerminalTitleText(title: string | null | undefined) {
-  const normalized = normalizeWorkspaceLlmTerminalTitle(title ?? '');
-  if (!normalized) return null;
-  const direct = normalizeTerminalLlmId(normalized);
-  if (direct) return direct;
-  if (/^(?:Claude|Claude\s+Code)(?:\b|[:\-—·|])/i.test(normalized)) return 'claude';
-  if (/^(?:Codex|OpenAI\s+Codex|Codex\s+CLI)(?:\b|[:\-—·|])/i.test(normalized)) return 'codex';
-  if (/^(?:Grok|Grok\s+(?:Build|Code))(?:\b|[:\-—·|])/i.test(normalized)) return 'grok';
-  if (/^(?:Antigravity|Google\s+Antigravity|AGY)(?:\b|[:\-—·|])/i.test(normalized)) return 'antigravity';
+  const candidates = workspaceLlmTerminalTitleCandidates(title ?? '');
+  if (!candidates.length) return null;
+  const tmuxSessionId = llmIdFromWorkspaceTmuxTitle(candidates[0]);
+  if (tmuxSessionId) return tmuxSessionId;
+  for (const normalized of candidates) {
+    const direct = normalizeTerminalLlmId(normalized);
+    if (direct) return direct;
+    if (/^(?:Claude|Claude\s+Code)(?:\b|[:\-—·|])/i.test(normalized)) return 'claude';
+    if (/^(?:Codex|OpenAI\s+Codex|Codex\s+CLI)(?:\b|[:\-—·|])/i.test(normalized)) return 'codex';
+    if (/^(?:Grok|Grok\s+(?:Build|Code))(?:\b|[:\-—·|])/i.test(normalized)) return 'grok';
+    if (/^(?:Antigravity|Google\s+Antigravity|AGY)(?:\b|[:\-—·|])/i.test(normalized)) return 'antigravity';
+  }
   return null;
+}
+
+function llmIdFromWorkspaceTmuxTitle(title: string) {
+  const match = title.match(/\bsvi_[A-Za-z0-9_-]*_(codex|claude|grok|agy|antigravity)(?:_\d+)?\b/i);
+  return normalizeTerminalLlmId(match?.[1]);
 }
 
 function llmIdFromTerminalOutputText(text: string | null | undefined) {
   if (!text) return null;
   const normalized = normalizeTerminalOutputForLlmWaitingDetection(text);
   if (/\bClaude\s+Code\b|\bWelcome\s+to\s+Claude\b|claude\.ai\/code/i.test(normalized)) return 'claude';
-  if (/\bOpenAI\s+Codex\b|\bCodex\s+CLI\b|\bWelcome\s+to\s+Codex\b/i.test(normalized)) return 'codex';
   if (/\bGrok\s+(?:Build|Code)\b|\bWelcome\s+to\s+Grok\b/i.test(normalized)) return 'grok';
   if (/\bGoogle\s+Antigravity\b|\bWelcome\s+to\s+Antigravity\b/i.test(normalized)) return 'antigravity';
   return null;
@@ -5547,7 +14048,9 @@ function markWorkspaceLlmTitleActivityForPane(
     status: 'working',
     source: 'title',
     activity,
-    expiresAt: Date.now() + durationMs
+    expiresAt: Date.now() + durationMs,
+    doneAlertEligible: true,
+    doneAlertOnExpire: true
   });
   workspaceLlmTitleActivityByPaneId.set(pane.paneId, {
     workspaceId: pane.workspaceId,
@@ -5555,6 +14058,7 @@ function markWorkspaceLlmTitleActivityForPane(
     expiresAt: Date.now() + durationMs
   });
   scheduleWorkspaceLlmTitleActivityExpiry(pane.paneId);
+  scheduleWorkspaceLlmTmuxTitlePoll(pane);
   if (workspaceLlmIndicatorState(pane.workspaceId) !== previousState) renderWorkspaceLlmActivityTab(pane.workspaceId);
 }
 
@@ -5663,6 +14167,8 @@ function cleanupWorkspaceLlmTitleDetectionForPane(pane: TerminalPane) {
   pane.llmTitleDisposable?.dispose();
   pane.llmTitleDisposable = undefined;
   pane.llmTitleOscBuffer = undefined;
+  pane.llmTitleStatusBuffer = undefined;
+  resetWorkspaceLlmTitleStatusTracker(pane);
   clearWorkspaceLlmTitleActivityForPane(pane);
 }
 
@@ -5670,7 +14176,7 @@ function updateWorkspaceLlmTitleFromTerminalData(pane: TerminalPane, data: strin
   if (!data && !pane.llmTitleOscBuffer) return;
   const combined = `${pane.llmTitleOscBuffer ?? ''}${data}`;
   pane.llmTitleOscBuffer = undefined;
-  const titlePattern = /(?:\x1b\]|\x9d)(?:0|2);([\s\S]*?)(?:\x07|\x1b\\|\x9c)/g;
+  const titlePattern = /(?:\x1b\]|\x9d)(?:0|1|2);([\s\S]*?)(?:\x07|\x1b\\|\x9c)/g;
   let match: RegExpExecArray | null;
   let lastCompleteIndex = 0;
   while ((match = titlePattern.exec(combined))) {
@@ -5690,9 +14196,94 @@ function updateWorkspaceLlmTitleFromTerminalData(pane: TerminalPane, data: strin
       pane.llmTitleOscBuffer = tail;
     }
   }
+  updateWorkspaceLlmTitleFromTmuxStatusData(pane, data);
 }
 
-function updateWorkspaceLlmTitleFromTerminalTitle(pane: TerminalPane, title: string) {
+function updateWorkspaceLlmTitleFromTmuxStatusData(pane: TerminalPane, data: string) {
+  const llmId = terminalPaneLlmId(pane);
+  if (!llmId || !llmUsesTitleOnlyStatus(llmId) || !data) return;
+  const normalized = normalizeTerminalOutputForLlmWaitingDetection(data);
+  if (!normalized.trim()) return;
+  pane.llmTitleStatusBuffer = trimLimitedTextBuffer(
+    `${pane.llmTitleStatusBuffer ?? ''}\n${normalized}`,
+    WORKSPACE_LLM_TITLE_STATUS_BUFFER_CHARS
+  );
+  const candidates = tmuxStatusTitleCandidates(pane.llmTitleStatusBuffer);
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const candidate = candidates[index];
+    const signal = classifyWorkspaceLlmTerminalTitle(llmId, candidate);
+    if (signal === 'unknown') continue;
+    if (llmId === 'codex' && signal === 'idle') {
+      appendDiagnosticLog(
+        'agent',
+        `ignored codex tmux idle title pane=${pane.paneId.slice(0, 6)} candidate=${sanitizeDiagnosticLogPart(candidate, 80)}`
+      );
+      continue;
+    }
+    if (!acceptWorkspaceLlmTmuxTitleSignal(pane, signal, candidate)) continue;
+    updateWorkspaceLlmTitleFromTerminalTitle(pane, candidate);
+    return;
+  }
+}
+
+function acceptWorkspaceLlmTmuxTitleSignal(
+  pane: TerminalPane,
+  signal: Exclude<WorkspaceLlmTitleSignal, 'unknown'>,
+  candidate: string
+) {
+  const normalized = normalizeWorkspaceLlmTerminalTitle(candidate) || candidate.trim();
+  const now = Date.now();
+  if (
+    pane.llmTitleStatusLastCandidate !== normalized
+    || pane.llmTitleStatusLastSignal !== signal
+    || !pane.llmTitleStatusLastChangedAt
+  ) {
+    pane.llmTitleStatusLastCandidate = normalized;
+    pane.llmTitleStatusLastSignal = signal;
+    pane.llmTitleStatusLastChangedAt = now;
+  }
+  if (signal !== 'working') {
+    return true;
+  }
+  // tmux can keep repainting the last quoted window title after Codex has already
+  // returned to the prompt. A changing spinner remains accepted, but one identical
+  // working title must stop extending the workspace dot so normal expiry can turn it
+  // back to idle even while the user stays in another workspace.
+  return now - pane.llmTitleStatusLastChangedAt <= WORKSPACE_LLM_TMUX_TITLE_STALE_REPEAT_MS;
+}
+
+function resetWorkspaceLlmTitleStatusTracker(pane: TerminalPane) {
+  pane.llmTitleStatusLastCandidate = undefined;
+  pane.llmTitleStatusLastSignal = undefined;
+  pane.llmTitleStatusLastChangedAt = undefined;
+}
+
+function tmuxStatusTitleCandidates(text: string) {
+  const candidates: string[] = [];
+  const lines = text.split('\n');
+  for (const line of lines.slice(-12)) {
+    const trimmed = line.trim();
+    // Inside tmux, app title OSC often does not reach the outer xterm. tmux paints it in
+    // the status line instead, e.g. `[svi_x:codex* ... "⠋ Thinking" 18:02 ...]`.
+    // Treat only status-line-shaped text as a title signal; this is not a generic output
+    // fallback, so Codex stays protected from scrollback/content false positives.
+    if (!/\[[^\n]{0,220}(?:\*|-)/.test(trimmed) || !/\b\d{1,2}:\d{2}\b/.test(trimmed)) continue;
+    const quotePattern = /"([^"\n]{1,180})"/g;
+    let match: RegExpExecArray | null;
+    while ((match = quotePattern.exec(trimmed))) {
+      const title = match[1].trim();
+      if (title) candidates.push(title);
+    }
+  }
+  return candidates;
+}
+
+function updateWorkspaceLlmTitleFromTerminalTitle(
+  pane: TerminalPane,
+  title: string,
+  options: { ignoreScrollSuppression?: boolean; trustedTmuxPoll?: boolean } = {}
+) {
+  if (!options.ignoreScrollSuppression && llmDetectionSuppressedAfterTerminalScroll(pane)) return;
   if ((pane.llmTitleDetectionSuppressUntil ?? 0) > performance.now()) return;
   pane.llmTitleDetectionSuppressUntil = undefined;
   const llmId = terminalPaneLlmId(pane)
@@ -5700,7 +14291,9 @@ function updateWorkspaceLlmTitleFromTerminalTitle(pane: TerminalPane, title: str
   if (!llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(llmId)) return;
   const signal = classifyWorkspaceLlmTerminalTitle(llmId, title);
   if (signal === 'unknown') return;
-  scheduleWorkspaceLlmTitleSignal(pane, signal, agentActivityForTitleSignal(signal));
+  scheduleWorkspaceLlmTitleSignal(pane, signal, agentActivityForTitleSignal(signal), {
+    trustedTmuxPoll: options.trustedTmuxPoll
+  });
 }
 
 function agentActivityForTitleSignal(signal: Exclude<WorkspaceLlmTitleSignal, 'unknown'>) {
@@ -5712,9 +14305,21 @@ function agentActivityForTitleSignal(signal: Exclude<WorkspaceLlmTitleSignal, 'u
 function scheduleWorkspaceLlmTitleSignal(
   pane: TerminalPane,
   signal: Exclude<WorkspaceLlmTitleSignal, 'unknown'>,
-  activity = ''
+  activity = '',
+  options: { trustedTmuxPoll?: boolean } = {}
 ) {
   if (!terminalPaneLlmId(pane) || !pane.workspaceId) return;
+  if (terminalPaneUsesHookLlmStatus(pane) && terminalPaneLlmId(pane) === 'grok' && signal === 'idle') return;
+  if (signal === 'idle' && !options.trustedTmuxPoll) {
+    const suppressUntil = workspaceLlmTitleDoneSuppressUntil(pane);
+    if (suppressUntil > Date.now()) {
+      appendDiagnosticLog(
+        'agent',
+        `suppressed title idle during scrollback pane=${pane.paneId.slice(0, 6)} until=${new Date(suppressUntil).toISOString()}`
+      );
+      return;
+    }
+  }
   if (signal === 'waiting') {
     clearWorkspaceLlmTitleSignalTimer(pane);
     markWorkspaceLlmWaitingForPane(pane, { source: 'title', activity: activity || 'Waiting for your response' });
@@ -5745,27 +14350,452 @@ function scheduleWorkspaceLlmTitleSignal(
   }, delay);
 }
 
+function terminalPaneShouldPollTmuxTitle(pane: TerminalPane | null | undefined) {
+  if (!pane || !isTerminalPaneAlive(pane) || !pane.backendId) return false;
+  if (!pane.llmTmuxSessionName || !terminalPaneUsesTitleOnlyLlmStatus(pane)) return false;
+  const profile = profileForIdWithWindowsFallback(pane.profileId);
+  return Boolean(profile && profile.kind !== 'windows');
+}
+
+function scheduleWorkspaceLlmTmuxTitlePoll(
+  pane: TerminalPane,
+  delayMs = WORKSPACE_LLM_TMUX_TITLE_POLL_MS
+) {
+  if (!terminalPaneShouldPollTmuxTitle(pane)) return;
+  if (pane.llmTmuxTitlePollTimer || pane.llmTmuxTitlePollPromise) return;
+  pane.llmTmuxTitlePollTimer = window.setTimeout(() => {
+    pane.llmTmuxTitlePollTimer = undefined;
+    void pollWorkspaceLlmTmuxTitle(pane);
+  }, delayMs);
+}
+
+async function pollWorkspaceLlmTmuxTitle(pane: TerminalPane) {
+  if (!terminalPaneShouldPollTmuxTitle(pane)) return;
+  const profile = profileForIdWithWindowsFallback(pane.profileId);
+  const sessionName = pane.llmTmuxSessionName;
+  if (!profile || !sessionName) return;
+  const poll = api.llmTmuxPaneTitle(profile.id, pane.cwd, sessionName)
+    .then((result) => {
+      if (!terminalPaneShouldPollTmuxTitle(pane) || pane.llmTmuxSessionName !== sessionName) return;
+      if (!result.available || result.paneDead) {
+        appendDiagnosticLog(
+          'agent',
+          `tmux title poll unavailable pane=${pane.paneId.slice(0, 6)} session=${sanitizeDiagnosticLogPart(sessionName, 64)} message=${sanitizeDiagnosticLogPart(result.message ?? 'unavailable', 80)}`
+        );
+        return;
+      }
+      const title = (result.paneTitle || result.windowName || '').trim();
+      if (!title) return;
+      if (pane.llmTmuxTitleLastValue !== title) {
+        pane.llmTmuxTitleLastValue = title;
+        appendDiagnosticLog(
+          'agent',
+          `tmux title poll pane=${pane.paneId.slice(0, 6)} title=${sanitizeDiagnosticLogPart(title, 80)}`
+        );
+      }
+      updateWorkspaceLlmTitleFromTerminalTitle(pane, title, {
+        ignoreScrollSuppression: true,
+        trustedTmuxPoll: true
+      });
+    })
+    .catch((error) => {
+      appendDiagnosticLog(
+        'agent',
+        `tmux title poll failed pane=${pane.paneId.slice(0, 6)} error=${sanitizeDiagnosticLogPart(String(error), 120)}`
+      );
+    })
+    .finally(() => {
+      if (pane.llmTmuxTitlePollPromise === poll) pane.llmTmuxTitlePollPromise = undefined;
+      if (!terminalPaneShouldPollTmuxTitle(pane)) return;
+      const progress = agentSessionProgressByPaneId.get(pane.paneId);
+      if (progress && effectiveAgentSessionStatus(progress) === 'working' && progress.source === 'title') {
+        scheduleWorkspaceLlmTmuxTitlePoll(pane, WORKSPACE_LLM_TMUX_TITLE_POLL_MS);
+      } else if ((pane.llmTitleDoneSuppressUntil ?? 0) > Date.now()) {
+        scheduleWorkspaceLlmTmuxTitlePoll(pane, WORKSPACE_LLM_TMUX_TITLE_POLL_RETRY_MS);
+      }
+    });
+  pane.llmTmuxTitlePollPromise = poll;
+  await poll;
+}
+
+function terminalPaneShouldProbeTmuxFreeze(pane: TerminalPane | null | undefined) {
+  if (!pane || !isTerminalPaneAlive(pane) || !pane.backendId || !pane.llmTmuxSessionName) return false;
+  if (terminalPaneVisibility(pane) !== 'visible') return false;
+  const profile = profileForIdWithWindowsFallback(pane.profileId);
+  return Boolean(profile && profile.kind !== 'windows');
+}
+
+function scheduleTerminalTmuxFreezeProbe(
+  pane: TerminalPane,
+  delayMs = TERMINAL_TMUX_FREEZE_PROBE_INTERVAL_MS
+) {
+  if (!terminalPaneShouldProbeTmuxFreeze(pane)) return;
+  if (pane.tmuxFreezeProbeTimer || pane.tmuxFreezeProbePromise) return;
+  pane.tmuxFreezeProbeTimer = window.setTimeout(() => {
+    pane.tmuxFreezeProbeTimer = undefined;
+    void pollTerminalTmuxFreezeProbe(pane, delayMs <= TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS ? 'visible' : 'periodic');
+  }, delayMs);
+}
+
+function clearTerminalTmuxFreezeProbe(pane: TerminalPane) {
+  if (pane.tmuxFreezeProbeTimer) window.clearTimeout(pane.tmuxFreezeProbeTimer);
+  pane.tmuxFreezeProbeTimer = undefined;
+  pane.tmuxFreezeProbePromise = undefined;
+}
+
+function syncTerminalTmuxFreezeProbes() {
+  for (const pane of state.terminals) {
+    if (terminalPaneShouldProbeTmuxFreeze(pane)) {
+      scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
+    } else {
+      clearTerminalTmuxFreezeProbe(pane);
+    }
+  }
+}
+
+function tmuxProbeSignature(result: LlmTmuxPaneProbeResult) {
+  return [
+    result.available ? '1' : '0',
+    result.paneDead ? 'dead' : 'alive',
+    result.paneInMode ? 'mode' : 'normal',
+    result.alternateOn ? 'alt' : 'main',
+    result.currentCommand ?? '',
+    result.panePid ?? '',
+    result.historySize ?? '',
+    result.sessionActivity ?? '',
+    result.titleChecksum ?? '',
+    result.titleBytes ?? '',
+    result.titleSeen ? 'title-seen' : 'title-missing',
+    result.titleParse ?? '',
+    result.windowChecksum ?? '',
+    result.windowBytes ?? '',
+    result.windowSeen ? 'window-seen' : 'window-missing',
+    result.windowParse ?? '',
+    result.captureChecksum ?? '',
+    result.captureBytes ?? '',
+    result.captureSeen ? 'capture-seen' : 'capture-missing',
+    result.captureParse ?? ''
+  ].join('|');
+}
+
+function diagnosticAgeMs(now: number, at: number | undefined) {
+  if (!at) return 'never';
+  return `${Math.max(0, Math.round(now - at))}ms`;
+}
+
+function tmuxProbeLogLine(
+  pane: TerminalPane,
+  result: LlmTmuxPaneProbeResult,
+  reason: string,
+  changed: boolean,
+  now: number
+) {
+  const dataAge = diagnosticAgeMs(now, pane.lastTerminalDataAt);
+  const refreshAge = diagnosticAgeMs(now, pane.lastTerminalRefreshAt);
+  const changeAge = diagnosticAgeMs(now, pane.tmuxFreezeProbeLastChangedAt);
+  const frameAge = diagnosticAgeMs(now, pane.writeFrameScheduledAt);
+  const timerAge = diagnosticAgeMs(now, pane.writeTimerScheduledAt);
+  const visibility = terminalPaneVisibility(pane);
+  const capture = result.captureChecksum
+    ? `${result.captureChecksum}/${result.captureBytes ?? 0}`
+    : 'none';
+  const title = result.titleChecksum
+    ? `${result.titleChecksum}/${result.titleBytes ?? 0}`
+    : 'none';
+  const windowName = result.windowChecksum
+    ? `${result.windowChecksum}/${result.windowBytes ?? 0}`
+    : 'none';
+  return [
+    `tmux probe reason=${reason}`,
+    `pane=${diagnosticPaneLabel(pane)}`,
+    `session=${sanitizeDiagnosticLogPart(result.sessionName, 48)}`,
+    `available=${result.available ? 'yes' : 'no'}`,
+    `changed=${changed ? 'yes' : 'no'}`,
+    `dead=${result.paneDead ? 'yes' : 'no'}`,
+    `mode=${result.paneInMode ? 'yes' : 'no'}`,
+    `alt=${result.alternateOn ? 'yes' : 'no'}`,
+    `active=${result.paneActive ? 'yes' : 'no'}`,
+    `vis=${visibility}`,
+    `cmd=${sanitizeDiagnosticLogPart(result.currentCommand ?? 'none', 32)}`,
+    `pid=${result.panePid ?? 'none'}`,
+    `hist=${result.historySize ?? 'none'}`,
+    `activity=${result.sessionActivity ?? 'none'}`,
+    `cap=${capture}`,
+    `capSeen=${result.captureSeen ? 'yes' : 'no'}`,
+    `capParse=${sanitizeDiagnosticLogPart(result.captureParse ?? 'none', 18)}`,
+    `title=${title}`,
+    `titleSeen=${result.titleSeen ? 'yes' : 'no'}`,
+    `titleParse=${sanitizeDiagnosticLogPart(result.titleParse ?? 'none', 18)}`,
+    `window=${windowName}`,
+    `windowSeen=${result.windowSeen ? 'yes' : 'no'}`,
+    `windowParse=${sanitizeDiagnosticLogPart(result.windowParse ?? 'none', 18)}`,
+    `probeLines=${result.probeStdoutLines ?? 'none'}`,
+    `probeBytes=${result.probeStdoutBytes ?? 'none'}`,
+    `dataAge=${dataAge}`,
+    `refreshAge=${refreshAge}`,
+    `changeAge=${changeAge}`,
+    `pending=${pane.writeBuffer.length}`,
+    `writes=${pane.pendingTerminalWrites ?? 0}`,
+    `frame=${pane.writeFrame ? 'yes' : 'no'}`,
+    `frameAge=${frameAge}`,
+    `timer=${pane.writeTimer ? 'yes' : 'no'}`,
+    `timerAge=${timerAge}`,
+    `chars=${pane.backendOutputChars}`,
+    `webglLost=${pane.webglContextLost ? 'yes' : 'no'}`
+  ].join(' ');
+}
+
+async function pollTerminalTmuxFreezeProbe(pane: TerminalPane, reason = 'periodic') {
+  if (!terminalPaneShouldProbeTmuxFreeze(pane)) return;
+  const profile = profileForIdWithWindowsFallback(pane.profileId);
+  const sessionName = pane.llmTmuxSessionName;
+  if (!profile || !sessionName) return;
+  const poll = api.llmTmuxPaneProbe(profile.id, pane.cwd, sessionName)
+    .then((result) => {
+      if (!terminalPaneShouldProbeTmuxFreeze(pane) || pane.llmTmuxSessionName !== sessionName) return;
+      const now = performance.now();
+      if (!result.available) {
+        appendDiagnosticLog(
+          'terminal',
+          `tmux probe unavailable pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} message=${sanitizeDiagnosticLogPart(result.message ?? 'unavailable', 80)}`,
+          'warn'
+        );
+        return;
+      }
+      const signature = tmuxProbeSignature(result);
+      const changed = pane.tmuxFreezeProbeLastSignature !== signature;
+      if (changed) {
+        pane.tmuxFreezeProbeLastSignature = signature;
+        pane.tmuxFreezeProbeLastChangedAt = now;
+      }
+      const dataAge = pane.lastTerminalDataAt ? now - pane.lastTerminalDataAt : Number.POSITIVE_INFINITY;
+      const staleData = dataAge > TERMINAL_TMUX_FREEZE_STALE_DATA_MS;
+      const hasPending = pane.writeBuffer.length > 0 || (pane.pendingTerminalWrites ?? 0) > 0;
+      const suspiciousStaleData = staleData && changed;
+      if (suspiciousStaleData) pane.tmuxStaleDeliveryCount = (pane.tmuxStaleDeliveryCount ?? 0) + 1;
+      else if (!staleData) pane.tmuxStaleDeliveryCount = 0;
+      const shouldLog = changed
+        || hasPending
+        || now - (pane.tmuxFreezeProbeLastLoggedAt ?? 0) > TERMINAL_TMUX_FREEZE_PROBE_MIN_LOG_MS;
+      if (shouldLog) {
+        pane.tmuxFreezeProbeLastLoggedAt = now;
+        appendDiagnosticLog(
+          'terminal',
+          tmuxProbeLogLine(pane, result, reason, changed, now),
+          suspiciousStaleData || hasPending ? 'warn' : 'info'
+        );
+        if (suspiciousStaleData) {
+          appendDiagnosticLog(
+            'terminal',
+            [
+              `tmux stale-delivery pane=${diagnosticPaneLabel(pane)}`,
+              `reason=${reason}`,
+              `dataAge=${diagnosticAgeMs(now, pane.lastTerminalDataAt)}`,
+              `refreshAge=${diagnosticAgeMs(now, pane.lastTerminalRefreshAt)}`,
+              `cap=${result.captureChecksum ? `${result.captureChecksum}/${result.captureBytes ?? 0}` : 'none'}`,
+              `capSeen=${result.captureSeen ? 'yes' : 'no'}`,
+              `capParse=${sanitizeDiagnosticLogPart(result.captureParse ?? 'none', 18)}`,
+              `hist=${result.historySize ?? 'none'}`,
+              `activity=${result.sessionActivity ?? 'none'}`,
+              `vis=${terminalPaneVisibility(pane)}`,
+              `pending=${pane.writeBuffer.length}`,
+              `writes=${pane.pendingTerminalWrites ?? 0}`,
+              `chars=${pane.backendOutputChars}`,
+              `webglLost=${pane.webglContextLost ? 'yes' : 'no'}`
+            ].join(' '),
+            'warn'
+          );
+          maybeRecoverTerminalTmuxStaleDelivery(pane, result, reason, now, dataAge);
+        }
+      }
+    })
+    .catch((error) => {
+      appendDiagnosticLog(
+        'terminal',
+        `tmux probe failed pane=${diagnosticPaneLabel(pane)} error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
+        'warn'
+      );
+    })
+    .finally(() => {
+      if (pane.tmuxFreezeProbePromise === poll) pane.tmuxFreezeProbePromise = undefined;
+      if (terminalPaneShouldProbeTmuxFreeze(pane)) {
+        scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_INTERVAL_MS);
+      }
+    });
+  pane.tmuxFreezeProbePromise = poll;
+  await poll;
+}
+
+function maybeRecoverTerminalTmuxStaleDelivery(
+  pane: TerminalPane,
+  result: LlmTmuxPaneProbeResult,
+  reason: string,
+  now: number,
+  dataAge: number
+) {
+  if (!terminalPaneShouldProbeTmuxFreeze(pane)) return;
+  if (!result.available || result.paneDead) return;
+  if ((pane.tmuxStaleDeliveryCount ?? 0) < TERMINAL_TMUX_STALE_RECOVERY_COUNT) return;
+  if (dataAge < TERMINAL_TMUX_STALE_RECOVERY_MIN_AGE_MS) return;
+  if (pane.tmuxStaleRecoveryPromise) return;
+  if (now - (pane.tmuxStaleRecoveryLastAt ?? 0) < TERMINAL_TMUX_STALE_RECOVERY_COOLDOWN_MS) return;
+  const sessionName = safeLlmTmuxSessionName(pane.llmTmuxSessionName);
+  if (!sessionName) return;
+  pane.tmuxStaleRecoveryLastAt = now;
+  const recovery = recoverTerminalTmuxStaleDelivery(pane, sessionName, reason, dataAge)
+    .catch((error) => {
+      appendDiagnosticLog(
+        'terminal',
+        `tmux stale-reconnect failed pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} error=${sanitizeDiagnosticLogPart(String(error), 160)}`,
+        'warn',
+        { force: true }
+      );
+      setStatus(`tmux reconnect failed: ${String(error)}`, true);
+    })
+    .finally(() => {
+      if (pane.tmuxStaleRecoveryPromise === recovery) pane.tmuxStaleRecoveryPromise = undefined;
+    });
+  pane.tmuxStaleRecoveryPromise = recovery;
+}
+
+function llmTmuxAttachCommand(sessionName: string) {
+  const safeName = safeLlmTmuxSessionName(sessionName);
+  if (!safeName) return null;
+  const target = `${safeName}:`;
+  return [
+    `if command -v tmux >/dev/null 2>&1; then`,
+    `  if tmux has-session -t ${bashQuote(target)} 2>/dev/null; then`,
+    `    tmux attach-session -t ${bashQuote(safeName)};`,
+    `  else`,
+    `    printf '\\n[simple-vibe-ide] tmux session not found: %s\\n' ${bashQuote(safeName)};`,
+    `  fi`,
+    `else`,
+    `  printf '\\n[simple-vibe-ide] tmux is not installed; cannot reconnect session %s\\n' ${bashQuote(safeName)};`,
+    `fi`
+  ].join('\n');
+}
+
+async function recoverTerminalTmuxStaleDelivery(
+  pane: TerminalPane,
+  sessionName: string,
+  reason: string,
+  dataAge: number
+) {
+  if (!isTerminalPaneAlive(pane) || !pane.backendId) return;
+  const profile = profileForIdWithWindowsFallback(pane.profileId);
+  const command = llmTmuxAttachCommand(sessionName);
+  if (!profile || profile.kind === 'windows' || !command) return;
+  const oldBackendId = pane.backendId;
+  appendDiagnosticLog(
+    'terminal',
+    `tmux stale-reconnect start pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} oldBackend=${oldBackendId.slice(0, 8)} reason=${sanitizeDiagnosticLogPart(reason, 24)} dataAge=${Math.round(dataAge)}ms`,
+    'warn',
+    { force: true }
+  );
+  pane.term.write('\r\n\x1b[33m[simple-vibe-ide] tmux output delivery looks stale; reconnecting this terminal client to the same tmux session...\x1b[0m\r\n');
+  setTerminalBackendId(pane, undefined);
+  dropPendingTerminalBackendEvents(oldBackendId);
+  void api.killTerminal(oldBackendId).catch((error) => {
+    appendDiagnosticLog(
+      'terminal',
+      `tmux stale-reconnect old-backend kill failed pane=${diagnosticPaneLabel(pane)} oldBackend=${oldBackendId.slice(0, 8)} error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
+      'warn'
+    );
+  });
+  const spawnPromise = api.spawnTerminal(
+    profile.id,
+    pane.cwd,
+    command,
+    pane.term.rows,
+    pane.term.cols,
+    pane.workspaceId,
+    `${pane.title} reconnect`
+  );
+  const backendId = await withTimeout(
+    spawnPromise,
+    terminalStartTimeoutMs(profile),
+    `${profile.kind.toUpperCase()} tmux reconnect`
+  );
+  if (!isTerminalPaneAlive(pane)) {
+    void api.killTerminal(backendId).catch(() => undefined);
+    return;
+  }
+  setTerminalBackendId(pane, backendId);
+  pane.tmuxStaleDeliveryCount = 0;
+  const now = performance.now();
+  pane.lastTerminalDataAt = now;
+  pane.lastTerminalRefreshAt = now;
+  scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
+  const widget = terminalWidgetForPane(pane);
+  if (widget) {
+    renderTerminalWidgetTabs(widget);
+    renderTerminalWidgetSplitLayout(widget);
+  }
+  setStatus(`Reconnected tmux session: ${sessionName}`);
+  appendDiagnosticLog(
+    'terminal',
+    `tmux stale-reconnect ok pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} newBackend=${backendId.slice(0, 8)}`,
+    'info',
+    { force: true }
+  );
+}
+
 function classifyWorkspaceLlmTerminalTitle(llmId: string, title: string): WorkspaceLlmTitleSignal {
-  const normalized = normalizeWorkspaceLlmTerminalTitle(title);
-  if (!normalized) return 'unknown';
-  if (llmId === 'codex') return classifyCodexTerminalTitle(normalized);
-  if (llmId === 'claude') return classifyClaudeTerminalTitle(normalized);
-  if (llmId === 'grok') return classifyGrokTerminalTitle(normalized);
+  const candidates = workspaceLlmTerminalTitleCandidates(title);
+  if (!candidates.length) return 'unknown';
+  for (const normalized of candidates) {
+    const signal = llmId === 'codex'
+      ? classifyCodexTerminalTitle(normalized)
+      : llmId === 'claude'
+        ? classifyClaudeTerminalTitle(normalized)
+        : llmId === 'grok'
+          ? classifyGrokTerminalTitle(normalized)
+          : 'unknown';
+    if (signal !== 'unknown') return signal;
+  }
   return 'unknown';
 }
 
 function normalizeWorkspaceLlmTerminalTitle(title: string) {
-  return title.replace(/\s+/g, ' ').trim();
+  return workspaceLlmTerminalTitleCandidates(title)[0] ?? '';
+}
+
+function workspaceLlmTerminalTitleCandidates(title: string) {
+  const normalized = title.replace(/\s+/g, ' ').trim();
+  if (!normalized) return [];
+  const candidates = [normalized];
+  const stripped = stripWorkspaceLlmTmuxTitlePrefix(normalized);
+  if (stripped && stripped !== normalized) candidates.push(stripped);
+  return candidates;
+}
+
+function stripWorkspaceLlmTmuxTitlePrefix(title: string) {
+  let value = title.trim();
+  for (let index = 0; index < 3; index += 1) {
+    const before = value;
+    value = value
+      .replace(/^\s*\[(?:tmux\s*[:|/\\-]\s*)?svi_[A-Za-z0-9_-]{1,64}[^\]]{0,96}\]\s*[:|—–-]?\s*/i, '')
+      .replace(/^\s*(?:tmux\s*[:|/\\-]\s*)?svi_[A-Za-z0-9_-]{1,64}(?:\s*[:|]\s*(?:\d+|[A-Za-z0-9_.-]{1,64})){0,2}\s*[:|—–-]\s*/i, '')
+      .replace(/^\s*tmux\s*[:|/\\-]\s*/i, '')
+      .trim();
+    if (value === before) break;
+  }
+  return value || title.trim();
 }
 
 function workspaceLlmTitleHasBrailleSpinner(title: string) {
   return /[\u2800-\u28ff]/u.test(title);
 }
 
+function workspaceLlmTitleHasSpinner(title: string) {
+  return workspaceLlmTitleHasBrailleSpinner(title) || /[◐◓◑◒⟳↻⏳⧖⧗✦✧✶✷✸✹✺✻✼✽✾]/u.test(title);
+}
+
 function classifyCodexTerminalTitle(title: string): WorkspaceLlmTitleSignal {
   if (/\[\s*[!.]\s*\]\s*Action Required/i.test(title)) return 'waiting';
+  if (/\b(?:Action Required|Needs Input|Approval Required)\b/i.test(title)) return 'waiting';
   if (/\bReady\b/i.test(title)) return 'idle';
-  if (workspaceLlmTitleHasBrailleSpinner(title)) return 'working';
+  if (workspaceLlmTitleHasSpinner(title)) return 'working';
   if (/\b(?:Starting|Working|Thinking|Waiting)\b/i.test(title)) return 'working';
   return 'unknown';
 }
@@ -5786,6 +14816,7 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
   const llmId = terminalPaneLlmId(pane)
     ?? setDetectedTerminalLlmId(pane, llmIdFromTerminalOutputText(normalized));
   if (!llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(llmId)) return false;
+  if (llmUsesTitleOnlyStatus(llmId)) return updateCodexWorkspaceLlmWaitingFromOutput(pane, normalized);
   const meaningful = normalized.trim();
   if (!meaningful) return workspaceLlmWaitingByPaneId.has(pane.paneId);
   if (llmWaitingDetectionSuppressedAfterInput(pane)) {
@@ -5805,26 +14836,67 @@ function updateWorkspaceLlmWaitingFromOutput(pane: TerminalPane, data: string) {
   }
   pane.llmWaitingDetectionBuffer = trimLlmWaitingDetectionBuffer(`${pane.llmWaitingDetectionBuffer ?? ''}\n${meaningful}`);
   const wasWaiting = workspaceLlmWaitingByPaneId.has(pane.paneId);
-  const looksWaiting = llmOutputLooksLikeUserPrompt(llmId, wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer);
-  if (looksWaiting) {
-    markWorkspaceLlmWaitingForPane(pane, {
-      source: 'output',
-      activity: agentActivityFromTerminalText(wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer, 'Waiting for your response')
-    });
-    return true;
-  }
-  if (llmOutputLooksLikeActiveWork(llmId, meaningful)) {
+  if (llmOutputLooksLikeActiveWork(llmId, meaningful, { normalized: true })) {
+    pane.llmWaitingDetectionBuffer = '';
     clearWorkspaceLlmWaitingForPane(pane);
     return false;
   }
   if (llmOutputLooksClearlyNotWaiting(meaningful)) {
+    pane.llmWaitingDetectionBuffer = '';
     clearWorkspaceLlmWaitingForPane(pane);
     return false;
+  }
+  const waitingCandidate = wasWaiting ? meaningful : pane.llmWaitingDetectionBuffer;
+  const looksWaiting = llmOutputLooksLikeUserPrompt(llmId, waitingCandidate);
+  if (looksWaiting) {
+    markWorkspaceLlmWaitingForPane(pane, {
+      source: 'output',
+      activity: agentActivityFromTerminalText(waitingCandidate, 'Waiting for your response')
+    });
+    return true;
   }
   // TUI apps frequently repaint the prompt/status area in several chunks. A later chunk can be
   // plain text with no prompt keywords even though the screen is still waiting for the user.
   // Keep the red state until explicit user input, terminal clear/close, or a clearly-not-waiting
   // status line arrives; otherwise the workspace dot flickers red/green during one repaint.
+  if (wasWaiting) return true;
+  return false;
+}
+
+function updateCodexWorkspaceLlmWaitingFromOutput(pane: TerminalPane, normalizedData: string) {
+  const meaningful = normalizedData.trim();
+  if (!meaningful) return workspaceLlmWaitingByPaneId.has(pane.paneId);
+  if (llmWaitingDetectionSuppressedAfterInput(pane)) {
+    if (llmOutputLooksLikeStructuredChoiceMenu(meaningful) || codexOutputLooksLikeWaitingPrompt(meaningful)) {
+      markWorkspaceLlmWaitingForPane(pane, {
+        source: 'output',
+        activity: codexWaitingActivityFromOutput(meaningful)
+      });
+      return true;
+    }
+    pane.llmWaitingDetectionBuffer = '';
+    return false;
+  }
+  pane.llmWaitingDetectionBuffer = trimLlmWaitingDetectionBuffer(`${pane.llmWaitingDetectionBuffer ?? ''}\n${meaningful}`);
+  const wasWaiting = workspaceLlmWaitingByPaneId.has(pane.paneId);
+  if (llmOutputLooksLikeActiveWork('codex', meaningful, { normalized: true })) {
+    pane.llmWaitingDetectionBuffer = '';
+    clearWorkspaceLlmWaitingForPane(pane);
+    return false;
+  }
+  if (llmOutputLooksClearlyNotWaiting(meaningful) && !codexOutputLooksLikeWaitingPrompt(pane.llmWaitingDetectionBuffer)) {
+    pane.llmWaitingDetectionBuffer = '';
+    clearWorkspaceLlmWaitingForPane(pane);
+    return false;
+  }
+  const candidate = wasWaiting ? pane.llmWaitingDetectionBuffer : pane.llmWaitingDetectionBuffer;
+  if (codexOutputLooksLikeWaitingPrompt(candidate)) {
+    markWorkspaceLlmWaitingForPane(pane, {
+      source: 'output',
+      activity: codexWaitingActivityFromOutput(candidate)
+    });
+    return true;
+  }
   if (wasWaiting) return true;
   return false;
 }
@@ -5835,6 +14907,41 @@ function llmWaitingDetectionSuppressedAfterInput(pane: TerminalPane) {
   if (performance.now() < suppressUntil) return true;
   pane.llmWaitingSuppressUntil = undefined;
   return false;
+}
+
+function llmDetectionSuppressedAfterTerminalScroll(pane: TerminalPane) {
+  const suppressUntil = pane.llmScrollDetectionSuppressUntil ?? 0;
+  if (!suppressUntil) return false;
+  if (performance.now() < suppressUntil) return true;
+  pane.llmScrollDetectionSuppressUntil = undefined;
+  return false;
+}
+
+function terminalPaneIsViewingScrollback(pane: TerminalPane | null | undefined) {
+  if (!pane) return false;
+  const buffer = pane.term.buffer.active;
+  if (buffer.viewportY < buffer.baseY) return true;
+  const widget = terminalWidgetForPane(pane);
+  return Boolean(
+    widget?.historyOverlayPaneId === pane.paneId
+    && !widget.historyOverlay.classList.contains('hidden')
+  );
+}
+
+function workspaceLlmTitleDoneSuppressUntil(pane: TerminalPane | null | undefined) {
+  if (!pane || !terminalPaneUsesTitleOnlyLlmStatus(pane)) return 0;
+  if (terminalPaneIsViewingScrollback(pane)) {
+    const until = Date.now() + WORKSPACE_LLM_SCROLLBACK_DONE_RECHECK_MS;
+    pane.llmTitleDoneSuppressUntil = Math.max(pane.llmTitleDoneSuppressUntil ?? 0, until);
+    return pane.llmTitleDoneSuppressUntil;
+  }
+  const suppressUntil = pane.llmTitleDoneSuppressUntil ?? 0;
+  if (!suppressUntil) return 0;
+  if (suppressUntil <= Date.now()) {
+    pane.llmTitleDoneSuppressUntil = undefined;
+    return 0;
+  }
+  return suppressUntil;
 }
 
 function clearTerminalPaneScreen(pane: TerminalPane | null | undefined) {
@@ -5851,11 +14958,17 @@ function markWorkspaceLlmWaitingForPane(
 ) {
   const llmId = terminalPaneLlmId(pane);
   if (!llmId || !pane.workspaceId) return;
+  const source = options.source ?? 'heuristic';
+  if (source !== 'hook') {
+    if (terminalPaneIsViewingScrollback(pane)) return;
+    const suppressUntil = pane.llmScrollDetectionSuppressUntil ?? 0;
+    if (suppressUntil && performance.now() < suppressUntil) return;
+  }
   const previousState = workspaceLlmIndicatorState(pane.workspaceId);
   updateAgentSessionProgressForPane(pane, {
     agentId: llmId,
     status: 'waiting',
-    source: options.source ?? 'heuristic',
+    source,
     activity: options.activity ?? 'Waiting for your response'
   });
   workspaceLlmWaitingByPaneId.set(pane.paneId, {
@@ -5888,9 +15001,9 @@ function normalizeTerminalOutputForLlmWaitingDetection(data: string) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
-function llmOutputLooksLikeActiveWork(llmId: string, data: string) {
+function llmOutputLooksLikeActiveWork(llmId: string, data: string, options: { normalized?: boolean } = {}) {
   if (!workspaceLlmSupportsWaitingDetection(llmId)) return false;
-  const text = normalizeTerminalOutputForLlmWaitingDetection(data).trim();
+  const text = (options.normalized ? data : normalizeTerminalOutputForLlmWaitingDetection(data)).trim();
   if (!text) return false;
   if (llmOutputHasIncompleteAgentProgress(text)) return true;
   const activeProgressPatterns = [
@@ -5948,6 +15061,37 @@ function llmOutputHasIncompleteAgentProgress(text: string) {
   return false;
 }
 
+function codexOutputLooksLikeWaitingPrompt(text: string) {
+  if (!text.trim()) return false;
+  if (llmOutputLooksLikeStructuredChoiceMenu(text)) return true;
+  const codexPromptPatterns = [
+    /\b(?:Action Required|Needs Input|Approval Required)\b/i,
+    /\bImplement this plan\?/i,
+    /\b(?:implement|apply|approve|confirm|continue|proceed) (?:this )?plan\?/i,
+    /\b(?:say|type|enter)\s+["“']?(?:implement it|implement|apply|approve|continue|proceed)["”']?\s+(?:if|to)\b/i,
+    /\bNo files have been edited yet\b[\s\S]{0,420}\b(?:implement|apply|approve|continue|proceed)\b/i,
+    /\bUpdated Plan\b[\s\S]{0,900}\b(?:implement|apply|approve|continue|proceed|choose|select)\b/i,
+    /\bPlan:\b[\s\S]{0,900}\b(?:implement|apply|approve|continue|proceed|choose|select)\b/i,
+    /\bdo you trust the contents of this (?:directory|project)\b/i,
+    /\bpress enter to (?:continue|confirm)\b/i,
+    /(?:^|\n)\s*[›>❯▶▸]\s*\d+[.)]\s+.{1,120}\n\s*\d+[.)]\s+.{1,120}/i
+  ];
+  return codexPromptPatterns.some((pattern) => pattern.test(text));
+}
+
+function codexWaitingActivityFromOutput(text: string) {
+  if (/\bImplement this plan\?/i.test(text) || /\bUpdated Plan\b/i.test(text) || /\bPlan:\b/i.test(text)) {
+    return 'Plan awaiting your choice';
+  }
+  if (/\b(?:Action Required|Needs Input|Approval Required)\b/i.test(text)) {
+    return 'Action required';
+  }
+  if (/\bdo you trust the contents of this (?:directory|project)\b/i.test(text)) {
+    return 'Trust prompt';
+  }
+  return 'Waiting for your response';
+}
+
 function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
   if (!text.trim()) return false;
   if (llmOutputLooksLikeStructuredChoiceMenu(text)) return true;
@@ -5983,7 +15127,8 @@ function llmOutputLooksLikeUserPrompt(llmId: string, text: string) {
   ];
   if (genericPromptPatterns.some((pattern) => pattern.test(text))) return true;
   if (llmId === 'codex') {
-    return /\bplan mode\b[\s\S]{0,360}\b(?:approve|confirm|continue|permission|proceed)\b/i.test(text);
+    return codexOutputLooksLikeWaitingPrompt(text)
+      || /\bplan mode\b[\s\S]{0,360}\b(?:approve|confirm|continue|permission|proceed)\b/i.test(text);
   }
   if (llmId === 'claude') {
     return /\b(?:allow|approve|confirm) .*\?/i.test(text)
@@ -6028,8 +15173,14 @@ function llmOutputLooksClearlyNotWaiting(text: string) {
   // dead entries — \b after ":" never matches the real "Tip: ..." spacing — so dropping
   // them changes nothing.
   return /\b(?:turn completed|worked for|model changed to|total cost|total duration|current session|current week|resets|nothing over|resume session|connecting mcps|user prompt submit|thought for|stop\s+\[hooks)\b/i.test(text)
+    || /\bmodel interrupted to submit steer instructions\b/i.test(text)
     || /\brequest_user_input\b[\s\S]{0,220}\b(?:unavailable|failed|error|not available)\b/i.test(text)
     || /\bunavailable in default mode\b/i.test(text)
+    || /(?:작업|턴).{0,20}(?:완료|종료)/.test(text);
+}
+
+function llmOutputLooksLikeTurnFinished(text: string) {
+  return /\b(?:turn completed|worked for|total cost|total duration|thought for)\b/i.test(text)
     || /(?:작업|턴).{0,20}(?:완료|종료)/.test(text);
 }
 
@@ -6064,7 +15215,8 @@ function workspaceTabsSignature() {
     const workspace = state.workspaceSnapshots[index];
     if (index) signature += '\n';
     const detailOpen = workspaceDockDetailIsOpen(workspace.id);
-    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceCaptureProtectionSessionEnabled(workspace.id) ? '1' : '0'}\t${workspaceCaptureProtectionAppliedForWorkspace(workspace.id) ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}\t${workspace.keepLive ? '1' : '0'}\t${workspaceMemorySleepingIds.has(workspace.id) ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailOpen ? workspaceAgentProgressSignature(workspace.id) : ''}`;
+    const detailSignature = detailOpen ? `${workspaceAgentProgressSignature(workspace.id)}\t${workspaceDetailContentSignature(workspace)}` : '';
+    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceCaptureProtectionSessionEnabled(workspace.id) ? '1' : '0'}\t${workspaceCaptureProtectionAppliedForWorkspace(workspace.id) ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}\t${workspace.keepLive ? '1' : '0'}\t${workspaceMemorySleepingIds.has(workspace.id) ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
   }
   return signature;
 }
@@ -6093,7 +15245,12 @@ function startWorkspaceTabRename(id: string) {
 }
 
 function finishWorkspaceTabRename(tab: HTMLElement, commit: boolean) {
-  if (!tab.classList.contains('renaming')) return;
+  if (!tab.classList.contains('renaming')) {
+    window.setTimeout(() => {
+      suppressWorkspaceTabClick = false;
+    }, 0);
+    return;
+  }
   const id = workspaceIdForTabElement(tab);
   const snapshot = workspaceSnapshotForId(id);
   const parts = workspaceTabParts(tab);
@@ -6639,6 +15796,8 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
     terminals: cloneTerminalSnapshots(source.terminals),
     terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
+    editorPanes: cloneEditorPaneSnapshots(source.editorPanes),
+    editorSplitLayout: cloneEditorSplitSnapshot(source.editorSplitLayout),
     imageTabs: cloneImageTabSnapshots(source.imageTabs),
     noteTabs: cloneNoteTabSnapshots(source.noteTabs),
     browserTabs: cloneBrowserTabSnapshots(source.browserTabs),
@@ -6700,6 +15859,21 @@ function cloneEditorTabSnapshots(tabs: EditorTabSnapshot[]) {
   const cloned: EditorTabSnapshot[] = [];
   for (const tab of tabs) cloned.push({ ...tab });
   return cloned;
+}
+
+function cloneEditorPaneSnapshots(panes?: EditorPaneSnapshot[]) {
+  if (!panes?.length) return undefined;
+  return panes.map((pane) => ({ ...pane, tabIds: [...pane.tabIds] }));
+}
+
+function cloneEditorSplitSnapshot(node?: WorkspaceEditorSplitSnapshot): WorkspaceEditorSplitSnapshot | undefined {
+  if (!node) return undefined;
+  if (node.kind === 'pane') return { ...node };
+  return {
+    ...node,
+    first: cloneEditorSplitSnapshot(node.first)!,
+    second: cloneEditorSplitSnapshot(node.second)!
+  };
 }
 
 function cloneImageTabSnapshots(tabs: ImageTabSnapshot[]) {
@@ -6797,7 +15971,10 @@ async function closeWorkspaceTab(id: string) {
 }
 
 async function activateWorkspaceTab(id: string) {
-  if (id === state.activeWorkspaceId && state.workspaceOpen) return;
+  if (id === state.activeWorkspaceId && state.workspaceOpen) {
+    acknowledgeWorkspaceDoneUnread(id);
+    return;
+  }
   const snapshot = workspaceSnapshotForId(id);
   if (!snapshot) return;
   const nextCaptureProtected = Boolean(snapshot.captureProtected);
@@ -6808,6 +15985,7 @@ async function activateWorkspaceTab(id: string) {
   saveActiveWorkspaceRuntimeCache();
   state.activeWorkspaceId = id;
   markWorkspaceActive(id);
+  acknowledgeWorkspaceDoneUnread(id);
   state.workspaceCaptureProtected = nextCaptureProtected;
   const nextCaptureShouldApply = workspaceCaptureProtectionShouldApply(id, nextCaptureProtected);
   renderWorkspaceTabActivation(previousActiveId, snapshot);
@@ -6843,6 +16021,9 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     activeTerminalIndex: 0,
     editorTabs: [],
     activeEditorTabId: '',
+    editorPanes: [],
+    activeEditorPaneId: '',
+    editorSplitLayout: undefined,
     editorOpenInNewTab: false,
     editorWordWrap: false,
     imageTabs: [],
@@ -6864,6 +16045,7 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     calculatorExpression: '',
     calculatorHistory: [],
     explorerOpenMode: 'single',
+    explorerAutoOpenEditor: false,
     showFileSizes: DEFAULT_SHOW_FILE_SIZES,
     editorFontSize: 13,
     terminalFontSize: 13,
@@ -6914,10 +16096,14 @@ function writeActiveWorkspaceSnapshot(persistMode: WorkspaceSnapshotPersistMode)
   }
 
   syncActiveImageTabFromState();
+  syncAllEditorPanesFromViews();
   const index = workspaceSnapshotIndexById(state.activeWorkspaceId);
   const snapshot = createCurrentWorkspaceSnapshot(state.activeWorkspaceId, state.workspaceSnapshots[index]?.updatedAt);
+  const savedEntryIndex = savedWorkspaceAutoUpdateEntryIndex(snapshot);
+  if (savedEntryIndex >= 0) linkSnapshotToSavedWorkspace(snapshot, state.savedWorkspaces[savedEntryIndex].id);
   const signature = workspaceSnapshotSignature(snapshot);
   if (workspaceSnapshotSignatures.get(snapshot.id) === signature) {
+    autoUpdateSavedWorkspaceFromSnapshot(snapshot);
     if (persistMode === 'flush' && workspacePersistTimer) flushWorkspaceStorePersist();
     return;
   }
@@ -6925,6 +16111,7 @@ function writeActiveWorkspaceSnapshot(persistMode: WorkspaceSnapshotPersistMode)
   workspaceSnapshotSignatures.set(snapshot.id, signature);
   if (index >= 0) replaceWorkspaceSnapshot(index, snapshot);
   else insertWorkspaceSnapshot(0, snapshot);
+  autoUpdateSavedWorkspaceFromSnapshot(snapshot);
   commitWorkspaceStorePersist(persistMode);
 }
 
@@ -6945,6 +16132,7 @@ function createCurrentWorkspaceSnapshot(
     id,
     label: workspaceLabel(profile, state.workspaceRoot || state.currentDir || profile.root),
     customLabel: previousSnapshot?.customLabel,
+    savedWorkspaceId: previousSnapshot?.savedWorkspaceId,
     profileId: profile.id,
     root: state.workspaceRoot,
     currentDir: state.currentDir || state.workspaceRoot,
@@ -6960,6 +16148,9 @@ function createCurrentWorkspaceSnapshot(
     activeTerminalIndex: terminalSnapshotState.activeTerminalIndex,
     editorTabs,
     activeEditorTabId: state.activeEditorTabId,
+    editorPanes: currentEditorPaneSnapshots(),
+    activeEditorPaneId: state.activeEditorPaneId,
+    editorSplitLayout: currentEditorSplitSnapshot(),
     editorOpenInNewTab: state.editorOpenInNewTab,
     editorWordWrap: state.editorWordWrap,
     imageTabs: currentImageTabSnapshots(),
@@ -6982,6 +16173,7 @@ function createCurrentWorkspaceSnapshot(
     calculatorExpression: state.calculatorExpression,
     calculatorHistory: currentCalculatorHistorySnapshot(),
     explorerOpenMode: state.explorerOpenMode,
+    explorerAutoOpenEditor: state.explorerAutoOpenEditor,
     showFileSizes: state.showFileSizes,
     editorFontSize,
     terminalFontSize,
@@ -7003,6 +16195,43 @@ function currentEditorTabSnapshots() {
     });
   }
   return tabs;
+}
+
+function currentEditorPaneSnapshots() {
+  ensureEditorPaneState();
+  const openTabIds = new Set(currentEditorTabSnapshots().map((tab) => tab.id));
+  const panes: EditorPaneSnapshot[] = [];
+  for (const pane of state.editorPanes) {
+    const tabIds = pane.tabIds.filter((tabId) => openTabIds.has(tabId));
+    panes.push({
+      id: pane.id,
+      tabIds,
+      activeTabId: openTabIds.has(pane.activeTabId) ? pane.activeTabId : tabIds[0] ?? ''
+    });
+  }
+  return panes;
+}
+
+function currentEditorSplitSnapshot() {
+  if (!state.editorSplitLayout) return undefined;
+  return workspaceEditorSplitSnapshotForNode(state.editorSplitLayout) ?? undefined;
+}
+
+function workspaceEditorSplitSnapshotForNode(node: EditorSplitNode): WorkspaceEditorSplitSnapshot | null {
+  if (node.kind === 'pane') {
+    return editorPaneForId(node.paneId) ? { kind: 'pane', paneId: node.paneId } : null;
+  }
+  const first = workspaceEditorSplitSnapshotForNode(node.first);
+  const second = workspaceEditorSplitSnapshotForNode(node.second);
+  if (!first) return second;
+  if (!second) return first;
+  return {
+    kind: 'split',
+    direction: node.direction,
+    ratio: clampEditorSplitRatio(node.ratio),
+    first,
+    second
+  };
 }
 
 function currentImageTabSnapshots() {
@@ -7075,6 +16304,7 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   let signature = workspaceSignaturePart(snapshot.id);
   signature += `|${workspaceSignaturePart(snapshot.label)}`;
   signature += `|${workspaceSignaturePart(snapshot.customLabel)}`;
+  signature += `|${workspaceSignaturePart(snapshot.savedWorkspaceId)}`;
   signature += `|${workspaceSignaturePart(snapshot.profileId)}`;
   signature += `|${workspaceSignaturePart(snapshot.root)}`;
   signature += `|${workspaceSignaturePart(snapshot.currentDir)}`;
@@ -7089,6 +16319,9 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${String(snapshot.activeTerminalIndex)}`;
   signature += `|${editorTabSnapshotsSignature(snapshot.editorTabs)}`;
   signature += `|${workspaceSignaturePart(snapshot.activeEditorTabId)}`;
+  signature += `|${editorPaneSnapshotsSignature(snapshot.editorPanes)}`;
+  signature += `|${workspaceSignaturePart(snapshot.activeEditorPaneId)}`;
+  signature += `|${editorSplitSnapshotSignature(snapshot.editorSplitLayout)}`;
   signature += `|${snapshot.editorOpenInNewTab ? '1' : '0'}`;
   signature += `|${snapshot.editorWordWrap ? '1' : '0'}`;
   signature += `|${imageTabSnapshotsSignature(snapshot.id, snapshot.imageTabs)}`;
@@ -7111,6 +16344,7 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${workspaceSignaturePart(snapshot.calculatorExpression)}`;
   signature += `|${calculatorSnapshotHistorySignature(snapshot.calculatorHistory)}`;
   signature += `|${workspaceSignaturePart(snapshot.explorerOpenMode)}`;
+  signature += `|${snapshot.explorerAutoOpenEditor ? '1' : '0'}`;
   signature += `|${snapshot.showFileSizes ? '1' : '0'}`;
   signature += `|${String(snapshot.editorFontSize)}`;
   signature += `|${String(snapshot.terminalFontSize)}`;
@@ -7183,6 +16417,19 @@ function editorTabSnapshotsSignature(tabs: WorkspaceSnapshot['editorTabs']) {
     signature += `${workspaceSignaturePart(tab.id)},${workspaceSignaturePart(tab.path)},${tab.rawMode ? '1' : '0'}`;
   }
   return signature;
+}
+
+function editorPaneSnapshotsSignature(panes?: WorkspaceSnapshot['editorPanes']) {
+  if (!panes?.length) return '';
+  return panes.map((pane) => (
+    `${workspaceSignaturePart(pane.id)}:${workspaceSignaturePart(pane.activeTabId)}:${pane.tabIds.map(workspaceSignaturePart).join(',')}`
+  )).join(';');
+}
+
+function editorSplitSnapshotSignature(node?: WorkspaceEditorSplitSnapshot): string {
+  if (!node) return '';
+  if (node.kind === 'pane') return `p:${workspaceSignaturePart(node.paneId)}`;
+  return `s:${node.direction}:${clampEditorSplitRatio(node.ratio).toFixed(4)}(${editorSplitSnapshotSignature(node.first)}|${editorSplitSnapshotSignature(node.second)})`;
 }
 
 function imageTabSnapshotsSignature(workspaceId: string, tabs: WorkspaceSnapshot['imageTabs']) {
@@ -7288,6 +16535,7 @@ function stringFingerprint(value: string) {
 function snapshotPanels() {
   const panels: Partial<Record<FloatingPanelId, WorkspacePanelSnapshot>> = {};
   for (const id of FLOATING_PANELS) {
+    if (id === 'settings') continue;
     const panel = getPanel(id);
     const opacity = widgetOpacityForElement(panel);
     panels[id] = {
@@ -7404,6 +16652,9 @@ function saveActiveWorkspaceRuntimeCache() {
   workspaceRuntimeCache.set(workspaceId, {
     editorTabs: snapshotEditorTabsForRuntime(state.editorTabs),
     activeEditorTabId: state.activeEditorTabId,
+    editorPanes: snapshotEditorPanesForRuntime(state.editorPanes),
+    activeEditorPaneId: state.activeEditorPaneId,
+    editorSplitLayout: state.editorSplitLayout ? cloneEditorSplitNode(state.editorSplitLayout) : null,
     explorer: snapshotExplorerRuntimeCache(),
     browserTabs: snapshotBrowserTabsForRuntime(),
     browserHistory: currentBrowserHistorySnapshot(),
@@ -7544,7 +16795,7 @@ function workspaceMemorySaverCanSleep(workspaceId: string, now: number, idleMs: 
 
 function workspaceHasImportantLiveActivity(workspaceId: string) {
   const llmState = workspaceLlmIndicatorState(workspaceId);
-  return llmState === 'working' || llmState === 'waiting';
+  return llmState === 'working' || llmState === 'waiting' || llmState === 'done-unread';
 }
 
 function workspaceHasBrowserRuntime(workspaceId: string) {
@@ -7571,6 +16822,7 @@ async function sleepWorkspaceTerminals(workspaceId: string) {
   workspaceMemorySleepingIds.add(workspaceId);
   renderWorkspaceTabs();
   scheduleWorkspaceStorePersist();
+  appendDiagnosticLog('memory', `slept workspace=${workspaceId.slice(0, 8)} live=${liveTerminalWorkspaceIds().size}`);
   setStatus(`Memory Saver slept ${workspaceDisplayLabel(snapshot)}; shell processes were stopped`);
 }
 
@@ -7591,6 +16843,19 @@ function snapshotEditorTabsForRuntime(tabs: EditorTabState[]) {
   const snapshot: EditorTabState[] = [];
   for (const tab of tabs) snapshot.push(tab);
   return snapshot;
+}
+
+function snapshotEditorPanesForRuntime(panes: EditorPaneState[]) {
+  return panes.map((pane) => ({ ...pane, tabIds: [...pane.tabIds] }));
+}
+
+function cloneEditorSplitNode(node: EditorSplitNode): EditorSplitNode {
+  if (node.kind === 'pane') return { ...node };
+  return {
+    ...node,
+    first: cloneEditorSplitNode(node.first),
+    second: cloneEditorSplitNode(node.second)
+  };
 }
 
 function snapshotBrowserTabsForRuntime() {
@@ -7716,6 +16981,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.workspaceOpen = true;
     state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
     state.explorerOpenMode = snapshot.explorerOpenMode ?? 'single';
+    state.explorerAutoOpenEditor = Boolean(snapshot.explorerAutoOpenEditor);
     state.showFileSizes = snapshot.showFileSizes ?? DEFAULT_SHOW_FILE_SIZES;
     state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
     state.editorWordWrap = Boolean(snapshot.editorWordWrap);
@@ -7749,6 +17015,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     setCheckedIfChanged(el.editorWordWrap, state.editorWordWrap);
     setCheckedIfChanged(el.imageOpenNewTab, state.imageOpenInNewTab);
     updateExplorerOpenMode();
+    updateExplorerAutoEditorToggle();
     updateExplorerFileSizeMode();
 
     const deferExplorerUntilShellReady = profileNeedsExplorerShellReadyGate(profile);
@@ -7856,11 +17123,17 @@ function workspaceHasRunningTerminalBackend(workspaceId: string) {
 
 function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
   for (const id of FLOATING_PANELS) {
+    if (id === 'settings') continue;
     const panel = getPanel(id);
     const snapshot = panels?.[id];
     const wasHidden = panel.classList.contains('hidden');
     const visible = snapshot?.visible ?? DEFAULT_PANEL_VISIBILITY[id];
-    if (snapshot?.rect) layoutRatios.set(panel, snapshot.rect);
+    if (snapshot?.rect) {
+      layoutRatios.set(panel, snapshot.rect);
+    } else {
+      layoutRatios.delete(panel);
+      resetPanelInlineGeometry(panel);
+    }
     applyWidgetOpacity(panel, snapshot?.opacity, { persist: false });
     setPanelVisible(id, visible, { skipSave: true, skipFocus: true });
     if (visible && !wasHidden && snapshot?.rect) applyLayoutRatio(panel, snapshot.rect);
@@ -7904,7 +17177,10 @@ async function restoreWorkspaceTerminals(
       const llmTmuxSessionName = llmId
         ? safeLlmTmuxSessionName(terminal.llmTmuxSessionName) ?? workspaceTmuxSessionName(snapshot.id, llmId)
         : undefined;
-      const llmParts = llmId ? llmLauncherParts(llmId, terminalProfile.kind, snapshot.id, llmTmuxSessionName) : null;
+      const agentBridge = llmId
+        ? await prepareAgentBridgeForLlmLaunch(llmId, terminalProfile, terminal.cwd || workspaceShellCwd(), { allowPrompt: false })
+        : null;
+      const llmParts = llmId ? llmLauncherParts(llmId, terminalProfile.kind, snapshot.id, llmTmuxSessionName, { agentBridge }) : null;
       const terminalCommand = llmParts ? llmParts.define : terminal.command;
       if (llmId) {
         terminalOptions.llmId = llmId;
@@ -7952,6 +17228,7 @@ async function restoreWorkspaceTerminals(
       if (llmParts && restoredPane?.backendId) {
         restoredPane.llmId = llmId;
         restoredPane.llmTmuxSessionName = llmTmuxSessionName;
+        await registerAgentBridgeForPane(restoredPane, agentBridge);
         markWorkspaceLlmActivityForPane(restoredPane, WORKSPACE_LLM_START_ACTIVE_MS);
         queueTerminalShellReadyAction(
           restoredPane,
@@ -8088,12 +17365,9 @@ async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
   if (runtime?.editorTabs.length) {
     state.editorTabs = snapshotEditorTabsForRuntime(runtime.editorTabs);
     rebuildEditorTabLookup();
-    state.activeEditorTabId = editorTabForId(runtime.activeEditorTabId)
-      ? runtime.activeEditorTabId
-      : state.editorTabs[0].id;
+    restoreEditorPaneState(runtime.editorPanes, runtime.activeEditorPaneId, runtime.editorSplitLayout ? cloneEditorSplitNode(runtime.editorSplitLayout) : null, runtime.activeEditorTabId);
     state.openFile = activeEditorTab().file;
     if (isEditorPanelVisible()) {
-      renderEditorTabs();
       renderEditor();
     } else {
       destroyCodeEditorView();
@@ -8103,13 +17377,10 @@ async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
 
   state.editorTabs = restoredEditorTabsFromSnapshot(snapshot);
   rebuildEditorTabLookup();
-  if (!state.editorTabs.length) createEditorTab(null, false);
-  state.activeEditorTabId = editorTabForId(snapshot.activeEditorTabId)
-    ? snapshot.activeEditorTabId
-    : state.editorTabs[0].id;
+  restoreEditorPaneState(snapshot.editorPanes, snapshot.activeEditorPaneId, null, snapshot.activeEditorTabId);
+  state.editorSplitLayout = editorSplitNodeFromSnapshot(snapshot.editorSplitLayout) ?? editorSplitLayoutFromPanes(state.editorPanes);
   state.openFile = activeEditorTab().file;
   if (isEditorPanelVisible()) {
-    renderEditorTabs();
     renderEditor();
     void hydrateVisibleEditorTab();
     scheduleInactiveEditorHydration();
@@ -8133,6 +17404,61 @@ function restoredEditorTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
   return tabs;
 }
 
+function restoreEditorPaneState(
+  panes: EditorPaneSnapshot[] | EditorPaneState[] | undefined,
+  activePaneId: string | undefined,
+  splitLayout: EditorSplitNode | null,
+  activeTabId: string | undefined
+) {
+  const knownTabs = new Set(state.editorTabs.map((tab) => tab.id));
+  state.editorPanes = [];
+  if (panes?.length) {
+    for (const pane of panes) {
+      const tabIds = [...pane.tabIds].filter((id) => knownTabs.has(id));
+      state.editorPanes.push({
+        id: pane.id || crypto.randomUUID(),
+        tabIds,
+        activeTabId: knownTabs.has(pane.activeTabId) ? pane.activeTabId : tabIds[0] ?? ''
+      });
+    }
+  }
+  if (!state.editorPanes.length) {
+    state.editorPanes = [{
+      id: crypto.randomUUID(),
+      tabIds: state.editorTabs.map((tab) => tab.id),
+      activeTabId: editorTabForId(activeTabId ?? '') ? activeTabId! : state.editorTabs[0]?.id ?? ''
+    }];
+  }
+  state.activeEditorPaneId = activePaneId && editorPaneForId(activePaneId) ? activePaneId : '';
+  state.editorSplitLayout = splitLayout;
+  ensureEditorPaneState();
+  if (activeTabId && editorTabForId(activeTabId)) {
+    const pane = editorPaneForTabId(activeTabId);
+    if (pane) {
+      pane.activeTabId = activeTabId;
+      state.activeEditorPaneId = pane.id;
+    }
+  }
+  syncActiveEditorStateFromPane();
+}
+
+function editorSplitNodeFromSnapshot(snapshot?: WorkspaceEditorSplitSnapshot): EditorSplitNode | null {
+  if (!snapshot) return null;
+  if (snapshot.kind === 'pane') return editorPaneForId(snapshot.paneId) ? { kind: 'pane', paneId: snapshot.paneId } : null;
+  const first = editorSplitNodeFromSnapshot(snapshot.first);
+  const second = editorSplitNodeFromSnapshot(snapshot.second);
+  if (!first) return second;
+  if (!second) return first;
+  return {
+    kind: 'split',
+    splitId: crypto.randomUUID(),
+    direction: snapshot.direction,
+    ratio: clampEditorSplitRatio(snapshot.ratio),
+    first,
+    second
+  };
+}
+
 function isEditorPanelVisible() {
   return !getPanel('editor').classList.contains('hidden');
 }
@@ -8142,17 +17468,34 @@ function destroyCodeEditorView() {
     window.cancelAnimationFrame(codeMeasureFrame);
     codeMeasureFrame = 0;
   }
-  codeView?.destroy();
-  codeView = null;
-  codeViewFile = null;
-  codeViewRenderSignature = '\0';
+  for (const paneId of editorPaneViewState.keys()) destroyEditorPaneView(paneId);
+  syncCodeViewReference();
+}
+
+function destroyEditorPaneView(paneId: string) {
+  const stateForPane = editorPaneViewState.get(paneId);
+  stateForPane?.view?.destroy();
+  editorPaneViewState.delete(paneId);
+  if (paneId === state.activeEditorPaneId) {
+    codeView = null;
+    codeViewFile = null;
+    codeViewRenderSignature = '\0';
+  }
 }
 
 function requestCodeEditorMeasure() {
-  if (!codeView || codeMeasureFrame) return;
+  if (codeMeasureFrame) return;
+  let hasView = false;
+  for (const stateForPane of editorPaneViewState.values()) {
+    if (stateForPane.view) {
+      hasView = true;
+      break;
+    }
+  }
+  if (!hasView) return;
   codeMeasureFrame = window.requestAnimationFrame(() => {
     codeMeasureFrame = 0;
-    codeView?.requestMeasure();
+    for (const stateForPane of editorPaneViewState.values()) stateForPane.view?.requestMeasure();
   });
 }
 
@@ -8208,11 +17551,9 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
     liveTab.pendingRawMode = undefined;
     liveTab.pendingProfileId = undefined;
     liveTab.loading = false;
-    if (renderWhenDone && state.activeEditorTabId === liveTab.id) {
-      state.openFile = liveTab.file;
+    if (!getPanel('editor').classList.contains('hidden')) {
+      if (state.activeEditorTabId === liveTab.id) state.openFile = liveTab.file;
       renderEditor();
-    } else if (!getPanel('editor').classList.contains('hidden')) {
-      renderEditorTabs();
     }
     saveActiveWorkspaceSnapshot();
   } catch {
@@ -8220,8 +17561,7 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
     const liveTab = editorTabForId(tab.id);
     if (liveTab) {
       liveTab.loading = false;
-      if (renderWhenDone && state.activeEditorTabId === liveTab.id) renderEditor();
-      else if (!getPanel('editor').classList.contains('hidden')) renderEditorTabs();
+      if (!getPanel('editor').classList.contains('hidden')) renderEditor();
     }
   }
 }
@@ -8294,6 +17634,209 @@ function restoredNoteTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
   return tabs;
 }
 
+function loadNoteMemoryStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(NOTES_MEMORY_STORE_KEY) ?? '') as Partial<NoteMemoryStore>;
+    noteMemoryRecords = noteMemoryRecordsFromStore(parsed.notes);
+  } catch {
+    noteMemoryRecords = [];
+  }
+  compactNoteMemoryRecords();
+}
+
+function noteMemoryRecordsFromStore(value: unknown) {
+  const records: NoteMemoryRecord[] = [];
+  if (!Array.isArray(value)) return records;
+  for (const item of value) {
+    const record = normalizeNoteMemoryRecord(item);
+    if (record) records.push(record);
+  }
+  return records;
+}
+
+function normalizeNoteMemoryRecord(value: unknown): NoteMemoryRecord | null {
+  if (!value || typeof value !== 'object') return null;
+  const source = value as Partial<NoteMemoryRecord>;
+  if (
+    typeof source.id !== 'string'
+    || typeof source.profileId !== 'string'
+    || typeof source.workspaceKey !== 'string'
+    || typeof source.path !== 'string'
+    || typeof source.content !== 'string'
+  ) return null;
+  return {
+    id: source.id,
+    profileId: source.profileId,
+    workspaceKey: source.workspaceKey,
+    path: source.path,
+    title: typeof source.title === 'string' ? source.title : noteTitleFromPath(source.path),
+    customTitle: typeof source.customTitle === 'string' ? source.customTitle : undefined,
+    theme: normalizeNoteTheme(source.theme),
+    content: source.content,
+    updatedAt: typeof source.updatedAt === 'number' && Number.isFinite(source.updatedAt)
+      ? source.updatedAt
+      : Date.now()
+  };
+}
+
+function noteWorkspaceKey() {
+  const base = workspaceBaseDir();
+  return base ? explorerPathKey(base) : '';
+}
+
+function noteMemoryPathKey(path: string) {
+  return explorerPathKey(path);
+}
+
+function noteMemoryRecordScopeKey(record: Pick<NoteMemoryRecord, 'profileId' | 'workspaceKey' | 'path'>) {
+  return `${record.profileId}\0${record.workspaceKey}\0${noteMemoryPathKey(record.path)}`;
+}
+
+function compactNoteMemoryRecords() {
+  const sorted = noteMemoryRecords
+    .filter((record) => record.profileId && record.workspaceKey && record.path)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  const seen = new Set<string>();
+  const compacted: NoteMemoryRecord[] = [];
+  for (const record of sorted) {
+    const key = noteMemoryRecordScopeKey(record);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    compacted.push(record);
+    if (compacted.length >= NOTES_MEMORY_LIMIT) break;
+  }
+  while (compacted.length > 1 && JSON.stringify({ version: 1, notes: compacted }).length > NOTES_MEMORY_STORE_MAX_CHARS) {
+    compacted.pop();
+  }
+  noteMemoryRecords = compacted;
+}
+
+function persistNoteMemoryStore() {
+  if (noteMemoryPersistTimer) {
+    window.clearTimeout(noteMemoryPersistTimer);
+    noteMemoryPersistTimer = 0;
+  }
+  compactNoteMemoryRecords();
+  try {
+    localStorage.setItem(NOTES_MEMORY_STORE_KEY, JSON.stringify({ version: 1, notes: noteMemoryRecords } satisfies NoteMemoryStore));
+  } catch {
+    while (noteMemoryRecords.length > 1) {
+      noteMemoryRecords.pop();
+      try {
+        localStorage.setItem(NOTES_MEMORY_STORE_KEY, JSON.stringify({ version: 1, notes: noteMemoryRecords } satisfies NoteMemoryStore));
+        return;
+      } catch {
+        // Keep pruning below.
+      }
+    }
+    setStatus('Notes memory could not be saved because browser storage is full', true);
+  }
+}
+
+function schedulePersistNoteMemoryStore(delayMs = 420) {
+  if (noteMemoryPersistTimer) window.clearTimeout(noteMemoryPersistTimer);
+  noteMemoryPersistTimer = window.setTimeout(persistNoteMemoryStore, delayMs);
+}
+
+function queueNoteMemoryUpsert(tab: NoteTabState, options: { delayMs?: number } = {}) {
+  upsertNoteMemoryRecord(tab);
+  schedulePersistNoteMemoryStore(options.delayMs ?? 420);
+}
+
+function upsertNoteMemoryRecord(tab: NoteTabState) {
+  const profile = state.activeProfile;
+  const workspaceKey = noteWorkspaceKey();
+  if (!profile || !workspaceKey || !tab.path || tab.loading) return;
+  const record: NoteMemoryRecord = {
+    id: tab.id,
+    profileId: profile.id,
+    workspaceKey,
+    path: tab.path,
+    title: tab.title || noteTitleFromPath(tab.path),
+    customTitle: tab.customTitle,
+    theme: normalizeNoteTheme(tab.theme),
+    content: tab.content,
+    updatedAt: Date.now()
+  };
+  const pathKey = noteMemoryPathKey(record.path);
+  const index = noteMemoryRecords.findIndex((item) => (
+    item.profileId === record.profileId
+    && item.workspaceKey === record.workspaceKey
+    && (item.id === record.id || noteMemoryPathKey(item.path) === pathKey)
+  ));
+  if (index >= 0) noteMemoryRecords[index] = record;
+  else noteMemoryRecords.unshift(record);
+  compactNoteMemoryRecords();
+}
+
+function removeNoteMemoryRecordForPath(profileId: string, path: string) {
+  const pathKey = noteMemoryPathKey(path);
+  const before = noteMemoryRecords.length;
+  noteMemoryRecords = noteMemoryRecords.filter((record) => (
+    record.profileId !== profileId || noteMemoryPathKey(record.path) !== pathKey
+  ));
+  if (noteMemoryRecords.length !== before) persistNoteMemoryStore();
+}
+
+function recoverableNoteMemoryRecords() {
+  const profile = state.activeProfile;
+  const workspaceKey = noteWorkspaceKey();
+  if (!profile || !workspaceKey) return [];
+  const openIds = new Set(state.noteTabs.map((tab) => tab.id));
+  const openPaths = new Set(state.noteTabs.map((tab) => noteMemoryPathKey(tab.path)));
+  return noteMemoryRecords
+    .filter((record) => (
+      record.profileId === profile.id
+      && record.workspaceKey === workspaceKey
+      && !openIds.has(record.id)
+      && !openPaths.has(noteMemoryPathKey(record.path))
+    ))
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function restoreNotesFromMemory() {
+  if (!state.workspaceOpen || !state.activeProfile) {
+    setStatus('Open a workspace before restoring notes from memory', true);
+    return;
+  }
+  const records = recoverableNoteMemoryRecords();
+  if (!records.length) {
+    setStatus('No missing notes found in memory');
+    return;
+  }
+  let restored = 0;
+  for (const record of records) {
+    const id = record.id || crypto.randomUUID();
+    if (noteTabForId(id) || state.noteTabs.some((tab) => sameExplorerPath(tab.path, record.path))) continue;
+    const tab: NoteTabState = {
+      id,
+      path: record.path,
+      title: record.title || noteTitleFromPath(record.path),
+      customTitle: record.customTitle,
+      theme: normalizeNoteTheme(record.theme),
+      content: record.content,
+      dirty: true,
+      saving: false,
+      loading: false,
+      lastSavedAt: record.updatedAt
+    };
+    state.noteTabs.push(tab);
+    rememberNoteTab(tab, state.noteTabs.length - 1);
+    scheduleNoteSave(tab, 0);
+    restored += 1;
+  }
+  if (!restored) {
+    setStatus('No missing notes found in memory');
+    return;
+  }
+  state.activeNoteTabId = state.noteTabs[state.noteTabs.length - restored]?.id ?? state.noteTabs[0]?.id ?? '';
+  renderNoteTabs();
+  renderNotes();
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  setStatus(restored === 1 ? 'Restored 1 note from memory' : `Restored ${restored} notes from memory`);
+  el.notesBody.focus();
+}
+
 function scheduleDeferredNoteHydration(workspaceId: string, profileId: string, timeout = 700) {
   const token = ++noteHydrationToken;
   runWhenUiIdle(() => {
@@ -8352,6 +17895,7 @@ async function hydrateNoteTabContent(tab: NoteTabState, workspaceId: string, pro
   live.content = content;
   live.loading = false;
   live.lastSavedAt = Date.now();
+  queueNoteMemoryUpsert(live);
 }
 
 async function ensureNotesReady() {
@@ -8384,6 +17928,7 @@ async function createNoteTab(options: { focus?: boolean } = {}) {
   state.activeNoteTabId = tab.id;
   renderNoteTabs();
   renderNotes();
+  queueNoteMemoryUpsert(tab, { delayMs: 0 });
   scheduleNoteSave(tab, 0);
   saveActiveWorkspaceSnapshot();
   if (options.focus !== false) el.notesBody.focus();
@@ -8483,6 +18028,38 @@ function closeNoteTab(id: string) {
   saveActiveWorkspaceSnapshot();
 }
 
+async function deleteNoteTabPermanently(id: string) {
+  const index = noteTabIndexById(id);
+  if (index < 0) return;
+  const tab = state.noteTabs[index];
+  const profile = state.activeProfile;
+  if (!profile) return;
+  const label = noteTabLabel(tab);
+  if (!window.confirm(`Permanently delete note "${label}"?\n\nThis removes the note file and its recovery memory.`)) return;
+
+  const timer = noteSaveTimers.get(id);
+  if (timer) window.clearTimeout(timer);
+  noteSaveTimers.delete(id);
+  try {
+    await api.deleteNoteFilePermanently(profile.id, tab.path);
+    invalidateExplorerParentDirectoryCache(profile.id, tab.path);
+    removeNoteMemoryRecordForPath(profile.id, tab.path);
+    forgetNoteTab(tab);
+    state.noteTabs.splice(index, 1);
+    refreshNoteTabIndexLookup(index);
+    if (state.activeNoteTabId === id) {
+      const next = state.noteTabs[index] ?? state.noteTabs[index - 1] ?? state.noteTabs[0];
+      state.activeNoteTabId = next?.id ?? '';
+    }
+    renderNoteTabs();
+    renderNotes();
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+    setStatus(`Deleted note: ${label}`);
+  } catch (error) {
+    setStatus(`Delete note failed: ${String(error)}`, true);
+  }
+}
+
 function renameNoteTab(id: string) {
   const tab = noteTabForId(id);
   if (!tab) return;
@@ -8504,6 +18081,7 @@ function setNoteTabCustomTitle(id: string, title: string) {
   const nextLabel = noteTabLabel(tab);
   if (previousLabel === nextLabel) noteTabsRenderSignature = '\0';
   renderNoteTabs();
+  queueNoteMemoryUpsert(tab);
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
   setStatus(customTitle ? `Note tab renamed: ${customTitle}` : 'Note tab uses automatic title');
 }
@@ -8712,6 +18290,7 @@ function setActiveNoteTheme(theme: NoteThemeId) {
   tab.theme = normalizeNoteTheme(theme);
   applyNoteTheme(tab.theme);
   renderNoteTabs();
+  queueNoteMemoryUpsert(tab);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -9216,6 +18795,7 @@ function handleNoteInput() {
   tab.title = noteTabAutoLabel(tab);
   if (noteTabLabel(tab) !== previousLabel) renderNoteTabs();
   renderNoteStatus();
+  queueNoteMemoryUpsert(tab);
   scheduleNoteSave(tab, NOTES_AUTOSAVE_DELAY_MS);
 }
 
@@ -9354,6 +18934,7 @@ async function saveNoteTabNow(tab: NoteTabState) {
     tab.saving = false;
     tab.lastSavedAt = Date.now();
     if (tab.content === content) tab.dirty = false;
+    queueNoteMemoryUpsert(tab);
     renderNoteTabs();
     renderNoteStatus();
   } catch (error) {
@@ -10073,6 +19654,9 @@ function selectProfile(profileId: string): boolean {
 
 function bindEvents() {
   el.newWorkspaceTab.addEventListener('click', () => void createBlankWorkspaceTab());
+  document.addEventListener('pointerover', handleWorkspaceHoverOnlyPointerOver, { passive: true });
+  document.addEventListener('pointerout', handleWorkspaceHoverOnlyPointerOut, { passive: true });
+  document.addEventListener('pointermove', handleWorkspaceHoverOnlyPointerMove, { passive: true });
   el.profileSelect.addEventListener('change', async () => {
     saveActiveWorkspaceSnapshot();
     const canFillActiveEmptyWorkspace = workspaceSnapshotCanAcceptOpen(activeWorkspaceSnapshot());
@@ -10104,7 +19688,6 @@ function bindEvents() {
     else void createTerminal(null, 'shell');
   });
   el.newWindowsShell.addEventListener('click', () => void createWindowsShell());
-  el.copyCurrentCd.addEventListener('click', () => void copyCurrentFolderCdCommand());
   el.marketAddSymbol.addEventListener('click', addMarketTickerFromInput);
   el.marketSymbolInput.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter') return;
@@ -10116,6 +19699,9 @@ function bindEvents() {
     createEditorTab(null, true);
     renderEditor();
   });
+  el.editorSplitRight.addEventListener('click', () => splitActiveEditorPane('row'));
+  el.editorSplitDown.addEventListener('click', () => splitActiveEditorPane('column'));
+  el.editorCloseSplit.addEventListener('click', closeActiveEditorSplit);
   el.editorOpenNewTab.addEventListener('change', () => {
     state.editorOpenInNewTab = el.editorOpenNewTab.checked;
     saveActiveWorkspaceSnapshot();
@@ -10201,6 +19787,11 @@ function bindEvents() {
   }
   bindWindowChrome();
   bindFloatingPanels();
+  document.querySelector<HTMLElement>('.glass-settings-header')
+    ?.addEventListener('pointerdown', (event) => startFixedPopoverDrag(event, el.glassSettingsPopover));
+  document.querySelector<HTMLElement>('.diagnostic-log-header')
+    ?.addEventListener('pointerdown', (event) => startFixedPopoverDrag(event, el.diagnosticLogPopover));
+  el.refreshFile.addEventListener('click', () => void refreshActiveEditorFromDisk());
   el.saveFile.addEventListener('click', saveOpenFile);
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
@@ -10242,6 +19833,12 @@ function bindEvents() {
   el.explorerOpenModeToggle.addEventListener('click', () => {
     state.explorerOpenMode = state.explorerOpenMode === 'single' ? 'double' : 'single';
     updateExplorerOpenMode();
+    saveActiveWorkspaceSnapshot();
+  });
+  el.explorerAutoEditorToggle.addEventListener('click', () => {
+    state.explorerAutoOpenEditor = !state.explorerAutoOpenEditor;
+    updateExplorerAutoEditorToggle();
+    saveActiveWorkspaceSnapshot();
   });
   el.fileSizeToggle.addEventListener('click', () => {
     state.showFileSizes = !state.showFileSizes;
@@ -10303,18 +19900,43 @@ function bindEvents() {
   el.settingsWorkspaceDockSize.addEventListener('input', () => updateWorkspaceDockSettingsFromForm());
   el.settingsWorkspaceDockSize.addEventListener('change', () => updateWorkspaceDockSettingsFromForm({ persist: true }));
   el.settingsWorkspaceDockDetail.addEventListener('change', () => updateWorkspaceDockSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceDetailActivity.addEventListener('change', () => updateWorkspaceDetailContentSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceDetailMeta.addEventListener('change', () => updateWorkspaceDetailContentSettingsFromForm({ persist: true }));
+  el.settingsWorkspaceDetailHideProtected.addEventListener('change', () => updateWorkspaceDetailContentSettingsFromForm({ persist: true }));
   el.settingsWorkspaceFocusBorder.addEventListener('change', () => updateWorkspaceFocusSettingsFromForm({ persist: true }));
   el.settingsWorkspaceFocusTitle.addEventListener('change', () => updateWorkspaceFocusSettingsFromForm({ persist: true }));
+  el.settingsAppGlassEnabled.addEventListener('change', () => updateAppGlassThemeSettingsFromForm({ persist: true }));
+  el.settingsGlassOpen.addEventListener('click', openGlassSettingsPopover);
   el.settingsAgentNotificationBanners.addEventListener('change', () => updateAgentAlertSettingsFromForm({ persist: true }));
   el.settingsAgentAlertSound.addEventListener('change', () => updateAgentAlertSettingsFromForm({ persist: true }));
   el.settingsAgentAlertTestBanner.addEventListener('click', () => void sendAgentAlertTest('banner'));
   el.settingsAgentAlertTestSound.addEventListener('click', () => void sendAgentAlertTest('sound'));
   el.settingsAgentAlertTestBoth.addEventListener('click', () => void sendAgentAlertTest('both'));
+  el.settingsAgentAlertTestBannerDelayed.addEventListener('click', scheduleAgentAlertBackgroundBannerTest);
+  el.settingsClaudeHookMode.addEventListener('change', () => updateAgentEventBridgeSettingsFromForm({ persist: true }));
+  el.settingsGrokHookMode.addEventListener('change', () => updateAgentEventBridgeSettingsFromForm({ persist: true }));
+  el.settingsLlmTmuxEnvPassthrough.addEventListener('change', () => updateAgentEventBridgeSettingsFromForm({ persist: true }));
+  el.settingsDebugLogEnabled.addEventListener('change', () => updateDiagnosticLogSettingsFromForm({ persist: true }));
+  el.settingsDebugLogOpen.addEventListener('click', openDiagnosticLogPanel);
+  el.settingsDebugLogClear.addEventListener('click', clearDiagnosticLog);
+  el.diagnosticLogCopy.addEventListener('click', () => void copyDiagnosticLog());
+  el.diagnosticLogClear.addEventListener('click', clearDiagnosticLog);
+  el.diagnosticLogClose.addEventListener('click', closeDiagnosticLogPanel);
   el.settingsWidgetRadius.addEventListener('input', () => updateWidgetAppearanceSettingsFromForm());
   el.settingsWidgetRadius.addEventListener('change', () => updateWidgetAppearanceSettingsFromForm({ persist: true }));
   el.settingsIdeScaleReset.addEventListener('click', resetIdeScaleToDefault);
   el.settingsWidgetFocusBorder.addEventListener('change', () => updateWidgetAppearanceSettingsFromForm({ persist: true }));
   el.settingsWidgetFocusTitle.addEventListener('change', () => updateWidgetAppearanceSettingsFromForm({ persist: true }));
+  el.glassWorkspaceEnabled.addEventListener('change', () => updateWorkspaceGlassEnabled(el.glassWorkspaceEnabled.checked));
+  el.glassBackgroundFile.addEventListener('change', () => {
+    const file = el.glassBackgroundFile.files?.[0];
+    if (file) void loadGlassBackgroundFile(file);
+  });
+  el.glassSettingsReset.addEventListener('click', resetGlassSettings);
+  el.glassSettingsExport.addEventListener('click', exportGlassSettings);
+  el.glassSettingsImport.addEventListener('click', chooseGlassSettingsImportFile);
+  el.glassSettingsImportFile.addEventListener('change', handleGlassSettingsImportFileChange);
+  el.glassSettingsClose.addEventListener('click', closeGlassSettingsPopover);
   el.workspaceDockDetailToggle.addEventListener('click', toggleWorkspaceDockDetail);
   el.workspaceDockResizer.addEventListener('pointerdown', startWorkspaceDockResize);
   el.widgetOpacityRange.addEventListener('input', () => updateWidgetOpacityFromPopover());
@@ -10337,6 +19959,7 @@ function bindEvents() {
   document.addEventListener('contextmenu', handleContextMenu, true);
   document.addEventListener('pointerdown', handleWidgetOpacityPointerDown, true);
   document.addEventListener('keydown', handleWidgetOpacityKeydown, true);
+  document.addEventListener('keydown', handleGlassSettingsKeydown, true);
   document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
   document.addEventListener('keydown', handleContextMenuKeydown, true);
   window.addEventListener('resize', scheduleWindowResizeWork);
@@ -10355,15 +19978,20 @@ function bindEvents() {
       hideNativeBrowserWebview();
       suspendBrowserFramesForAllWorkspaces();
     } else if (state.workspaceOpen) {
+      flushDeferredAppGlassRecapture('visible');
       cancelBrowserFrameSuspend();
       scheduleExplorerWatch(1200);
       queueVisibleExplorerDirectoryPrefetch(900);
-      forEachActiveWorkspaceTerminalWidget((widget) => scheduleFitTerminalWidget(widget, { activeOnly: true }));
+      forEachActiveWorkspaceTerminalWidget((widget) => {
+        flushVisibleTerminalWidgetPanes(widget);
+        scheduleFitTerminalWidget(widget, { activeOnly: true });
+      });
       scheduleMarketTickerStart(MARKET_TICKER_VISIBLE_RESUME_DELAY_MS);
       scheduleMarketTickerRender();
       scheduleWslProfilesBackgroundLoad(1200);
       if (!isBrowserPanelHidden()) ensureActiveBrowserFrame();
     } else {
+      flushDeferredAppGlassRecapture('visible');
       cancelBrowserFrameSuspend();
       scheduleMarketTickerStart(MARKET_TICKER_VISIBLE_RESUME_DELAY_MS);
       scheduleMarketTickerRender();
@@ -10371,6 +19999,7 @@ function bindEvents() {
     }
   });
   window.addEventListener('beforeunload', () => {
+    markDiagnosticSessionClean();
     flushActiveWorkspaceSnapshotSave('flush');
     flushTerminalCwdSnapshotSave();
     flushWorkspaceStorePersist();
@@ -10398,10 +20027,13 @@ function scheduleWindowResizeWork() {
     applyWorkspaceDockSettings({ skipLayoutRefresh: true });
     FLOATING_PANELS.forEach((id) => {
       const panel = getPanel(id);
-      if (!panel.classList.contains('hidden')) applyStoredLayoutRatio(panel);
+      if (panel.classList.contains('hidden')) return;
+      syncAppGlassOwnerTargets(panel);
+      applyStoredLayoutRatio(panel);
     });
     state.terminalWidgets.forEach((widget) => {
       if (widget.element.classList.contains('hidden')) return;
+      syncAppGlassOwnerTargets(widget.element);
       applyStoredLayoutRatio(widget.element);
       scheduleFitTerminalWidget(widget);
     });
@@ -10409,6 +20041,14 @@ function scheduleWindowResizeWork() {
     requestCodeEditorMeasure();
     scheduleConfigureEdgeViewport();
     scheduleNativeBrowserWebviewSync();
+    if (appGlassCanCaptureSnapshotNow()) {
+      if (!scheduleAppGlassActiveOwnerRecaptures('window-resize', { delay: 120 })) {
+        scheduleAppGlassRefresh({ recapture: true, delay: 140, reason: 'window-resize' });
+      }
+      flushDeferredAppGlassRecapture('window-resize');
+    } else {
+      deferAppGlassRecapture('window-resize');
+    }
   });
 }
 
@@ -10430,6 +20070,12 @@ function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
   const noteTab = target.closest<HTMLElement>('.note-tab');
   if (noteTab?.dataset.noteTabId) return noteTabContextMenuItems(noteTab.dataset.noteTabId);
 
+  const editorPane = target.closest<HTMLElement>('.editor-pane');
+  if (editorPane?.dataset.editorPaneId) {
+    activateEditorPane(editorPane.dataset.editorPaneId);
+    return editorContextMenuItems();
+  }
+
   const codeEditor = target.closest('.cm-editor');
   if (codeEditor) return editorContextMenuItems();
 
@@ -10444,6 +20090,7 @@ function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
   if (target.closest('.explorer')) return explorerContextMenuItems();
 
   if (target.closest('.image')) return imageContextMenuItems();
+  if (target.closest('.editor')) return editorContextMenuItems();
   if (target.closest('.notes-panel')) return notesContextMenuItems();
   if (target.closest('.browser')) return browserContextMenuItems();
   return [];
@@ -10522,13 +20169,14 @@ function explorerContextMenuItems(): ContextMenuItem[] {
         }]
       : []),
     { label: 'Rename', action: renameSelectedExplorerEntry, disabled: !entry || multi },
+    { label: multi ? `Copy ${selectedCount} items` : 'Copy', action: copySelectedExplorerEntries, disabled: !selectedCount },
+    { label: 'Paste', action: () => void pasteExplorerClipboard(), disabled: !canPasteExplorerClipboard() },
     { label: multi ? `Export ${selectedCount} items` : 'Export', action: startExportSelectedExplorerEntry, disabled: !selectedCount },
     { label: multi ? `Delete ${selectedCount} items` : 'Delete', action: deleteSelectedExplorerEntries, disabled: !selectedCount, danger: true },
     { label: 'Undo delete', action: undoExplorerDelete, disabled: !explorerDeleteUndo },
     { separator: true },
     { label: 'New file', action: () => createExplorerItem('file') },
     { label: 'New folder', action: () => createExplorerItem('dir') },
-    { label: 'Copy current cd', action: copyCurrentFolderCdCommand },
     { label: 'Refresh', action: () => refreshExplorerTree({ manual: true }) }
   ];
   return items;
@@ -10542,7 +20190,12 @@ function editorContextMenuItems(): ContextMenuItem[] {
     { label: 'Paste', action: pasteIntoCodeEditor, disabled: !codeView },
     { label: 'Select all', action: selectAllCodeEditor, disabled: !codeView },
     { separator: true },
+    { label: 'Refresh from disk', action: () => refreshActiveEditorFromDisk(), disabled: !state.openFile },
     { label: 'Save', action: saveOpenFile, disabled: !state.openFile },
+    { separator: true },
+    { label: 'Split right', action: () => splitActiveEditorPane('row') },
+    { label: 'Split down', action: () => splitActiveEditorPane('column') },
+    { label: 'Close split pane', action: closeActiveEditorSplit, disabled: state.editorPanes.length <= 1 },
     { label: state.editorWordWrap ? 'Word wrap off' : 'Word wrap on', action: toggleEditorWordWrap }
   ];
 }
@@ -10604,9 +20257,11 @@ function imageContextMenuItems(): ContextMenuItem[] {
 }
 
 function notesContextMenuItems(): ContextMenuItem[] {
+  const recoverableCount = recoverableNoteMemoryRecords().length;
   return [
     { label: 'New note', action: () => createNoteTab({ focus: true }) },
     { label: 'Save note', action: saveActiveNoteNow, disabled: !activeNoteTab() },
+    { label: recoverableCount > 0 ? `Restore ${recoverableCount} notes from memory` : 'Restore notes from memory', action: restoreNotesFromMemory, disabled: !recoverableCount },
     { label: state.notePinned ? 'Unpin notes' : 'Pin notes', action: toggleNotePin }
   ];
 }
@@ -10614,14 +20269,17 @@ function notesContextMenuItems(): ContextMenuItem[] {
 function noteTabContextMenuItems(id: string): ContextMenuItem[] {
   const tab = noteTabForId(id);
   if (!tab) return notesContextMenuItems();
+  const recoverableCount = recoverableNoteMemoryRecords().length;
   return [
     { label: 'Rename tab', action: () => renameNoteTab(id) },
     { label: 'Use auto title', action: () => setNoteTabCustomTitle(id, ''), disabled: !noteTabCustomTitle(tab) },
     { separator: true },
     { label: 'New note', action: () => createNoteTab({ focus: true }) },
     { label: 'Save note', action: () => saveNoteTabNow(tab), disabled: !shouldSaveNoteTabNow(tab) },
+    { label: recoverableCount > 0 ? `Restore ${recoverableCount} notes from memory` : 'Restore notes from memory', action: restoreNotesFromMemory, disabled: !recoverableCount },
     { separator: true },
-    { label: 'Close note tab', action: () => closeNoteTab(id), danger: true }
+    { label: 'Close note tab', action: () => closeNoteTab(id) },
+    { label: 'Delete note permanently', action: () => deleteNoteTabPermanently(id), danger: true }
   ];
 }
 
@@ -10720,30 +20378,6 @@ async function copyTextToClipboard(text: string, message: string) {
   setStatus(message);
 }
 
-async function copyCurrentFolderCdCommand() {
-  const activeWidget = activeTerminalWidget();
-  const activePane = activeWidget ? activePaneForWidget(activeWidget) : null;
-  const dir = activePane?.cwd ?? state.currentDir ?? state.workspaceRoot;
-  if (!dir) {
-    setStatus('No current folder to copy', true);
-    return;
-  }
-  const profile = activePane
-    ? profileForId(activePane.profileId) ?? state.activeProfile
-    : state.activeProfile;
-  await writeText(cdCommandForPath(dir, profile?.kind ?? 'wsl'));
-  setStatus('Copied cd command for current folder');
-}
-
-function cdCommandForPath(path: string, profileKind: string) {
-  if (profileKind === 'windows' || isWindowsPath(path)) return `Set-Location -LiteralPath ${powershellQuote(path)}`;
-  return `cd ${posixShellQuote(path)}`;
-}
-
-function posixShellQuote(value: string) {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 function bindWindowChrome() {
   el.titlebar.addEventListener('mousedown', handleTitlebarMouseDown);
   el.windowControlButtons.forEach((button) => {
@@ -10783,6 +20417,9 @@ function handleTitlebarMouseDown(event: MouseEvent) {
   if (event.button !== 0 || isWindowChromeInteractive(event.target)) return;
 
   event.preventDefault();
+  const suspendedTilt = suspendLiquidGlassTiltForOwner(el.titlebar);
+  refreshLiquidGlassGeometryForOwner(el.titlebar);
+  restoreLiquidGlassTiltAfterPointerRelease(suspendedTilt);
   if (event.detail >= 2) {
     void currentWindow.toggleMaximize();
     return;
@@ -10858,6 +20495,309 @@ async function resolveSelectedRoot() {
   return resolved;
 }
 
+async function prepareAgentBridgeForLlmLaunch(
+  agentId: string,
+  profile: ConnectionProfile,
+  cwd: string,
+  options: { allowPrompt?: boolean } = {}
+): Promise<AgentBridgeLaunchContext | null> {
+  const normalized = normalizeTerminalLlmId(agentId);
+  if (normalized !== 'claude' && normalized !== 'grok') return null;
+  const hookMode = normalized === 'claude'
+    ? agentEventClaudeHookMode(state.ideSettings.agentEventClaudeHooks)
+    : agentEventGrokHookMode(state.ideSettings.agentEventGrokHooks);
+  if (hookMode === 'off') return null;
+  if (profile.kind !== 'wsl') {
+    console.info(`${agentSessionLabel(normalized)} hook bridge is currently enabled only for WSL workspaces.`);
+    return null;
+  }
+  const hookState = normalized === 'claude'
+    ? await claudeLocalHookState(profile, cwd).catch(() => ({ hooksInstalled: false, envCurrent: false }))
+    : await grokGlobalHookState(profile).catch(() => ({ hooksInstalled: false, envCurrent: true }));
+  if (hookMode === 'ask' && !hookState.hooksInstalled) {
+    if (options.allowPrompt === false) return null;
+    const approved = window.confirm(
+      normalized === 'claude'
+        ? 'Install/update Simple Vibe IDE local Claude hooks for this workspace? This writes .claude/settings.local.json and a small local hook script without secrets.'
+        : 'Install/update Simple Vibe IDE global Grok hooks for this WSL user? This writes ~/.grok/hooks/simple-vibe-ide.* without secrets. The hook stays inert unless Grok is launched by this IDE.'
+    );
+    if (!approved) return null;
+  }
+  try {
+    if (hookMode === 'auto' || !hookState.hooksInstalled || !hookState.envCurrent) {
+      if (normalized === 'claude') await installClaudeLocalHooks(profile, cwd);
+      else await installGrokGlobalHooks(profile);
+    }
+    const bridge = await api.agentBridgeInfo();
+    return {
+      agentId: normalized,
+      sessionId: crypto.randomUUID().replace(/[^A-Za-z0-9_-]+/g, '_'),
+      bridge
+    };
+  } catch (error) {
+    console.warn(`Failed to prepare ${normalized} agent hook bridge`, error);
+    setStatus(`${agentSessionLabel(normalized)} hook bridge setup failed; falling back to terminal detection: ${String(error)}`, true);
+    return null;
+  }
+}
+
+async function claudeLocalHookState(profile: ConnectionProfile, cwd: string) {
+  const settingsPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, 'settings.local.json');
+  const scriptPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SCRIPT_NAME);
+  const [settingsText, scriptText] = await Promise.all([
+    api.readTextFile(profile.id, settingsPath).catch(() => ''),
+    api.readTextFile(profile.id, scriptPath).catch(() => '')
+  ]);
+  if (!scriptText.includes('SVIDE_AGENT_BRIDGE_PORT') || !scriptText.includes('/agent-event?agent=')) {
+    return { hooksInstalled: false, envCurrent: false };
+  }
+  const settings = parseClaudeLocalSettings(settingsText);
+  const hooks = normalizeClaudeHookSettings(settings.hooks);
+  const hooksInstalled = CLAUDE_HOOK_EVENTS.some((eventName) =>
+    Array.isArray(hooks[eventName])
+    && hooks[eventName].some((group) => {
+      const groupHooks = Array.isArray((group as { hooks?: unknown }).hooks) ? (group as { hooks: unknown[] }).hooks : [];
+      return groupHooks.some((hook) => {
+        if (!hook || typeof hook !== 'object') return false;
+        return String((hook as { command?: unknown }).command ?? '').includes(CLAUDE_HOOK_SCRIPT_NAME);
+      });
+    })
+  );
+  return {
+    hooksInstalled,
+    envCurrent: claudeLocalSettingsEnvCurrent(settings)
+  };
+}
+
+async function grokGlobalHookState(profile: ConnectionProfile) {
+  const { configPath, scriptPath } = await grokGlobalHookPaths(profile);
+  const [configText, scriptText] = await Promise.all([
+    api.readTextFile(profile.id, configPath).catch(() => ''),
+    api.readTextFile(profile.id, scriptPath).catch(() => '')
+  ]);
+  const hooksInstalled = configText.includes(GROK_HOOK_SCRIPT_NAME)
+    && scriptText.includes('SVIDE_AGENT_BRIDGE_PORT')
+    && scriptText.includes('/agent-event?agent=');
+  return { hooksInstalled, envCurrent: true };
+}
+
+function claudeLocalSettingsEnvCurrent(settings: Record<string, any>) {
+  if (!safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough).includes('IS_DEMO')) return true;
+  const env = settings.env;
+  return Boolean(env && typeof env === 'object' && !Array.isArray(env) && String((env as Record<string, unknown>).IS_DEMO ?? '') === '1');
+}
+
+async function registerAgentBridgeForPane(pane: TerminalPane, context: AgentBridgeLaunchContext | null) {
+  if (!context) return;
+  pane.llmBridgeSessionId = context.sessionId;
+  try {
+    await api.registerAgentBridgeSession({
+      sessionId: context.sessionId,
+      agentId: context.agentId,
+      paneId: pane.paneId,
+      workspaceId: pane.workspaceId,
+      cwd: pane.cwd
+    });
+  } catch (error) {
+    pane.llmBridgeSessionId = undefined;
+    console.warn('Failed to register agent bridge session', error);
+    setStatus(`Agent bridge registration failed: ${String(error)}`, true);
+  }
+}
+
+async function installClaudeLocalHooks(profile: ConnectionProfile, cwd: string) {
+  const settingsPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, 'settings.local.json');
+  const scriptPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SCRIPT_NAME);
+  await api.writeTextFile(profile.id, scriptPath, claudeHookScriptContent());
+  const existingText = await api.readTextFile(profile.id, settingsPath).catch(() => '');
+  const settings = parseClaudeLocalSettings(existingText);
+  const hooks = normalizeClaudeHookSettings(settings.hooks);
+  for (const eventName of CLAUDE_HOOK_EVENTS) {
+    const groups = removeSimpleVibeClaudeHookGroups(hooks[eventName]);
+    groups.push({
+      hooks: [{ type: 'command', command: CLAUDE_HOOK_COMMAND, timeout: 5 }]
+    });
+    hooks[eventName] = groups;
+  }
+  if (safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough).includes('IS_DEMO')) {
+    const env = settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env)
+      ? settings.env as Record<string, unknown>
+      : {};
+    settings.env = {
+      ...env,
+      IS_DEMO: '1'
+    };
+  }
+  settings.hooks = hooks;
+  await api.writeTextFile(profile.id, settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+async function installGrokGlobalHooks(profile: ConnectionProfile) {
+  const { configPath, scriptPath } = await grokGlobalHookPaths(profile);
+  await api.writeTextFile(profile.id, scriptPath, grokHookScriptContent());
+  const hooks: Record<string, Array<{ hooks: Array<{ type: string; command: string; timeout: number }> }>> = {};
+  for (const eventName of GROK_HOOK_EVENTS) {
+    hooks[eventName] = [{
+      hooks: [{ type: 'command', command: GROK_HOOK_COMMAND, timeout: 5 }]
+    }];
+  }
+  await api.writeTextFile(profile.id, configPath, `${JSON.stringify({ hooks }, null, 2)}\n`);
+}
+
+async function grokGlobalHookPaths(profile: ConnectionProfile) {
+  const home = await api.resolveProfilePath(profile.id, '~');
+  const hookDir = posixJoinPath(home, GROK_HOOK_DIR);
+  return {
+    configPath: posixJoinPath(hookDir, GROK_HOOK_CONFIG_NAME),
+    scriptPath: posixJoinPath(hookDir, GROK_HOOK_SCRIPT_NAME)
+  };
+}
+
+function parseClaudeLocalSettings(text: string): Record<string, any> {
+  if (!text.trim()) return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeClaudeHookSettings(value: unknown): Record<string, any[]> {
+  const hooks: Record<string, any[]> = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return hooks;
+  for (const [key, groups] of Object.entries(value as Record<string, unknown>)) {
+    hooks[key] = Array.isArray(groups) ? groups.filter((group) => group && typeof group === 'object') : [];
+  }
+  return hooks;
+}
+
+function removeSimpleVibeClaudeHookGroups(groups: unknown): any[] {
+  if (!Array.isArray(groups)) return [];
+  return groups.filter((group) => {
+    if (!group || typeof group !== 'object') return false;
+    const hooks = Array.isArray((group as { hooks?: unknown }).hooks) ? (group as { hooks: unknown[] }).hooks : [];
+    return !hooks.some((hook) => {
+      if (!hook || typeof hook !== 'object') return false;
+      const command = String((hook as { command?: unknown }).command ?? '');
+      return command.includes(CLAUDE_HOOK_SCRIPT_NAME);
+    });
+  });
+}
+
+function claudeHookScriptContent() {
+  return `#!/bin/sh
+set -eu
+port="\${SVIDE_AGENT_BRIDGE_PORT:-}"
+token="\${SVIDE_AGENT_BRIDGE_TOKEN:-}"
+session="\${SVIDE_AGENT_SESSION_ID:-}"
+agent="\${SVIDE_AGENT_ID:-claude}"
+if [ -z "$port" ] || [ -z "$token" ] || [ -z "$session" ]; then
+  printf '{"continue":true,"suppressOutput":true}\\n'
+  exit 0
+fi
+tmp="\${TMPDIR:-/tmp}/svi-claude-hook-$$.json"
+cat > "$tmp" || true
+hosts="127.0.0.1 localhost"
+if [ -r /etc/resolv.conf ]; then
+  ns="$(awk '/^nameserver[[:space:]]+/ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)"
+  if [ -n "$ns" ]; then hosts="$hosts $ns"; fi
+fi
+for host in $hosts; do
+  curl -fsS -m 1 --connect-timeout 0.25 \\
+    -H "content-type: application/json" \\
+    -H "x-svi-agent-token: $token" \\
+    --data-binary "@$tmp" \\
+    "http://$host:$port/agent-event?agent=$agent&session=$session" >/dev/null 2>&1 && break
+done
+rm -f "$tmp"
+printf '{"continue":true,"suppressOutput":true}\\n'
+`;
+}
+
+function grokHookScriptContent() {
+  return `#!/bin/sh
+set -eu
+port="\${SVIDE_AGENT_BRIDGE_PORT:-}"
+token="\${SVIDE_AGENT_BRIDGE_TOKEN:-}"
+session="\${SVIDE_AGENT_SESSION_ID:-}"
+agent="\${SVIDE_AGENT_ID:-grok}"
+event="\${GROK_HOOK_EVENT:-}"
+tmp="\${TMPDIR:-/tmp}/svi-grok-hook-$$.json"
+compact="\${TMPDIR:-/tmp}/svi-grok-hook-$$.compact.json"
+cat > "$tmp" || true
+if [ -n "$port" ] && [ -n "$token" ] && [ -n "$session" ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$tmp" "$compact" <<'PY' >/dev/null 2>&1 || rm -f "$compact"
+import json
+import os
+import sys
+
+source_path, target_path = sys.argv[1], sys.argv[2]
+try:
+    with open(source_path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+except Exception:
+    payload = {}
+
+def pick(*names):
+    for name in names:
+        value = payload.get(name)
+        if value is not None:
+            return value
+    return None
+
+compact = {
+    "hookEventName": pick("hookEventName", "hook_event_name") or os.environ.get("GROK_HOOK_EVENT") or "unknown",
+    "sessionId": pick("sessionId", "session_id") or os.environ.get("GROK_SESSION_ID") or "",
+    "cwd": pick("cwd") or os.environ.get("GROK_WORKSPACE_ROOT") or "",
+    "workspaceRoot": pick("workspaceRoot", "workspace_root") or os.environ.get("GROK_WORKSPACE_ROOT") or "",
+    "toolName": pick("toolName", "tool_name", "effectiveToolName", "effective_tool_name"),
+    "effectiveToolName": pick("effectiveToolName", "effective_tool_name"),
+    "reason": pick("reason"),
+    "permissionMode": pick("permissionMode", "permission_mode"),
+    "isBackgrounded": pick("isBackgrounded", "is_backgrounded"),
+    "toolInputTruncated": pick("toolInputTruncated", "tool_input_truncated"),
+    "toolResultTruncated": pick("toolResultTruncated", "tool_result_truncated"),
+    "transcriptPath": pick("transcriptPath", "transcript_path"),
+    "timestamp": pick("timestamp")
+}
+compact = {key: value for key, value in compact.items() if value not in (None, "")}
+with open(target_path, "w", encoding="utf-8") as fh:
+    json.dump(compact, fh, ensure_ascii=False, separators=(",", ":"))
+PY
+  if [ -s "$compact" ]; then
+    hosts="127.0.0.1 localhost"
+    if [ -r /etc/resolv.conf ]; then
+      ns="$(awk '/^nameserver[[:space:]]+/ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)"
+      if [ -n "$ns" ]; then hosts="$hosts $ns"; fi
+    fi
+    for host in $hosts; do
+      curl -fsS -m 1 --connect-timeout 0.25 \\
+        -H "content-type: application/json" \\
+        -H "x-svi-agent-token: $token" \\
+        --data-binary "@$compact" \\
+        "http://$host:$port/agent-event?agent=$agent&session=$session" >/dev/null 2>&1 && break
+    done
+  fi
+fi
+rm -f "$tmp" "$compact"
+if [ "$event" = "pre_tool_use" ]; then
+  printf '{"decision":"allow"}\\n'
+fi
+`;
+}
+
+function posixJoinPath(base: string, ...parts: string[]) {
+  let out = (base || '.').replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!out) out = '.';
+  for (const part of parts) {
+    const clean = part.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!clean) continue;
+    out = out === '/' ? `/${clean}` : `${out}/${clean}`;
+  }
+  return out;
+}
+
 function launchLlm(id: string) {
   void startLlmLauncher(id);
 }
@@ -10871,7 +20811,8 @@ async function startLlmLauncher(id: string) {
   if (!profile) return;
   const cwd = workspaceShellCwd();
   const tmuxSessionName = await nextLlmTmuxSessionName(profile, cwd, state.activeWorkspaceId, id);
-  const { define, call } = llmLauncherParts(id, profile.kind, state.activeWorkspaceId, tmuxSessionName);
+  const agentBridge = await prepareAgentBridgeForLlmLaunch(id, profile, cwd);
+  const { define, call } = llmLauncherParts(id, profile.kind, state.activeWorkspaceId, tmuxSessionName, { agentBridge });
   const widget = await createTerminal(define, llmTmuxTabTitle(id, tmuxSessionName), {
     initialHeight: 420,
     profile,
@@ -10885,7 +20826,9 @@ async function startLlmLauncher(id: string) {
   // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
   pane.llmId = id;
   pane.llmTmuxSessionName = tmuxSessionName;
+  await registerAgentBridgeForPane(pane, agentBridge);
   markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
+  scheduleWorkspaceLlmTmuxTitlePoll(pane, 1000);
   queueTerminalShellReadyAction(
     pane,
     `launch ${id}`,
@@ -10907,15 +20850,27 @@ function llmLauncherParts(
   id: string,
   profileKind: string | undefined = state.activeProfile?.kind,
   workspaceId = state.activeWorkspaceId,
-  tmuxSessionName?: string | null
+  tmuxSessionName?: string | null,
+  options: { agentBridge?: AgentBridgeLaunchContext | null; envPassthrough?: string[] } = {}
 ): { define: string | null; call: string } {
   const launcher = LLM_LAUNCHERS[id];
   if (!launcher) return { define: null, call: id };
   if (profileKind === 'windows') return { define: null, call: powershellLlmLauncherCommand(launcher) };
-  return bashLlmLauncherParts(launcher, safeLlmTmuxSessionName(tmuxSessionName) ?? workspaceTmuxSessionName(workspaceId, id));
+  return bashLlmLauncherParts(
+    launcher,
+    safeLlmTmuxSessionName(tmuxSessionName) ?? workspaceTmuxSessionName(workspaceId, id),
+    {
+      agentBridge: options.agentBridge ?? null,
+      envPassthrough: options.envPassthrough ?? safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough)
+    }
+  );
 }
 
-function bashLlmLauncherParts(launcher: LlmLauncherConfig, tmuxSessionName: string): { define: string; call: string } {
+function bashLlmLauncherParts(
+  launcher: LlmLauncherConfig,
+  tmuxSessionName: string,
+  options: { agentBridge?: AgentBridgeLaunchContext | null; envPassthrough?: string[] } = {}
+): { define: string; call: string } {
   const executable = launcher.executable;
   // Add the bypass flag only when it is NOT already in the resolved command. `type` reveals an
   // alias/function body; a wrapper SCRIPT on PATH only shows its path via `type`, so also fold in
@@ -10924,14 +20879,30 @@ function bashLlmLauncherParts(launcher: LlmLauncherConfig, tmuxSessionName: stri
   // Otherwise add it. claude additionally refuses the flag as root, so gate it on a non-zero uid.
   // These lines only COMPUTE __svi_args (no CLI is run), so running them in the rcfile is silent.
   const needsRootGate = launcher.flags.some((flag) => flag.skipWhenRoot);
+  const envPassthrough = options.envPassthrough ?? safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough);
+  const bridge = options.agentBridge ?? null;
   const lines = [
     `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
     `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
     `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`,
     'unset __svi_args',
-    '__svi_args=()'
+    '__svi_args=()',
+    'unset __svi_env_args',
+    '__svi_env_args=()'
   ];
   if (needsRootGate) lines.push(`__svi_euid="$(id -u 2>/dev/null || echo 1000)"`);
+  for (const envName of envPassthrough) {
+    lines.push(`if [ -n "\${${envName}+x}" ]; then __svi_env_args+=("${envName}=\$${envName}"); fi`);
+  }
+  if (bridge) {
+    lines.push(
+      `__svi_agent_bridge_port=${bashQuote(String(bridge.bridge.port))}`,
+      `__svi_agent_bridge_token=${bashQuote(bridge.bridge.token)}`,
+      `__svi_agent_session_id=${bashQuote(bridge.sessionId)}`,
+      `__svi_agent_id=${bashQuote(bridge.agentId)}`,
+      '__svi_env_args+=("SVIDE_AGENT_BRIDGE_PORT=$__svi_agent_bridge_port" "SVIDE_AGENT_BRIDGE_TOKEN=$__svi_agent_bridge_token" "SVIDE_AGENT_SESSION_ID=$__svi_agent_session_id" "SVIDE_AGENT_ID=$__svi_agent_id")'
+    );
+  }
   for (const flag of launcher.flags) {
     const add = `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`;
     lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
@@ -10941,12 +20912,14 @@ function bashLlmLauncherParts(launcher: LlmLauncherConfig, tmuxSessionName: stri
     ? `__svi_launch_args=(); if [ "$(id -u 2>/dev/null || echo 1000)" != 0 ]; then __svi_launch_args=("\${__svi_args[@]}"); fi`
     : `__svi_launch_args=("\${__svi_args[@]}")`;
   const call = [
+    `__svi_launch_v=${IDE_LLM_LAUNCHER_VERSION};`,
     `${launchArgs};`,
+    `__svi_launcher_cmd="$(printf '%q ' "\${__svi_env_args[@]}" ${executableCommand} "\${__svi_launch_args[@]}")";`,
     `if command -v tmux >/dev/null 2>&1; then`,
-    `  __svi_tmux_cmd="$(printf '%q ' ${executableCommand} "\${__svi_launch_args[@]}")";`,
+    `  __svi_tmux_cmd="$(printf '%q ' bash -ic "eval $__svi_launcher_cmd")";`,
     `  tmux new-session -A -s ${bashQuote(tmuxSessionName)} "$__svi_tmux_cmd";`,
     `else`,
-    `  ${executableCommand} "\${__svi_launch_args[@]}";`,
+    `  eval "$__svi_launcher_cmd";`,
     `fi`
   ].join(' ');
   return { define: lines.join('\n'), call };
@@ -11028,7 +21001,17 @@ async function createWindowsShell() {
   await createTerminal(null, 'Windows PowerShell', { profile, cwd });
 }
 
+function isEditableShortcutTarget(target: EventTarget | null) {
+  const element = target instanceof Element ? target : null;
+  if (!element) return false;
+  if (element.closest('input, textarea, select')) return true;
+  const editable = element.closest<HTMLElement>('[contenteditable]');
+  if (editable?.isContentEditable) return true;
+  return element.closest('[role="textbox"]') !== null;
+}
+
 function handleEditorSaveShortcut(event: KeyboardEvent) {
+  if (isEditableShortcutTarget(event.target)) return;
   if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
   if (event.key.toLowerCase() !== 's') return;
   if (event.target instanceof Element && event.target.closest('.notes-panel')) return;
@@ -11041,6 +21024,7 @@ function handleEditorSaveShortcut(event: KeyboardEvent) {
 
 function handleResizeShortcut(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
+  if (isEditableShortcutTarget(event.target)) return;
   if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
   const direction = shortcutResizeDirection(event);
   if (!direction) return;
@@ -11052,6 +21036,7 @@ function handleResizeShortcut(event: KeyboardEvent) {
 
 function handleWidgetFocusShortcut(event: KeyboardEvent) {
   if (!isWidgetFocusShortcut(event)) return;
+  if (isEditableShortcutTarget(event.target)) return;
   if (event.target instanceof Element && event.target.closest('.terminal-host .xterm')) return;
 
   event.preventDefault();
@@ -11061,6 +21046,7 @@ function handleWidgetFocusShortcut(event: KeyboardEvent) {
 
 function handleTerminalTypingPadFocusShortcut(event: KeyboardEvent) {
   if (event.defaultPrevented || !isTerminalTypingPadFocusShortcut(event)) return;
+  if (isEditableShortcutTarget(event.target)) return;
   const target = event.target instanceof Element ? event.target : null;
   const card = target?.closest<HTMLElement>('.terminal-card') ?? null;
   let widget = card ? terminalWidgetForElement(card) : null;
@@ -11095,6 +21081,7 @@ function shortcutResizeDirection(event: KeyboardEvent) {
 
 function handleBrowserZoomShortcut(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
+  if (isEditableShortcutTarget(event.target)) return;
   if (!browserZoomShortcutTargetActive(event)) return;
   const action = browserZoomShortcutAction(event);
   if (!action) return;
@@ -11137,6 +21124,20 @@ function handleExplorerKeyboard(event: KeyboardEvent) {
     event.preventDefault();
     event.stopPropagation();
     void undoExplorerDelete();
+    return;
+  }
+
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'c') {
+    event.preventDefault();
+    event.stopPropagation();
+    copySelectedExplorerEntries();
+    return;
+  }
+
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'v') {
+    event.preventDefault();
+    event.stopPropagation();
+    void pasteExplorerClipboard();
     return;
   }
 
@@ -11459,6 +21460,25 @@ function terminalMinWidth() {
   return window.matchMedia('(max-width: 900px)').matches ? 220 : 300;
 }
 
+function terminalGlassPaddingX() {
+  if (!appGlassEnabled() || normalizeAppGlassSettings(state.ideSettings.appGlass).terminalWidgets !== true) return 0;
+  const value = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-glass-widget-padding-x'));
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function terminalSpawnMinWidth(options: CreateTerminalOptions = {}) {
+  const compact = window.matchMedia('(max-width: 900px)').matches;
+  let minWidth = terminalMinWidth();
+  if (appGlassEnabled() && normalizeAppGlassSettings(state.ideSettings.appGlass).terminalWidgets === true) {
+    minWidth = Math.max(minWidth, compact ? 280 : 360);
+    minWidth += terminalGlassPaddingX() * 2;
+  }
+  if (normalizeTerminalLlmId(options.llmId)) {
+    minWidth = Math.max(minWidth, compact ? 320 : 420);
+  }
+  return minWidth;
+}
+
 function terminalMinHeight() {
   return window.matchMedia('(max-width: 900px)').matches ? 220 : 280;
 }
@@ -11466,16 +21486,22 @@ function terminalMinHeight() {
 function setKeyboardResizeTarget(target: ResizeTarget) {
   keyboardResizeTarget = target;
   const nextElement = keyboardResizeElementForTarget(target);
+  const nextWidgetElement = terminalWidgetElementForKeyboardTarget(target);
   if (keyboardResizeTargetElement && keyboardResizeTargetElement !== nextElement) {
     keyboardResizeTargetElement.classList.remove('keyboard-target');
+  }
+  if (keyboardResizeTargetWidgetElement && keyboardResizeTargetWidgetElement !== nextWidgetElement) {
+    keyboardResizeTargetWidgetElement.classList.remove('keyboard-target');
   }
   el.titlebar.classList.toggle('keyboard-target', target.kind === 'ide');
   if (target.kind === 'panel') {
     nextElement?.classList.add('keyboard-target');
   } else if (target.kind === 'terminal') {
     nextElement?.classList.add('keyboard-target');
+    nextWidgetElement?.classList.add('keyboard-target');
   }
   keyboardResizeTargetElement = nextElement;
+  keyboardResizeTargetWidgetElement = nextWidgetElement;
 }
 
 function keyboardResizeElementForTarget(target: ResizeTarget) {
@@ -11485,6 +21511,13 @@ function keyboardResizeElementForTarget(target: ResizeTarget) {
     return pane?.host.closest<HTMLElement>('.terminal-split-leaf') ?? pane?.element ?? null;
   }
   return null;
+}
+
+function terminalWidgetElementForKeyboardTarget(target: ResizeTarget) {
+  if (target.kind !== 'terminal') return null;
+  const pane = terminalPaneById.get(target.paneId);
+  const widget = pane ? terminalWidgetForPane(pane) : null;
+  return widget?.element ?? null;
 }
 
 type WidgetFocusItem =
@@ -11667,6 +21700,10 @@ function syncWidgetOpacityButton(element: HTMLElement) {
 }
 
 function showWidgetOpacityPopover(target: WidgetOpacityTarget, anchor: HTMLElement) {
+  if (appGlassEnabled()) {
+    hideWidgetOpacityPopover();
+    return;
+  }
   widgetOpacityPopoverTarget = target;
   widgetOpacityPopoverDirty = false;
   const opacity = widgetOpacityForElement(target.element);
@@ -11737,7 +21774,56 @@ function handleWidgetOpacityPointerDown(event: PointerEvent) {
 }
 
 function handleWidgetOpacityKeydown(event: KeyboardEvent) {
+  if (isEditableShortcutTarget(event.target)) return;
   if (event.key === 'Escape') hideWidgetOpacityPopover();
+}
+
+
+function handleGlassSettingsKeydown(event: KeyboardEvent) {
+  if (isEditableShortcutTarget(event.target)) return;
+  if (event.key === 'Escape') closeGlassSettingsPopover();
+}
+
+function startFixedPopoverDrag(event: PointerEvent, popover: HTMLElement) {
+  if (event.button !== 0) return;
+  if (event.target instanceof Element && event.target.closest('button, input, select, textarea, a')) return;
+  event.preventDefault();
+  event.stopPropagation();
+
+  const rect = popover.getBoundingClientRect();
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const startLeft = rect.left;
+  const startTop = rect.top;
+  const width = rect.width;
+  const height = rect.height;
+  popover.style.left = `${startLeft}px`;
+  popover.style.top = `${startTop}px`;
+  popover.style.right = 'auto';
+  popover.style.bottom = 'auto';
+  popover.setPointerCapture(event.pointerId);
+  popover.classList.add('dragging');
+
+  const move = (moveEvent: PointerEvent) => {
+    const maxLeft = Math.max(0, window.innerWidth - width);
+    const maxTop = Math.max(0, window.innerHeight - height);
+    const left = clamp(startLeft + moveEvent.clientX - startX, 0, maxLeft);
+    const top = clamp(startTop + moveEvent.clientY - startY, 0, maxTop);
+    popover.style.left = `${Math.round(left)}px`;
+    popover.style.top = `${Math.round(top)}px`;
+  };
+
+  const up = (upEvent: PointerEvent) => {
+    popover.classList.remove('dragging');
+    popover.releasePointerCapture(upEvent.pointerId);
+    popover.removeEventListener('pointermove', move);
+    popover.removeEventListener('pointerup', up);
+    popover.removeEventListener('pointercancel', up);
+  };
+
+  popover.addEventListener('pointermove', move);
+  popover.addEventListener('pointerup', up);
+  popover.addEventListener('pointercancel', up);
 }
 
 function terminalWidgetOpacityForSnapshot(snapshot: WorkspaceSnapshot, widgetKey: string) {
@@ -11770,10 +21856,9 @@ function bindFloatingPanels() {
   for (const button of el.togglePanelButtons) {
     button.addEventListener('click', () => {
       const id = button.dataset.togglePanel as FloatingPanelId;
-      setPanelVisible(id, getPanel(id).classList.contains('hidden'));
+      toggleFloatingPanelFromButton(id);
     });
   }
-  el.resetLayout.addEventListener('click', resetFloatingLayout);
 }
 
 function getPanel(id: FloatingPanelId) {
@@ -11790,6 +21875,42 @@ function isBrowserPanelHidden() {
 
 function isPanelVisible(id: FloatingPanelId) {
   return !getPanel(id).classList.contains('hidden');
+}
+
+function floatingSurfaceExplicitZ(element: HTMLElement) {
+  const value = Number.parseInt(element.style.zIndex || '', 10);
+  return Number.isFinite(value) ? value : null;
+}
+
+function floatingPanelIsFrontmost(panel: HTMLElement) {
+  const panelZValue = floatingSurfaceExplicitZ(panel);
+  if (panelZValue === null) return false;
+  for (const id of FLOATING_PANELS) {
+    const other = getPanel(id);
+    if (other === panel || other.classList.contains('hidden')) continue;
+    const otherZ = floatingSurfaceExplicitZ(other);
+    if (otherZ !== null && otherZ > panelZValue) return false;
+  }
+  for (const widget of state.terminalWidgets) {
+    const other = widget.element;
+    if (other === panel || !other.isConnected || other.classList.contains('hidden')) continue;
+    const otherZ = floatingSurfaceExplicitZ(other);
+    if (otherZ !== null && otherZ > panelZValue) return false;
+  }
+  return true;
+}
+
+function toggleFloatingPanelFromButton(id: FloatingPanelId) {
+  const panel = getPanel(id);
+  if (panel.classList.contains('hidden')) {
+    setPanelVisible(id, true);
+    return;
+  }
+  if (!floatingPanelIsFrontmost(panel)) {
+    setPanelVisible(id, true);
+    return;
+  }
+  setPanelVisible(id, false);
 }
 
 function getPanelToggle(id: FloatingPanelId) {
@@ -11832,6 +21953,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     setAttributeIfChanged(toggle, 'aria-pressed', String(visible));
   }
   if (visible) {
+    if (wasHidden) syncAppGlassOwnerTargets(panel);
     if (wasHidden) applyStoredLayoutRatio(panel);
     if (!options.skipFocus) {
       bringPanelToFront(panel);
@@ -11852,7 +21974,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       renderImageHistory();
     }
     if (id === 'calculator' && wasHidden && !restoringWorkspace) renderCalculator();
-    if (id === 'settings' && wasHidden && !restoringWorkspace) renderSettings();
+    if (id === 'settings' && wasHidden) renderSettings();
     if (id === 'explorer' && wasHidden && state.workspaceOpen && !restoringWorkspace) {
       if (shouldLoadExplorerDirectoryOnShow()) {
         void loadDirectory(state.currentDir);
@@ -11890,20 +22012,12 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
     }
   }
   if (visibilityChanged && !options.skipSave) saveActiveWorkspaceSnapshot();
-}
-
-function resetFloatingLayout() {
-  for (const id of FLOATING_PANELS) {
-    const panel = getPanel(id);
-    panel.style.left = '';
-    panel.style.top = '';
-    panel.style.width = '';
-    panel.style.height = '';
-    panel.style.zIndex = '';
-    setPanelVisible(id, DEFAULT_PANEL_VISIBILITY[id]);
+  if (visibilityChanged) {
+    scheduleAppGlassOwnerRefresh(panel, {
+      delay: visible ? 120 : 0,
+      reason: visible ? 'panel-show' : 'panel-hide'
+    });
   }
-  requestCodeEditorMeasure();
-  saveActiveWorkspaceSnapshot();
 }
 
 function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
@@ -11918,15 +22032,16 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
   } else {
     setKeyboardResizeTarget({ kind: 'panel', id: panel.dataset.panel as FloatingPanelId });
   }
-  commitPanelRect(panel);
+  panel.classList.add('dragging');
+  const suspendedTilt = suspendLiquidGlassTiltForOwner(panel);
+  commitPanelRect(panel, { skipGlassRefresh: true });
 
   const workspace = panel.parentElement as HTMLElement;
-  const workspaceRect = workspace.getBoundingClientRect();
-  const panelRect = panel.getBoundingClientRect();
+  const panelRect = currentPanelRect(panel, workspace);
   const startX = event.clientX;
   const startY = event.clientY;
-  const startLeft = panelRect.left - workspaceRect.left;
-  const startTop = panelRect.top - workspaceRect.top;
+  const startLeft = panelRect.left;
+  const startTop = panelRect.top;
   const workspaceWidth = workspace.clientWidth;
   const workspaceHeight = workspace.clientHeight;
   const panelWidth = panelRect.width;
@@ -11934,7 +22049,7 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
   const snapGuides = collectSnapGuides(panel, workspace);
 
   panel.setPointerCapture(event.pointerId);
-  panel.classList.add('dragging');
+  refreshLiquidGlassGeometryForOwner(panel);
 
   const move = (moveEvent: PointerEvent) => {
     const maxLeft = Math.max(0, workspaceWidth - panelWidth);
@@ -11945,8 +22060,9 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
       width: panelWidth,
       height: panelHeight
     };
-    applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }, snapGuides));
+    applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }, snapGuides), { skipGlassRefresh: true });
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    scheduleLiquidGlassGeometryForOwner(panel);
   };
 
   const up = (upEvent: PointerEvent) => {
@@ -11956,6 +22072,8 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
     panel.removeEventListener('pointerup', up);
     panel.removeEventListener('pointercancel', up);
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    restoreLiquidGlassTiltSuspension(suspendedTilt);
+    refreshLiquidGlassGeometryForOwner(panel);
     saveActiveWorkspaceSnapshot();
   };
 
@@ -11980,7 +22098,9 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
   } else {
     setKeyboardResizeTarget({ kind: 'panel', id: panel.dataset.panel as FloatingPanelId });
   }
-  commitPanelRect(panel);
+  panel.classList.add('resizing');
+  const suspendedTilt = suspendLiquidGlassTiltForOwner(panel);
+  commitPanelRect(panel, { skipGlassRefresh: true });
 
   const workspace = panel.parentElement as HTMLElement;
   const panelRect = currentPanelRect(panel, workspace);
@@ -11993,7 +22113,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
   const snapGuides = collectSnapGuides(panel, workspace);
 
   grip.setPointerCapture(event.pointerId);
-  panel.classList.add('resizing');
+  refreshLiquidGlassGeometryForOwner(panel);
 
   const move = (moveEvent: PointerEvent) => {
     const deltaX = moveEvent.clientX - startX;
@@ -12025,11 +22145,12 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
       resizeRight: resizeEast,
       resizeTop: resizeNorth,
       resizeBottom: resizeSouth
-    }, snapGuides));
+    }, snapGuides), { skipGlassRefresh: true });
     if (panel.dataset.panel === 'editor') requestCodeEditorMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    scheduleLiquidGlassGeometryForOwner(panel);
   };
 
   const up = (upEvent: PointerEvent) => {
@@ -12042,6 +22163,8 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    restoreLiquidGlassTiltSuspension(suspendedTilt);
+    refreshLiquidGlassGeometryForOwner(panel);
     saveActiveWorkspaceSnapshot();
   };
 
@@ -12051,19 +22174,34 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
 }
 
 function bringPanelToFront(panel: HTMLElement) {
+  panelZ = Math.max(panelZ, maxFloatingSurfaceZ());
   panel.style.zIndex = String(++panelZ);
+  scheduleLiquidGlassGeometryForOwner(panel);
 }
 
-function commitPanelRect(panel: HTMLElement) {
+function maxFloatingSurfaceZ() {
+  let maxZ = panelZ;
+  for (const id of FLOATING_PANELS) {
+    const panel = getPanel(id);
+    const z = floatingSurfaceExplicitZ(panel);
+    if (z !== null) maxZ = Math.max(maxZ, z);
+  }
+  for (const widget of state.terminalWidgets) {
+    const z = floatingSurfaceExplicitZ(widget.element);
+    if (z !== null) maxZ = Math.max(maxZ, z);
+  }
+  return maxZ;
+}
+
+function commitPanelRect(panel: HTMLElement, options: { skipGlassRefresh?: boolean } = {}) {
   const workspace = panel.parentElement as HTMLElement;
-  const workspaceRect = workspace.getBoundingClientRect();
-  const panelRect = panel.getBoundingClientRect();
+  const panelRect = currentPanelRect(panel, workspace);
   applyPanelRect(panel, {
-    left: Math.round(panelRect.left - workspaceRect.left),
-    top: Math.round(panelRect.top - workspaceRect.top),
+    left: Math.round(panelRect.left),
+    top: Math.round(panelRect.top),
     width: Math.round(panelRect.width),
     height: Math.round(panelRect.height)
-  });
+  }, options);
 }
 
 function pinPanelToWorkspace(panel: HTMLElement) {
@@ -12076,7 +22214,14 @@ function pinPanelToWorkspace(panel: HTMLElement) {
   }));
 }
 
-function applyPanelRect(panel: HTMLElement, rect: PanelRect) {
+function resetPanelInlineGeometry(panel: HTMLElement) {
+  panel.style.left = '';
+  panel.style.top = '';
+  panel.style.width = '';
+  panel.style.height = '';
+}
+
+function applyPanelRect(panel: HTMLElement, rect: PanelRect, options: { skipGlassRefresh?: boolean } = {}) {
   panel.style.left = `${Math.round(rect.left)}px`;
   panel.style.top = `${Math.round(rect.top)}px`;
   panel.style.width = `${Math.round(rect.width)}px`;
@@ -12085,6 +22230,7 @@ function applyPanelRect(panel: HTMLElement, rect: PanelRect) {
   if (workspace?.clientWidth && workspace.clientHeight) {
     layoutRatios.set(panel, rectToLayoutRatio(rect, workspace));
   }
+  if (!options.skipGlassRefresh) scheduleLiquidGlassGeometryForOwner(panel);
 }
 
 function snapPanelRect(
@@ -12197,6 +22343,14 @@ function clampPanelRect(panel: HTMLElement, rect: PanelRect) {
 }
 
 function currentPanelRect(element: HTMLElement, workspace: HTMLElement): PanelRect {
+  if (element.offsetParent === workspace) {
+    return {
+      left: element.offsetLeft,
+      top: element.offsetTop,
+      width: element.offsetWidth,
+      height: element.offsetHeight
+    };
+  }
   const workspaceRect = workspace.getBoundingClientRect();
   const rect = element.getBoundingClientRect();
   return {
@@ -12408,6 +22562,7 @@ async function closeAllTerminals() {
   }
   for (const widget of widgets) {
     forgetTerminalWidget(widget);
+    cleanupAppGlassOwner(widget.element);
     widget.element.remove();
   }
   for (const workspaceId of [...workspaceLlmActivityExpiresAt.keys()]) clearWorkspaceLlmActivity(workspaceId);
@@ -12458,7 +22613,9 @@ function hideTerminalWidgetsForWorkspace(workspaceId: string) {
   for (const widget of state.terminalWidgets) {
     if (workspaceId && widget.workspaceId !== workspaceId) continue;
     if (!workspaceId && widget.element.classList.contains('hidden')) continue;
-    toggleClassIfChanged(widget.element, 'hidden', true);
+    if (toggleClassIfChanged(widget.element, 'hidden', true)) {
+      scheduleAppGlassOwnerRefresh(widget.element, { delay: 0, reason: 'terminal-hide' });
+    }
   }
 }
 
@@ -12861,6 +23018,13 @@ function bufferPendingTerminalExit(payload: TerminalExitEvent) {
   prunePendingTerminalBackendEvents();
 }
 
+function dropPendingTerminalBackendEvents(backendId: string | undefined) {
+  if (!backendId) return;
+  pendingTerminalDataByBackendId.delete(backendId);
+  pendingTerminalCursorQueriesByBackendId.delete(backendId);
+  pendingTerminalExitByBackendId.delete(backendId);
+}
+
 function flushPendingTerminalBackendEvents(pane: TerminalPane, backendId: string) {
   const data = pendingTerminalDataByBackendId.get(backendId);
   if (data) {
@@ -12895,6 +23059,8 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
     clearWorkspaceLlmTitleActivityForPane(pane);
     clearWorkspaceLlmTitleSignalTimer(pane);
     pane.llmTitleOscBuffer = undefined;
+    pane.llmTitleStatusBuffer = undefined;
+    resetWorkspaceLlmTitleStatusTracker(pane);
     pane.detectedLlmId = undefined;
   }
   clearTerminalPendingShellReadyActions(pane);
@@ -12904,6 +23070,8 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
   if (backendId) {
     pane.llmWaitingDetectionBuffer = '';
     pane.llmTitleOscBuffer = undefined;
+    pane.llmTitleStatusBuffer = undefined;
+    resetWorkspaceLlmTitleStatusTracker(pane);
     if (!terminalNeedsShellReadyGate(pane)) pane.shellReadyAt = performance.now();
     else scheduleTerminalShellReadyFallback(pane);
   }
@@ -12950,13 +23118,30 @@ function showTerminalWidgetsForWorkspace(workspaceId: string) {
     const wasHidden = widget.element.classList.contains('hidden');
     if (wasHidden) {
       widget.element.classList.remove('hidden');
+      syncAppGlassOwnerTargets(widget.element);
       applyStoredLayoutRatio(widget.element);
       syncTerminalWidgetActiveState(widget);
       scheduleFitTerminalWidget(widget, { activeOnly: true });
+      scheduleAppGlassOwnerRefresh(widget.element, { delay: 120, reason: 'terminal-show' });
     }
-    const activePane = activePaneForWidget(widget);
-    if (activePane) flushTerminalWriteBuffer(activePane);
+    flushVisibleTerminalWidgetPanes(widget);
   }
+}
+
+function flushVisibleTerminalWidgetPanes(widget: TerminalWidget) {
+  const activeGroup = activeTerminalGroupForWidget(widget);
+  const paneIds = activeGroup ? terminalGroupPaneIds(activeGroup) : [widget.activePaneId];
+  let flushed = 0;
+  for (const paneId of paneIds) {
+    const pane = terminalPaneById.get(paneId);
+    if (!pane || terminalPaneVisibility(pane) !== 'visible') continue;
+    flushTerminalWriteBuffer(pane);
+    refreshTerminalViewportIfRecentOutput(pane);
+    scheduleTerminalRenderWatchdog(pane);
+    scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
+    flushed += 1;
+  }
+  if (flushed) appendDiagnosticLog('terminal', `workspace show flushed ${flushed} visible pane${flushed === 1 ? '' : 's'} widget=${widget.widgetId.slice(0, 6)}`);
 }
 
 function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {}) {
@@ -12980,6 +23165,11 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   state.editorTabs = [];
   clearEditorTabLookup();
   state.activeEditorTabId = '';
+  state.editorPanes = [];
+  state.activeEditorPaneId = '';
+  state.editorSplitLayout = null;
+  editorPaneElementCache.clear();
+  editorPaneViewState.clear();
   if (renderIntermediate) ensureEditorTab();
   state.imagePreviewDataUrl = '';
   state.imagePreviewLabel = 'No image selected';
@@ -12994,6 +23184,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   if (renderIntermediate) ensureImageTab();
   for (const timer of noteSaveTimers.values()) window.clearTimeout(timer);
   noteSaveTimers.clear();
+  persistNoteMemoryStore();
   noteHydrationToken += 1;
   state.noteTabs = [];
   clearNoteTabLookup();
@@ -13119,12 +23310,10 @@ function renderWorkspaceControls(open: boolean) {
   const signature = open ? '1' : '0';
   if (workspaceControlsRenderSignature === signature) return;
   workspaceControlsRenderSignature = signature;
-  setDisabledIfChanged(el.copyCurrentCd, !open);
   setDisabledIfChanged(el.saveWorkspace, !open);
   setDisabledIfChanged(el.newShell, !open);
   setDisabledIfChanged(el.shellNewTab, !open);
   el.shellTabs.classList.add('hidden');
-  setDisabledIfChanged(el.resetLayout, !open);
   for (const button of el.llmButtons) {
     setDisabledIfChanged(button, !open);
   }
@@ -13507,18 +23696,21 @@ function scheduleCachedExplorerDirectoryRefresh(
 function renderExplorer() {
   if (getPanel('explorer').classList.contains('hidden')) {
     explorerRenderDirty = true;
+    removeExplorerLiquidGlass();
     return;
   }
   explorerRenderDirty = false;
   const scrollTop = el.fileList.scrollTop;
   updateExplorerFileSizeMode();
   updateExplorerOpenMode();
+  updateExplorerAutoEditorToggle();
   renderExplorerPathRow();
 
   rebuildExplorerVisibleRows();
   renderVirtualExplorerRows(scrollTop, { force: true });
   renderExportJobs();
   queueVisibleExplorerDirectoryPrefetch(900);
+  scheduleExplorerLiquidGlassRefresh();
 }
 
 function renderExplorerPathRow() {
@@ -13543,14 +23735,15 @@ function renderExplorerPathRow() {
 }
 
 function openExplorerEntry(entry: FileEntry) {
-  selectExplorerEntry(entry.path, false);
-  if (entry.kind === 'dir') {
-    void toggleExplorerDirectory(entry);
-  } else if (isWindowsExecutablePath(entry.path)) {
-    void openExecutablePath(entry.path);
-  } else {
-    void openFile(entry.path);
+  explorerAutoOpenSuppressed += 1;
+  try {
+    selectExplorerEntry(entry.path, false);
+  } finally {
+    explorerAutoOpenSuppressed = Math.max(0, explorerAutoOpenSuppressed - 1);
   }
+  if (entry.kind === 'dir') void toggleExplorerDirectory(entry);
+  else if (isWindowsExecutablePath(entry.path)) void openExecutablePath(entry.path);
+  else void openFile(entry.path);
 }
 
 function openSelectedExplorerEntry() {
@@ -13707,6 +23900,7 @@ function renderVirtualExplorerRows(
     dropTargetKey,
     renameKey
   })) {
+    scheduleExplorerLiquidGlassRefresh();
     return;
   }
 
@@ -13724,6 +23918,8 @@ function renderVirtualExplorerRows(
   el.fileList.replaceChildren(fragment);
   if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
   explorerLastSelectedPath = state.explorerSelectedPath;
+  scheduleExplorerLiquidGlassRefresh();
+  scheduleExplorerScrollDiagnostic('render');
 }
 
 function patchVirtualExplorerRows(options: {
@@ -13780,6 +23976,7 @@ function patchVirtualExplorerRows(options: {
   updateExplorerSpacerHeight(explorerBottomSpacer, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT);
   if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
   explorerLastSelectedPath = state.explorerSelectedPath;
+  scheduleExplorerScrollDiagnostic('patch');
   return true;
 }
 
@@ -13799,6 +23996,8 @@ function removeExplorerRenderedChild(child: Element | null) {
   if (!(child instanceof HTMLElement) || child === explorerTopSpacer || child === explorerBottomSpacer) return;
   const key = child.dataset.pathKey;
   if (key && explorerRenderedRowByPath.get(key) === child) explorerRenderedRowByPath.delete(key);
+  const glass = child.querySelector<HTMLElement>(':scope > .file-row-glass');
+  if (glass) cleanupExplorerLiquidGlassTarget(glass);
   child.remove();
 }
 
@@ -13863,26 +24062,59 @@ function createExplorerRowElement() {
   row.tabIndex = 0;
   row.setAttribute('role', 'option');
 
+  const glass = document.createElement('div');
+  glass.className = 'file-row-glass credit-card-glass';
+  glass.setAttribute('aria-hidden', 'true');
+  const outline = document.createElement('div');
+  outline.className = 'file-row-outline-plane';
+  outline.setAttribute('aria-hidden', 'true');
   const disclosure = document.createElement('span');
   disclosure.className = 'file-disclosure';
   const name = document.createElement('span');
   name.className = 'file-name';
   const size = document.createElement('small');
-  row.append(disclosure, name, size);
-  explorerRowPartCache.set(row, { disclosure, name, size });
+  row.append(glass, outline, disclosure, name, size);
+  explorerRowPartCache.set(row, { glass, outline, disclosure, name, size });
   return row;
 }
 
 function explorerRowParts(row: HTMLElement) {
   const cached = explorerRowPartCache.get(row);
-  if (cached) return cached;
+  if (cached) {
+    cached.outline = ensureExplorerRowOutlinePlane(row, cached.glass);
+    return cached;
+  }
+  let glass = row.querySelector<HTMLElement>(':scope > .file-row-glass');
+  if (!glass) {
+    glass = document.createElement('div');
+    glass.className = 'file-row-glass credit-card-glass';
+    glass.setAttribute('aria-hidden', 'true');
+    row.prepend(glass);
+  }
+  const outline = ensureExplorerRowOutlinePlane(row, glass);
   const parts = {
-    disclosure: row.children[0] as HTMLElement,
-    name: row.children[1] as HTMLElement,
-    size: row.children[2] as HTMLElement
+    glass,
+    outline,
+    disclosure: row.querySelector<HTMLElement>(':scope > .file-disclosure')!,
+    name: row.querySelector<HTMLElement>(':scope > .file-name')!,
+    size: row.querySelector<HTMLElement>(':scope > small')!
   };
   explorerRowPartCache.set(row, parts);
   return parts;
+}
+
+function ensureExplorerRowOutlinePlane(row: HTMLElement, glass?: HTMLElement | null) {
+  let outline = row.querySelector<HTMLElement>(':scope > .file-row-outline-plane');
+  if (!outline) {
+    outline = document.createElement('div');
+    outline.className = 'file-row-outline-plane';
+    outline.setAttribute('aria-hidden', 'true');
+    const anchor = glass ?? row.querySelector<HTMLElement>(':scope > .file-row-glass');
+    if (anchor?.nextSibling) row.insertBefore(outline, anchor.nextSibling);
+    else if (anchor) row.append(outline);
+    else row.prepend(outline);
+  }
+  return outline;
 }
 
 function updateExplorerRowElement(
@@ -13998,6 +24230,8 @@ function explorerCachePruneBusy() {
 
 function recycleExplorerRowElement(row?: HTMLElement) {
   if (!row || row.isConnected || explorerReusableRowElements.length >= EXPLORER_ROW_RECYCLE_LIMIT) return;
+  const glass = row.querySelector<HTMLElement>(':scope > .file-row-glass');
+  if (glass) cleanupExplorerLiquidGlassTarget(glass);
   row.dataset.staticSignature = '';
   row.dataset.stateSignature = '';
   row.dataset.renameActive = '0';
@@ -14009,15 +24243,20 @@ function recycleExplorerRowElement(row?: HTMLElement) {
 
 function bindExplorerListEvents() {
   el.fileList.addEventListener('scroll', handleExplorerScroll, { passive: true });
+  el.fileList.addEventListener('pointerover', handleExplorerHoverOnlyPointerOver, { passive: true });
+  el.fileList.addEventListener('pointerout', handleExplorerHoverOnlyPointerOut, { passive: true });
+  el.fileList.addEventListener('pointermove', handleExplorerHoverOnlyPointerMove, { passive: true });
   el.fileList.addEventListener('pointerover', handleExplorerPointerOver);
   el.fileList.addEventListener('pointerdown', handleExplorerPointerDown);
   el.fileList.addEventListener('selectstart', handleExplorerSelectStart);
   el.fileList.addEventListener('focusin', handleExplorerFocusIn);
   el.fileList.addEventListener('click', handleExplorerClick);
   el.fileList.addEventListener('dblclick', handleExplorerDoubleClick);
+  getPanel('explorer').addEventListener('pointerdown', handleExplorerScrollDiagnosticPointerDown, { capture: true });
   explorerResizeObserver = new ResizeObserver((entries) => {
     explorerViewportHeight = Math.round(entries[0]?.contentRect.height ?? el.fileList.clientHeight);
     scheduleExplorerVirtualRender();
+    scheduleExplorerScrollDiagnostic('resize');
   });
   explorerResizeObserver.observe(el.fileList);
 }
@@ -14025,6 +24264,82 @@ function bindExplorerListEvents() {
 function handleExplorerScroll() {
   markExplorerScrolling();
   scheduleExplorerVirtualRender();
+  scheduleExplorerLiquidGlassScrollRender();
+  scheduleExplorerLiquidGlassRefresh();
+  scheduleExplorerScrollDiagnostic('scroll');
+  if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
+}
+
+function explorerScrollDiagnosticsEnabled() {
+  return state.ideSettings.appGlass?.diagnostics === true || state.ideSettings.debugLogEnabled === true;
+}
+
+function scheduleExplorerScrollDiagnostic(reason: string) {
+  if (!explorerScrollDiagnosticsEnabled()) return;
+  if (explorerScrollDiagnosticFrame) return;
+  explorerScrollDiagnosticFrame = window.requestAnimationFrame(() => {
+    explorerScrollDiagnosticFrame = 0;
+    const now = Date.now();
+    if (reason === 'scroll' && now - explorerScrollDiagnosticLastAt < 350) return;
+    explorerScrollDiagnosticLastAt = now;
+    appendExplorerScrollDiagnostic(reason);
+  });
+}
+
+function handleExplorerScrollDiagnosticPointerDown(event: PointerEvent) {
+  if (!explorerScrollDiagnosticsEnabled()) return;
+  const panel = getPanel('explorer');
+  const panelRect = panel.getBoundingClientRect();
+  const nearBottom = event.clientY >= panelRect.bottom - 36;
+  const nearRight = event.clientX >= panelRect.right - 36;
+  if (!nearBottom && !nearRight) return;
+  const targetName = event.target instanceof Element ? glassDiagnosticElementName(event.target) : 'none';
+  appendExplorerScrollDiagnostic(
+    `pointer target=${targetName} x=${Math.round(event.clientX - panelRect.left)} y=${Math.round(event.clientY - panelRect.top)} nb=${nearBottom ? 1 : 0} nr=${nearRight ? 1 : 0}`
+  );
+}
+
+function appendExplorerScrollDiagnostic(reason: string) {
+  const fileList = el.fileList;
+  const panel = getPanel('explorer');
+  const listRect = fileList.getBoundingClientRect();
+  const panelRect = panel.getBoundingClientRect();
+  const style = getComputedStyle(fileList);
+  const southGrip = panel.querySelector<HTMLElement>(':scope > .panel-resize-south');
+  const eastGrip = panel.querySelector<HTMLElement>(':scope > .panel-resize-east');
+  const southeastGrip = panel.querySelector<HTMLElement>(':scope > .panel-resize-southeast');
+  appendDiagnosticLog(
+    'explorer-scroll',
+    [
+      `reason=${sanitizeDiagnosticLogPart(reason, 80)}`,
+      `st=${Math.round(fileList.scrollTop)}`,
+      `sl=${Math.round(fileList.scrollLeft)}`,
+      `cw=${fileList.clientWidth}`,
+      `sw=${fileList.scrollWidth}`,
+      `ch=${fileList.clientHeight}`,
+      `sh=${fileList.scrollHeight}`,
+      `vh=${explorerViewportHeight}`,
+      `rows=${explorerVisibleRows.length}`,
+      `win=${explorerRenderedStart}-${explorerRenderedEnd}/${explorerRenderedTotal}`,
+      `pad=${style.paddingTop}/${style.paddingRight}/${style.paddingBottom}/${style.paddingLeft}`,
+      `overflow=${style.overflowX}/${style.overflowY}`,
+      `list=${rectDiagnostic(listRect, panelRect)}`,
+      `south=${elementRectDiagnostic(southGrip, panelRect)}`,
+      `east=${elementRectDiagnostic(eastGrip, panelRect)}`,
+      `se=${elementRectDiagnostic(southeastGrip, panelRect)}`
+    ].join(' '),
+    'info',
+    { force: state.ideSettings.appGlass?.diagnostics === true }
+  );
+}
+
+function elementRectDiagnostic(element: HTMLElement | null, origin: DOMRect) {
+  if (!element) return 'none';
+  return rectDiagnostic(element.getBoundingClientRect(), origin);
+}
+
+function rectDiagnostic(rect: DOMRect, origin: DOMRect) {
+  return `${Math.round(rect.left - origin.left)},${Math.round(rect.top - origin.top)},${Math.round(rect.width)}x${Math.round(rect.height)}`;
 }
 
 function scheduleExplorerVirtualRender() {
@@ -14088,6 +24403,30 @@ function handleExplorerPointerOver(event: PointerEvent) {
   const entry = explorerEntryForRow(row);
   if (!entry) return;
   scheduleExplorerHoverPrefetch(entry);
+}
+
+function handleExplorerHoverOnlyPointerOver(event: PointerEvent) {
+  if (!explorerGlassHoverOnlyEnabled()) return;
+  const row = explorerRowFromEvent(event);
+  if (row) setExplorerHoverOnlyTarget(row);
+}
+
+function handleExplorerHoverOnlyPointerOut(event: PointerEvent) {
+  if (!explorerGlassHoverOnlyEnabled()) return;
+  const row = explorerRowFromEvent(event);
+  if (!row || row !== explorerLiquidGlassHoverOnlyTarget) return;
+  const related = event.relatedTarget instanceof Element
+    ? event.relatedTarget.closest<HTMLElement>('.file-row')
+    : null;
+  if (related === row) return;
+  setExplorerHoverOnlyTarget(related);
+}
+
+function handleExplorerHoverOnlyPointerMove(event: PointerEvent) {
+  if (!explorerGlassHoverOnlyEnabled()) return;
+  const hit = document.elementFromPoint(event.clientX, event.clientY);
+  const row = hit instanceof Element ? hit.closest<HTMLElement>('.file-row') : null;
+  if (row !== explorerLiquidGlassHoverOnlyTarget) setExplorerHoverOnlyTarget(row);
 }
 
 function handleExplorerPointerDown(event: PointerEvent) {
@@ -14342,6 +24681,76 @@ async function undoExplorerDelete() {
     setStatus(undo.items.length === 1 ? `Restored ${undo.items[0].name}` : `Restored ${undo.items.length} items`);
   } catch (error) {
     setStatus(`Undo delete failed: ${String(error)}`, true);
+  }
+}
+
+function copySelectedExplorerEntries() {
+  if (!state.activeProfile || !state.workspaceOpen) return;
+  const entries = compactRecursiveExplorerSelection(selectedExplorerEntries());
+  if (!entries.length) {
+    setStatus('Select item(s) to copy', true);
+    return;
+  }
+  explorerClipboard = {
+    profileId: state.activeProfile.id,
+    sourcePaths: entries.map((entry) => entry.path),
+    names: entries.map((entry) => entry.name),
+    copiedAt: Date.now()
+  };
+  setStatus(entries.length === 1 ? `Copied ${entries[0].name}` : `Copied ${entries.length} items`);
+}
+
+function canPasteExplorerClipboard() {
+  return Boolean(
+    explorerClipboard &&
+      explorerClipboard.sourcePaths.length &&
+      state.activeProfile &&
+      state.workspaceOpen &&
+      state.currentDir &&
+      explorerClipboard.profileId === state.activeProfile.id
+  );
+}
+
+function explorerPasteTargetDirectory() {
+  const selected = findExplorerEntry(state.explorerSelectedPath);
+  if (selected?.kind === 'dir' && state.explorerSelectedPaths.size <= 1) return selected.path;
+  return state.currentDir;
+}
+
+async function pasteExplorerClipboard(targetDir = explorerPasteTargetDirectory()) {
+  if (!explorerClipboard || !state.activeProfile || !state.workspaceOpen || !state.currentDir) {
+    setStatus('Nothing copied in Explorer');
+    return;
+  }
+  if (explorerClipboard.profileId !== state.activeProfile.id) {
+    setStatus('Explorer clipboard belongs to another profile', true);
+    return;
+  }
+  if (!targetDir) {
+    setStatus('No Explorer paste target', true);
+    return;
+  }
+
+  const profileId = state.activeProfile.id;
+  const sourcePaths = [...explorerClipboard.sourcePaths];
+  const names = [...explorerClipboard.names];
+  try {
+    const createdPaths = await api.copyProfilePaths(profileId, sourcePaths, targetDir);
+    invalidateExplorerDirectoryCache(profileId, targetDir);
+    for (const sourcePath of sourcePaths) {
+      invalidateExplorerParentDirectoryCache(profileId, sourcePath);
+    }
+    await reloadExplorerDirectory(targetDir);
+    if (createdPaths.length) setExplorerSelection(createdPaths, createdPaths[0], createdPaths[0]);
+    const label = names.length === 1 ? names[0] : `${names.length} items`;
+    setStatus(`Pasted ${label}`);
+  } catch (error) {
+    const message = String(error);
+    if (/command\s+copy_profile_paths\s+not\s+found/i.test(message)) {
+      setStatus('Paste failed: backend command not loaded. Restart Tauri dev/app once, then paste again.', true);
+      return;
+    }
+    setStatus(`Paste failed: ${message}`, true);
   }
 }
 
@@ -15570,6 +25979,16 @@ function setExplorerSelection(paths: Iterable<string>, activePath = '', anchorPa
   state.explorerSelectedPath = activePath || next.values().next().value || '';
   state.explorerSelectionAnchorPath = anchorPath || state.explorerSelectedPath;
   updateExplorerSelection(scrollIntoView, true);
+  maybeAutoOpenExplorerSelection();
+}
+
+function maybeAutoOpenExplorerSelection() {
+  if (explorerAutoOpenSuppressed) return;
+  if (!state.explorerAutoOpenEditor || state.explorerOpenMode === 'single') return;
+  if (state.explorerSelectedPaths.size > 1) return;
+  const entry = findExplorerEntry(state.explorerSelectedPath);
+  if (!entry || entry.kind !== 'file' || isWindowsExecutablePath(entry.path)) return;
+  void openFile(entry.path);
 }
 
 function resetExplorerSelection() {
@@ -15932,6 +26351,16 @@ function updateExplorerOpenMode() {
   el.explorerOpenModeToggle.setAttribute('aria-pressed', String(!single));
 }
 
+function updateExplorerAutoEditorToggle() {
+  const enabled = state.explorerAutoOpenEditor;
+  el.explorerAutoEditorToggle.classList.toggle('active', enabled);
+  el.explorerAutoEditorToggle.setAttribute('aria-pressed', String(enabled));
+  el.explorerAutoEditorToggle.textContent = enabled ? 'Auto Edit: on' : 'Auto Edit';
+  el.explorerAutoEditorToggle.title = enabled
+    ? 'Selecting a file opens the Editor automatically'
+    : 'Do not auto-open the Editor when selecting files';
+}
+
 async function goToParentDirectory() {
   const parent = parentPath(state.currentDir);
   if (parent === state.currentDir) return;
@@ -15944,6 +26373,386 @@ function pathBadge(path: string): HTMLElement {
   span.textContent = path;
   span.title = path;
   return span;
+}
+
+const EDITOR_SPLIT_MIN_RATIO = 0.15;
+const EDITOR_SPLIT_MAX_RATIO = 0.85;
+const EDITOR_SPLIT_SNAP_RATIO = 0.5;
+const EDITOR_SPLIT_SNAP_THRESHOLD = 0.025;
+
+function clampEditorSplitRatio(value: number) {
+  const clamped = clamp(value, EDITOR_SPLIT_MIN_RATIO, EDITOR_SPLIT_MAX_RATIO);
+  return Math.abs(clamped - EDITOR_SPLIT_SNAP_RATIO) <= EDITOR_SPLIT_SNAP_THRESHOLD
+    ? EDITOR_SPLIT_SNAP_RATIO
+    : clamped;
+}
+
+function createBareEditorTab(file: OpenFileState | null, id: string = crypto.randomUUID()): EditorTabState {
+  const tab: EditorTabState = { id, file };
+  state.editorTabs.push(tab);
+  rememberEditorTab(tab, state.editorTabs.length - 1);
+  return tab;
+}
+
+function createEditorPane(tabIds: string[] = [], id: string = crypto.randomUUID()): EditorPaneState {
+  const pane: EditorPaneState = { id, tabIds: [...tabIds], activeTabId: tabIds[0] ?? '' };
+  state.editorPanes.push(pane);
+  if (!state.activeEditorPaneId) state.activeEditorPaneId = pane.id;
+  return pane;
+}
+
+function ensureEditorPaneState() {
+  if (!state.editorPanes.length) {
+    createEditorPane(state.editorTabs.map((tab) => tab.id));
+  }
+  if (!state.editorTabs.length) {
+    const pane = state.editorPanes[0] ?? createEditorPane();
+    const tab = createBareEditorTab(null);
+    pane.tabIds = [tab.id];
+    pane.activeTabId = tab.id;
+  }
+  normalizeEditorPaneMembership();
+  if (!editorPaneForId(state.activeEditorPaneId)) {
+    state.activeEditorPaneId = state.editorPanes[0]?.id ?? '';
+  }
+  const pane = editorPaneForId(state.activeEditorPaneId) ?? state.editorPanes[0];
+  if (pane) {
+    if (!pane.activeTabId || !editorTabForId(pane.activeTabId) || !pane.tabIds.includes(pane.activeTabId)) {
+      pane.activeTabId = pane.tabIds[0] ?? '';
+    }
+    state.activeEditorTabId = pane.activeTabId;
+    state.openFile = editorTabForId(pane.activeTabId)?.file ?? null;
+  }
+  if (!state.editorSplitLayout || !editorSplitLayoutHasAllPanes(state.editorSplitLayout)) {
+    state.editorSplitLayout = editorSplitLayoutFromPanes(state.editorPanes);
+  }
+}
+
+function normalizeEditorPaneMembership() {
+  const tabIds = new Set(state.editorTabs.map((tab) => tab.id));
+  const assigned = new Set<string>();
+  for (const pane of state.editorPanes) {
+    const next: string[] = [];
+    for (const tabId of pane.tabIds) {
+      if (!tabIds.has(tabId) || assigned.has(tabId)) continue;
+      next.push(tabId);
+      assigned.add(tabId);
+    }
+    pane.tabIds = next;
+    if (!pane.activeTabId || !pane.tabIds.includes(pane.activeTabId)) pane.activeTabId = pane.tabIds[0] ?? '';
+  }
+  let target = editorPaneForId(state.activeEditorPaneId) ?? state.editorPanes[0];
+  if (!target) target = createEditorPane();
+  for (const tab of state.editorTabs) {
+    if (assigned.has(tab.id)) continue;
+    target.tabIds.push(tab.id);
+    assigned.add(tab.id);
+  }
+  for (const pane of state.editorPanes) {
+    if (!pane.tabIds.length) {
+      const tab = createBareEditorTab(null);
+      pane.tabIds.push(tab.id);
+    }
+    if (!pane.activeTabId || !pane.tabIds.includes(pane.activeTabId)) pane.activeTabId = pane.tabIds[0] ?? '';
+  }
+}
+
+function editorPaneForId(id: string) {
+  if (!id) return null;
+  return state.editorPanes.find((pane) => pane.id === id) ?? null;
+}
+
+function activeEditorPane() {
+  ensureEditorPaneState();
+  return editorPaneForId(state.activeEditorPaneId) ?? state.editorPanes[0];
+}
+
+function editorPaneForTabId(tabId: string) {
+  if (!tabId) return null;
+  return state.editorPanes.find((pane) => pane.tabIds.includes(tabId)) ?? null;
+}
+
+function setActiveEditorPaneElements(paneId: string) {
+  const elements = editorPaneElementCache.get(paneId);
+  if (!elements) return;
+  el.editorTabs = elements.tabs;
+  el.editorBody = elements.body;
+}
+
+function syncActiveEditorStateFromPane() {
+  const pane = activeEditorPane();
+  if (!pane) return;
+  state.activeEditorPaneId = pane.id;
+  state.activeEditorTabId = pane.activeTabId;
+  state.openFile = editorTabForId(pane.activeTabId)?.file ?? null;
+  setActiveEditorPaneElements(pane.id);
+  syncCodeViewReference();
+}
+
+function activateEditorPane(paneId: string, options: { render?: boolean; focus?: boolean } = {}) {
+  const pane = editorPaneForId(paneId);
+  if (!pane) return;
+  syncActiveEditorTabFromView();
+  state.activeEditorPaneId = pane.id;
+  if (!pane.activeTabId || !pane.tabIds.includes(pane.activeTabId)) pane.activeTabId = pane.tabIds[0] ?? '';
+  state.activeEditorTabId = pane.activeTabId;
+  state.openFile = editorTabForId(pane.activeTabId)?.file ?? null;
+  setActiveEditorPaneElements(pane.id);
+  syncCodeViewReference();
+  updateEditorPaneActivationClasses();
+  updateEditorLabel();
+  if (options.render) renderEditor();
+  if (options.focus) focusActiveCodeEditor();
+}
+
+function focusActiveCodeEditor() {
+  syncCodeViewReference();
+  codeView?.focus();
+}
+
+function syncCodeViewReference() {
+  const viewState = editorPaneViewState.get(state.activeEditorPaneId);
+  codeView = viewState?.view ?? null;
+  codeViewFile = viewState?.file ?? null;
+  codeViewRenderSignature = viewState?.renderSignature ?? '\0';
+}
+
+function editorSplitLayoutHasAllPanes(node: EditorSplitNode) {
+  const ids = new Set<string>();
+  collectEditorSplitPaneIds(node, ids);
+  if (ids.size !== state.editorPanes.length) return false;
+  return state.editorPanes.every((pane) => ids.has(pane.id));
+}
+
+function collectEditorSplitPaneIds(node: EditorSplitNode, ids: Set<string>) {
+  if (node.kind === 'pane') {
+    ids.add(node.paneId);
+    return;
+  }
+  collectEditorSplitPaneIds(node.first, ids);
+  collectEditorSplitPaneIds(node.second, ids);
+}
+
+function editorSplitLayoutFromPanes(panes: EditorPaneState[]): EditorSplitNode | null {
+  if (!panes.length) return null;
+  let node: EditorSplitNode = { kind: 'pane', paneId: panes[0].id };
+  for (let index = 1; index < panes.length; index += 1) {
+    node = {
+      kind: 'split',
+      splitId: crypto.randomUUID(),
+      direction: 'row',
+      ratio: EDITOR_SPLIT_SNAP_RATIO,
+      first: node,
+      second: { kind: 'pane', paneId: panes[index].id }
+    };
+  }
+  return node;
+}
+
+function replaceEditorSplitPaneNode(node: EditorSplitNode, paneId: string, replacement: EditorSplitNode): EditorSplitNode {
+  if (node.kind === 'pane') return node.paneId === paneId ? replacement : node;
+  return {
+    ...node,
+    first: replaceEditorSplitPaneNode(node.first, paneId, replacement),
+    second: replaceEditorSplitPaneNode(node.second, paneId, replacement)
+  };
+}
+
+function removeEditorSplitPaneNode(node: EditorSplitNode, paneId: string): EditorSplitNode | null {
+  if (node.kind === 'pane') return node.paneId === paneId ? null : node;
+  const first = removeEditorSplitPaneNode(node.first, paneId);
+  const second = removeEditorSplitPaneNode(node.second, paneId);
+  if (!first) return second;
+  if (!second) return first;
+  return { ...node, first, second };
+}
+
+function firstEditorSplitPaneId(node: EditorSplitNode | null | undefined): string {
+  if (!node) return '';
+  return node.kind === 'pane' ? node.paneId : firstEditorSplitPaneId(node.first);
+}
+
+function removeEditorTabsFromState(tabIds: Iterable<string>) {
+  const ids = new Set(tabIds);
+  if (!ids.size) return;
+  for (const tab of state.editorTabs) {
+    if (ids.has(tab.id)) {
+      forgetEditorTab(tab);
+      editorTabElementCache.delete(tab.id);
+    }
+  }
+  state.editorTabs = state.editorTabs.filter((tab) => !ids.has(tab.id));
+  rebuildEditorTabLookup();
+  for (const pane of state.editorPanes) {
+    pane.tabIds = pane.tabIds.filter((tabId) => !ids.has(tabId));
+    if (!pane.tabIds.includes(pane.activeTabId)) pane.activeTabId = pane.tabIds[0] ?? '';
+  }
+}
+
+function removeEditorPaneFromState(paneId: string) {
+  destroyEditorPaneView(paneId);
+  editorPaneElementCache.delete(paneId);
+  state.editorPanes = state.editorPanes.filter((pane) => pane.id !== paneId);
+  state.editorSplitLayout = state.editorSplitLayout
+    ? removeEditorSplitPaneNode(state.editorSplitLayout, paneId)
+    : editorSplitLayoutFromPanes(state.editorPanes);
+  if (state.editorPanes.length && (!state.editorSplitLayout || !editorSplitLayoutHasAllPanes(state.editorSplitLayout))) {
+    state.editorSplitLayout = editorSplitLayoutFromPanes(state.editorPanes);
+  }
+  const nextPaneId = firstEditorSplitPaneId(state.editorSplitLayout) || state.editorPanes[0]?.id || '';
+  return editorPaneForId(nextPaneId) ?? state.editorPanes[0] ?? null;
+}
+
+function ensureEditorPaneHasEmptyTab(pane: EditorPaneState) {
+  if (pane.tabIds.length) return;
+  const replacement = createBareEditorTab(null);
+  pane.tabIds = [replacement.id];
+  pane.activeTabId = replacement.id;
+}
+
+function splitActiveEditorPane(direction: EditorSplitDirection) {
+  ensureEditorPaneState();
+  syncActiveEditorTabFromView();
+  const source = activeEditorPane();
+  if (!source) return;
+  const pane = createEditorPane();
+  const tab = createBareEditorTab(null);
+  pane.tabIds = [tab.id];
+  pane.activeTabId = tab.id;
+  const split: EditorSplitNode = {
+    kind: 'split',
+    splitId: crypto.randomUUID(),
+    direction,
+    ratio: EDITOR_SPLIT_SNAP_RATIO,
+    first: { kind: 'pane', paneId: source.id },
+    second: { kind: 'pane', paneId: pane.id }
+  };
+  state.editorSplitLayout = state.editorSplitLayout
+    ? replaceEditorSplitPaneNode(state.editorSplitLayout, source.id, split)
+    : editorSplitLayoutFromPanes(state.editorPanes);
+  state.activeEditorPaneId = pane.id;
+  state.activeEditorTabId = tab.id;
+  state.openFile = null;
+  renderEditor();
+  saveActiveWorkspaceSnapshot();
+}
+
+function closeActiveEditorSplit() {
+  ensureEditorPaneState();
+  if (state.editorPanes.length <= 1) return;
+  syncActiveEditorTabFromView();
+  const closing = activeEditorPane();
+  if (!closing) return;
+  const closingTabIds = [...closing.tabIds];
+  removeEditorTabsFromState(closingTabIds);
+  const target = removeEditorPaneFromState(closing.id);
+  if (!target) return;
+  ensureEditorPaneHasEmptyTab(target);
+  state.activeEditorPaneId = target.id;
+  state.activeEditorTabId = target.activeTabId;
+  state.openFile = editorTabForId(target.activeTabId)?.file ?? null;
+  renderEditor();
+  saveActiveWorkspaceSnapshot();
+}
+
+function renderEditorSplitSurface() {
+  if (!isEditorPanelVisible()) return;
+  ensureEditorPaneState();
+  const layout = state.editorSplitLayout ?? editorSplitLayoutFromPanes(state.editorPanes);
+  if (!layout) return;
+  state.editorSplitLayout = layout;
+  el.editorSurface.replaceChildren(renderEditorSplitNode(layout));
+  updateEditorPaneActivationClasses();
+}
+
+function renderEditorSplitNode(node: EditorSplitNode): HTMLElement {
+  if (node.kind === 'pane') return editorPaneElement(node.paneId).pane;
+  const split = document.createElement('div');
+  split.className = `editor-split ${node.direction}`;
+  split.dataset.splitId = node.splitId;
+  setEditorSplitElementRatio(split, node.ratio);
+  const first = document.createElement('div');
+  first.className = 'editor-split-branch first';
+  first.append(renderEditorSplitNode(node.first));
+  const second = document.createElement('div');
+  second.className = 'editor-split-branch second';
+  second.append(renderEditorSplitNode(node.second));
+  const resizer = document.createElement('div');
+  resizer.className = 'editor-split-resizer';
+  resizer.title = 'Drag to resize editor split';
+  resizer.addEventListener('pointerdown', (event) => startEditorSplitResize(event, node, split));
+  split.append(first, resizer, second);
+  return split;
+}
+
+function editorPaneElement(paneId: string) {
+  let cached = editorPaneElementCache.get(paneId);
+  if (cached) return cached;
+  let pane = !editorPaneElementCache.size
+    ? el.editorSurface.querySelector<HTMLElement>('.editor-pane')
+    : null;
+  if (!pane) {
+    pane = document.createElement('section');
+    pane.className = 'editor-pane';
+    const tabs = document.createElement('div');
+    tabs.className = 'widget-tabs editor-pane-tabs';
+    const body = document.createElement('div');
+    body.className = 'editor-body empty';
+    body.textContent = 'Open a file from Explorer.';
+    pane.append(tabs, body);
+  }
+  pane.dataset.editorPaneId = paneId;
+  pane.addEventListener('pointerdown', () => activateEditorPane(paneId));
+  pane.addEventListener('focusin', () => activateEditorPane(paneId));
+  const tabs = pane.querySelector<HTMLDivElement>('.editor-pane-tabs, .widget-tabs')!;
+  const body = pane.querySelector<HTMLDivElement>('.editor-body')!;
+  cached = { pane, tabs, body };
+  editorPaneElementCache.set(paneId, cached);
+  return cached;
+}
+
+function updateEditorPaneActivationClasses() {
+  for (const [paneId, elements] of editorPaneElementCache) {
+    const active = paneId === state.activeEditorPaneId;
+    elements.pane.classList.toggle('active', active);
+    elements.pane.setAttribute('aria-selected', String(active));
+  }
+  el.editorCloseSplit.disabled = state.editorPanes.length <= 1;
+}
+
+function setEditorSplitElementRatio(element: HTMLElement, ratio: number) {
+  element.style.setProperty('--editor-split-ratio', `${(clampEditorSplitRatio(ratio) * 100).toFixed(2)}%`);
+}
+
+function startEditorSplitResize(event: PointerEvent, node: Extract<EditorSplitNode, { kind: 'split' }>, element: HTMLElement) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const rect = element.getBoundingClientRect();
+  const start = node.direction === 'row' ? event.clientX : event.clientY;
+  const size = Math.max(1, node.direction === 'row' ? rect.width : rect.height);
+  const startRatio = clampEditorSplitRatio(node.ratio);
+  element.classList.add('resizing');
+  element.setPointerCapture(event.pointerId);
+
+  const move = (moveEvent: PointerEvent) => {
+    const current = node.direction === 'row' ? moveEvent.clientX : moveEvent.clientY;
+    node.ratio = clampEditorSplitRatio(startRatio + ((current - start) / size));
+    setEditorSplitElementRatio(element, node.ratio);
+    requestCodeEditorMeasure();
+  };
+  const up = (upEvent: PointerEvent) => {
+    element.classList.remove('resizing');
+    element.releasePointerCapture(upEvent.pointerId);
+    element.removeEventListener('pointermove', move);
+    element.removeEventListener('pointerup', up);
+    element.removeEventListener('pointercancel', up);
+    requestCodeEditorMeasure();
+    saveActiveWorkspaceSnapshot();
+  };
+  element.addEventListener('pointermove', move);
+  element.addEventListener('pointerup', up);
+  element.addEventListener('pointercancel', up);
 }
 
 function clearEditorTabLookup() {
@@ -15961,7 +26770,7 @@ function rebuildEditorTabLookup() {
 
 function rememberEditorTab(tab: EditorTabState, index?: number) {
   editorTabById.set(tab.id, tab);
-  const path = tab.file?.path;
+  const path = tab.file?.path ?? tab.pendingPath;
   if (path && !editorTabByPath.has(path)) editorTabByPath.set(path, tab);
   if (index !== undefined) editorTabIndexByIdLookup.set(tab.id, index);
 }
@@ -15969,12 +26778,12 @@ function rememberEditorTab(tab: EditorTabState, index?: number) {
 function forgetEditorTab(tab: EditorTabState) {
   editorTabById.delete(tab.id);
   editorTabIndexByIdLookup.delete(tab.id);
-  const path = tab.file?.path;
+  const path = tab.file?.path ?? tab.pendingPath;
   if (!path || editorTabByPath.get(path) !== tab) return;
   editorTabByPath.delete(path);
   for (let index = 0; index < state.editorTabs.length; index += 1) {
     const candidate = state.editorTabs[index];
-    if (candidate === tab || candidate.file?.path !== path) continue;
+    if (candidate === tab || (candidate.file?.path ?? candidate.pendingPath) !== path) continue;
     rememberEditorTab(candidate, index);
     return;
   }
@@ -16001,7 +26810,7 @@ function editorTabForPath(path: string) {
   if (!tab) {
     for (let index = 0; index < state.editorTabs.length; index += 1) {
       const candidate = state.editorTabs[index];
-      if (candidate.file?.path !== path) continue;
+      if ((candidate.file?.path ?? candidate.pendingPath) !== path) continue;
       tab = candidate;
       rememberEditorTab(tab, index);
       break;
@@ -16031,13 +26840,19 @@ function refreshEditorTabIndexLookup(startIndex = 0) {
 }
 
 function setEditorTabFile(tab: EditorTabState, file: OpenFileState | null) {
-  const previousPath = tab.file?.path;
+  const previousPath = tab.file?.path ?? tab.pendingPath;
   if (previousPath && editorTabByPath.get(previousPath) === tab) editorTabByPath.delete(previousPath);
   tab.file = file;
+  if (file) {
+    tab.pendingPath = undefined;
+    tab.pendingRawMode = undefined;
+    tab.pendingProfileId = undefined;
+    tab.loading = false;
+  }
   rememberEditorTab(tab);
   if (previousPath && previousPath !== file?.path && !editorTabByPath.has(previousPath)) {
     for (const candidate of state.editorTabs) {
-      if (candidate === tab || candidate.file?.path !== previousPath) continue;
+      if (candidate === tab || (candidate.file?.path ?? candidate.pendingPath) !== previousPath) continue;
       editorTabByPath.set(previousPath, candidate);
       break;
     }
@@ -16064,21 +26879,27 @@ function ensureEditorTab() {
 }
 
 function activeEditorTab() {
-  let tab = editorTabForId(state.activeEditorTabId);
-  if (!tab) tab = createEditorTab(null, false);
+  const pane = activeEditorPane();
+  let tab = editorTabForId(pane?.activeTabId ?? state.activeEditorTabId);
+  if (!tab) tab = createEditorTab(null, false, crypto.randomUUID(), pane?.id);
   return tab;
 }
 
-function createEditorTab(file: OpenFileState | null, activate = true, id: string = crypto.randomUUID()) {
-  const tab = { id, file };
-  const index = state.editorTabs.length;
-  state.editorTabs.push(tab);
-  rememberEditorTab(tab, index);
+function createEditorTab(file: OpenFileState | null, activate = true, id: string = crypto.randomUUID(), paneId?: string) {
+  ensureEditorPaneState();
+  const pane = editorPaneForId(paneId ?? state.activeEditorPaneId) ?? state.editorPanes[0] ?? createEditorPane();
+  const tab = createBareEditorTab(file, id);
+  if (!pane.tabIds.includes(tab.id)) pane.tabIds.push(tab.id);
+  if (!pane.activeTabId) pane.activeTabId = tab.id;
   if (!state.activeEditorTabId) state.activeEditorTabId = tab.id;
   if (activate) {
     syncActiveEditorTabFromView();
+    state.activeEditorPaneId = pane.id;
+    pane.activeTabId = tab.id;
     state.activeEditorTabId = tab.id;
     state.openFile = tab.file;
+    setActiveEditorPaneElements(pane.id);
+    syncCodeViewReference();
     renderEditorTabs();
     renderEditor();
   }
@@ -16090,77 +26911,95 @@ function activateEditorTab(id: string) {
   const previousActiveId = state.activeEditorTabId;
   const tab = editorTabForId(id);
   if (!tab) return;
+  const pane = editorPaneForTabId(id) ?? activeEditorPane();
+  if (pane) {
+    pane.activeTabId = tab.id;
+    state.activeEditorPaneId = pane.id;
+    setActiveEditorPaneElements(pane.id);
+  }
   state.activeEditorTabId = tab.id;
   state.openFile = tab.file;
+  syncCodeViewReference();
   renderEditorTabActivation(previousActiveId, tab);
-  if (previousActiveId !== tab.id) renderEditor();
+  if (previousActiveId !== tab.id || pane?.id !== state.activeEditorPaneId) renderEditor();
   void hydrateVisibleEditorTab();
   if (previousActiveId !== tab.id) saveActiveWorkspaceSnapshot();
 }
 
 function closeEditorTab(id: string) {
   syncActiveEditorTabFromView();
-  const index = editorTabIndexById(id);
-  if (index < 0) return;
-  const closingTab = state.editorTabs[index];
-  forgetEditorTab(closingTab);
-  state.editorTabs.splice(index, 1);
-  refreshEditorTabIndexLookup(index);
-  if (!state.editorTabs.length) createEditorTab(null, false);
-  if (state.activeEditorTabId === id) {
-    const next = state.editorTabs[index] ?? state.editorTabs[index - 1] ?? state.editorTabs[0];
-    state.activeEditorTabId = next.id;
-    state.openFile = next.file;
+  if (editorTabIndexById(id) < 0) return;
+  const pane = editorPaneForTabId(id);
+  const removedActivePane = pane?.id === state.activeEditorPaneId;
+  const closingActiveTab = state.activeEditorTabId === id;
+  const tabIndex = pane?.tabIds.indexOf(id) ?? -1;
+  const paneActiveTab = pane?.activeTabId === id;
+  removeEditorTabsFromState([id]);
+
+  let targetPane = pane ?? activeEditorPane();
+  let removedPane = false;
+  if (pane && !pane.tabIds.length && state.editorPanes.length > 1) {
+    targetPane = removeEditorPaneFromState(pane.id);
+    removedPane = true;
+  } else if (pane && !pane.tabIds.length) {
+    ensureEditorPaneHasEmptyTab(pane);
+  } else if (pane && (paneActiveTab || !pane.tabIds.includes(pane.activeTabId))) {
+    pane.activeTabId = pane.tabIds[Math.max(0, Math.min(tabIndex, pane.tabIds.length - 1))] ?? pane.tabIds[0] ?? '';
+  }
+
+  if (!state.editorTabs.length) {
+    const fallbackPane = targetPane ?? activeEditorPane();
+    if (fallbackPane) {
+      ensureEditorPaneHasEmptyTab(fallbackPane);
+      targetPane = fallbackPane;
+    }
+  }
+
+  if ((removedPane && removedActivePane) || closingActiveTab || !editorTabForId(state.activeEditorTabId)) {
+    if (!targetPane || (removedPane && !removedActivePane)) targetPane = activeEditorPane();
+    if (targetPane) {
+      state.activeEditorPaneId = targetPane.id;
+      state.activeEditorTabId = targetPane.activeTabId;
+      state.openFile = editorTabForId(targetPane.activeTabId)?.file ?? null;
+    }
   }
   renderEditorTabs();
   renderEditor();
   saveActiveWorkspaceSnapshot();
 }
 
-function renderEditorTabs() {
+function renderEditorTabs(paneId?: string) {
   if (!isEditorPanelVisible()) return;
-  const signature = editorTabsSignature();
-  if (editorTabsRenderSignature === signature) return;
-  const orderSignature = editorTabsOrderSignature();
-  const sameOrder = editorTabsOrderRenderSignature === orderSignature
-    && el.editorTabs.childElementCount === state.editorTabs.length;
-  editorTabsRenderSignature = signature;
+  ensureEditorPaneState();
   setCheckedIfChanged(el.editorOpenNewTab, state.editorOpenInNewTab);
   setCheckedIfChanged(el.editorWordWrap, state.editorWordWrap);
-
-  if (sameOrder) {
-    for (const tab of state.editorTabs) {
-      updateEditorTabElement(editorTabElement(tab.id), tab);
-    }
-    return;
-  }
-
-  editorTabsOrderRenderSignature = orderSignature;
-  const fragment = document.createDocumentFragment();
   const seen = new Set<string>();
-  for (const tab of state.editorTabs) {
-    seen.add(tab.id);
-    const item = editorTabElement(tab.id);
-    updateEditorTabElement(item, tab);
-    fragment.append(item);
+  const panes = paneId ? state.editorPanes.filter((pane) => pane.id === paneId) : state.editorPanes;
+  for (const pane of panes) {
+    const elements = editorPaneElement(pane.id);
+    const fragment = document.createDocumentFragment();
+    for (const tabId of pane.tabIds) {
+      const tab = editorTabForId(tabId);
+      if (!tab) continue;
+      seen.add(tab.id);
+      const item = editorTabElement(tab.id);
+      updateEditorTabElement(item, tab);
+      fragment.append(item);
+    }
+    elements.tabs.replaceChildren(fragment);
   }
-  el.editorTabs.replaceChildren(fragment);
-  pruneEditorTabElementCache(seen);
+  if (!paneId) pruneEditorTabElementCache(seen);
+  editorTabsRenderSignature = editorTabsSignature();
+  editorTabsOrderRenderSignature = editorTabsOrderSignature();
 }
 
 function renderEditorTabActivation(previousActiveId: string, activeTab: EditorTabState) {
   if (!isEditorPanelVisible()) return;
-  const orderSignature = editorTabsOrderSignature();
   const previousChanged = Boolean(previousActiveId && previousActiveId !== activeTab.id);
   const previousTab = previousChanged ? editorTabForId(previousActiveId) : null;
   const previousElement = previousChanged ? connectedEditorTabElement(previousActiveId) : null;
   const activeElement = connectedEditorTabElement(activeTab.id);
-  if (
-    editorTabsOrderRenderSignature !== orderSignature
-    || el.editorTabs.childElementCount !== state.editorTabs.length
-    || !activeElement
-    || (previousChanged && (!previousTab || !previousElement))
-  ) {
+  if (!activeElement || (previousChanged && (!previousTab || !previousElement))) {
     renderEditorTabs();
     return;
   }
@@ -16202,8 +27041,13 @@ function connectedEditorTabElement(id: string) {
   return item?.isConnected ? item : null;
 }
 
+function editorTabIsPaneSelected(tabId: string) {
+  const pane = editorPaneForTabId(tabId);
+  return Boolean(pane && pane.activeTabId === tabId);
+}
+
 function updateEditorTabElement(item: HTMLElement, tab: EditorTabState) {
-  const active = tab.id === state.activeEditorTabId;
+  const active = editorTabIsPaneSelected(tab.id);
   const label = editorTabLabel(tab);
   const title = tab.file?.path ?? tab.pendingPath ?? 'Empty editor';
   const signature = `${tab.id}\t${active ? '1' : '0'}\t${label}\t${title}`;
@@ -16226,9 +27070,12 @@ function pruneEditorTabElementCache(seen: Set<string>) {
 }
 
 function editorTabsSignature() {
-  let signature = `${state.editorOpenInNewTab ? '1' : '0'}\n${state.editorWordWrap ? '1' : '0'}`;
+  let signature = `${state.editorOpenInNewTab ? '1' : '0'}\n${state.editorWordWrap ? '1' : '0'}\n${state.activeEditorPaneId}`;
+  for (const pane of state.editorPanes) {
+    signature += `\np:${pane.id}:${pane.activeTabId}:${pane.tabIds.join(',')}`;
+  }
   for (const tab of state.editorTabs) {
-    signature += `\n${tab.id}\t${tab.id === state.activeEditorTabId ? '1' : '0'}\t${editorTabLabel(tab)}\t${tab.file?.path ?? tab.pendingPath ?? ''}\t${tab.file?.rawMode ? '1' : '0'}`;
+    signature += `\n${tab.id}\t${editorTabIsPaneSelected(tab.id) ? '1' : '0'}\t${editorTabLabel(tab)}\t${tab.file?.path ?? tab.pendingPath ?? ''}\t${tab.file?.rawMode ? '1' : '0'}`;
   }
   return signature;
 }
@@ -16251,10 +27098,23 @@ function editorTabLabel(tab: EditorTabState) {
 }
 
 function syncActiveEditorTabFromView() {
-  const tab = editorTabForId(state.activeEditorTabId);
-  if (!tab?.file) return;
-  if (codeView && codeViewFile === tab.file && state.openFile === tab.file && !(tab.file.masked && !tab.file.rawMode)) {
-    tab.file.draftContent = codeView.state.doc.toString();
+  syncEditorPaneFromView(state.activeEditorPaneId);
+  syncCodeViewReference();
+}
+
+function syncAllEditorPanesFromViews() {
+  for (const paneId of editorPaneViewState.keys()) syncEditorPaneFromView(paneId);
+  syncCodeViewReference();
+}
+
+function syncEditorPaneFromView(paneId: string) {
+  const pane = editorPaneForId(paneId);
+  if (!pane) return;
+  const tab = editorTabForId(pane.activeTabId);
+  if (!tab?.file || tab.file.masked && !tab.file.rawMode) return;
+  const viewState = editorPaneViewState.get(paneId);
+  if (viewState?.view && viewState.file === tab.file) {
+    tab.file.draftContent = viewState.view.state.doc.toString();
     tab.file.dirty = !sameEditorContent(tab.file.draftContent, tab.file.content);
   }
 }
@@ -16836,33 +27696,41 @@ async function openImageFile(path: string): Promise<boolean> {
 }
 
 function renderEditor() {
-  if (codeView) syncActiveEditorTabFromView();
+  syncAllEditorPanesFromViews();
+  ensureEditorPaneState();
+  renderEditorSplitSurface();
+  for (const pane of state.editorPanes) renderEditorPane(pane);
+  syncActiveEditorStateFromPane();
   const activeTab = activeEditorTab();
-  state.openFile = activeTab.file;
-  const file = state.openFile;
-  el.editorBody.classList.remove('empty');
+  const file = activeTab.file;
   el.toggleRaw.classList.toggle('hidden', !file?.masked);
+  el.refreshFile.disabled = !file;
   el.saveFile.disabled = !file;
+  el.editorLabel.textContent = file
+    ? `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`
+    : activeTab.pendingPath ?? 'Editor';
+  if (file) el.toggleRaw.textContent = file.rawMode ? 'Secure form' : 'Raw reveal';
+  renderEditorTabs();
+  updateEditorPaneActivationClasses();
+}
+
+function renderEditorPane(pane: EditorPaneState) {
+  const elements = editorPaneElement(pane.id);
+  const tab = editorTabForId(pane.activeTabId) ?? editorTabForId(pane.tabIds[0] ?? '');
+  const file = tab?.file ?? null;
+  elements.body.classList.remove('empty');
 
   if (!file) {
-    editorRenderToken += 1;
-    destroyCodeEditorView();
-    el.editorBody.innerHTML = '';
-    el.editorLabel.textContent = activeTab.pendingPath ?? 'Editor';
-    el.editorBody.textContent = activeTab.pendingPath ? 'Opening file...' : 'Open a file from Explorer.';
-    el.editorBody.classList.add('empty');
-    renderEditorTabs();
+    destroyEditorPaneView(pane.id);
+    elements.body.innerHTML = '';
+    elements.body.textContent = tab?.pendingPath ? 'Opening file...' : 'Open a file from Explorer.';
+    elements.body.classList.add('empty');
     return;
   }
 
-  el.editorLabel.textContent = `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`;
-  el.toggleRaw.textContent = file.rawMode ? 'Secure form' : 'Raw reveal';
-  renderEditorTabs();
-
   if (file.masked && !file.rawMode) {
-    editorRenderToken += 1;
-    destroyCodeEditorView();
-    el.editorBody.innerHTML = '';
+    destroyEditorPaneView(pane.id);
+    elements.body.innerHTML = '';
     const form = document.createElement('div');
     form.className = 'secure-form';
     const banner = document.createElement('div');
@@ -16880,28 +27748,30 @@ function renderEditor() {
       }
     }
     appendSecureAddKeyForm(form, file);
-    el.editorBody.append(form);
+    elements.body.append(form);
     return;
   }
 
   const viewSignature = editorCodeViewSignature(file);
+  const viewState = editorPaneViewState.get(pane.id);
   if (
-    codeView
-    && codeViewFile === file
-    && codeViewRenderSignature === viewSignature
-    && el.editorBody.querySelector('.code-mount')
+    viewState?.view
+    && viewState.file === file
+    && viewState.renderSignature === viewSignature
+    && elements.body.querySelector('.code-mount')
   ) {
     requestCodeEditorMeasure();
     return;
   }
 
   const renderToken = ++editorRenderToken;
-  destroyCodeEditorView();
-  el.editorBody.innerHTML = '';
+  destroyEditorPaneView(pane.id);
+  editorPaneViewState.set(pane.id, { view: null, file, renderSignature: viewSignature, renderToken });
+  elements.body.innerHTML = '';
   const mount = document.createElement('div');
   mount.className = 'code-mount';
-  el.editorBody.append(mount);
-  void mountCodeEditor(file, mount, renderToken, viewSignature);
+  elements.body.append(mount);
+  void mountCodeEditor(file, mount, renderToken, viewSignature, pane.id);
 }
 
 function editorCodeViewSignature(file: OpenFileState) {
@@ -17047,20 +27917,31 @@ function insertSecureKey(file: OpenFileState, key: string, value: string) {
   file.lines.push(line);
 }
 
-async function mountCodeEditor(file: OpenFileState, mount: HTMLElement, renderToken: number, viewSignature: string) {
+async function mountCodeEditor(
+  file: OpenFileState,
+  mount: HTMLElement,
+  renderToken: number,
+  viewSignature: string,
+  paneId: string
+) {
   const runtime = await ensureEditorRuntime();
-  if (renderToken !== editorRenderToken || state.openFile !== file) return;
+  const pane = editorPaneForId(paneId);
+  const tab = pane ? editorTabForId(pane.activeTabId) : null;
+  if (!pane || !tab || tab.file !== file || !mount.isConnected) return;
+  const viewState = editorPaneViewState.get(paneId);
+  if (viewState && viewState.renderToken !== renderToken) return;
+  const languageCompartment = new runtime.Compartment();
 
-  codeView = new runtime.EditorView({
+  const view = new runtime.EditorView({
     state: runtime.EditorState.create({
       doc: editorDocumentText(file),
-      extensions: editorExtensions(file.path, runtime)
+      extensions: editorExtensions(file.path, runtime, file, languageCompartment)
     }),
     parent: mount
   });
-  codeViewFile = file;
-  codeViewRenderSignature = viewSignature;
-  void hydrateEditorLanguage(file.path, renderToken, runtime);
+  editorPaneViewState.set(paneId, { view, file, renderSignature: viewSignature, renderToken, languageCompartment });
+  if (paneId === state.activeEditorPaneId) syncCodeViewReference();
+  void hydrateEditorLanguage(file.path, renderToken, runtime, paneId);
 }
 
 function editorDocumentText(file: OpenFileState) {
@@ -17068,7 +27949,12 @@ function editorDocumentText(file: OpenFileState) {
   return file.draftContent ?? file.content;
 }
 
-function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
+function editorExtensions(
+  path: string,
+  runtime: EditorRuntime,
+  file: OpenFileState,
+  languageCompartment: import('@codemirror/state').Compartment
+): Extension[] {
   return [
     runtime.lineNumbers(),
     runtime.highlightActiveLine(),
@@ -17084,10 +27970,10 @@ function editorExtensions(path: string, runtime: EditorRuntime): Extension[] {
       ...runtime.defaultKeymap,
       ...runtime.searchKeymap
     ]),
-    runtime.languageCompartment.of([]),
+    languageCompartment.of([]),
     runtime.EditorView.updateListener.of((update) => {
-      if (update.docChanged && state.openFile) {
-        markOpenFileDirtyFromEditorEdit();
+      if (update.docChanged) {
+        markOpenFileDirtyFromEditorEdit(file);
       }
     })
   ];
@@ -17189,7 +28075,7 @@ async function ensureEditorRuntime() {
     defaultHighlightStyle: languageModule.defaultHighlightStyle,
     HighlightStyle: languageModule.HighlightStyle,
     tags: highlightModule.tags,
-    languageCompartment: new stateModule.Compartment()
+    Compartment: stateModule.Compartment
   }));
   return editorRuntimePromise;
 }
@@ -17266,11 +28152,12 @@ function warmEditorForPath(path: string) {
     .catch(() => undefined);
 }
 
-async function hydrateEditorLanguage(path: string, renderToken: number, runtime: EditorRuntime) {
+async function hydrateEditorLanguage(path: string, renderToken: number, runtime: EditorRuntime, paneId: string) {
   const language = await languageFor(path);
-  if (renderToken !== editorRenderToken || !codeView) return;
-  codeView.dispatch({
-    effects: runtime.languageCompartment.reconfigure(language)
+  const viewState = editorPaneViewState.get(paneId);
+  if (!viewState?.view || !viewState.languageCompartment || viewState.renderToken !== renderToken) return;
+  viewState.view.dispatch({
+    effects: viewState.languageCompartment.reconfigure(language)
   });
 }
 
@@ -17348,14 +28235,13 @@ function markDirty() {
   setEditorDirtyFromContent(current);
 }
 
-function markOpenFileDirtyFromEditorEdit() {
-  const file = state.openFile;
+function markOpenFileDirtyFromEditorEdit(file: OpenFileState = state.openFile!) {
   if (!file) return;
   file.dirty = true;
   file.draftContent = undefined;
-  updateEditorLabel();
+  if (file === state.openFile) updateEditorLabel();
   renderEditorTabs();
-  el.saveFile.disabled = false;
+  if (file === state.openFile) el.saveFile.disabled = false;
 }
 
 function setEditorDirtyFromContent(currentContent: string) {
@@ -17383,6 +28269,50 @@ function updateEditorLabel() {
     return;
   }
   setTextContentIfChanged(el.editorLabel, `${file.masked ? '🔒 ' : ''}${file.path}${file.dirty ? ' *' : ''}`);
+}
+
+async function refreshActiveEditorFromDisk() {
+  syncActiveEditorTabFromView();
+  const tab = activeEditorTab();
+  const file = tab.file;
+  const profile = state.activeProfile;
+  if (!file || !profile) return;
+  if (file.dirty && !window.confirm('Discard unsaved editor changes and reload this file from disk?')) return;
+
+  const path = file.path;
+  const refreshToken = ++fileOpenToken;
+  el.refreshFile.disabled = true;
+  setStatus(`Refreshing ${path}...`);
+  try {
+    invalidateTextFileCache(profile.id, path);
+    const content = await readTextFileCached(profile.id, path);
+    if (refreshToken !== fileOpenToken || state.activeProfile?.id !== profile.id) {
+      renderEditor();
+      return;
+    }
+    const live = editorTabForId(tab.id);
+    if (!live || live.file !== file || file.path !== path) {
+      renderEditor();
+      return;
+    }
+    const refreshed: OpenFileState = {
+      path,
+      content,
+      masked: file.masked,
+      rawMode: file.masked ? file.rawMode : false,
+      lines: file.masked ? parseSecretLinesCached(content, path) : [],
+      dirty: false,
+      draftContent: undefined
+    };
+    setEditorTabFile(live, refreshed);
+    if (state.activeEditorTabId === live.id) state.openFile = refreshed;
+    setStatus('File refreshed from disk');
+    renderEditor();
+    saveActiveWorkspaceSnapshot();
+  } catch (error) {
+    setStatus(`Refresh failed: ${String(error)}`, true);
+    renderEditor();
+  }
 }
 
 async function saveOpenFile() {
@@ -17449,10 +28379,6 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
 
   const titlebar = document.createElement('div');
   titlebar.className = 'terminal-title panel-drag-handle';
-  const focusDot = document.createElement('button');
-  focusDot.className = 'focus-dot';
-  focusDot.type = 'button';
-  focusDot.title = 'Active prompt target';
   const titleEl = document.createElement('strong');
   titleEl.className = 'terminal-widget-title';
   titleEl.textContent = title;
@@ -17490,7 +28416,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   closeButton.title = 'Close shell widget';
   closeButton.setAttribute('aria-label', 'Close shell widget');
   closeButton.textContent = 'x';
-  titlebar.append(focusDot, titleEl, cwdEl, spacer, rendererBadge, opacityButton, historyButton, typePadToggle, typePadFocusToggle, closeButton);
+  titlebar.append(titleEl, cwdEl, spacer, rendererBadge, opacityButton, historyButton, typePadToggle, typePadFocusToggle, closeButton);
 
   const tabbar = document.createElement('div');
   tabbar.className = 'terminal-widget-tabbar';
@@ -17503,7 +28429,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   llmSessionsButton.setAttribute('aria-label', 'LLM tmux sessions');
   llmSessionsButton.textContent = 'Tmux';
   const newTabButton = document.createElement('button');
-  newTabButton.className = 'terminal-new-tab tab-add';
+  newTabButton.className = 'terminal-new-tab';
   newTabButton.type = 'button';
   newTabButton.title = 'New tab in this shell';
   newTabButton.setAttribute('aria-label', 'New tab in this shell');
@@ -17555,19 +28481,27 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   typePadActions.className = 'terminal-type-pad-actions';
   const typePadHint = document.createElement('span');
   typePadHint.className = 'terminal-type-pad-hint';
-  typePadHint.textContent = 'Ctrl+Enter paste · Ctrl+` return to shell';
+  typePadHint.textContent = 'Ctrl+Enter paste · Ctrl+` shell · Recall restores sent text';
+  const typePadRecall = document.createElement('button');
+  typePadRecall.className = 'terminal-type-pad-recall';
+  typePadRecall.type = 'button';
+  typePadRecall.title = 'Recall previous Type pad paste. Click repeatedly for older text.';
+  typePadRecall.textContent = 'Recall';
   const typePadPaste = document.createElement('button');
   typePadPaste.className = 'terminal-type-pad-paste';
   typePadPaste.type = 'button';
   typePadPaste.title = 'Paste draft into the active shell without pressing Enter';
   typePadPaste.textContent = 'Paste';
-  typePadActions.append(typePadHint, typePadPaste);
+  typePadActions.append(typePadHint, typePadRecall, typePadPaste);
   typePad.append(typePadInput, typePadActions);
   card.append(titlebar, tabbar, hostStack, typePad, historyOverlay);
   el.mainGrid.append(card);
+  const glassPlane = ensureAppGlassPlane(card, 'terminal-widgets');
+  syncAppGlassTarget(glassPlane);
   const grips = ensureResizeGrips(card, 'terminal');
   if (options.rect) applyLayoutRatio(card, options.rect);
   else placeTerminalCard(card, options);
+  scheduleAppGlassOwnerRefresh(card, { delay: 120, reason: 'terminal-create' });
 
   const widget: TerminalWidget = {
     widgetId,
@@ -17594,6 +28528,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     typePadFocusToggle,
     typePad,
     typePadInput,
+    typePadRecall,
     typePadPaste,
     tabGroups: [],
     activeGroupId: '',
@@ -17653,7 +28588,6 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
     event.stopPropagation();
     toggleTerminalTypingPad(widget);
   });
-  typePadFocusToggle.addEventListener('pointerdown', (event) => event.stopPropagation());
   typePadFocusToggle.addEventListener('click', (event) => {
     event.stopPropagation();
     toggleTerminalWidgetDefaultFocusTarget(widget);
@@ -17661,6 +28595,7 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   typePadInput.addEventListener('input', () => updateTerminalTypingPadDraft(widget));
   typePadInput.addEventListener('focus', () => setTerminalTextTarget('typing-pad'));
   typePadInput.addEventListener('keydown', (event) => handleTerminalTypingPadKey(event, widget));
+  typePadRecall.addEventListener('click', () => recallTerminalTypingPadHistory(widget));
   typePadPaste.addEventListener('click', () => void pasteTerminalTypingPadDraft(widget));
   newTabButton.addEventListener('click', (event) => {
     event.stopPropagation();
@@ -17753,6 +28688,7 @@ function updateTerminalTypingPadDraft(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   if (!pane) return;
   pane.typingPadDraft = widget.typePadInput.value;
+  terminalTypingPadHistoryCursorByWidgetId.delete(widget.widgetId);
   syncTerminalTypingPadControls(widget);
 }
 
@@ -17845,6 +28781,45 @@ function focusTerminalFromTypingPad(widget: TerminalWidget) {
   focusTerminalPaneWhenReady(pane);
 }
 
+function prepareTerminalForTypingPadPaste(widget: TerminalWidget, pane: TerminalPane) {
+  setTerminalTextTarget('shell');
+  setActivePane(pane.paneId);
+  focusTerminalPaneNow(pane);
+  bringPanelToFront(widget.element);
+}
+
+function rememberTerminalTypingPadHistory(value: string) {
+  const normalized = normalizeTerminalPasteText(value).trimEnd();
+  if (!normalized) return;
+  const existingIndex = terminalTypingPadHistory.indexOf(normalized);
+  if (existingIndex >= 0) terminalTypingPadHistory.splice(existingIndex, 1);
+  terminalTypingPadHistory.unshift(normalized);
+  if (terminalTypingPadHistory.length > TERMINAL_TYPING_PAD_HISTORY_MAX) {
+    terminalTypingPadHistory.length = TERMINAL_TYPING_PAD_HISTORY_MAX;
+  }
+}
+
+function recallTerminalTypingPadHistory(widget: TerminalWidget) {
+  const pane = activePaneForWidget(widget);
+  if (!pane) return;
+  if (!terminalTypingPadHistory.length) {
+    setStatus('No Type pad history yet', true);
+    widget.typePadInput.focus({ preventScroll: true });
+    return;
+  }
+  const previousIndex = terminalTypingPadHistoryCursorByWidgetId.get(widget.widgetId) ?? -1;
+  const nextIndex = (previousIndex + 1) % terminalTypingPadHistory.length;
+  const value = terminalTypingPadHistory[nextIndex];
+  terminalTypingPadHistoryCursorByWidgetId.set(widget.widgetId, nextIndex);
+  pane.typingPadDraft = value;
+  widget.typePadInput.value = value;
+  syncTerminalTypingPadControls(widget);
+  widget.typePadInput.focus({ preventScroll: true });
+  const end = widget.typePadInput.value.length;
+  widget.typePadInput.setSelectionRange(end, end);
+  setStatus(`Recalled Type pad history ${nextIndex + 1}/${terminalTypingPadHistory.length}`);
+}
+
 async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   if (!pane) return;
@@ -17860,9 +28835,12 @@ async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
     return;
   }
   try {
+    prepareTerminalForTypingPadPaste(widget, pane);
     markTerminalUserInput(pane);
     markWorkspaceLlmUserActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
     await sendTerminalInputNow(pane, terminalPastePayload(value));
+    rememberTerminalTypingPadHistory(value);
+    terminalTypingPadHistoryCursorByWidgetId.delete(widget.widgetId);
     pane.typingPadDraft = '';
     widget.typePadInput.value = '';
     syncTerminalTypingPadControls(widget);
@@ -18055,26 +29033,45 @@ function stripTerminalHistoryControlSequences(data: string) {
 }
 
 function appendTerminalHistoryPlainText(cache: TerminalHistoryCache, text: string) {
+  let segmentStart = 0;
+  const appendPlainSegment = (end: number) => {
+    if (end > segmentStart) cache.currentLine += text.slice(segmentStart, end);
+  };
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
     if (char === '\r') {
-      if (text[index + 1] === '\n') continue;
+      appendPlainSegment(index);
+      if (text[index + 1] === '\n') {
+        pushTerminalHistoryLine(cache, cache.currentLine);
+        cache.currentLine = '';
+        segmentStart = index + 2;
+        index += 1;
+        continue;
+      }
       cache.currentLine = '';
+      segmentStart = index + 1;
       continue;
     }
     if (char === '\n') {
+      appendPlainSegment(index);
       pushTerminalHistoryLine(cache, cache.currentLine);
       cache.currentLine = '';
+      segmentStart = index + 1;
       continue;
     }
     if (char === '\b') {
+      appendPlainSegment(index);
       cache.currentLine = cache.currentLine.slice(0, -1);
+      segmentStart = index + 1;
       continue;
     }
     const code = char.charCodeAt(0);
-    if ((code < 32 || code === 127) && char !== '\t') continue;
-    cache.currentLine += char;
+    if ((code < 32 || code === 127) && char !== '\t') {
+      appendPlainSegment(index);
+      segmentStart = index + 1;
+    }
   }
+  appendPlainSegment(text.length);
   const limits = terminalHistoryCacheLimits();
   if (limits.enabled && cache.currentLine.length > limits.maxChars) {
     cache.currentLine = cache.currentLine.slice(-limits.maxChars);
@@ -18117,7 +29114,8 @@ function terminalHistoryLines(pane: TerminalPane) {
 }
 
 function terminalHistoryLineCount(pane: TerminalPane | null | undefined) {
-  return pane ? terminalHistoryLines(pane).length : 0;
+  const cache = pane?.historyCache;
+  return cache ? cache.lines.length + (cache.currentLine ? 1 : 0) : 0;
 }
 
 function terminalHasCachedHistory(pane: TerminalPane | null | undefined) {
@@ -18130,9 +29128,25 @@ function syncTerminalHistoryControlsForPane(pane: TerminalPane) {
   const activePane = activePaneForWidget(widget);
   if (activePane?.paneId !== pane.paneId && widget.historyOverlayPaneId !== pane.paneId) return;
   const lineCount = terminalHistoryLineCount(pane);
-  if (widget.historyButton.disabled || widget.historyOverlayPaneId === pane.paneId || lineCount % 100 === 0) {
+  const now = performance.now();
+  const overlayOpen = widget.historyOverlayPaneId === pane.paneId;
+  const shouldSyncNow = widget.historyButton.disabled
+    || overlayOpen
+    || lineCount % 500 === 0
+    || now - (pane.historyControlsLastSyncAt ?? 0) >= TERMINAL_HISTORY_CONTROL_SYNC_MIN_MS;
+  if (shouldSyncNow) {
+    pane.historyControlsLastSyncAt = now;
     syncTerminalHistoryControls(widget);
-    if (widget.historyOverlayPaneId === pane.paneId) renderTerminalHistoryOverlay(widget);
+    if (overlayOpen) renderTerminalHistoryOverlay(widget);
+    return;
+  }
+  if (!pane.historyControlsSyncTimer) {
+    pane.historyControlsSyncTimer = window.setTimeout(() => {
+      pane.historyControlsSyncTimer = undefined;
+      pane.historyControlsLastSyncAt = performance.now();
+      syncTerminalHistoryControls(widget);
+      if (widget.historyOverlayPaneId === pane.paneId) renderTerminalHistoryOverlay(widget);
+    }, TERMINAL_HISTORY_CONTROL_SYNC_MIN_MS);
   }
 }
 
@@ -18147,6 +29161,13 @@ function syncTerminalHistoryControls(widget: TerminalWidget) {
       : 'No cached terminal history yet';
   toggleClassIfChanged(widget.historyButton, 'has-history', enabled);
   if (!enabled && widget.historyOverlayPaneId === pane?.paneId) closeTerminalHistoryOverlay(widget);
+}
+
+function refreshTerminalHistoryGlassOverlay(widget: TerminalWidget) {
+  if (!appGlassEnabled() || !widget.element.classList.contains('app-glass-active-shell')) return;
+  const suspensions = suspendLiquidGlassTiltForOwner(widget.element);
+  restoreLiquidGlassTiltSuspension(suspensions);
+  refreshLiquidGlassGeometryForOwner(widget.element);
 }
 
 function openTerminalHistoryOverlay(
@@ -18176,9 +29197,11 @@ function openTerminalHistoryOverlay(
   widget.historyOverlayEndLine = endLine;
   renderTerminalHistoryOverlay(widget);
   toggleClassIfChanged(widget.historyOverlay, 'hidden', false);
+  refreshTerminalHistoryGlassOverlay(widget);
   widget.historyContent.focus();
   window.requestAnimationFrame(() => {
     widget.historyContent.scrollTop = widget.historyContent.scrollHeight;
+    refreshLiquidGlassGeometryForOwner(widget.element);
   });
 }
 
@@ -18189,6 +29212,7 @@ function closeTerminalHistoryOverlay(widget: TerminalWidget) {
   widget.historyOverlayPageEnd = undefined;
   widget.historyContent.value = '';
   toggleClassIfChanged(widget.historyOverlay, 'hidden', true);
+  refreshTerminalHistoryGlassOverlay(widget);
 }
 
 function renderTerminalHistoryOverlay(widget: TerminalWidget) {
@@ -18261,6 +29285,20 @@ function clearTerminalHistoryForWidget(widget: TerminalWidget) {
   if (!pane) return;
   clearTerminalHistoryCache(pane);
   setStatus('Terminal history cache cleared');
+}
+
+function handleTerminalWheel(event: WheelEvent, pane: TerminalPane) {
+  suppressWorkspaceLlmDetectionForTerminalScroll(pane, event);
+  handleTerminalHistoryWheel(event, pane);
+}
+
+function suppressWorkspaceLlmDetectionForTerminalScroll(pane: TerminalPane, event: WheelEvent) {
+  if (!terminalPaneLlmId(pane) || !pane.llmTmuxSessionName) return;
+  if (event.deltaY === 0) return;
+  pane.llmScrollDetectionSuppressUntil = performance.now() + WORKSPACE_LLM_SCROLL_DETECTION_SUPPRESS_MS;
+  pane.llmTitleDoneSuppressUntil = Date.now() + WORKSPACE_LLM_SCROLL_DONE_SUPPRESS_MS;
+  pane.llmTitleOscBuffer = undefined;
+  if (event.deltaY < 0) pane.llmWaitingDetectionBuffer = '';
 }
 
 function handleTerminalHistoryWheel(event: WheelEvent, pane: TerminalPane) {
@@ -18469,13 +29507,14 @@ async function createTerminalTab(
   const runtime = await ensureTerminalRuntime();
 
   const term = new runtime.Terminal({
+    allowTransparency: true,
     allowProposedApi: true,
     cursorBlink: true,
     convertEol: true,
     fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
     fontSize: terminalFontSize,
     scrollback: normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows),
-    theme: { background: '#080b10', foreground: '#d8e0ea' }
+    theme: { background: terminalBackgroundForCurrentGlassMode(), foreground: '#d8e0ea' }
   });
   const fit = new runtime.FitAddon();
   const unicode11 = new runtime.Unicode11Addon();
@@ -18561,7 +29600,7 @@ async function createTerminalTab(
     }
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
-  host.addEventListener('wheel', (event) => handleTerminalHistoryWheel(event, pane), { capture: true, passive: false });
+  host.addEventListener('wheel', (event) => handleTerminalWheel(event, pane), { capture: true, passive: false });
   bindTerminalImeCompositionGuard(pane);
 
   pane.resizeObserver = new ResizeObserver(() => {
@@ -18599,6 +29638,7 @@ async function createTerminalTab(
       return pane;
     }
     setTerminalBackendId(pane, backendId);
+    scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
       bringPanelToFront(widget.element);
@@ -18656,6 +29696,7 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
     if (widgetIndex >= 0) state.terminalWidgets.splice(widgetIndex, 1);
     if (widgetOpacityPopoverTarget?.element === widget.element) hideWidgetOpacityPopover({ persist: true });
     forgetTerminalWidget(widget);
+    cleanupAppGlassOwner(widget.element);
     widget.element.remove();
   } else if (widget && widget.activePaneId === paneId) {
     const activeGroup = activeTerminalGroupForWidget(widget);
@@ -19344,7 +30385,8 @@ async function createLlmTmuxTabInWidget(
   const cwd = active?.cwd ?? workspaceShellCwd();
   const tmuxSessionName = safeLlmTmuxSessionName(options.sessionName)
     ?? await nextLlmTmuxSessionName(profile, cwd, widget.workspaceId, llmId);
-  const { define, call } = llmLauncherParts(llmId, profile.kind, widget.workspaceId, tmuxSessionName);
+  const agentBridge = await prepareAgentBridgeForLlmLaunch(llmId, profile, cwd);
+  const { define, call } = llmLauncherParts(llmId, profile.kind, widget.workspaceId, tmuxSessionName, { agentBridge });
   const title = options.title ?? llmTmuxTabTitle(llmId, tmuxSessionName);
   const pane = await createTerminalTab(widget, define, title, {
     profile,
@@ -19354,7 +30396,9 @@ async function createLlmTmuxTabInWidget(
     llmTmuxSessionName: tmuxSessionName
   });
   if (!pane?.backendId) return pane;
+  await registerAgentBridgeForPane(pane, agentBridge);
   markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
+  scheduleWorkspaceLlmTmuxTitlePoll(pane, 1000);
   queueTerminalShellReadyAction(
     pane,
     `launch ${llmId}`,
@@ -19454,7 +30498,8 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
   const tmuxSessionName = pane.llmId
     ? await nextLlmTmuxSessionName(profile, pane.cwd, pane.workspaceId, pane.llmId)
     : undefined;
-  const llmParts = pane.llmId ? llmLauncherParts(pane.llmId, profile.kind, pane.workspaceId, tmuxSessionName) : null;
+  const agentBridge = pane.llmId ? await prepareAgentBridgeForLlmLaunch(pane.llmId, profile, pane.cwd) : null;
+  const llmParts = pane.llmId ? llmLauncherParts(pane.llmId, profile.kind, pane.workspaceId, tmuxSessionName, { agentBridge }) : null;
   const command = llmParts ? llmParts.define : pane.command;
   const title = pane.llmId ? llmTmuxTabTitle(pane.llmId, tmuxSessionName) : (pane.title.replace(/\s+\(exited\)$/i, '') || 'shell');
   const newPane = await createTerminalTab(widget, command, title, {
@@ -19468,6 +30513,7 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
   });
   if (!newPane) return;
   if (llmParts && newPane.backendId) {
+    await registerAgentBridgeForPane(newPane, agentBridge);
     markWorkspaceLlmActivityForPane(newPane, WORKSPACE_LLM_START_ACTIVE_MS);
     queueTerminalShellReadyAction(
       newPane,
@@ -19869,6 +30915,7 @@ function markWorkspaceLlmInputActivityForPane(pane: TerminalPane, data: string) 
   }
   if (!terminalInputCountsAsWorkspaceLlmActivity(data)) return;
   markWorkspaceLlmUserActivityForPane(pane, WORKSPACE_LLM_INPUT_ACTIVE_MS);
+  scheduleWorkspaceLlmTmuxTitlePoll(pane, 500);
 }
 
 function terminalInputCountsAsWorkspaceLlmActivity(data: string) {
@@ -20080,7 +31127,8 @@ function placeTerminalCard(card: HTMLElement, options: CreateTerminalOptions = {
   const guideRect = el.terminalGrid.getBoundingClientRect();
   const index = state.terminalWidgets.length;
   const rememberedSize = rememberedTerminalSpawnSize();
-  const width = clamp((rememberedSize?.width ?? guideRect.width) || 620, terminalMinWidth(), Math.max(terminalMinWidth(), el.mainGrid.clientWidth - 16));
+  const minWidth = terminalSpawnMinWidth(options);
+  const width = clamp((rememberedSize?.width ?? guideRect.width) || 620, minWidth, Math.max(minWidth, el.mainGrid.clientWidth - 16));
   const preferredHeight = rememberedSize?.height ?? options.initialHeight ?? 340;
   const height = clamp(preferredHeight, terminalMinHeight(), Math.max(terminalMinHeight(), el.mainGrid.clientHeight - 16));
   const offset = index * 22;
@@ -20222,7 +31270,9 @@ function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
   if (previousPaneId === paneId) {
     setKeyboardResizeTarget({ kind: 'terminal', paneId });
     flushTerminalWriteBuffer(pane);
+    refreshTerminalViewportIfRecentOutput(pane);
     scheduleFitTerminal(pane);
+    scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     if (options.focus === false) cancelTerminalFocusRequest(pane);
     else focusTerminalPaneWhenReady(pane);
     return;
@@ -20250,7 +31300,9 @@ function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
   }
   shellTabsRenderSignature = shellTabsSignature();
   flushTerminalWriteBuffer(pane);
+  refreshTerminalViewportIfRecentOutput(pane);
   scheduleFitTerminal(pane);
+  scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
   if (options.focus === false) cancelTerminalFocusRequest(pane);
   else focusTerminalPaneWhenReady(pane);
   saveActiveWorkspaceSnapshot();
@@ -21328,15 +32380,28 @@ function handleTerminalData(
   options: TerminalDataHandlingOptions = {}
 ) {
   clearTerminalStartupWatch(pane);
+  pane.lastTerminalDataAt = performance.now();
+  pane.tmuxStaleDeliveryCount = 0;
   pane.backendOutputChars += data.length;
   appendTerminalHistoryCache(pane, data);
   markWorkspaceTerminalOutput(pane.workspaceId);
-  if (options.detectLlmState !== false) {
-    updateWorkspaceLlmTitleFromTerminalData(pane, llmDetectionData);
-    const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, llmDetectionData);
-    if (!llmWaiting) markWorkspaceLlmOutputActivityForPane(pane, llmDetectionData, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  if (options.detectLlmState !== false && !llmDetectionSuppressedAfterTerminalScroll(pane)) {
+    const hookStatusActive = terminalPaneUsesHookLlmStatus(pane);
+    const grokHookSupplement = hookStatusActive && terminalPaneLlmId(pane) === 'grok';
+    if (!hookStatusActive || grokHookSupplement) {
+      updateWorkspaceLlmTitleFromTerminalData(pane, llmDetectionData);
+    }
+    if (!hookStatusActive || grokHookSupplement) {
+      scheduleTerminalLlmOutputDetection(pane, llmDetectionData, {
+        markActivity: !hookStatusActive && !terminalPaneUsesTitleOnlyLlmStatus(pane)
+      });
+    }
   }
   const visibility = enqueueTerminalWrite(pane, data);
+  if (visibility === 'visible') {
+    scheduleTerminalRenderWatchdog(pane);
+    scheduleTerminalTmuxFreezeProbe(pane);
+  }
   if (data.includes('\x1b]7;')) {
     const oscCwd = extractOsc7Cwd(data);
     if (oscCwd) updateTerminalCwd(pane, oscCwd);
@@ -21350,6 +32415,38 @@ function handleTerminalData(
 
   if (shouldTrackPromptCwd) trackTerminalPromptCwdFromOutput(pane, data);
   if (shouldScanPorts) scanTerminalOutputForPorts(pane, data);
+}
+
+function scheduleTerminalLlmOutputDetection(
+  pane: TerminalPane,
+  data: string,
+  options: { markActivity?: boolean } = {}
+) {
+  if (!data || pane.closed) return;
+  const existing = pane.llmOutputDetectionBuffer ?? '';
+  const next = existing + (existing ? '\n' : '') + data;
+  pane.llmOutputDetectionBuffer = next.length > TERMINAL_LLM_DETECTION_BUFFER_CHARS
+    ? next.slice(next.length - TERMINAL_LLM_DETECTION_BUFFER_CHARS)
+    : next;
+  pane.llmOutputDetectionMarkActivity = Boolean(pane.llmOutputDetectionMarkActivity || options.markActivity);
+  if (pane.llmOutputDetectionTimer) return;
+  pane.llmOutputDetectionTimer = window.setTimeout(() => {
+    pane.llmOutputDetectionTimer = undefined;
+    runTerminalLlmOutputDetection(pane);
+  }, TERMINAL_LLM_DETECTION_THROTTLE_MS);
+}
+
+function runTerminalLlmOutputDetection(pane: TerminalPane) {
+  if (pane.closed) return;
+  const data = pane.llmOutputDetectionBuffer ?? '';
+  const markActivity = pane.llmOutputDetectionMarkActivity === true;
+  pane.llmOutputDetectionBuffer = '';
+  pane.llmOutputDetectionMarkActivity = false;
+  if (!data || llmDetectionSuppressedAfterTerminalScroll(pane)) return;
+  const llmWaiting = updateWorkspaceLlmWaitingFromOutput(pane, data);
+  if (markActivity && !llmWaiting && !terminalPaneUsesTitleOnlyLlmStatus(pane)) {
+    markWorkspaceLlmOutputActivityForPane(pane, data, WORKSPACE_LLM_OUTPUT_ACTIVE_MS);
+  }
 }
 
 function handleTerminalSnapshotData(pane: TerminalPane, output: string) {
@@ -21370,6 +32467,7 @@ function handleTerminalSnapshotData(pane: TerminalPane, output: string) {
 
 function enqueueTerminalWrite(pane: TerminalPane, data: string) {
   pane.writeBuffer += data;
+  capTerminalWriteBuffer(pane);
 
   const visibility = terminalPaneVisibility(pane);
   if (visibility === 'visible') {
@@ -21382,8 +32480,10 @@ function enqueueTerminalWrite(pane: TerminalPane, data: string) {
       return visibility;
     }
     if (pane.writeFrame) return visibility;
+    pane.writeFrameScheduledAt = performance.now();
     pane.writeFrame = window.requestAnimationFrame(() => {
       pane.writeFrame = undefined;
+      pane.writeFrameScheduledAt = undefined;
       flushTerminalWriteBuffer(pane);
     });
     return visibility;
@@ -21401,8 +32501,10 @@ function enqueueTerminalWrite(pane: TerminalPane, data: string) {
   const delay = visibility === 'inactive'
     ? TERMINAL_INACTIVE_WRITE_BATCH_MS
     : TERMINAL_BACKGROUND_WRITE_BATCH_MS;
+  pane.writeTimerScheduledAt = performance.now();
   pane.writeTimer = window.setTimeout(() => {
     pane.writeTimer = undefined;
+    pane.writeTimerScheduledAt = undefined;
     flushTerminalWriteBufferWhenReady(pane, delay);
   }, delay);
   return visibility;
@@ -21434,13 +32536,19 @@ function flushTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.writeFrame) {
     window.cancelAnimationFrame(pane.writeFrame);
     pane.writeFrame = undefined;
+    pane.writeFrameScheduledAt = undefined;
   }
   if (pane.writeTimer) {
     window.clearTimeout(pane.writeTimer);
     pane.writeTimer = undefined;
+    pane.writeTimerScheduledAt = undefined;
   }
   if (!pane.writeBuffer) return;
   const visibility = terminalPaneVisibility(pane);
+  if ((pane.pendingTerminalWrites ?? 0) >= TERMINAL_MAX_PENDING_TERM_WRITES) {
+    scheduleTerminalWriteContinuation(pane, visibility);
+    return;
+  }
   const chunkSize = terminalWriteChunkSize(pane, visibility);
   const end = pane.writeBuffer.length > chunkSize
     ? surrogateSafeChunkEnd(pane.writeBuffer, chunkSize)
@@ -21451,6 +32559,17 @@ function flushTerminalWriteBuffer(pane: TerminalPane) {
   pane.term.write(output, () => markTerminalWriteFinished(pane));
   scheduleTerminalWriteContinuation(pane, visibility);
   resolveTerminalWriteDrainIfReady(pane);
+}
+
+function capTerminalWriteBuffer(pane: TerminalPane) {
+  if (pane.writeBuffer.length <= TERMINAL_WRITE_BUFFER_MAX_CHARS) return;
+  const removed = pane.writeBuffer.length - TERMINAL_WRITE_BUFFER_TRIM_TARGET_CHARS;
+  const marker = `\x1b[0m\r\n[Simple Vibe IDE skipped ${removed.toLocaleString()} buffered terminal chars to keep the UI responsive]\r\n`;
+  pane.writeBuffer = marker + pane.writeBuffer.slice(-TERMINAL_WRITE_BUFFER_TRIM_TARGET_CHARS);
+  if (performance.now() - (pane.lastRenderWatchdogLogAt ?? 0) > 5000) {
+    pane.lastRenderWatchdogLogAt = performance.now();
+    appendDiagnosticLog('terminal', `write buffer capped pane=${diagnosticPaneLabel(pane)} removed=${removed}`);
+  }
 }
 
 function surrogateSafeChunkEnd(text: string, desiredEnd: number) {
@@ -21478,8 +32597,10 @@ function scheduleTerminalWriteContinuation(pane: TerminalPane, visibility = term
   if (!pane.writeBuffer) return;
   if (visibility === 'visible') {
     if (pane.writeFrame) return;
+    pane.writeFrameScheduledAt = performance.now();
     pane.writeFrame = window.requestAnimationFrame(() => {
       pane.writeFrame = undefined;
+      pane.writeFrameScheduledAt = undefined;
       flushTerminalWriteBuffer(pane);
     });
     return;
@@ -21488,16 +32609,68 @@ function scheduleTerminalWriteContinuation(pane: TerminalPane, visibility = term
   const delay = visibility === 'inactive'
     ? TERMINAL_INACTIVE_WRITE_BATCH_MS
     : TERMINAL_BACKGROUND_WRITE_BATCH_MS;
+  pane.writeTimerScheduledAt = performance.now();
   pane.writeTimer = window.setTimeout(() => {
     pane.writeTimer = undefined;
+    pane.writeTimerScheduledAt = undefined;
     flushTerminalWriteBufferWhenReady(pane, delay);
   }, delay);
+}
+
+function scheduleTerminalRenderWatchdog(pane: TerminalPane) {
+  if (pane.renderWatchdogTimer || !isTerminalPaneAlive(pane)) return;
+  pane.renderWatchdogTimer = window.setTimeout(() => {
+    pane.renderWatchdogTimer = undefined;
+    runTerminalRenderWatchdog(pane);
+  }, TERMINAL_RENDER_WATCHDOG_MS);
+}
+
+function runTerminalRenderWatchdog(pane: TerminalPane) {
+  if (!isTerminalPaneAlive(pane)) return;
+  if (terminalPaneVisibility(pane) !== 'visible') return;
+  scheduleTerminalTmuxFreezeProbe(pane);
+  const now = performance.now();
+  let staleRaf = false;
+  if (pane.writeFrame && now - (pane.writeFrameScheduledAt ?? now) > TERMINAL_RENDER_WATCHDOG_STALE_RAF_MS) {
+    window.cancelAnimationFrame(pane.writeFrame);
+    pane.writeFrame = undefined;
+    pane.writeFrameScheduledAt = undefined;
+    staleRaf = true;
+  }
+  const pendingChars = pane.writeBuffer.length;
+  if (pane.writeBuffer && !pane.writeFrame) flushTerminalWriteBuffer(pane);
+  const refreshed = refreshTerminalViewportIfRecentOutput(pane, now);
+  if (staleRaf || pendingChars > 0 || (refreshed && now - (pane.lastRenderWatchdogLogAt ?? 0) > 5000)) {
+    pane.lastRenderWatchdogLogAt = now;
+    appendDiagnosticLog(
+      'terminal',
+      `watchdog pane=${diagnosticPaneLabel(pane)} staleRaf=${staleRaf ? 'yes' : 'no'} pending=${pendingChars} refreshed=${refreshed ? 'yes' : 'no'}`
+    );
+  }
+  if (pane.writeBuffer || pane.writeFrame) scheduleTerminalRenderWatchdog(pane);
+}
+
+function refreshTerminalViewportIfRecentOutput(pane: TerminalPane, now = performance.now()) {
+  const lastDataAt = pane.lastTerminalDataAt ?? 0;
+  const lastRefreshAt = pane.lastTerminalRefreshAt ?? 0;
+  if (!lastDataAt || lastDataAt <= lastRefreshAt) return false;
+  if (lastRefreshAt && now - lastRefreshAt < TERMINAL_RENDER_REFRESH_MIN_MS) return false;
+  pane.lastTerminalRefreshAt = now;
+  try {
+    pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
+  } catch {
+    // xterm can reject refresh while the pane is being disposed.
+  }
+  return true;
 }
 
 function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.writeFrame) window.cancelAnimationFrame(pane.writeFrame);
   if (pane.focusFrame) window.cancelAnimationFrame(pane.focusFrame);
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
+  if (pane.renderWatchdogTimer) window.clearTimeout(pane.renderWatchdogTimer);
+  if (pane.llmOutputDetectionTimer) window.clearTimeout(pane.llmOutputDetectionTimer);
+  if (pane.historyControlsSyncTimer) window.clearTimeout(pane.historyControlsSyncTimer);
   if (pane.focusRetryTimer) window.clearTimeout(pane.focusRetryTimer);
   if (pane.shellReadyFallbackTimer) window.clearTimeout(pane.shellReadyFallbackTimer);
   if (pane.portScanTimer) window.clearTimeout(pane.portScanTimer);
@@ -21505,9 +32678,18 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
   if (pane.imeFallbackTimer) window.clearTimeout(pane.imeFallbackTimer);
   if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
+  if (pane.llmTmuxTitlePollTimer) window.clearTimeout(pane.llmTmuxTitlePollTimer);
+  if (pane.tmuxFreezeProbeTimer) window.clearTimeout(pane.tmuxFreezeProbeTimer);
   pane.writeFrame = undefined;
+  pane.writeFrameScheduledAt = undefined;
   pane.focusFrame = undefined;
   pane.writeTimer = undefined;
+  pane.writeTimerScheduledAt = undefined;
+  pane.renderWatchdogTimer = undefined;
+  pane.llmOutputDetectionTimer = undefined;
+  pane.llmOutputDetectionBuffer = '';
+  pane.llmOutputDetectionMarkActivity = false;
+  pane.historyControlsSyncTimer = undefined;
   pane.focusRetryTimer = undefined;
   pane.shellReadyFallbackTimer = undefined;
   pane.portScanTimer = undefined;
@@ -21515,6 +32697,14 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.inputFlushTimer = undefined;
   pane.imeFallbackTimer = undefined;
   pane.imeReleaseTimer = undefined;
+  pane.llmTmuxTitlePollTimer = undefined;
+  pane.llmTmuxTitlePollPromise = undefined;
+  pane.llmTmuxTitleLastValue = undefined;
+  pane.tmuxFreezeProbeTimer = undefined;
+  pane.tmuxFreezeProbePromise = undefined;
+  pane.tmuxFreezeProbeLastSignature = undefined;
+  pane.tmuxFreezeProbeLastLoggedAt = undefined;
+  pane.tmuxFreezeProbeLastChangedAt = undefined;
   pane.inputBuffer = '';
   pane.shellReadyAt = undefined;
   pane.pendingShellReadyActions = undefined;
@@ -23807,6 +34997,7 @@ function renderBrowserAddressSuggestions(force = false) {
   if (!suggestions.length) {
     el.browserAddressSuggestions.replaceChildren();
     toggleClassIfChanged(el.browserAddressSuggestions, 'hidden', true);
+    setBrowserAddressSuggestionsOpen(false);
     return;
   }
   const fragment = document.createDocumentFragment();
@@ -23823,6 +35014,7 @@ function renderBrowserAddressSuggestions(force = false) {
   }
   el.browserAddressSuggestions.replaceChildren(fragment);
   toggleClassIfChanged(el.browserAddressSuggestions, 'hidden', false);
+  setBrowserAddressSuggestionsOpen(true);
 }
 
 function browserAddressSuggestionsForInput() {
@@ -23840,6 +35032,11 @@ function hideBrowserAddressSuggestions() {
   browserAddressSuggestionSignature = '\0';
   el.browserAddressSuggestions.replaceChildren();
   toggleClassIfChanged(el.browserAddressSuggestions, 'hidden', true);
+  setBrowserAddressSuggestionsOpen(false);
+}
+
+function setBrowserAddressSuggestionsOpen(open: boolean) {
+  toggleClassIfChanged(el.browserPanel, 'browser-suggestions-open', open);
 }
 
 function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
@@ -24967,6 +36164,7 @@ function navigateBrowserHistory(delta: -1 | 1) {
 
 function handleBrowserRefreshShortcut(event: KeyboardEvent) {
   if (event.key !== 'F5') return;
+  if (isEditableShortcutTarget(event.target)) return;
   const target = event.target instanceof Element ? event.target : null;
   const browserFocused = keyboardResizeTarget.kind === 'panel' && keyboardResizeTarget.id === 'browser';
   if (!target?.closest('.browser-panel') && !browserFocused) return;
