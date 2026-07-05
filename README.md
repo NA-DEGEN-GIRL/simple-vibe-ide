@@ -9,13 +9,13 @@
 
 Simple Vibe IDE is a Windows-first Tauri v2 desktop app for fast LLM coding sessions across Windows, WSL, and SSH workspaces. It is a local, pre-1.0 tool focused on terminal responsiveness, workspace memory, and practical multi-agent coding loops.
 
-![Simple Vibe IDE Glass theme demo screenshot](docs/simple-vibe-ide-glass-demo.jpg)
+![Simple Vibe IDE Glass theme demo screenshot](docs/simple-vibe-ide-glass-demo.png)
 
-_Glass theme demo. Workspace, profile, and file-list labels are sanitized for this public README._
+_Glass theme screenshot._
 
-![Simple Vibe IDE classic theme demo screenshot](docs/simple-vibe-ide-classic-demo.jpg)
+![Simple Vibe IDE classic theme demo screenshot](docs/simple-vibe-ide-classic-demo.png)
 
-_Classic theme demo. Workspace, profile, and file-list labels are sanitized for this public README._
+_Classic theme screenshot._
 
 <details id="korean-version" open>
 <summary><strong>한국어 버전 보기</strong></summary>
