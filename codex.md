@@ -54,6 +54,33 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 ### 2026-07-05 - Simplify LLM card background controls
 
 #### Changed (`src/main.ts`, `src/styles.css`)
+- Terminal render watchdog refreshes now wait until the xterm write pipeline is
+  fully drained before forcing a full viewport repaint. This avoids presenting
+  half-applied GL frames while large TUI output is still being chunk-written,
+  which is the likely cause of the brief left-edge glyph fragments.
+- Grok Build terminal panes now use xterm's DOM renderer even when the global
+  terminal renderer setting is `auto`. Grok's fullscreen TUI can trigger stale
+  glyph fragments in xterm WebGL, and the attempted texture-atlas reset path was
+  removed because WebGL glyph atlases can be shared across terminal instances
+  and disturb otherwise healthy GL panes.
+- Grok launcher commands now use a reduced embedded-terminal contract:
+  `TERM=xterm`, empty `COLORTERM`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`,
+  `NO_COLOR=1`, `FORCE_COLOR=0`, and `grok --no-alt-screen`. These are
+  applied only to Grok launcher panes so other shells and agents keep their
+  existing terminal capabilities.
+- Grok panes now use xterm's built-in Unicode 6 width provider while other
+  panes keep the Unicode 11 add-on active. This is scoped to Grok because its
+  OpenTUI inline redraw can desync from newer xterm width tables on ambiguous
+  punctuation/symbol cells.
+- LLM launcher panes now disable xterm `convertEol`, because LLM TUIs already
+  own cursor movement and xterm's LF-to-CRLF compatibility mode is intended for
+  non-PTY streams. Plain shell panes keep the existing setting for now.
+- Grok panes also get a post-write/scroll viewport refresh after xterm's write
+  queue drains. This is throttled and Grok-only, nudging the DOM/transparent
+  WebView compositor without adding a heavy refresh path to normal shells.
+- Grok output now normalizes bare carriage-return redraws to `CR + erase to
+  end-of-line` before xterm writes. This is scoped to Grok panes and targets
+  stale front-edge cells from partial-line TUI repaint/wcwidth mismatches.
 - Terminal-focused `Ctrl++` / `Ctrl+-` now resize the terminal font before
   xterm can treat the key as shell input, so the shortcut works even when the
   terminal helper textarea has focus. Font resize shortcuts now report the

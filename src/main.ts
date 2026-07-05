@@ -167,6 +167,9 @@ interface TerminalPane {
   tmuxStaleRecoveryLastAt?: number;
   tmuxStaleRecoveryPromise?: Promise<void>;
   llmTitleDisposable?: { dispose: () => void };
+  grokOutputPendingCarriageReturn?: boolean;
+  grokPostWriteRefreshFrame?: number;
+  grokScrollRefreshDisposable?: { dispose: () => void };
   activePythonEnv?: TerminalPythonEnvSnapshot;
   pendingTerminalWrites?: number;
   lastTerminalDataAt?: number;
@@ -1467,6 +1470,7 @@ type LlmLauncherFlag = {
 type LlmLauncherConfig = {
   executable: string;
   flags: LlmLauncherFlag[];
+  env?: Record<string, string>;
 };
 
 type AgentBridgeLaunchContext = {
@@ -1505,7 +1509,20 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   },
   grok: {
     executable: 'grok',
+    env: {
+      TERM: 'xterm',
+      COLORTERM: '',
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C.UTF-8',
+      NO_COLOR: '1',
+      FORCE_COLOR: '0'
+    },
     flags: [
+      {
+        bashPattern: '*--no-alt-screen*',
+        powershellPattern: '--no-alt-screen',
+        args: ['--no-alt-screen']
+      },
       {
         bashPattern: '*--always-approve*',
         powershellPattern: '--always-approve',
@@ -1642,6 +1659,7 @@ const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
 const TERMINAL_RENDER_WATCHDOG_MS = 420;
 const TERMINAL_RENDER_WATCHDOG_STALE_RAF_MS = 500;
 const TERMINAL_RENDER_REFRESH_MIN_MS = 260;
+const TERMINAL_GROK_RENDER_REFRESH_MIN_MS = 80;
 const TERMINAL_TMUX_FREEZE_PROBE_INTERVAL_MS = 12_000;
 const TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS = 150;
 const TERMINAL_TMUX_FREEZE_PROBE_MIN_LOG_MS = 20_000;
@@ -14343,6 +14361,55 @@ function terminalPaneLlmId(pane: TerminalPane | null | undefined) {
   return normalizeTerminalLlmId(pane?.llmId) ?? normalizeTerminalLlmId(pane?.detectedLlmId);
 }
 
+function terminalUnicodeVersionForLlm(llmId: string | null | undefined) {
+  // Grok Build/OpenTUI's inline diff redraw can drift from xterm's newer
+  // Unicode width tables on ambiguous-width symbols. Keep this surgical:
+  // only Grok panes fall back to xterm's built-in Unicode 6 provider.
+  return normalizeTerminalLlmId(llmId) === 'grok' ? '6' : '11';
+}
+
+function terminalConvertEolForLlm(llmId: string | null | undefined) {
+  // LLM TUIs own cursor movement and line redraws. xterm's convertEol is
+  // documented for non-PTY streams and can inject CRs on LF, which can desync
+  // inline TUI diffs. Keep the existing plain-shell behavior for now.
+  return !normalizeTerminalLlmId(llmId);
+}
+
+function applyTerminalUnicodeVersionForLlm(term: XTermTerminal, llmId: string | null | undefined) {
+  const version = terminalUnicodeVersionForLlm(llmId);
+  if (term.unicode.activeVersion === version) return;
+  try {
+    term.unicode.activeVersion = version;
+  } catch (error) {
+    console.warn(`Failed to activate xterm Unicode ${version} width table.`, error);
+  }
+}
+
+function applyTerminalCompatibilityForLlm(term: XTermTerminal, llmId: string | null | undefined) {
+  applyTerminalUnicodeVersionForLlm(term, llmId);
+  const convertEol = terminalConvertEolForLlm(llmId);
+  if (term.options.convertEol !== convertEol) term.options.convertEol = convertEol;
+}
+
+function normalizeTerminalOutputForPaneWrite(pane: TerminalPane, data: string) {
+  if (!data || terminalPaneLlmId(pane) !== 'grok') return data;
+  let normalized = data;
+  if (pane.grokOutputPendingCarriageReturn) {
+    normalized = normalized.startsWith('\n') ? `\r${normalized}` : `\r\x1b[K${normalized}`;
+    pane.grokOutputPendingCarriageReturn = false;
+  }
+  if (normalized.endsWith('\r')) {
+    pane.grokOutputPendingCarriageReturn = true;
+    normalized = normalized.slice(0, -1);
+  }
+  // Grok's TUI frequently redraws status/progress rows from column 0 with a
+  // bare carriage return. If the new row is narrower, or if Grok/tmux and
+  // xterm disagree about wide/zero-width glyph widths, stale cells at the
+  // front edge remain in xterm's buffer even in DOM renderer. Clear to EOL on
+  // Grok-only bare CR redraws so the following partial repaint starts clean.
+  return normalized.replace(/\r(?!\n)/g, '\r\x1b[K');
+}
+
 function llmUsesTitleOnlyStatus(llmId: string | null | undefined) {
   return normalizeTerminalLlmId(llmId) === 'codex';
 }
@@ -14361,6 +14428,7 @@ function setDetectedTerminalLlmId(pane: TerminalPane, llmId: string | null | und
   if (pane.detectedLlmId === normalized) return normalized;
   const previousState = workspaceLlmIndicatorState(pane.workspaceId);
   pane.detectedLlmId = normalized;
+  applyTerminalCompatibilityForLlm(pane.term, normalized);
   updateAgentSessionProgressForPane(pane, {
     agentId: normalized,
     status: pane.backendId ? 'idle' : 'idle',
@@ -21414,6 +21482,9 @@ function bashLlmLauncherParts(
   for (const envName of envPassthrough) {
     lines.push(`if [ -n "\${${envName}+x}" ]; then __svi_env_args+=("${envName}=\$${envName}"); fi`);
   }
+  for (const [envName, envValue] of Object.entries(launcher.env ?? {})) {
+    lines.push(`__svi_env_args+=(${bashQuote(`${envName}=${envValue}`)})`);
+  }
   if (bridge) {
     lines.push(
       `__svi_agent_bridge_port=${bashQuote(String(bridge.bridge.port))}`,
@@ -21500,6 +21571,7 @@ function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
   return [
     `$sviSource = (Get-Command ${executable} -All -ErrorAction SilentlyContinue | Format-List CommandType,Name,Definition,Source | Out-String)`,
     '$sviArgs = @()',
+    ...Object.entries(launcher.env ?? {}).map(([envName, envValue]) => `$env:${envName} = ${powershellQuote(envValue)}`),
     ...launcher.flags.map((flag) =>
       `if ($sviSource -notmatch ${powershellQuote(flag.powershellPattern)}) { $sviArgs += @(${flag.args.map(powershellQuote).join(', ')}) }`
     ),
@@ -23111,6 +23183,8 @@ async function closeAllTerminals() {
 function disposeTerminalPaneRenderer(pane: TerminalPane) {
   pane.webglContextLossDisposable?.dispose();
   pane.webglContextLossDisposable = undefined;
+  pane.grokScrollRefreshDisposable?.dispose();
+  pane.grokScrollRefreshDisposable = undefined;
   pane.webgl?.dispose();
   pane.webgl = undefined;
 }
@@ -23242,6 +23316,9 @@ function markTerminalWriteStarted(pane: TerminalPane) {
 function markTerminalWriteFinished(pane: TerminalPane) {
   pane.pendingTerminalWrites = Math.max(0, (pane.pendingTerminalWrites ?? 0) - 1);
   resolveTerminalWriteDrainIfReady(pane);
+  if (terminalWriteDrainReady(pane) && terminalPaneLlmId(pane) === 'grok') {
+    scheduleGrokTerminalViewportRefresh(pane, 'write-drain');
+  }
 }
 
 function resolveTerminalWriteDrainIfReady(pane: TerminalPane) {
@@ -23250,6 +23327,24 @@ function resolveTerminalWriteDrainIfReady(pane: TerminalPane) {
   pane.writeDrainPromise = undefined;
   pane.writeDrainResolve = undefined;
   if (resolve) resolve();
+}
+
+function scheduleGrokTerminalViewportRefresh(pane: TerminalPane, reason: string) {
+  if (pane.grokPostWriteRefreshFrame || !isTerminalPaneAlive(pane)) return;
+  pane.grokPostWriteRefreshFrame = window.requestAnimationFrame(() => {
+    pane.grokPostWriteRefreshFrame = undefined;
+    if (!isTerminalPaneAlive(pane) || terminalPaneVisibility(pane) !== 'visible') return;
+    const refreshed = refreshTerminalViewportIfRecentOutput(pane, performance.now(), {
+      force: reason === 'scroll',
+      minIntervalMs: TERMINAL_GROK_RENDER_REFRESH_MIN_MS
+    });
+    if (refreshed) {
+      // Force a cheap layout read after xterm.refresh(). In WebView + transparent
+      // DOM renderer paths this nudges the compositor similarly to a resize, but
+      // only for Grok panes and only after xterm has processed the write batch.
+      void pane.host.offsetHeight;
+    }
+  });
 }
 
 function queueTerminalInput(pane: TerminalPane, data: string) {
@@ -29069,6 +29164,15 @@ function maybeLoadTerminalWebglAddon(term: XTermTerminal, runtime: TerminalRunti
   }
 }
 
+function terminalLlmShouldUseWebglRenderer(llmId: string | null | undefined) {
+  // Grok Build's fullscreen TUI rewrites and scrolls wide-character rows much more
+  // aggressively than plain shells. In xterm WebGL this can leave stale glyph
+  // fragments after output/scroll, and clearing the shared glyph atlas can disturb
+  // other GL terminals. Keep Grok panes on xterm's DOM renderer until the upstream
+  // WebGL/wide-character path is stable.
+  return normalizeTerminalLlmId(llmId) !== 'grok';
+}
+
 function registerTerminalWebglContextLoss(pane: TerminalPane) {
   const webgl = pane.webgl;
   if (!webgl) return;
@@ -30450,12 +30554,13 @@ async function createTerminalTab(
   host.dataset.paneId = paneId;
   widget.hostStack.append(host);
   const runtime = await ensureTerminalRuntime();
+  const terminalLlmId = normalizeTerminalLlmId(options.llmId) ?? undefined;
 
   const term = new runtime.Terminal({
     allowTransparency: true,
     allowProposedApi: true,
     cursorBlink: true,
-    convertEol: true,
+    convertEol: terminalConvertEolForLlm(terminalLlmId),
     fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
     fontSize: terminalFontSize,
     scrollback: normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows),
@@ -30464,10 +30569,12 @@ async function createTerminalTab(
   const fit = new runtime.FitAddon();
   const unicode11 = new runtime.Unicode11Addon();
   term.loadAddon(unicode11);
-  term.unicode.activeVersion = '11';
+  applyTerminalCompatibilityForLlm(term, terminalLlmId);
   term.loadAddon(fit);
   term.open(host);
-  const webgl = maybeLoadTerminalWebglAddon(term, runtime) ?? undefined;
+  const webgl = terminalLlmShouldUseWebglRenderer(terminalLlmId)
+    ? maybeLoadTerminalWebglAddon(term, runtime) ?? undefined
+    : undefined;
 
   const pane: TerminalPane = {
     paneId,
@@ -30476,7 +30583,7 @@ async function createTerminalTab(
     workspaceId: widget.workspaceId,
     title,
     command,
-    llmId: normalizeTerminalLlmId(options.llmId) ?? undefined,
+    llmId: terminalLlmId,
     llmTmuxSessionName: safeLlmTmuxSessionName(options.llmTmuxSessionName) ?? undefined,
     profileId: terminalProfile.id,
     cwd: terminalCwd,
@@ -30511,6 +30618,9 @@ async function createTerminalTab(
   rememberTerminalPane(pane);
   pane.llmTitleDisposable = term.onTitleChange((terminalTitle) => {
     updateWorkspaceLlmTitleFromTerminalTitle(pane, terminalTitle);
+  });
+  pane.grokScrollRefreshDisposable = term.onScroll(() => {
+    if (terminalPaneLlmId(pane) === 'grok') scheduleGrokTerminalViewportRefresh(pane, 'scroll');
   });
   detectTerminalPaneLlmFromMetadata(pane);
   const group = rememberPaneInTerminalGroup(widget, pane, options);
@@ -31498,6 +31608,13 @@ function terminalRendererBadgeState(pane: TerminalPane | null | undefined) {
       key: 'lost',
       label: 'GL!',
       title: 'Terminal WebGL context was lost; xterm is using its DOM fallback'
+    };
+  }
+  if (terminalPaneLlmId(pane) === 'grok') {
+    return {
+      key: 'grok-dom',
+      label: 'DOM',
+      title: 'Terminal renderer: DOM selected for Grok Build compatibility'
     };
   }
   if (state.ideSettings.terminalRenderer === 'dom') {
@@ -33339,7 +33456,8 @@ function handleTerminalData(
   pane.lastTerminalDataAt = performance.now();
   pane.tmuxStaleDeliveryCount = 0;
   pane.backendOutputChars += data.length;
-  appendTerminalHistoryCache(pane, data);
+  const writeData = normalizeTerminalOutputForPaneWrite(pane, data);
+  if (writeData) appendTerminalHistoryCache(pane, writeData);
   markWorkspaceTerminalOutput(pane.workspaceId);
   if (options.detectLlmState !== false && !llmDetectionSuppressedAfterTerminalScroll(pane)) {
     const hookStatusActive = terminalPaneUsesHookLlmStatus(pane);
@@ -33353,7 +33471,7 @@ function handleTerminalData(
       });
     }
   }
-  const visibility = enqueueTerminalWrite(pane, data);
+  const visibility = writeData ? enqueueTerminalWrite(pane, writeData) : terminalPaneVisibility(pane);
   if (visibility === 'visible') {
     scheduleTerminalRenderWatchdog(pane);
     scheduleTerminalTmuxFreezeProbe(pane);
@@ -33606,11 +33724,17 @@ function runTerminalRenderWatchdog(pane: TerminalPane) {
   if (pane.writeBuffer || pane.writeFrame) scheduleTerminalRenderWatchdog(pane);
 }
 
-function refreshTerminalViewportIfRecentOutput(pane: TerminalPane, now = performance.now()) {
+function refreshTerminalViewportIfRecentOutput(
+  pane: TerminalPane,
+  now = performance.now(),
+  options: { force?: boolean; minIntervalMs?: number } = {}
+) {
+  if (!terminalWriteDrainReady(pane)) return false;
   const lastDataAt = pane.lastTerminalDataAt ?? 0;
   const lastRefreshAt = pane.lastTerminalRefreshAt ?? 0;
-  if (!lastDataAt || lastDataAt <= lastRefreshAt) return false;
-  if (lastRefreshAt && now - lastRefreshAt < TERMINAL_RENDER_REFRESH_MIN_MS) return false;
+  if (!options.force && (!lastDataAt || lastDataAt <= lastRefreshAt)) return false;
+  const minIntervalMs = options.minIntervalMs ?? TERMINAL_RENDER_REFRESH_MIN_MS;
+  if (lastRefreshAt && now - lastRefreshAt < minIntervalMs) return false;
   pane.lastTerminalRefreshAt = now;
   try {
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
@@ -33623,6 +33747,7 @@ function refreshTerminalViewportIfRecentOutput(pane: TerminalPane, now = perform
 function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.writeFrame) window.cancelAnimationFrame(pane.writeFrame);
   if (pane.focusFrame) window.cancelAnimationFrame(pane.focusFrame);
+  if (pane.grokPostWriteRefreshFrame) window.cancelAnimationFrame(pane.grokPostWriteRefreshFrame);
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
   if (pane.renderWatchdogTimer) window.clearTimeout(pane.renderWatchdogTimer);
   if (pane.llmOutputDetectionTimer) window.clearTimeout(pane.llmOutputDetectionTimer);
@@ -33639,6 +33764,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.writeFrame = undefined;
   pane.writeFrameScheduledAt = undefined;
   pane.focusFrame = undefined;
+  pane.grokPostWriteRefreshFrame = undefined;
   pane.writeTimer = undefined;
   pane.writeTimerScheduledAt = undefined;
   pane.renderWatchdogTimer = undefined;
@@ -33667,6 +33793,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.inputWritePromise = undefined;
   pane.imeComposing = false;
   pane.writeBuffer = '';
+  pane.grokOutputPendingCarriageReturn = false;
   pane.pendingTerminalWrites = 0;
   pane.writeDrainResolve?.();
   pane.writeDrainPromise = undefined;
