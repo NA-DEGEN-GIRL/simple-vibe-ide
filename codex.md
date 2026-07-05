@@ -51,6 +51,189 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-05 - Simplify LLM card background controls
+
+#### Changed (`src/main.ts`, `src/styles.css`)
+- Glass-mode workspace LLM/Agy card color overlays no longer own a separate
+  border. `LLM 카드 단일 테두리 강도` now drives the real card outline instead,
+  with the same 1px outline on all sides, so background geometry controls
+  cannot create an internal vertical border.
+- Replaced the LLM color `inset`/`extension`/`width`/`overflow` controls with a
+  simpler rectangle model: background size left/right/top/bottom and move X/Y,
+  plus one visible card/container radius.
+- The LLM/Agy color background is now an independent 62%-wide rectangle instead
+  of a full-card layer. The inner color rectangle stays square, while
+  `LLM 카드 R값` changes the real card/container radius that clips the final
+  visible shape.
+- The simplified LLM/Agy model now defaults its card radius to
+  `0`; old saved default radius `9` from the removed inset/width model is
+  migrated to `0` unless the simplified size/move fields are already present.
+- Added finer LLM detail-card controls: title/activity/meta text colors, sizes,
+  weights, and line-heights; logo badge size/weight/height/padding/radius,
+  border width, and alpha controls; and variable LLM background gradient start,
+  middle, end alpha, stop positions, and angle.
+- `LLM 카드 단일 테두리 강도` now paints through a card-outline `::after`
+  layer above the inner color background, so the border remains visible instead
+  of being hidden by the LLM background layer/clipping.
+- Expanded `explorer-scroll` diagnostics for the intermittent Explorer
+  scrollbar/layout issue. The log now records render/resize/watch/glass-apply
+  lifecycle reasons, expected vs actual vertical scrollbar state, virtual row
+  content height, spacer heights, child count, extra scroll height, and changed
+  fields from the previous diagnostic snapshot.
+- Explorer row liquidGL's viewport-sized internal mirror now stays in the
+  Explorer overlay host instead of being adopted into each `.file-row`; only the
+  small row-local mirror remains inside the row. This prevents the hidden
+  mirror from inflating the file list's `scrollWidth`/`scrollHeight` after
+  `glass-apply`.
+- In glass-mode side workspace rows, the gap between the workspace row header
+  and the first LLM/Agy detail card now reuses `LLM 카드 간격`, instead of
+  stacking the detail top padding plus the agent-list top margin.
+- Workspace row LLM status spacing now treats the setting as
+  `상태 점-이름 간격`: the name starts from the status-dot right edge plus that
+  gap, instead of using an absolute left padding that made `0` still look too
+  far from the dot. The glass-mode status dot now renders inside the label's
+  local coordinate system, so row padding/glass planes no longer add hidden
+  space between the dot and workspace name. Old absolute saved values are
+  migrated to an equivalent dot-to-name gap.
+- Fixed a protected/capture-applied workspace row override that could keep the
+  old row-level LLM status dot visible above the new label-local dot. That
+  stale dot made `상태 점-이름 간격 = 0` still look widely separated.
+- Replaced the glass-mode workspace row status dot with a real inline dot/span
+  inside the workspace label, using CSS `gap` for `상태 점-이름 간격` instead of
+  pseudo-element padding math. Workspace glass diagnostics now log the label,
+  dot, and text rects plus the actual measured dot-to-text gap.
+- Glass-mode workspace labels are now stretched and `justify-content:flex-start`
+  so the status-dot/name group stays left-aligned inside the header grid instead
+  of visually centering as an intrinsic inline-flex group.
+- Added detailed selected badge controls for workspace row glass: text color,
+  background alpha, font size/weight, height, padding, radius, left gap,
+  X/Y offset, and line-height.
+- Workspace row glass now reserves an inner edge gap around the scrollable row
+  list, using the larger of `카드 간격` and `rail glow`, so the first row's
+  rail/glow is not clipped against the workspace header and side glow has room
+  to render.
+- The row edge gap is vertical-only; horizontal padding is kept at `0` so the
+  row glass width no longer shrinks left/right when the gap is enabled.
+- Selected workspace rail glow also paints on the row outline plane with a
+  uniform `0 0` shadow, so the rail glow reads with the same thickness on
+  left/right and top/bottom instead of mainly showing below the row.
+- Window resize now does an immediate workspace glass geometry pass and then,
+  after resize settles, rebuilds the workspace row/container liquidGL lenses.
+  This clears stale mirror/clip rectangles that could leave the workspace
+  container or rows stretched/misaligned after shrinking and expanding the app.
+- Moved the workspace row/tab liquidGL master toggle into the `Glass 사용 범위`
+  group and renamed it as an explicit row/tab on/off control, so it no longer
+  feels hidden inside the workspace material section.
+- Workspace hover-only row glass now keeps row render layers after the container
+  glass layers even when the container lens is toggled on later. The hover-only
+  active set also includes both the row/add button and their glass planes, so
+  legacy and current row lenses stay renderable on hover while inactive rows
+  remain filtered out.
+- Workspace side rows now reserve horizontal rail-glow bleed outside the row
+  list by expanding the scroll container outward while keeping the actual row
+  glass width unchanged, so increasing row width no longer clips the selected
+  rail glow at the left/right edges.
+- The workspace row rail bleed keeps the actual row/add-button glass at full
+  width, while side-dock header highlights are clipped horizontally to the row
+  header/glass width. This keeps manual highlight expansion from spilling into
+  the extra rail-glow safety space.
+- Workspace idle/tab header highlights no longer apply to the active workspace
+  row/tab. Active rows now show only the selected-highlight layer when that
+  option is enabled, and show no idle highlight when selected highlight is off.
+- Explorer glass row scrolling now has a semantic vertical-overflow guard:
+  when the real file row content fits but row-local glass/mirror overflow
+  inflates native `scrollHeight`, the Explorer hides only the bogus vertical
+  scrollbar and resets stale `scrollTop`. Diagnostics now include `guardY`.
+- Explorer glass row scrolling clips row-local glass overflow so rows do not
+  inflate native scroll height, and logs visible vs native vertical scrollbar
+  state separately.
+- Explorer horizontal overflow is now driven by a semantic row-content width
+  computed from an offscreen DOM-measured file row using the same CSS grid,
+  depth indentation, file name, and optional size text, then applied to rows
+  and virtual spacers. This restores the horizontal scrollbar when content is
+  wider than the glass viewport without relying on row/mirror overflow that
+  previously broke vertical scroll height.
+- Explorer now also has a semantic horizontal-overflow guard. When the panel is
+  widened until the horizontal scrollbar disappears and then narrowed again
+  while vertical scrolling is still not needed, the guard forces horizontal
+  scrolling back on from the measured content width instead of waiting for a
+  later vertical-overflow recalculation.
+- The Explorer horizontal guard now compares the real row-content right edge
+  (`padding-left + measured row content width`) against `clientWidth`, instead
+  of treating clipped trailing right padding as meaningful content overflow.
+- Explorer horizontal overflow detection now uses strict rounded
+  `scrollWidth > clientWidth` semantics instead of the previous one-pixel
+  tolerance, so the `contentOuterW=300` / `cw=299` boundary no longer suppresses
+  the horizontal guard. Diagnostics also log `hBar` for the actual reserved
+  horizontal scrollbar height.
+- Explorer scroll diagnostics now log `hiddenContentX`, `hBar`, native `xOff`,
+  and `xMax` near the front of each line, making it clear when semantic row
+  content is clipped and whether native horizontal scrolling is actually
+  available before log truncation.
+- Removed the attempted glass-attached custom horizontal rail/thumb and the
+  virtual X-offset path. Native file-list scrolling owns horizontal movement
+  again, including in glass mode, so dragging the scrollbar no longer snaps
+  back to the left during virtual render/scroll diagnostics.
+- Removed the forced glass file-list height snap. The Explorer grid now owns
+  file-list height again, and resize observation includes the title/path/export
+  rows so wrapped Explorer controls cannot overlap the list body.
+- Glass-mode Explorer native scrollbars are styled to fit the glass look
+  instead of being replaced by a separate custom bar.
+- Explorer scroll diagnostics now include the remaining horizontal-scroll
+  decision points needed for the no-vertical-scroll case: native vs semantic X
+  ranges, glass scope state, panel/list/title/path/export dimensions, row/name
+  measured widths, computed `--explorer-content-width`, grid rows, overflow,
+  gutter, and key class names.
+- When the Explorer glass row vertical-overflow guard hides a bogus vertical
+  scrollbar, it now keeps `scrollbar-gutter: stable`. This preserves the same
+  client-width budget as the vertical-scroll case, so horizontal overflow does
+  not disappear only because vertical scrolling is semantically unnecessary.
+- Restored the geometry recalculation that snaps the glass Explorer file-list
+  height to the panel bottom, now with the current wrapped title/path rows in
+  the resize observer. The native horizontal scrollbar can therefore sit on the
+  Explorer glass bottom boundary without reintroducing the old custom rail.
+- Glass settings export now tries the WebView save-file picker first, so users
+  can choose the JSON destination. If that API is unavailable, it falls back to
+  the previous browser download behavior and the status message says it used the
+  default downloads folder.
+- Wrapped glass widget headers no longer apply the single-line topbar content
+  Y-offset to each child. This keeps narrow Explorer headers from being pushed
+  upward and clipped when their controls wrap onto multiple lines.
+- Wrapped glass widget headers now use their own multi-line layout metrics:
+  top-aligned rows, larger line-height, row gap, and child margins. This avoids
+  reusing single-line topbar typography that clipped the first Explorer header
+  row when the controls wrapped to two or more lines.
+- Explorer glass layout now measures the wrapped title bar's actual child
+  bottom and adds a title-bottom gap when the visual controls overflow the
+  computed title box. This prevents the path/use row from overlapping a
+  multi-line Explorer header while keeping the file-list bottom snap.
+- Removed the Explorer `Auto Edit` title-bar button and its toggle/update path.
+  The double-open Explorer mode now always auto-opens a single selected
+  non-executable file in the editor; single-open mode still opens through the
+  direct entry action.
+- Explorer glass headers now use the wrapped/auto-height title layout
+  unconditionally, independent of the generic widget title-wrap setting, and
+  the title-overflow gap measurement runs for Explorer glass headers whenever
+  the panel glass shell is active. This keeps the path/use row below wrapped
+  title controls instead of letting them overlap.
+- Added a Glass theme row at the top of the Glass settings popover. The bundled
+  `theme/glass_set_01.json` + `theme/glass_bg_01.jpg` pair is exposed as
+  `기본 Glass 테마 01`, and `테마 저장` exports the current background plus glass
+  settings as a reusable theme JSON.
+- Fresh default IDE settings now seed from that bundled Glass theme, while
+  existing persisted settings are left unchanged unless the user applies it.
+- `테마 저장` embeds the active wallpaper image when it is stored as a local or
+  bundled image URL small enough for settings, so saved themes can carry the
+  background as well as the glass slider/toggle values.
+- Background image load/error events now recapture workspace, Explorer, and app
+  glass surfaces, so applying a theme with a bundled wallpaper refreshes all
+  glass snapshots after the image is actually available.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `git diff --check -- src/main.ts src/styles.css src/vite-env.d.ts codex.md`
+
 ### 2026-07-04 - Reduce app-glass WebGL contexts and recover context loss
 
 #### Changed (`src/main.ts`, `src/styles.css`)

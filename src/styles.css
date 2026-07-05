@@ -175,7 +175,6 @@
   --app-glass-terminal-scroll-thumb-hover: rgba(160, 198, 255, 0.46);
   --app-glass-terminal-scroll-track: rgba(5, 10, 18, 0.04);
   --app-glass-terminal-scroll-width: 8px;
-  --app-glass-explorer-horizontal-scrollbar-gap: 8px;
   --app-glass-terminal-host-outline: rgba(127, 176, 255, 0);
   --app-glass-terminal-split-resizer-bg: rgba(77, 141, 255, 0.34);
   --app-glass-explorer-row-radius: 5px;
@@ -428,6 +427,8 @@
   --workspace-glass-row-pad-x: 4px;
   --workspace-glass-row-pad-y: 3px;
   --workspace-glass-row-gap: 9px;
+  --workspace-glass-row-edge-gap: 9px;
+  --workspace-glass-row-inline-safe-gap: 0px;
   --workspace-glass-row-bg: rgba(255, 255, 255, 0.052);
   --workspace-glass-row-shadow: 0 10px 22px rgba(0, 0, 0, 0);
   --workspace-glass-outline: rgba(190, 224, 255, 0);
@@ -484,17 +485,23 @@
   --workspace-glass-agent-title: #f6faff;
   --workspace-glass-agent-title-size: 0.86em;
   --workspace-glass-agent-title-weight: 760;
+  --workspace-glass-agent-title-line-height: 1.24;
   --workspace-glass-agent-activity: #c6d8ef;
   --workspace-glass-agent-activity-size: 0.68em;
   --workspace-glass-agent-activity-weight: 560;
+  --workspace-glass-agent-activity-line-height: 1.35;
   --workspace-glass-agent-meta: #acbed8;
   --workspace-glass-agent-meta-size: 0.68em;
   --workspace-glass-agent-meta-weight: 520;
+  --workspace-glass-agent-meta-line-height: 1.35;
   --workspace-glass-agent-badge-size: 0.58em;
   --workspace-glass-agent-status-size: 0.58em;
   --workspace-glass-agent-badge-weight: 800;
   --workspace-glass-agent-status-weight: 800;
   --workspace-glass-agent-badge-height: 17px;
+  --workspace-glass-agent-badge-pad-x: 6px;
+  --workspace-glass-agent-badge-radius: 999px;
+  --workspace-glass-agent-badge-border-width: 1px;
   --workspace-glass-agent-status-pad-x: 6px;
   --workspace-glass-agent-status-radius: 999px;
   --workspace-glass-agent-status-border-width: 0px;
@@ -516,22 +523,45 @@
   --workspace-glass-agent-status-exited: #a8b3c2;
   --workspace-glass-agent-status-exited-bg: rgba(168, 179, 194, 0.18);
   --workspace-glass-agent-status-exited-border: rgba(168, 179, 194, 0.34);
-  --workspace-glass-agent-type-bg-left: 0px;
-  --workspace-glass-agent-type-bg-right: 0px;
-  --workspace-glass-agent-type-bg-top: 0px;
-  --workspace-glass-agent-type-bg-bottom: 0px;
-  --workspace-glass-agent-type-bg-bleed-left: 0px;
-  --workspace-glass-agent-type-bg-bleed-right: 0px;
-  --workspace-glass-agent-type-bg-width: 62%;
-  --workspace-glass-agent-type-bg-radius: 9px;
+  --workspace-glass-agent-type-bg-size-left: 0px;
+  --workspace-glass-agent-type-bg-size-right: 0px;
+  --workspace-glass-agent-type-bg-size-top: 0px;
+  --workspace-glass-agent-type-bg-size-bottom: 0px;
+  --workspace-glass-agent-type-bg-move-x: 0px;
+  --workspace-glass-agent-type-bg-move-y: 0px;
+  --workspace-glass-agent-type-bg-base-width: 62%;
+  --workspace-glass-agent-type-bg-radius: 0px;
+  --workspace-glass-agent-type-bg-angle: 90deg;
+  --workspace-glass-agent-type-bg-mid-stop: 36%;
+  --workspace-glass-agent-type-bg-end-stop: 100%;
   --workspace-glass-agent-codex-bg: rgba(46, 126, 137, 0.48);
+  --workspace-glass-agent-codex-bg-mid: rgba(46, 126, 137, 0.48);
+  --workspace-glass-agent-codex-bg-end: rgba(46, 126, 137, 0);
   --workspace-glass-agent-claude-bg: rgba(138, 99, 210, 0.48);
+  --workspace-glass-agent-claude-bg-mid: rgba(138, 99, 210, 0.48);
+  --workspace-glass-agent-claude-bg-end: rgba(138, 99, 210, 0);
   --workspace-glass-agent-grok-bg: rgba(63, 143, 82, 0.48);
+  --workspace-glass-agent-grok-bg-mid: rgba(63, 143, 82, 0.48);
+  --workspace-glass-agent-grok-bg-end: rgba(63, 143, 82, 0);
   --workspace-glass-agent-agy-bg: rgba(214, 146, 61, 0.48);
+  --workspace-glass-agent-agy-bg-mid: rgba(214, 146, 61, 0.48);
+  --workspace-glass-agent-agy-bg-end: rgba(214, 146, 61, 0);
   --workspace-glass-agent-codex-border: rgba(46, 126, 137, 0.58);
   --workspace-glass-agent-claude-border: rgba(138, 99, 210, 0.58);
   --workspace-glass-agent-grok-border: rgba(63, 143, 82, 0.58);
   --workspace-glass-agent-agy-border: rgba(214, 146, 61, 0.58);
+  --workspace-glass-agent-codex-badge-bg: rgba(46, 126, 137, 0.18);
+  --workspace-glass-agent-claude-badge-bg: rgba(138, 99, 210, 0.18);
+  --workspace-glass-agent-grok-badge-bg: rgba(63, 143, 82, 0.18);
+  --workspace-glass-agent-agy-badge-bg: rgba(214, 146, 61, 0.18);
+  --workspace-glass-agent-codex-badge-border: rgba(46, 126, 137, 0.56);
+  --workspace-glass-agent-claude-badge-border: rgba(138, 99, 210, 0.56);
+  --workspace-glass-agent-grok-badge-border: rgba(63, 143, 82, 0.56);
+  --workspace-glass-agent-agy-badge-border: rgba(214, 146, 61, 0.56);
+  --workspace-glass-agent-codex-badge-text: rgba(46, 126, 137, 1);
+  --workspace-glass-agent-claude-badge-text: rgba(138, 99, 210, 1);
+  --workspace-glass-agent-grok-badge-text: rgba(63, 143, 82, 1);
+  --workspace-glass-agent-agy-badge-text: rgba(214, 146, 61, 1);
   --workspace-glass-llm-working: #35e070;
   --workspace-glass-llm-working-glow: rgba(53, 224, 112, 0.56);
   --workspace-glass-llm-working-pulse-ring: rgba(53, 224, 112, 0.48);
@@ -551,10 +581,12 @@
   --workspace-glass-status-dot-top: 16px;
   --workspace-glass-status-dot-size: 8px;
   --workspace-glass-status-dot-glow: 10px;
+  --workspace-glass-status-dot-offset-y: 0px;
   --workspace-glass-llm-pulse-duration: 1.25s;
   --workspace-glass-llm-pulse-dim-opacity: 0.54;
   --workspace-glass-llm-pulse-ring-size: 5px;
-  --workspace-glass-label-status-pad: 19px;
+  --workspace-glass-label-status-gap: 6px;
+  --workspace-glass-label-status-pad: 21px;
   --workspace-glass-selected-accent: #d9f6ff;
   --workspace-glass-selected-surface-soft: rgba(217, 246, 255, 0.16);
   --workspace-glass-selected-surface-strong: rgba(217, 246, 255, 0.27);
@@ -575,7 +607,17 @@
   --workspace-glass-selected-rail-radius: 999px;
   --workspace-glass-selected-rail-glow: 0px;
   --workspace-glass-selected-badge-bg: #e2f8ff;
+  --workspace-glass-selected-badge-color: #081018;
   --workspace-glass-selected-badge-size: 0.54em;
+  --workspace-glass-selected-badge-weight: 900;
+  --workspace-glass-selected-badge-height: 15px;
+  --workspace-glass-selected-badge-pad-x: 6px;
+  --workspace-glass-selected-badge-pad-y: 1px;
+  --workspace-glass-selected-badge-radius: 999px;
+  --workspace-glass-selected-badge-margin-left: 6px;
+  --workspace-glass-selected-badge-shift-x: 0px;
+  --workspace-glass-selected-badge-shift-y: 0px;
+  --workspace-glass-selected-badge-line-height: 1.1;
   --workspace-glass-tab-highlight-opacity: 0.72;
   --workspace-glass-tab-highlight-width: 66%;
   --workspace-glass-tab-highlight-left: 0px;
@@ -1569,6 +1611,33 @@ body.glass-mode-on .window-control-icon {
   gap: 10px;
   padding: 11px;
 }
+.glass-theme-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  padding: 8px;
+  border: 1px solid rgba(122, 174, 255, 0.18);
+  border-radius: 9px;
+  background: rgba(122, 174, 255, 0.055);
+}
+.glass-theme-row label {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  color: #c9d6e8;
+  font-size: 12px;
+  font-weight: 700;
+}
+.glass-theme-row select {
+  min-width: 0;
+  width: 100%;
+}
+.glass-theme-row button {
+  min-height: 28px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
 .glass-master-toggle {
   grid-column: 1 / -1;
   flex-direction: row-reverse;
@@ -2480,6 +2549,11 @@ body.workspace-dock-resizing * {
 .shell.workspace-dock-side.workspace-side-glass .workspace-tabs {
   scrollbar-gutter: auto;
   gap: var(--workspace-glass-row-gap);
+  box-sizing: border-box;
+  padding-block: var(--workspace-glass-row-edge-gap);
+  padding-inline: var(--workspace-glass-row-inline-safe-gap);
+  margin-inline: calc(0px - var(--workspace-glass-row-inline-safe-gap));
+  width: calc(100% + var(--workspace-glass-row-inline-safe-gap) + var(--workspace-glass-row-inline-safe-gap));
   isolation: auto;
   z-index: auto;
 }
@@ -2669,6 +2743,11 @@ body.workspace-dock-resizing * {
   z-index: 2;
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab-label {
+  justify-self: stretch;
+  width: 100%;
+  box-sizing: border-box;
+  justify-content: flex-start;
+  text-align: left;
   color: var(--workspace-glass-text);
   font-size: var(--workspace-glass-text-size);
   font-weight: var(--workspace-glass-text-weight);
@@ -2713,8 +2792,10 @@ body.workspace-dock-resizing * {
 }
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-tab-highlight .workspace-tab > .workspace-tab-head {
   overflow: visible;
+  clip-path: inset(-160px 0 -160px 0);
+  -webkit-clip-path: inset(-160px 0 -160px 0);
 }
-.shell.workspace-dock-side.workspace-side-glass.workspace-glass-tab-highlight .workspace-tab > .workspace-tab-head::before {
+.shell.workspace-dock-side.workspace-side-glass.workspace-glass-tab-highlight .workspace-tab:not(.active) > .workspace-tab-head::before {
   display: block;
 }
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-selected-highlight .workspace-tab.active {
@@ -2740,6 +2821,8 @@ body.workspace-dock-resizing * {
 }
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-selected-highlight .workspace-tab.active > .workspace-tab-head {
   overflow: visible;
+  clip-path: inset(-160px 0 -160px 0);
+  -webkit-clip-path: inset(-160px 0 -160px 0);
 }
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-selected-highlight .workspace-tab.active > .workspace-tab-head::before {
   display: block;
@@ -2755,6 +2838,16 @@ body.workspace-dock-resizing * {
 }
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-selected-rail .workspace-tab.active::before {
   display: block;
+}
+.shell.workspace-dock-side.workspace-side-glass.workspace-glass-selected-rail .workspace-tab.active {
+  overflow: visible;
+}
+.shell.workspace-dock-side.workspace-side-glass.workspace-glass-selected-rail .workspace-tab.active > .workspace-tab-outline-plane {
+  box-shadow:
+    0 0 var(--workspace-glass-selected-rail-glow) var(--workspace-glass-selected-rail),
+    0 var(--workspace-glass-selected-glow-y) var(--workspace-glass-selected-glow-blur) var(--workspace-glass-selected-glow-spread) var(--workspace-glass-selected-glow),
+    0 0 0 var(--workspace-glass-outline-soft-width) var(--workspace-glass-active-outline-soft),
+    inset 0 1px 0 var(--workspace-glass-row-inset);
 }
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-rail-pill .workspace-tab.active::before {
   left: var(--workspace-glass-selected-rail-offset);
@@ -2789,16 +2882,21 @@ body.workspace-dock-resizing * {
   content: "선택됨";
   display: inline-flex;
   align-items: center;
-  margin-left: 6px;
-  padding: 1px 6px 2px;
-  border-radius: 999px;
-  color: #081018;
+  justify-content: center;
+  min-height: var(--workspace-glass-selected-badge-height);
+  margin-left: var(--workspace-glass-selected-badge-margin-left);
+  padding: var(--workspace-glass-selected-badge-pad-y) var(--workspace-glass-selected-badge-pad-x);
+  border-radius: var(--workspace-glass-selected-badge-radius);
+  color: var(--workspace-glass-selected-badge-color);
   background: var(--workspace-glass-selected-badge-bg);
   font-size: var(--workspace-glass-selected-badge-size);
-  font-weight: 900;
+  font-weight: var(--workspace-glass-selected-badge-weight);
+  line-height: var(--workspace-glass-selected-badge-line-height);
+  transform: translate(var(--workspace-glass-selected-badge-shift-x), var(--workspace-glass-selected-badge-shift-y));
   vertical-align: middle;
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present::after {
+  display: none;
   left: var(--workspace-glass-status-dot-left);
   top: calc(var(--workspace-glass-row-pad-y) + var(--workspace-glass-status-dot-top));
   width: var(--workspace-glass-status-dot-size);
@@ -2808,9 +2906,28 @@ body.workspace-dock-resizing * {
   z-index: 5;
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present .workspace-tab-label {
+  position: relative;
   padding-left: var(--workspace-glass-label-status-pad);
 }
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present .workspace-tab-label::before {
+  content: "";
+  position: absolute;
+  left: var(--workspace-glass-status-dot-left);
+  top: calc(50% + var(--workspace-glass-status-dot-offset-y));
+  width: var(--workspace-glass-status-dot-size);
+  height: var(--workspace-glass-status-dot-size);
+  border-radius: 999px;
+  transform: translateY(-50%);
+  background: var(--workspace-glass-llm-idle);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-idle-glow), 0 0 0 1px rgba(91, 125, 96, 0.45), inset 0 0 4px rgba(22, 34, 24, 0.72);
+  pointer-events: none;
+}
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-working::after {
+  background: var(--workspace-glass-llm-working);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-working-glow);
+  animation: none;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-working .workspace-tab-label::before {
   background: var(--workspace-glass-llm-working);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-working-glow);
   animation: none;
@@ -2818,7 +2935,15 @@ body.workspace-dock-resizing * {
 .shell.workspace-dock-side.workspace-side-glass.workspace-glass-working-pulse .workspace-tab.llm-working::after {
   animation: workspace-glass-llm-pulse var(--workspace-glass-llm-pulse-duration) ease-in-out infinite;
 }
+.shell.workspace-dock-side.workspace-side-glass.workspace-glass-working-pulse .workspace-tab.llm-working .workspace-tab-label::before {
+  animation: workspace-glass-llm-pulse var(--workspace-glass-llm-pulse-duration) ease-in-out infinite;
+}
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-waiting::after {
+  background: var(--workspace-glass-llm-waiting);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-waiting-glow);
+  animation: none;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-waiting .workspace-tab-label::before {
   background: var(--workspace-glass-llm-waiting);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-waiting-glow);
   animation: none;
@@ -2827,11 +2952,76 @@ body.workspace-dock-resizing * {
   background: var(--workspace-glass-llm-error);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-error-glow);
 }
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-error .workspace-tab-label::before {
+  background: var(--workspace-glass-llm-error);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-error-glow);
+}
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-done-unread::after {
   background: var(--workspace-glass-llm-done-unread);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-done-unread-glow);
 }
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-done-unread .workspace-tab-label::before {
+  background: var(--workspace-glass-llm-done-unread);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-done-unread-glow);
+}
 .shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-exited::after {
+  background: var(--workspace-glass-llm-exited);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-exited-glow);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-exited .workspace-tab-label::before {
+  background: var(--workspace-glass-llm-exited);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-exited-glow);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present::after,
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.protected.llm-present::after,
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.capture-applied.llm-present::after {
+  display: none;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present .workspace-tab-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  justify-self: stretch;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
+  gap: var(--workspace-glass-label-status-gap);
+  padding-left: 0;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present .workspace-tab-label::before {
+  content: none;
+  display: none;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-present .workspace-tab-status-dot-inline {
+  display: inline-block;
+  width: var(--workspace-glass-status-dot-size);
+  height: var(--workspace-glass-status-dot-size);
+  margin-left: var(--workspace-glass-status-dot-left);
+  border-radius: 999px;
+  transform: translateY(var(--workspace-glass-status-dot-offset-y));
+  background: var(--workspace-glass-llm-idle);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-idle-glow), 0 0 0 1px rgba(91, 125, 96, 0.45), inset 0 0 4px rgba(22, 34, 24, 0.72);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-working .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-working);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-working-glow);
+}
+.shell.workspace-dock-side.workspace-side-glass.workspace-glass-working-pulse .workspace-tab.llm-working .workspace-tab-status-dot-inline {
+  animation: workspace-glass-llm-pulse var(--workspace-glass-llm-pulse-duration) ease-in-out infinite;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-waiting .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-waiting);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-waiting-glow);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-error .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-error);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-error-glow);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-done-unread .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-done-unread);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-done-unread-glow);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.llm-exited .workspace-tab-status-dot-inline {
   background: var(--workspace-glass-llm-exited);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-exited-glow);
 }
@@ -3022,6 +3212,11 @@ body.workspace-dock-resizing * {
   z-index: 2;
 }
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab-label {
+  justify-self: stretch;
+  width: 100%;
+  box-sizing: border-box;
+  justify-content: flex-start;
+  text-align: left;
   color: var(--workspace-glass-text);
   font-size: var(--workspace-glass-text-size);
   font-weight: var(--workspace-glass-text-weight);
@@ -3058,7 +3253,7 @@ body.workspace-dock-resizing * {
 .shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-selected-highlight .workspace-tab.active {
   overflow: visible;
 }
-.shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-tab-highlight .workspace-tab > .workspace-tab-head::before {
+.shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-tab-highlight .workspace-tab:not(.active) > .workspace-tab-head::before {
   display: block;
 }
 .shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-selected-highlight .workspace-tab.active {
@@ -3096,6 +3291,16 @@ body.workspace-dock-resizing * {
 .shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-selected-rail .workspace-tab.active::before {
   display: block;
 }
+.shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-selected-rail .workspace-tab.active {
+  overflow: visible;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-selected-rail .workspace-tab.active > .workspace-tab-outline-plane {
+  box-shadow:
+    0 0 var(--workspace-glass-selected-rail-glow) var(--workspace-glass-selected-rail),
+    0 var(--workspace-glass-selected-glow-y) var(--workspace-glass-selected-glow-blur) var(--workspace-glass-selected-glow-spread) var(--workspace-glass-selected-glow),
+    0 0 0 var(--workspace-glass-outline-soft-width) var(--workspace-glass-active-outline-soft),
+    inset 0 1px 0 var(--workspace-glass-row-inset);
+}
 .shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-rail-pill .workspace-tab.active::before {
   left: var(--workspace-glass-selected-rail-offset);
   top: var(--workspace-glass-selected-rail-inset);
@@ -3129,16 +3334,21 @@ body.workspace-dock-resizing * {
   content: "선택됨";
   display: inline-flex;
   align-items: center;
-  margin-left: 6px;
-  padding: 1px 6px 2px;
-  border-radius: 999px;
-  color: #081018;
+  justify-content: center;
+  min-height: var(--workspace-glass-selected-badge-height);
+  margin-left: var(--workspace-glass-selected-badge-margin-left);
+  padding: var(--workspace-glass-selected-badge-pad-y) var(--workspace-glass-selected-badge-pad-x);
+  border-radius: var(--workspace-glass-selected-badge-radius);
+  color: var(--workspace-glass-selected-badge-color);
   background: var(--workspace-glass-selected-badge-bg);
   font-size: var(--workspace-glass-selected-badge-size);
-  font-weight: 900;
+  font-weight: var(--workspace-glass-selected-badge-weight);
+  line-height: var(--workspace-glass-selected-badge-line-height);
+  transform: translate(var(--workspace-glass-selected-badge-shift-x), var(--workspace-glass-selected-badge-shift-y));
   vertical-align: middle;
 }
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present::after {
+  display: none;
   left: var(--workspace-glass-status-dot-left);
   width: var(--workspace-glass-status-dot-size);
   height: var(--workspace-glass-status-dot-size);
@@ -3147,9 +3357,28 @@ body.workspace-dock-resizing * {
   z-index: 5;
 }
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present .workspace-tab-label {
+  position: relative;
   padding-left: var(--workspace-glass-label-status-pad);
 }
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present .workspace-tab-label::before {
+  content: "";
+  position: absolute;
+  left: var(--workspace-glass-status-dot-left);
+  top: calc(50% + var(--workspace-glass-status-dot-offset-y));
+  width: var(--workspace-glass-status-dot-size);
+  height: var(--workspace-glass-status-dot-size);
+  border-radius: 999px;
+  transform: translateY(-50%);
+  background: var(--workspace-glass-llm-idle);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-idle-glow), 0 0 0 1px rgba(91, 125, 96, 0.45), inset 0 0 4px rgba(22, 34, 24, 0.72);
+  pointer-events: none;
+}
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-working::after {
+  background: var(--workspace-glass-llm-working);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-working-glow);
+  animation: none;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-working .workspace-tab-label::before {
   background: var(--workspace-glass-llm-working);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-working-glow);
   animation: none;
@@ -3157,7 +3386,15 @@ body.workspace-dock-resizing * {
 .shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-working-pulse .workspace-tab.llm-working::after {
   animation: workspace-glass-llm-pulse var(--workspace-glass-llm-pulse-duration) ease-in-out infinite;
 }
+.shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-working-pulse .workspace-tab.llm-working .workspace-tab-label::before {
+  animation: workspace-glass-llm-pulse var(--workspace-glass-llm-pulse-duration) ease-in-out infinite;
+}
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-waiting::after {
+  background: var(--workspace-glass-llm-waiting);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-waiting-glow);
+  animation: none;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-waiting .workspace-tab-label::before {
   background: var(--workspace-glass-llm-waiting);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-waiting-glow);
   animation: none;
@@ -3166,11 +3403,76 @@ body.workspace-dock-resizing * {
   background: var(--workspace-glass-llm-error);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-error-glow);
 }
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-error .workspace-tab-label::before {
+  background: var(--workspace-glass-llm-error);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-error-glow);
+}
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-done-unread::after {
   background: var(--workspace-glass-llm-done-unread);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-done-unread-glow);
 }
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-done-unread .workspace-tab-label::before {
+  background: var(--workspace-glass-llm-done-unread);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-done-unread-glow);
+}
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-exited::after {
+  background: var(--workspace-glass-llm-exited);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-exited-glow);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-exited .workspace-tab-label::before {
+  background: var(--workspace-glass-llm-exited);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-exited-glow);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present::after,
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.protected.llm-present::after,
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.capture-applied.llm-present::after {
+  display: none;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present .workspace-tab-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  justify-self: stretch;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
+  gap: var(--workspace-glass-label-status-gap);
+  padding-left: 0;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present .workspace-tab-label::before {
+  content: none;
+  display: none;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-present .workspace-tab-status-dot-inline {
+  display: inline-block;
+  width: var(--workspace-glass-status-dot-size);
+  height: var(--workspace-glass-status-dot-size);
+  margin-left: var(--workspace-glass-status-dot-left);
+  border-radius: 999px;
+  transform: translateY(var(--workspace-glass-status-dot-offset-y));
+  background: var(--workspace-glass-llm-idle);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-idle-glow), 0 0 0 1px rgba(91, 125, 96, 0.45), inset 0 0 4px rgba(22, 34, 24, 0.72);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-working .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-working);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-working-glow);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side).workspace-glass-working-pulse .workspace-tab.llm-working .workspace-tab-status-dot-inline {
+  animation: workspace-glass-llm-pulse var(--workspace-glass-llm-pulse-duration) ease-in-out infinite;
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-waiting .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-waiting);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-waiting-glow);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-error .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-error);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-error-glow);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-done-unread .workspace-tab-status-dot-inline {
+  background: var(--workspace-glass-llm-done-unread);
+  box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-done-unread-glow);
+}
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab.llm-exited .workspace-tab-status-dot-inline {
   background: var(--workspace-glass-llm-exited);
   box-shadow: 0 0 var(--workspace-glass-status-dot-glow) var(--workspace-glass-llm-exited-glow);
 }
@@ -3259,78 +3561,146 @@ body.workspace-dock-resizing * {
   isolation: isolate;
   padding: var(--workspace-glass-agent-pad-y) var(--workspace-glass-agent-pad-x);
   background: linear-gradient(105deg, var(--workspace-glass-agent-base-tint), var(--workspace-glass-agent-bg));
+  border-left-width: 1px;
+  border-radius: var(--workspace-glass-agent-type-bg-radius);
   border-color: var(--workspace-glass-agent-base-border);
   color: var(--workspace-glass-agent-text);
   font-weight: var(--workspace-glass-agent-text-weight);
   box-shadow: inset 0 1px 0 var(--workspace-glass-agent-base-highlight);
 }
-.shell.workspace-dock-side.workspace-side-glass.workspace-glass-agent-bg-overflow .workspace-agent-card {
-  overflow: visible;
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-codex {
+  border-color: var(--workspace-glass-agent-codex-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-claude {
+  border-color: var(--workspace-glass-agent-claude-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-grok {
+  border-color: var(--workspace-glass-agent-grok-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-antigravity,
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-agy {
+  border-color: var(--workspace-glass-agent-agy-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  box-sizing: border-box;
+  border: 1px solid var(--workspace-glass-agent-base-border);
+  border-radius: inherit;
+  background: transparent;
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-codex::after {
+  border-color: var(--workspace-glass-agent-codex-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-claude::after {
+  border-color: var(--workspace-glass-agent-claude-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-grok::after {
+  border-color: var(--workspace-glass-agent-grok-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-antigravity::after,
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-agy::after {
+  border-color: var(--workspace-glass-agent-agy-border);
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card::before {
-  left: calc(var(--workspace-glass-agent-type-bg-left) - var(--workspace-glass-agent-type-bg-bleed-left));
-  right: calc(var(--workspace-glass-agent-type-bg-right) - var(--workspace-glass-agent-type-bg-bleed-right));
-  top: var(--workspace-glass-agent-type-bg-top);
-  bottom: var(--workspace-glass-agent-type-bg-bottom);
-  width: auto;
-  height: auto;
-  border-radius: var(--workspace-glass-agent-type-bg-radius);
+  left: calc(0px - var(--workspace-glass-agent-type-bg-size-left) + var(--workspace-glass-agent-type-bg-move-x));
+  top: calc(0px - var(--workspace-glass-agent-type-bg-size-top) + var(--workspace-glass-agent-type-bg-move-y));
+  width: max(0px, calc(var(--workspace-glass-agent-type-bg-base-width) + var(--workspace-glass-agent-type-bg-size-left) + var(--workspace-glass-agent-type-bg-size-right)));
+  height: max(0px, calc(100% + var(--workspace-glass-agent-type-bg-size-top) + var(--workspace-glass-agent-type-bg-size-bottom)));
+  border-radius: 0;
   opacity: 1;
   z-index: 0;
-  background: linear-gradient(90deg, var(--workspace-glass-agent-codex-bg), transparent var(--workspace-glass-agent-type-bg-width));
-  border: 1px solid var(--workspace-glass-agent-codex-border);
+  background: linear-gradient(
+    var(--workspace-glass-agent-type-bg-angle),
+    var(--workspace-glass-agent-codex-bg) 0%,
+    var(--workspace-glass-agent-codex-bg-mid) var(--workspace-glass-agent-type-bg-mid-stop),
+    var(--workspace-glass-agent-codex-bg-end) var(--workspace-glass-agent-type-bg-end-stop)
+  );
+  border: 0;
   box-shadow: inset 0 1px 0 var(--workspace-glass-agent-type-highlight);
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-codex::before {
-  background: linear-gradient(90deg, var(--workspace-glass-agent-codex-bg), transparent var(--workspace-glass-agent-type-bg-width));
-  border-color: var(--workspace-glass-agent-codex-border);
+  background: linear-gradient(
+    var(--workspace-glass-agent-type-bg-angle),
+    var(--workspace-glass-agent-codex-bg) 0%,
+    var(--workspace-glass-agent-codex-bg-mid) var(--workspace-glass-agent-type-bg-mid-stop),
+    var(--workspace-glass-agent-codex-bg-end) var(--workspace-glass-agent-type-bg-end-stop)
+  );
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-claude::before {
-  background: linear-gradient(90deg, var(--workspace-glass-agent-claude-bg), transparent var(--workspace-glass-agent-type-bg-width));
-  border-color: var(--workspace-glass-agent-claude-border);
+  background: linear-gradient(
+    var(--workspace-glass-agent-type-bg-angle),
+    var(--workspace-glass-agent-claude-bg) 0%,
+    var(--workspace-glass-agent-claude-bg-mid) var(--workspace-glass-agent-type-bg-mid-stop),
+    var(--workspace-glass-agent-claude-bg-end) var(--workspace-glass-agent-type-bg-end-stop)
+  );
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-grok::before {
-  background: linear-gradient(90deg, var(--workspace-glass-agent-grok-bg), transparent var(--workspace-glass-agent-type-bg-width));
-  border-color: var(--workspace-glass-agent-grok-border);
+  background: linear-gradient(
+    var(--workspace-glass-agent-type-bg-angle),
+    var(--workspace-glass-agent-grok-bg) 0%,
+    var(--workspace-glass-agent-grok-bg-mid) var(--workspace-glass-agent-type-bg-mid-stop),
+    var(--workspace-glass-agent-grok-bg-end) var(--workspace-glass-agent-type-bg-end-stop)
+  );
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-antigravity::before,
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.agent-agy::before {
-  background: linear-gradient(90deg, var(--workspace-glass-agent-agy-bg), transparent var(--workspace-glass-agent-type-bg-width));
-  border-color: var(--workspace-glass-agent-agy-border);
-}
-.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.status-idle {
-  border-left-color: var(--workspace-glass-agent-status-idle);
-}
-.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.status-working {
-  border-left-color: var(--workspace-glass-agent-status-working);
-}
-.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.status-waiting {
-  border-left-color: var(--workspace-glass-agent-status-waiting);
-}
-.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.status-error {
-  border-left-color: var(--workspace-glass-agent-status-error);
-}
-.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.status-done-unread {
-  border-left-color: var(--workspace-glass-agent-status-done-unread);
-}
-.shell.workspace-dock-side.workspace-side-glass .workspace-agent-card.status-exited {
-  border-left-color: var(--workspace-glass-agent-status-exited);
+  background: linear-gradient(
+    var(--workspace-glass-agent-type-bg-angle),
+    var(--workspace-glass-agent-agy-bg) 0%,
+    var(--workspace-glass-agent-agy-bg-mid) var(--workspace-glass-agent-type-bg-mid-stop),
+    var(--workspace-glass-agent-agy-bg-end) var(--workspace-glass-agent-type-bg-end-stop)
+  );
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-card > * {
   position: relative;
-  z-index: 1;
+  z-index: 3;
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-dock-detail {
   padding: var(--workspace-glass-detail-pad-y) var(--workspace-glass-detail-pad-x);
 }
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab.detail-open .workspace-tab-detail {
+  margin-top: var(--workspace-glass-agent-gap);
+  padding-top: 0;
+  border-top: 0;
+}
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-list {
   gap: var(--workspace-glass-agent-gap);
+  margin-top: 0;
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-badge {
   min-height: var(--workspace-glass-agent-badge-height);
   height: var(--workspace-glass-agent-badge-height);
+  padding-left: var(--workspace-glass-agent-badge-pad-x);
+  padding-right: var(--workspace-glass-agent-badge-pad-x);
+  border-radius: var(--workspace-glass-agent-badge-radius);
+  border: var(--workspace-glass-agent-badge-border-width) solid transparent;
   font-size: var(--workspace-glass-agent-badge-size);
   font-weight: var(--workspace-glass-agent-badge-weight);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-badge.agent-codex {
+  color: var(--workspace-glass-agent-codex-badge-text);
+  background: var(--workspace-glass-agent-codex-badge-bg);
+  border-color: var(--workspace-glass-agent-codex-badge-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-badge.agent-claude {
+  color: var(--workspace-glass-agent-claude-badge-text);
+  background: var(--workspace-glass-agent-claude-badge-bg);
+  border-color: var(--workspace-glass-agent-claude-badge-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-badge.agent-grok {
+  color: var(--workspace-glass-agent-grok-badge-text);
+  background: var(--workspace-glass-agent-grok-badge-bg);
+  border-color: var(--workspace-glass-agent-grok-badge-border);
+}
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-badge.agent-antigravity,
+.shell.workspace-dock-side.workspace-side-glass .workspace-agent-badge.agent-agy {
+  color: var(--workspace-glass-agent-agy-badge-text);
+  background: var(--workspace-glass-agent-agy-badge-bg);
+  border-color: var(--workspace-glass-agent-agy-badge-border);
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-status {
   min-height: var(--workspace-glass-agent-badge-height);
@@ -3376,16 +3746,19 @@ body.workspace-dock-resizing * {
   color: var(--workspace-glass-agent-title);
   font-size: var(--workspace-glass-agent-title-size);
   font-weight: var(--workspace-glass-agent-title-weight);
+  line-height: var(--workspace-glass-agent-title-line-height);
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-activity {
   color: var(--workspace-glass-agent-activity);
   font-size: var(--workspace-glass-agent-activity-size);
   font-weight: var(--workspace-glass-agent-activity-weight);
+  line-height: var(--workspace-glass-agent-activity-line-height);
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-agent-meta {
   color: var(--workspace-glass-agent-meta);
   font-size: var(--workspace-glass-agent-meta-size);
   font-weight: var(--workspace-glass-agent-meta-weight);
+  line-height: var(--workspace-glass-agent-meta-line-height);
 }
 @supports not (backdrop-filter: blur(1px)) {
   .shell.workspace-dock-side.workspace-side-glass .workspace-tab:not(.credit-card-glass),
@@ -3407,6 +3780,16 @@ body.workspace-dock-resizing * {
 }
 .workspace-tab button, .widget-tab button { min-width: 0; border: 0; background: transparent; padding: 4px 7px; }
 .workspace-tab-label, .widget-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.workspace-tab-status-dot-inline {
+  display: none;
+  flex: 0 0 auto;
+}
+.workspace-tab-label-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .workspace-tab-label { cursor: grab; }
 .workspace-tab.dragging .workspace-tab-label { cursor: grabbing; }
 .workspace-tab.renaming .workspace-tab-label { visibility: hidden; }
@@ -3869,6 +4252,7 @@ body.glass-mode-on .terminal-card.app-glass-active-shell > .app-glass-plane {
 }
 body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell {
   border-radius: var(--app-glass-explorer-panel-radius);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 body.glass-mode-on .floating-panel[data-panel="editor"].app-glass-active-shell {
   border-radius: var(--app-glass-editor-panel-radius);
@@ -3966,13 +4350,28 @@ body.glass-mode-on .terminal-card.app-glass-active-shell > .terminal-title {
   isolation: isolate;
   overflow: visible;
 }
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell > .panel-title {
+  height: auto;
+  min-height: var(--app-glass-widget-topbar-height);
+  flex-wrap: wrap;
+  align-content: flex-start;
+  align-items: center;
+  row-gap: 5px;
+  padding-block: 7px;
+  line-height: 1.22;
+  white-space: normal;
+  margin-bottom: var(--explorer-title-overflow-bottom, 0px);
+}
 body.glass-mode-on .floating-panel.app-glass-active-shell.widget-title-wrap > .panel-title,
 body.glass-mode-on .terminal-card.app-glass-active-shell.widget-title-wrap > .terminal-title {
   height: auto;
   min-height: var(--app-glass-widget-topbar-height);
   flex-wrap: wrap;
-  align-content: center;
-  padding-block: 4px;
+  align-content: flex-start;
+  align-items: center;
+  row-gap: 5px;
+  padding-block: 7px;
+  line-height: 1.22;
   white-space: normal;
 }
 body.glass-mode-on .floating-panel.app-glass-active-shell > .panel-title::before,
@@ -4009,6 +4408,32 @@ body.glass-mode-on .terminal-card.app-glass-active-shell > .terminal-title > * {
   position: relative;
   z-index: 1;
   transform: translateY(var(--app-glass-widget-topbar-content-y));
+}
+body.glass-mode-on .floating-panel.app-glass-active-shell.widget-title-wrap > .panel-title > *,
+body.glass-mode-on .terminal-card.app-glass-active-shell.widget-title-wrap > .terminal-title > * {
+  transform: none !important;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell > .panel-title > * {
+  transform: none !important;
+}
+body.glass-mode-on .floating-panel.app-glass-active-shell.widget-title-wrap > .panel-title > span:first-child,
+body.glass-mode-on .terminal-card.app-glass-active-shell.widget-title-wrap > .terminal-title > strong {
+  line-height: 1.22;
+  padding-block: 2px;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell > .panel-title > span:first-child {
+  line-height: 1.22;
+  padding-block: 2px;
+}
+body.glass-mode-on .floating-panel.app-glass-active-shell.widget-title-wrap > .panel-title button,
+body.glass-mode-on .terminal-card.app-glass-active-shell.widget-title-wrap > .terminal-title button,
+body.glass-mode-on .floating-panel.app-glass-active-shell.widget-title-wrap > .panel-title select,
+body.glass-mode-on .terminal-card.app-glass-active-shell.widget-title-wrap > .terminal-title .terminal-renderer-badge {
+  margin-block: 1px;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell > .panel-title button,
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell > .panel-title select {
+  margin-block: 1px;
 }
 body.glass-mode-on .panel-title .widget-opacity-button,
 body.glass-mode-on .terminal-title .widget-opacity-button {
@@ -4440,9 +4865,9 @@ body.glass-mode-on .shell.app-glass-explorer-panel-on .explorer .export-list {
   0% { transform: translateX(-120%); }
   100% { transform: translateX(240%); }
 }
-.file-list { --explorer-row-height: 32px; overflow: auto; padding: 6px; contain: layout paint style; overscroll-behavior: contain; scrollbar-gutter: stable; will-change: scroll-position; user-select: none; -webkit-user-select: none; }
-.explorer-spacer { width: 100%; pointer-events: none; }
-.file-row { position: relative; width: 100%; height: var(--explorer-row-height); box-sizing: border-box; display: grid; grid-template-columns: 22px minmax(0, 1fr) max-content; gap: 6px; align-items: center; text-align: left; border: 0; background: transparent; padding: 6px 7px 6px calc(7px + var(--depth, 0) * 14px); cursor: default; border-radius: 5px; contain: layout paint style; user-select: none; -webkit-user-select: none; }
+.file-list { --explorer-row-height: 32px; min-height: 0; align-self: stretch; overflow: auto; padding: 6px; contain: layout paint style; overscroll-behavior: contain; scrollbar-gutter: stable; will-change: scroll-position; user-select: none; -webkit-user-select: none; }
+.explorer-spacer { width: 100%; min-width: var(--explorer-content-width, 0px); pointer-events: none; }
+.file-row { position: relative; width: 100%; min-width: var(--explorer-content-width, 0px); height: var(--explorer-row-height); box-sizing: border-box; display: grid; grid-template-columns: 22px minmax(0, 1fr) max-content; gap: 6px; align-items: center; text-align: left; border: 0; background: transparent; padding: 6px 7px 6px calc(7px + var(--depth, 0) * 14px); cursor: default; border-radius: 5px; contain: layout paint style; user-select: none; -webkit-user-select: none; }
 .file-row:hover { background: #172033; }
 .file-list.scrolling .file-row:hover { background: transparent; }
 .file-list.scrolling .file-row.selected:hover { background: #16243a; }
@@ -4483,6 +4908,7 @@ body.glass-mode-on .shell.app-glass-explorer-panel-on .explorer .export-list {
     0 0 0 var(--app-glass-explorer-row-outline-soft-width) var(--app-glass-explorer-row-outline-soft),
     inset 0 1px 0 var(--app-glass-explorer-row-outline-inset);
 }
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell,
 body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer {
   position: relative;
   isolation: isolate;
@@ -4502,18 +4928,57 @@ body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer > .explorer-liqui
   overflow: hidden;
   contain: paint;
 }
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell .file-list,
 body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list {
   position: relative;
   z-index: 2;
   background: transparent;
   isolation: isolate;
   contain: none;
+  min-height: 0;
+  align-self: stretch;
+  height: var(--explorer-file-list-height, auto);
+  max-height: var(--explorer-file-list-height, none);
+  overflow: auto;
+  scrollbar-gutter: stable;
 }
 body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell > .file-list {
-  margin-bottom: var(--app-glass-explorer-horizontal-scrollbar-gap);
+  margin-bottom: 0 !important;
+}
+body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list.explorer-semantic-no-y-scroll {
+  overflow-y: hidden;
+  scrollbar-gutter: stable;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell .file-list.explorer-semantic-x-scroll,
+body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list.explorer-semantic-x-scroll {
+  overflow-x: auto;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell .file-list::-webkit-scrollbar,
+body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell .file-list::-webkit-scrollbar-track,
+body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: rgba(7, 12, 22, 0.22);
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell .file-list::-webkit-scrollbar-thumb,
+body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list::-webkit-scrollbar-thumb {
+  min-width: 32px;
+  min-height: 32px;
+  border: 2px solid rgba(6, 10, 18, 0.28);
+  border-radius: 999px;
+  background:
+    linear-gradient(90deg, rgba(238, 250, 255, 0.78), rgba(127, 176, 255, 0.78), rgba(88, 146, 255, 0.64)) padding-box;
+  background-clip: padding-box;
+}
+body.glass-mode-on .floating-panel[data-panel="explorer"].app-glass-active-shell .file-list::-webkit-scrollbar-corner,
+body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-list::-webkit-scrollbar-corner {
+  background: transparent;
 }
 body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-row {
-  overflow: visible;
+  overflow: hidden;
   background: transparent;
   border-radius: var(--app-glass-explorer-row-radius);
   box-shadow: none;

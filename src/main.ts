@@ -10,6 +10,8 @@ import type { FitAddon as XTermFitAddon } from '@xterm/addon-fit';
 import type { WebglAddon as XTermWebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import './styles.css';
+import bundledGlassThemeSettings from '../theme/glass_set_01.json';
+import bundledGlassThemeBackgroundUrl from '../theme/glass_bg_01.jpg?url';
 import { api } from './api';
 import type { AgentAlertDelayedResultEvent, AgentAlertResult, AgentBridgeEvent, AgentBridgeInfo, BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxSession, PortForwardResult, RendererHeartbeatResponse, RendererRecoveryNotice, SnippetItem, SnippetsStore, SnippetTab, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
@@ -417,6 +419,16 @@ type IdeBackgroundFit = 'cover' | 'contain' | 'stretch';
 type WorkspaceGlassRailStyle = 'pill' | 'line' | 'top' | 'bottom' | 'outline';
 type WorkspaceGlassTextBlend = 'normal' | 'difference';
 type WorkspaceGlassReveal = 'none' | 'fade';
+type BundledGlassThemeId = 'glass-01';
+
+interface BundledGlassTheme {
+  id: BundledGlassThemeId;
+  label: string;
+  description: string;
+  payload: unknown;
+  backgroundUrl?: string;
+  backgroundName?: string;
+}
 
 interface IdeBackgroundLightSettings {
   color: string;
@@ -548,12 +560,15 @@ interface WorkspaceGlassSettings {
   agentTitleColor: string;
   agentTitleSize: number;
   agentTitleWeight: number;
+  agentTitleLineHeight: number;
   agentActivityColor: string;
   agentActivitySize: number;
   agentActivityWeight: number;
+  agentActivityLineHeight: number;
   agentMetaColor: string;
   agentMetaSize: number;
   agentMetaWeight: number;
+  agentMetaLineHeight: number;
   detailPaddingX: number;
   detailPaddingY: number;
   agentGap: number;
@@ -564,6 +579,12 @@ interface WorkspaceGlassSettings {
   agentBadgeWeight: number;
   agentStatusWeight: number;
   agentBadgeHeight: number;
+  agentBadgePaddingX: number;
+  agentBadgeRadius: number;
+  agentBadgeBorderWidth: number;
+  agentBadgeBgAlpha: number;
+  agentBadgeBorderAlpha: number;
+  agentBadgeTextAlpha: number;
   agentStatusPaddingX: number;
   agentStatusRadius: number;
   agentStatusBorderWidth: number;
@@ -577,16 +598,19 @@ interface WorkspaceGlassSettings {
   agentStatusExitedColor: string;
   agentBgAlpha: number;
   agentTypeBgAlpha: number;
+  agentTypeBgMidAlpha: number;
+  agentTypeBgEndAlpha: number;
+  agentTypeBgMidStop: number;
+  agentTypeBgEndStop: number;
+  agentTypeBgAngle: number;
   agentTypeBorderAlpha: number;
-  agentTypeBgLeft: number;
-  agentTypeBgRight: number;
-  agentTypeBgTop: number;
-  agentTypeBgBottom: number;
-  agentTypeBgBleedLeft: number;
-  agentTypeBgBleedRight: number;
-  agentTypeBgWidth: number;
+  agentTypeBgSizeLeft: number;
+  agentTypeBgSizeRight: number;
+  agentTypeBgSizeTop: number;
+  agentTypeBgSizeBottom: number;
+  agentTypeBgMoveX: number;
+  agentTypeBgMoveY: number;
   agentTypeBgRadius: number;
-  agentTypeBgOverflow: boolean;
   agentCodexAccent: string;
   agentClaudeAccent: string;
   agentGrokAccent: string;
@@ -607,6 +631,7 @@ interface WorkspaceGlassSettings {
   llmWorkingPulseRingSize: number;
   llmWorkingPulseGlowAlpha: number;
   llmLabelPadding: number;
+  llmLabelPaddingMode: 'dot-gap';
   tabHighlight: boolean;
   tabHighlightAccent: string;
   tabHighlightOpacity: number;
@@ -632,6 +657,17 @@ interface WorkspaceGlassSettings {
   selectedGlowBlur: number;
   selectedGlowSpread: number;
   selectedBadgeSize: number;
+  selectedBadgeTextColor: string;
+  selectedBadgeBgAlpha: number;
+  selectedBadgeWeight: number;
+  selectedBadgeHeight: number;
+  selectedBadgePaddingX: number;
+  selectedBadgePaddingY: number;
+  selectedBadgeRadius: number;
+  selectedBadgeMarginLeft: number;
+  selectedBadgeShiftX: number;
+  selectedBadgeShiftY: number;
+  selectedBadgeLineHeight: number;
   selectedHighlightAccent: string;
   selectedHighlightOpacity: number;
   selectedHighlightStrongAlpha: number;
@@ -898,7 +934,6 @@ interface AppGlassSettings {
   terminalScrollbarThumbHoverAlpha: number;
   terminalScrollbarTrackAlpha: number;
   terminalScrollbarWidth: number;
-  explorerHorizontalScrollbarBottomGap: number;
   terminalHostOutlineAlpha: number;
   terminalSplitResizerAlpha: number;
   explorerRowsRadius: number;
@@ -1185,7 +1220,6 @@ interface WorkspaceSnapshot {
   calculatorExpression?: string;
   calculatorHistory?: CalculatorHistoryItem[];
   explorerOpenMode: ExplorerOpenMode;
-  explorerAutoOpenEditor?: boolean;
   showFileSizes: boolean;
   editorFontSize: number;
   terminalFontSize: number;
@@ -2376,12 +2410,15 @@ const DEFAULT_WORKSPACE_GLASS_SETTINGS: WorkspaceGlassSettings = {
   agentTitleColor: '#f6faff',
   agentTitleSize: 0.86,
   agentTitleWeight: 760,
+  agentTitleLineHeight: 1.24,
   agentActivityColor: '#c6d8ef',
   agentActivitySize: 0.68,
   agentActivityWeight: 560,
+  agentActivityLineHeight: 1.35,
   agentMetaColor: '#acbed8',
   agentMetaSize: 0.68,
   agentMetaWeight: 520,
+  agentMetaLineHeight: 1.35,
   detailPaddingX: 8,
   detailPaddingY: 5,
   agentGap: 6,
@@ -2392,6 +2429,12 @@ const DEFAULT_WORKSPACE_GLASS_SETTINGS: WorkspaceGlassSettings = {
   agentBadgeWeight: 800,
   agentStatusWeight: 800,
   agentBadgeHeight: 17,
+  agentBadgePaddingX: 6,
+  agentBadgeRadius: 999,
+  agentBadgeBorderWidth: 1,
+  agentBadgeBgAlpha: 0.18,
+  agentBadgeBorderAlpha: 0.56,
+  agentBadgeTextAlpha: 1,
   agentStatusPaddingX: 6,
   agentStatusRadius: 999,
   agentStatusBorderWidth: 0,
@@ -2405,16 +2448,19 @@ const DEFAULT_WORKSPACE_GLASS_SETTINGS: WorkspaceGlassSettings = {
   agentStatusExitedColor: '#a8b3c2',
   agentBgAlpha: 0.045,
   agentTypeBgAlpha: 0.48,
+  agentTypeBgMidAlpha: 0.48,
+  agentTypeBgEndAlpha: 0,
+  agentTypeBgMidStop: 36,
+  agentTypeBgEndStop: 100,
+  agentTypeBgAngle: 90,
   agentTypeBorderAlpha: 0.58,
-  agentTypeBgLeft: 0,
-  agentTypeBgRight: 0,
-  agentTypeBgTop: 0,
-  agentTypeBgBottom: 0,
-  agentTypeBgBleedLeft: 0,
-  agentTypeBgBleedRight: 0,
-  agentTypeBgWidth: 62,
-  agentTypeBgRadius: 9,
-  agentTypeBgOverflow: false,
+  agentTypeBgSizeLeft: 0,
+  agentTypeBgSizeRight: 0,
+  agentTypeBgSizeTop: 0,
+  agentTypeBgSizeBottom: 0,
+  agentTypeBgMoveX: 0,
+  agentTypeBgMoveY: 0,
+  agentTypeBgRadius: 0,
   agentCodexAccent: '#2e7e89',
   agentClaudeAccent: '#8a63d2',
   agentGrokAccent: '#3f8f52',
@@ -2434,7 +2480,8 @@ const DEFAULT_WORKSPACE_GLASS_SETTINGS: WorkspaceGlassSettings = {
   llmWorkingPulseDimOpacity: 0.54,
   llmWorkingPulseRingSize: 5,
   llmWorkingPulseGlowAlpha: 0.85,
-  llmLabelPadding: 23,
+  llmLabelPadding: 6,
+  llmLabelPaddingMode: 'dot-gap',
   tabHighlight: false,
   tabHighlightAccent: '#bfeaff',
   tabHighlightOpacity: 0.72,
@@ -2460,6 +2507,17 @@ const DEFAULT_WORKSPACE_GLASS_SETTINGS: WorkspaceGlassSettings = {
   selectedGlowBlur: 0,
   selectedGlowSpread: 0,
   selectedBadgeSize: 0.54,
+  selectedBadgeTextColor: '#081018',
+  selectedBadgeBgAlpha: 1,
+  selectedBadgeWeight: 900,
+  selectedBadgeHeight: 15,
+  selectedBadgePaddingX: 6,
+  selectedBadgePaddingY: 1,
+  selectedBadgeRadius: 999,
+  selectedBadgeMarginLeft: 6,
+  selectedBadgeShiftX: 0,
+  selectedBadgeShiftY: 0,
+  selectedBadgeLineHeight: 1.1,
   selectedHighlightAccent: '#d9f6ff',
   selectedHighlightOpacity: 1,
   selectedHighlightStrongAlpha: 0.27,
@@ -2724,7 +2782,6 @@ const DEFAULT_APP_GLASS_SETTINGS: AppGlassSettings = {
   terminalScrollbarThumbHoverAlpha: 0.46,
   terminalScrollbarTrackAlpha: 0.04,
   terminalScrollbarWidth: 8,
-  explorerHorizontalScrollbarBottomGap: 8,
   terminalHostOutlineAlpha: 0,
   terminalSplitResizerAlpha: 0.34,
   explorerRowsRadius: 5,
@@ -2823,6 +2880,16 @@ const IDE_BACKGROUND_FIT_CHOICES: Array<{ id: IdeBackgroundFit; label: string }>
   { id: 'cover', label: '꽉 채우기 cover' },
   { id: 'contain', label: '전체 보이기 contain' },
   { id: 'stretch', label: '늘이기 stretch' }
+];
+const BUNDLED_GLASS_THEMES: BundledGlassTheme[] = [
+  {
+    id: 'glass-01',
+    label: '기본 Glass 테마 01',
+    description: 'theme/glass_set_01.json + theme/glass_bg_01.jpg',
+    payload: bundledGlassThemeSettings,
+    backgroundUrl: bundledGlassThemeBackgroundUrl,
+    backgroundName: 'glass_bg_01.jpg'
+  }
 ];
 const WORKSPACE_GLASS_RAIL_STYLE_CHOICES: Array<{ id: WorkspaceGlassRailStyle; label: string }> = [
   { id: 'pill', label: '왼쪽 pill' },
@@ -3108,7 +3175,6 @@ const GLASS_SETTINGS_CONTROLS: GlassSettingsControl[] = [
   { type: 'color', label: 'Explorer row 선택 bar 색', path: 'appGlass.explorerSelectedRailColor' },
   { type: 'range', label: 'Explorer row 선택 bar 투명도', path: 'appGlass.explorerSelectedRailAlpha', min: 0, max: 1, step: 0.01 },
   { type: 'range', label: 'Explorer row 선택 bar 두께', path: 'appGlass.explorerSelectedRailWidth', min: 0, max: 8, step: 0.5, unit: 'px' },
-  { type: 'range', label: 'Explorer 가로 스크롤 하단 여백', path: 'appGlass.explorerHorizontalScrollbarBottomGap', min: 0, max: 28, step: 1, unit: 'px' },
   { type: 'section', label: 'Glass 그림자' },
   { type: 'range', label: 'shadow alpha', path: 'appGlass.shadowAlpha', min: 0, max: 0.9, step: 0.01 },
   { type: 'range', label: 'shadow Y', path: 'appGlass.shadowY', min: -24, max: 80, step: 1, unit: 'px' },
@@ -3279,29 +3345,39 @@ const GLASS_SETTINGS_CONTROLS: GlassSettingsControl[] = [
   { type: 'color', label: '개별 active 색상', path: 'workspaceGlass.detailButtonActiveColor' },
   { type: 'range', label: '개별 active', path: 'workspaceGlass.detailButtonActiveAlpha', min: 0, max: 1, step: 0.01 },
   { type: 'range', label: '개별 라운드', path: 'workspaceGlass.detailButtonRadius', min: 0, max: 28, step: 1, unit: 'px' },
-  { type: 'range', label: '선택 badge 크기', path: 'workspaceGlass.selectedBadgeSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
-  { type: 'color', label: 'agent 기본 글자색', path: 'workspaceGlass.agentTextColor' },
-  { type: 'range', label: 'agent 기본 굵기', path: 'workspaceGlass.agentTextWeight', min: 350, max: 950, step: 10 },
-  { type: 'color', label: 'agent 제목 색', path: 'workspaceGlass.agentTitleColor' },
-  { type: 'range', label: 'agent 제목 크기', path: 'workspaceGlass.agentTitleSize', min: 0.62, max: 1.18, step: 0.01, unit: 'em' },
-  { type: 'range', label: 'agent 제목 굵기', path: 'workspaceGlass.agentTitleWeight', min: 350, max: 950, step: 10 },
-  { type: 'color', label: 'activity 색', path: 'workspaceGlass.agentActivityColor' },
-  { type: 'range', label: 'activity 크기', path: 'workspaceGlass.agentActivitySize', min: 0.48, max: 0.96, step: 0.01, unit: 'em' },
-  { type: 'range', label: 'activity 굵기', path: 'workspaceGlass.agentActivityWeight', min: 300, max: 900, step: 10 },
-  { type: 'color', label: 'meta 색', path: 'workspaceGlass.agentMetaColor' },
-  { type: 'range', label: 'meta 크기', path: 'workspaceGlass.agentMetaSize', min: 0.48, max: 0.96, step: 0.01, unit: 'em' },
-  { type: 'range', label: 'meta 굵기', path: 'workspaceGlass.agentMetaWeight', min: 300, max: 900, step: 10 },
+  { type: 'section', label: 'LLM 텍스트' },
+  { type: 'color', label: 'LLM 기본 글자색', path: 'workspaceGlass.agentTextColor' },
+  { type: 'range', label: 'LLM 기본 굵기', path: 'workspaceGlass.agentTextWeight', min: 350, max: 950, step: 10 },
+  { type: 'color', label: 'LLM 제목 색', path: 'workspaceGlass.agentTitleColor' },
+  { type: 'range', label: 'LLM 제목 크기', path: 'workspaceGlass.agentTitleSize', min: 0.62, max: 1.18, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'LLM 제목 굵기', path: 'workspaceGlass.agentTitleWeight', min: 350, max: 950, step: 10 },
+  { type: 'range', label: 'LLM 제목 줄높이', path: 'workspaceGlass.agentTitleLineHeight', min: 0.85, max: 2, step: 0.01 },
+  { type: 'color', label: 'LLM 상태/활동 색', path: 'workspaceGlass.agentActivityColor' },
+  { type: 'range', label: 'LLM 상태/활동 크기', path: 'workspaceGlass.agentActivitySize', min: 0.48, max: 0.96, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'LLM 상태/활동 굵기', path: 'workspaceGlass.agentActivityWeight', min: 300, max: 900, step: 10 },
+  { type: 'range', label: 'LLM 상태/활동 줄높이', path: 'workspaceGlass.agentActivityLineHeight', min: 0.85, max: 2, step: 0.01 },
+  { type: 'color', label: 'LLM 경로/meta 색', path: 'workspaceGlass.agentMetaColor' },
+  { type: 'range', label: 'LLM 경로/meta 크기', path: 'workspaceGlass.agentMetaSize', min: 0.48, max: 0.96, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'LLM 경로/meta 굵기', path: 'workspaceGlass.agentMetaWeight', min: 300, max: 900, step: 10 },
+  { type: 'range', label: 'LLM 경로/meta 줄높이', path: 'workspaceGlass.agentMetaLineHeight', min: 0.85, max: 2, step: 0.01 },
   { type: 'range', label: '상세 패딩 X', path: 'workspaceGlass.detailPaddingX', min: 0, max: 20, step: 1, unit: 'px' },
   { type: 'range', label: '상세 패딩 Y', path: 'workspaceGlass.detailPaddingY', min: 0, max: 18, step: 1, unit: 'px' },
-  { type: 'range', label: 'agent 간격', path: 'workspaceGlass.agentGap', min: 2, max: 16, step: 1, unit: 'px' },
-  { type: 'range', label: 'agent 패딩 X', path: 'workspaceGlass.agentPaddingX', min: 3, max: 20, step: 1, unit: 'px' },
-  { type: 'range', label: 'agent 패딩 Y', path: 'workspaceGlass.agentPaddingY', min: 3, max: 18, step: 1, unit: 'px' },
-  { type: 'range', label: 'agent badge 크기', path: 'workspaceGlass.agentBadgeSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
-  { type: 'range', label: '상태 badge 크기', path: 'workspaceGlass.agentStatusSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
-  { type: 'range', label: 'agent badge 굵기', path: 'workspaceGlass.agentBadgeWeight', min: 500, max: 950, step: 10 },
-  { type: 'range', label: '상태 badge 굵기', path: 'workspaceGlass.agentStatusWeight', min: 500, max: 950, step: 10 },
-  { type: 'range', label: 'badge 높이', path: 'workspaceGlass.agentBadgeHeight', min: 13, max: 25, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 카드 간격', path: 'workspaceGlass.agentGap', min: 2, max: 16, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 카드 패딩 X', path: 'workspaceGlass.agentPaddingX', min: 3, max: 20, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 카드 패딩 Y', path: 'workspaceGlass.agentPaddingY', min: 3, max: 18, step: 1, unit: 'px' },
+  { type: 'section', label: 'LLM 로고 badge' },
+  { type: 'range', label: '로고 글자 크기', path: 'workspaceGlass.agentBadgeSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
+  { type: 'range', label: '로고 글자 굵기', path: 'workspaceGlass.agentBadgeWeight', min: 500, max: 950, step: 10 },
+  { type: 'range', label: '로고 높이', path: 'workspaceGlass.agentBadgeHeight', min: 13, max: 25, step: 1, unit: 'px' },
+  { type: 'range', label: '로고 X 여백', path: 'workspaceGlass.agentBadgePaddingX', min: 0, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: '로고 R값', path: 'workspaceGlass.agentBadgeRadius', min: 0, max: 999, step: 1, unit: 'px' },
+  { type: 'range', label: '로고 border 폭', path: 'workspaceGlass.agentBadgeBorderWidth', min: 0, max: 4, step: 1, unit: 'px' },
+  { type: 'range', label: '로고 bg 강도', path: 'workspaceGlass.agentBadgeBgAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '로고 border 강도', path: 'workspaceGlass.agentBadgeBorderAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: '로고 글자 강도', path: 'workspaceGlass.agentBadgeTextAlpha', min: 0, max: 1, step: 0.01 },
   { type: 'section', label: 'agent 상태 라벨' },
+  { type: 'range', label: '상태 badge 크기', path: 'workspaceGlass.agentStatusSize', min: 0.42, max: 0.82, step: 0.01, unit: 'em' },
+  { type: 'range', label: '상태 badge 굵기', path: 'workspaceGlass.agentStatusWeight', min: 500, max: 950, step: 10 },
   { type: 'range', label: '상태 라벨 X 여백', path: 'workspaceGlass.agentStatusPaddingX', min: 0, max: 18, step: 1, unit: 'px' },
   { type: 'range', label: '상태 라벨 R', path: 'workspaceGlass.agentStatusRadius', min: 0, max: 999, step: 1, unit: 'px' },
   { type: 'range', label: '상태 라벨 border 폭', path: 'workspaceGlass.agentStatusBorderWidth', min: 0, max: 3, step: 1, unit: 'px' },
@@ -3315,17 +3391,20 @@ const GLASS_SETTINGS_CONTROLS: GlassSettingsControl[] = [
   { type: 'color', label: '종료 라벨 색', path: 'workspaceGlass.agentStatusExitedColor' },
   { type: 'section', label: 'LLM / Agy agent 배경' },
   { type: 'range', label: 'agent 카드 bg', path: 'workspaceGlass.agentBgAlpha', min: 0, max: 0.22, step: 0.005 },
-  { type: 'range', label: 'LLM 색 배경 강도', path: 'workspaceGlass.agentTypeBgAlpha', min: 0, max: 1, step: 0.01 },
-  { type: 'range', label: 'LLM 색 테두리 강도', path: 'workspaceGlass.agentTypeBorderAlpha', min: 0, max: 1, step: 0.01 },
-  { type: 'range', label: 'LLM 색 왼쪽 inset', path: 'workspaceGlass.agentTypeBgLeft', min: -80, max: 80, step: 1, unit: 'px' },
-  { type: 'range', label: 'LLM 색 오른쪽 inset', path: 'workspaceGlass.agentTypeBgRight', min: -80, max: 80, step: 1, unit: 'px' },
-  { type: 'range', label: 'LLM 색 위 inset', path: 'workspaceGlass.agentTypeBgTop', min: -24, max: 32, step: 1, unit: 'px' },
-  { type: 'range', label: 'LLM 색 아래 inset', path: 'workspaceGlass.agentTypeBgBottom', min: -24, max: 32, step: 1, unit: 'px' },
-  { type: 'range', label: 'LLM 색 왼쪽 확장', path: 'workspaceGlass.agentTypeBgBleedLeft', min: 0, max: 140, step: 1, unit: 'px' },
-  { type: 'range', label: 'LLM 색 오른쪽 확장', path: 'workspaceGlass.agentTypeBgBleedRight', min: 0, max: 140, step: 1, unit: 'px' },
-  { type: 'range', label: 'LLM 색 폭', path: 'workspaceGlass.agentTypeBgWidth', min: 10, max: 150, step: 1, unit: '%' },
-  { type: 'range', label: 'LLM 색 R값', path: 'workspaceGlass.agentTypeBgRadius', min: 0, max: 36, step: 1, unit: 'px' },
-  { type: 'checkbox', label: 'LLM 색 카드 밖 확장 허용', path: 'workspaceGlass.agentTypeBgOverflow' },
+  { type: 'range', label: 'LLM 배경 시작 강도', path: 'workspaceGlass.agentTypeBgAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'LLM 배경 중간 강도', path: 'workspaceGlass.agentTypeBgMidAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'LLM 배경 끝 강도', path: 'workspaceGlass.agentTypeBgEndAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'LLM 배경 중간 위치', path: 'workspaceGlass.agentTypeBgMidStop', min: 0, max: 100, step: 1, unit: '%' },
+  { type: 'range', label: 'LLM 배경 끝 위치', path: 'workspaceGlass.agentTypeBgEndStop', min: 0, max: 100, step: 1, unit: '%' },
+  { type: 'range', label: 'LLM 배경 각도', path: 'workspaceGlass.agentTypeBgAngle', min: -180, max: 180, step: 1, unit: 'deg' },
+  { type: 'range', label: 'LLM 카드 단일 테두리 강도', path: 'workspaceGlass.agentTypeBorderAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'LLM 배경 크기 왼쪽', path: 'workspaceGlass.agentTypeBgSizeLeft', min: -120, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 배경 크기 오른쪽', path: 'workspaceGlass.agentTypeBgSizeRight', min: -120, max: 140, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 배경 크기 위', path: 'workspaceGlass.agentTypeBgSizeTop', min: -60, max: 60, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 배경 크기 아래', path: 'workspaceGlass.agentTypeBgSizeBottom', min: -60, max: 60, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 배경 이동 X', path: 'workspaceGlass.agentTypeBgMoveX', min: -120, max: 120, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 배경 이동 Y', path: 'workspaceGlass.agentTypeBgMoveY', min: -80, max: 80, step: 1, unit: 'px' },
+  { type: 'range', label: 'LLM 카드 R값', path: 'workspaceGlass.agentTypeBgRadius', min: 0, max: 36, step: 1, unit: 'px' },
   { type: 'color', label: 'Codex 색', path: 'workspaceGlass.agentCodexAccent' },
   { type: 'color', label: 'Claude 색', path: 'workspaceGlass.agentClaudeAccent' },
   { type: 'color', label: 'Grok 색', path: 'workspaceGlass.agentGrokAccent' },
@@ -3346,7 +3425,7 @@ const GLASS_SETTINGS_CONTROLS: GlassSettingsControl[] = [
   { type: 'range', label: 'pulse 어두운 정도', path: 'workspaceGlass.llmWorkingPulseDimOpacity', min: 0.20, max: 1, step: 0.02 },
   { type: 'range', label: 'pulse 링 크기', path: 'workspaceGlass.llmWorkingPulseRingSize', min: 0, max: 14, step: 1, unit: 'px' },
   { type: 'range', label: 'pulse 밝기', path: 'workspaceGlass.llmWorkingPulseGlowAlpha', min: 0, max: 1, step: 0.02 },
-  { type: 'range', label: '이름 왼쪽 여백', path: 'workspaceGlass.llmLabelPadding', min: 0, max: 42, step: 1, unit: 'px' },
+  { type: 'range', label: '상태 점-이름 간격', path: 'workspaceGlass.llmLabelPadding', min: 0, max: 28, step: 1, unit: 'px' },
   { type: 'section', label: 'Workspace tab/row idle highlight' },
   { type: 'checkbox', label: 'idle row highlight', path: 'workspaceGlass.tabHighlight' },
   { type: 'color', label: 'idle row highlight 색', path: 'workspaceGlass.tabHighlightAccent' },
@@ -3371,6 +3450,19 @@ const GLASS_SETTINGS_CONTROLS: GlassSettingsControl[] = [
   { type: 'range', label: 'glow Y', path: 'workspaceGlass.selectedGlowY', min: -8, max: 36, step: 1, unit: 'px' },
   { type: 'range', label: 'glow blur', path: 'workspaceGlass.selectedGlowBlur', min: 0, max: 72, step: 1, unit: 'px' },
   { type: 'range', label: 'glow spread', path: 'workspaceGlass.selectedGlowSpread', min: -14, max: 30, step: 1, unit: 'px' },
+  { type: 'section', label: '선택 badge 디테일' },
+  { type: 'color', label: 'badge 글자색', path: 'workspaceGlass.selectedBadgeTextColor' },
+  { type: 'range', label: 'badge 배경 강도', path: 'workspaceGlass.selectedBadgeBgAlpha', min: 0, max: 1, step: 0.01 },
+  { type: 'range', label: 'badge 글자 크기', path: 'workspaceGlass.selectedBadgeSize', min: 0.30, max: 1.20, step: 0.01, unit: 'em' },
+  { type: 'range', label: 'badge 글자 굵기', path: 'workspaceGlass.selectedBadgeWeight', min: 300, max: 950, step: 10 },
+  { type: 'range', label: 'badge 높이', path: 'workspaceGlass.selectedBadgeHeight', min: 8, max: 28, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge 패딩 X', path: 'workspaceGlass.selectedBadgePaddingX', min: 0, max: 18, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge 패딩 Y', path: 'workspaceGlass.selectedBadgePaddingY', min: 0, max: 8, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge R값', path: 'workspaceGlass.selectedBadgeRadius', min: 0, max: 999, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge 왼쪽 간격', path: 'workspaceGlass.selectedBadgeMarginLeft', min: 0, max: 24, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge 글자/위치 X', path: 'workspaceGlass.selectedBadgeShiftX', min: -24, max: 24, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge 글자/위치 Y', path: 'workspaceGlass.selectedBadgeShiftY', min: -12, max: 12, step: 1, unit: 'px' },
+  { type: 'range', label: 'badge 줄높이', path: 'workspaceGlass.selectedBadgeLineHeight', min: 0.7, max: 1.8, step: 0.01 },
   { type: 'color', label: 'selected row highlight 색', path: 'workspaceGlass.selectedHighlightAccent' },
   { type: 'range', label: 'selected row highlight 강도', path: 'workspaceGlass.selectedHighlightOpacity', min: 0, max: 1, step: 0.01 },
   { type: 'range', label: 'selected row 중심 강도', path: 'workspaceGlass.selectedHighlightStrongAlpha', min: 0, max: 1, step: 0.01 },
@@ -3399,7 +3491,6 @@ const state = {
   currentDir: '',
   entries: [] as FileEntry[],
   explorerOpenMode: 'single' as ExplorerOpenMode,
-  explorerAutoOpenEditor: false,
   explorerSelectedPath: '',
   explorerSelectedPaths: new Set<string>(),
   explorerSelectionAnchorPath: '',
@@ -3632,6 +3723,17 @@ let explorerRenderedTotal = -1;
 let explorerRenderFrame = 0;
 let explorerRenderDirty = false;
 let explorerViewportHeight = 0;
+let explorerFileListViewportHeight = 0;
+let explorerTitleOverflowGap = 0;
+let explorerSemanticContentWidth = 0;
+let explorerMeasureCanvas: HTMLCanvasElement | null = null;
+let explorerMeasureContext: CanvasRenderingContext2D | null = null;
+let explorerMeasureHost: HTMLDivElement | null = null;
+let explorerMeasureRow: HTMLDivElement | null = null;
+let explorerMeasureDisclosure: HTMLSpanElement | null = null;
+let explorerMeasureName: HTMLSpanElement | null = null;
+let explorerMeasureSize: HTMLElement | null = null;
+const explorerRowWidthMeasureCache = new Map<string, number>();
 let explorerPathRowRenderSignature = '\0';
 let explorerFileSizeModeRenderSignature = '\0';
 let explorerOpenModeRenderSignature = '\0';
@@ -3639,6 +3741,8 @@ let explorerScrollIdleTimer = 0;
 let explorerScrollingUntil = 0;
 let explorerScrollDiagnosticFrame = 0;
 let explorerScrollDiagnosticLastAt = 0;
+let explorerScrollDiagnosticPendingReasons = new Set<string>();
+let explorerScrollDiagnosticLastMetrics: Record<string, string | number> | null = null;
 let explorerRowElementCachePruneTimer = 0;
 let explorerPathKeyCachePruneTimer = 0;
 let explorerDirectoryCachePruneTimer = 0;
@@ -3817,6 +3921,7 @@ let glassSettingsSectionOpenState: Record<string, boolean> | null = null;
 let liquidGLScriptsPromise: Promise<void> | null = null;
 let workspaceLiquidGlassRefreshTimer = 0;
 let workspaceLiquidGlassRefreshRecapture = false;
+let workspaceLiquidGlassResizeRebuildTimer = 0;
 let workspaceLiquidGlassApplying = false;
 let workspaceLiquidGlassLastDiagnosticAt = 0;
 let workspaceLiquidGlassLastHoverDiagnosticAt = 0;
@@ -3969,7 +4074,6 @@ app.innerHTML = `
           <button id="refresh-explorer" class="panel-mode" title="Refresh Explorer">Refresh</button>
           <button id="export-selected" class="panel-mode" title="Export selected item for Windows drag-out">Export</button>
           <button id="toggle-explorer-open-mode" class="panel-mode" title="Toggle single/double click open">Open: 1x</button>
-          <button id="toggle-explorer-auto-editor" class="panel-mode" title="Open selected files in Editor automatically" aria-pressed="false">Auto Edit</button>
           <button id="toggle-file-sizes" class="panel-mode" title="Toggle file sizes" aria-pressed="false">Size</button>
           <button class="panel-close" data-close-panel="explorer" title="Close Explorer" aria-label="Close Explorer">x</button>
         </div>
@@ -4276,8 +4380,15 @@ app.innerHTML = `
     </div>
     <div class="glass-settings-body">
       <input id="glass-settings-import-file" class="hidden" type="file" accept="application/json,.json" />
-      <label class="settings-inline-check glass-master-toggle"><input id="glass-workspace-enabled" type="checkbox" /> workspace tab/row liquidGL 사용</label>
-      <p id="glass-settings-status" class="hint">Glass 테마 전체 on/off는 &quot;Glass 사용 범위&quot; 섹션에서 켭니다. 이 체크박스는 workspace tab/row 렌즈 전용입니다.</p>
+      <div class="glass-theme-row">
+        <label>Glass 테마
+          <select id="glass-theme-select" aria-label="Glass theme"></select>
+        </label>
+        <button id="glass-theme-apply" type="button">테마 적용</button>
+        <button id="glass-theme-save" type="button">테마 저장하기</button>
+      </div>
+      <label class="settings-inline-check glass-master-toggle"><input id="glass-workspace-enabled" type="checkbox" /> Workspace row/tab glass on/off (liquidGL)</label>
+      <p id="glass-settings-status" class="hint">Glass 테마 전체 on/off는 &quot;Glass 사용 범위&quot; 섹션에서 켭니다. 이 체크박스는 workspace row/tab liquidGL 렌즈 전용입니다.</p>
       <label class="settings-file-label">
         커스텀 IDE 배경 이미지
         <input id="glass-background-file" type="file" accept="image/*" />
@@ -4354,7 +4465,6 @@ const el = {
   exportSelected: document.querySelector<HTMLButtonElement>('#export-selected')!,
   exportList: document.querySelector<HTMLDivElement>('#export-list')!,
   explorerOpenModeToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-open-mode')!,
-  explorerAutoEditorToggle: document.querySelector<HTMLButtonElement>('#toggle-explorer-auto-editor')!,
   fileSizeToggle: document.querySelector<HTMLButtonElement>('#toggle-file-sizes')!,
   fileList: document.querySelector<HTMLDivElement>('#file-list')!,
   pathRow: document.querySelector<HTMLDivElement>('#path-row')!,
@@ -4497,6 +4607,9 @@ const el = {
   widgetOpacityNote: document.querySelector<HTMLDivElement>('#widget-opacity-note')!,
   glassSettingsPopover: document.querySelector<HTMLDivElement>('#glass-settings-popover')!,
   glassSettingsControls: document.querySelector<HTMLDivElement>('#glass-settings-controls')!,
+  glassThemeSelect: document.querySelector<HTMLSelectElement>('#glass-theme-select')!,
+  glassThemeApply: document.querySelector<HTMLButtonElement>('#glass-theme-apply')!,
+  glassThemeSave: document.querySelector<HTMLButtonElement>('#glass-theme-save')!,
   glassWorkspaceEnabled: document.querySelector<HTMLInputElement>('#glass-workspace-enabled')!,
   glassBackgroundFile: document.querySelector<HTMLInputElement>('#glass-background-file')!,
   glassSettingsStatus: document.querySelector<HTMLParagraphElement>('#glass-settings-status')!,
@@ -4643,6 +4756,21 @@ function showNextSshAuthPrompt() {
 
 function setTextContentIfChanged(element: HTMLElement, text: string) {
   if (element.textContent !== text) element.textContent = text;
+}
+
+function setWorkspaceTabLabelText(label: HTMLButtonElement, text: string) {
+  let dot = label.querySelector<HTMLSpanElement>(':scope > .workspace-tab-status-dot-inline');
+  let textNode = label.querySelector<HTMLSpanElement>(':scope > .workspace-tab-label-text');
+  if (!dot || !textNode) {
+    label.replaceChildren();
+    dot = document.createElement('span');
+    dot.className = 'workspace-tab-status-dot-inline';
+    dot.setAttribute('aria-hidden', 'true');
+    textNode = document.createElement('span');
+    textNode.className = 'workspace-tab-label-text';
+    label.append(dot, textNode);
+  }
+  setTextContentIfChanged(textNode, text);
 }
 
 function setDisabledIfChanged(
@@ -5524,6 +5652,32 @@ function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false
     outlineSoftAlpha: 0,
     outlineSoftWidth: 0
   };
+  const hasLegacyAgentTypeBgGeometry = source.agentTypeBgLeft !== undefined
+    || source.agentTypeBgRight !== undefined
+    || source.agentTypeBgTop !== undefined
+    || source.agentTypeBgBottom !== undefined
+    || source.agentTypeBgBleedLeft !== undefined
+    || source.agentTypeBgBleedRight !== undefined
+    || source.agentTypeBgWidth !== undefined
+    || source.agentTypeBgOverflow !== undefined;
+  const hasSimplifiedAgentTypeBgGeometry = source.agentTypeBgSizeLeft !== undefined
+    || source.agentTypeBgSizeRight !== undefined
+    || source.agentTypeBgSizeTop !== undefined
+    || source.agentTypeBgSizeBottom !== undefined
+    || source.agentTypeBgMoveX !== undefined
+    || source.agentTypeBgMoveY !== undefined;
+  const agentTypeBgRadiusSource = hasLegacyAgentTypeBgGeometry
+    && !hasSimplifiedAgentTypeBgGeometry
+    && normalizedFiniteNumber(source.agentTypeBgRadius, 9, 0, 80) === 9
+      ? undefined
+      : source.agentTypeBgRadius;
+  const normalizedLlmStatusDotLeft = normalizedFiniteNumber(source.llmStatusDotLeft, fallback.llmStatusDotLeft, -20, 60);
+  const normalizedLlmStatusDotSize = normalizedFiniteNumber(source.llmStatusDotSize, fallback.llmStatusDotSize, 3, 18);
+  const rawLlmLabelPadding = normalizedFiniteNumber(source.llmLabelPadding, fallback.llmLabelPadding, 0, 56);
+  const llmLabelPaddingUsesGap = source.llmLabelPaddingMode === 'dot-gap';
+  const normalizedLlmLabelPadding = source.llmLabelPadding === undefined || llmLabelPaddingUsesGap
+    ? rawLlmLabelPadding
+    : Math.max(0, rawLlmLabelPadding - normalizedLlmStatusDotLeft - normalizedLlmStatusDotSize);
   return {
     enabled: typeof source.enabled === 'boolean' ? source.enabled : enabledFallback,
     useCustomEffect: source.useCustomEffect === true,
@@ -5604,12 +5758,15 @@ function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false
     agentTitleColor: normalizedHexColor(source.agentTitleColor, fallback.agentTitleColor),
     agentTitleSize: normalizedFiniteNumber(source.agentTitleSize, fallback.agentTitleSize, 0.4, 1.6),
     agentTitleWeight: Math.round(normalizedFiniteNumber(source.agentTitleWeight, fallback.agentTitleWeight, 100, 1000)),
+    agentTitleLineHeight: normalizedFiniteNumber(source.agentTitleLineHeight, fallback.agentTitleLineHeight, 0.8, 2.2),
     agentActivityColor: normalizedHexColor(source.agentActivityColor, fallback.agentActivityColor),
     agentActivitySize: normalizedFiniteNumber(source.agentActivitySize, fallback.agentActivitySize, 0.4, 1.4),
     agentActivityWeight: Math.round(normalizedFiniteNumber(source.agentActivityWeight, fallback.agentActivityWeight, 100, 1000)),
+    agentActivityLineHeight: normalizedFiniteNumber(source.agentActivityLineHeight, fallback.agentActivityLineHeight, 0.8, 2.2),
     agentMetaColor: normalizedHexColor(source.agentMetaColor, fallback.agentMetaColor),
     agentMetaSize: normalizedFiniteNumber(source.agentMetaSize, fallback.agentMetaSize, 0.4, 1.4),
     agentMetaWeight: Math.round(normalizedFiniteNumber(source.agentMetaWeight, fallback.agentMetaWeight, 100, 1000)),
+    agentMetaLineHeight: normalizedFiniteNumber(source.agentMetaLineHeight, fallback.agentMetaLineHeight, 0.8, 2.2),
     detailPaddingX: normalizedFiniteNumber(source.detailPaddingX, fallback.detailPaddingX, 0, 30),
     detailPaddingY: normalizedFiniteNumber(source.detailPaddingY, fallback.detailPaddingY, 0, 24),
     agentGap: normalizedFiniteNumber(source.agentGap, fallback.agentGap, 0, 24),
@@ -5620,6 +5777,12 @@ function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false
     agentBadgeWeight: Math.round(normalizedFiniteNumber(source.agentBadgeWeight, fallback.agentBadgeWeight, 100, 1000)),
     agentStatusWeight: Math.round(normalizedFiniteNumber(source.agentStatusWeight, fallback.agentStatusWeight, 100, 1000)),
     agentBadgeHeight: normalizedFiniteNumber(source.agentBadgeHeight, fallback.agentBadgeHeight, 10, 34),
+    agentBadgePaddingX: normalizedFiniteNumber(source.agentBadgePaddingX, fallback.agentBadgePaddingX, 0, 24),
+    agentBadgeRadius: normalizedFiniteNumber(source.agentBadgeRadius, fallback.agentBadgeRadius, 0, 999),
+    agentBadgeBorderWidth: normalizedFiniteNumber(source.agentBadgeBorderWidth, fallback.agentBadgeBorderWidth, 0, 6),
+    agentBadgeBgAlpha: normalizedFiniteNumber(source.agentBadgeBgAlpha, fallback.agentBadgeBgAlpha, 0, 1),
+    agentBadgeBorderAlpha: normalizedFiniteNumber(source.agentBadgeBorderAlpha, fallback.agentBadgeBorderAlpha, 0, 1),
+    agentBadgeTextAlpha: normalizedFiniteNumber(source.agentBadgeTextAlpha, fallback.agentBadgeTextAlpha, 0, 1),
     agentStatusPaddingX: normalizedFiniteNumber(source.agentStatusPaddingX, fallback.agentStatusPaddingX, 0, 32),
     agentStatusRadius: normalizedFiniteNumber(source.agentStatusRadius, fallback.agentStatusRadius, 0, 999),
     agentStatusBorderWidth: normalizedFiniteNumber(source.agentStatusBorderWidth, fallback.agentStatusBorderWidth, 0, 8),
@@ -5633,16 +5796,19 @@ function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false
     agentStatusExitedColor: normalizedHexColor(source.agentStatusExitedColor, fallback.agentStatusExitedColor),
     agentBgAlpha: normalizedFiniteNumber(source.agentBgAlpha, fallback.agentBgAlpha, 0, 0.4),
     agentTypeBgAlpha: normalizedFiniteNumber(source.agentTypeBgAlpha, fallback.agentTypeBgAlpha, 0, 1),
+    agentTypeBgMidAlpha: normalizedFiniteNumber(source.agentTypeBgMidAlpha, fallback.agentTypeBgMidAlpha, 0, 1),
+    agentTypeBgEndAlpha: normalizedFiniteNumber(source.agentTypeBgEndAlpha, fallback.agentTypeBgEndAlpha, 0, 1),
+    agentTypeBgMidStop: normalizedFiniteNumber(source.agentTypeBgMidStop, fallback.agentTypeBgMidStop, 0, 100),
+    agentTypeBgEndStop: normalizedFiniteNumber(source.agentTypeBgEndStop, fallback.agentTypeBgEndStop, 0, 100),
+    agentTypeBgAngle: normalizedFiniteNumber(source.agentTypeBgAngle, fallback.agentTypeBgAngle, -180, 180),
     agentTypeBorderAlpha: normalizedFiniteNumber(source.agentTypeBorderAlpha, fallback.agentTypeBorderAlpha, 0, 1),
-    agentTypeBgLeft: normalizedFiniteNumber(source.agentTypeBgLeft, fallback.agentTypeBgLeft, -160, 160),
-    agentTypeBgRight: normalizedFiniteNumber(source.agentTypeBgRight, fallback.agentTypeBgRight, -160, 160),
-    agentTypeBgTop: normalizedFiniteNumber(source.agentTypeBgTop, fallback.agentTypeBgTop, -80, 80),
-    agentTypeBgBottom: normalizedFiniteNumber(source.agentTypeBgBottom, fallback.agentTypeBgBottom, -80, 80),
-    agentTypeBgBleedLeft: normalizedFiniteNumber(source.agentTypeBgBleedLeft, fallback.agentTypeBgBleedLeft, 0, 240),
-    agentTypeBgBleedRight: normalizedFiniteNumber(source.agentTypeBgBleedRight, fallback.agentTypeBgBleedRight, 0, 240),
-    agentTypeBgWidth: normalizedFiniteNumber(source.agentTypeBgWidth, fallback.agentTypeBgWidth, 0, 240),
-    agentTypeBgRadius: normalizedFiniteNumber(source.agentTypeBgRadius, fallback.agentTypeBgRadius, 0, 80),
-    agentTypeBgOverflow: source.agentTypeBgOverflow === true,
+    agentTypeBgSizeLeft: normalizedFiniteNumber(source.agentTypeBgSizeLeft, fallback.agentTypeBgSizeLeft, -240, 240),
+    agentTypeBgSizeRight: normalizedFiniteNumber(source.agentTypeBgSizeRight, fallback.agentTypeBgSizeRight, -240, 240),
+    agentTypeBgSizeTop: normalizedFiniteNumber(source.agentTypeBgSizeTop, fallback.agentTypeBgSizeTop, -120, 120),
+    agentTypeBgSizeBottom: normalizedFiniteNumber(source.agentTypeBgSizeBottom, fallback.agentTypeBgSizeBottom, -120, 120),
+    agentTypeBgMoveX: normalizedFiniteNumber(source.agentTypeBgMoveX, fallback.agentTypeBgMoveX, -240, 240),
+    agentTypeBgMoveY: normalizedFiniteNumber(source.agentTypeBgMoveY, fallback.agentTypeBgMoveY, -160, 160),
+    agentTypeBgRadius: normalizedFiniteNumber(agentTypeBgRadiusSource, fallback.agentTypeBgRadius, 0, 80),
     agentCodexAccent: normalizedHexColor(source.agentCodexAccent, fallback.agentCodexAccent),
     agentClaudeAccent: normalizedHexColor(source.agentClaudeAccent, fallback.agentClaudeAccent),
     agentGrokAccent: normalizedHexColor(source.agentGrokAccent, fallback.agentGrokAccent),
@@ -5653,16 +5819,17 @@ function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false
     llmErrorColor: normalizedHexColor(source.llmErrorColor, fallback.llmErrorColor),
     llmDoneUnreadColor: normalizedHexColor(source.llmDoneUnreadColor, fallback.llmDoneUnreadColor),
     llmExitedColor: normalizedHexColor(source.llmExitedColor, fallback.llmExitedColor),
-    llmStatusDotLeft: normalizedFiniteNumber(source.llmStatusDotLeft, fallback.llmStatusDotLeft, -20, 60),
+    llmStatusDotLeft: normalizedLlmStatusDotLeft,
     llmStatusDotTop: normalizedFiniteNumber(source.llmStatusDotTop, fallback.llmStatusDotTop, -20, 80),
-    llmStatusDotSize: normalizedFiniteNumber(source.llmStatusDotSize, fallback.llmStatusDotSize, 3, 18),
+    llmStatusDotSize: normalizedLlmStatusDotSize,
     llmStatusDotGlow: normalizedFiniteNumber(source.llmStatusDotGlow, fallback.llmStatusDotGlow, 0, 40),
     llmWorkingPulseEnabled: source.llmWorkingPulseEnabled !== false,
     llmWorkingPulseDuration: normalizedFiniteNumber(source.llmWorkingPulseDuration, fallback.llmWorkingPulseDuration, 0.3, 4),
     llmWorkingPulseDimOpacity: normalizedFiniteNumber(source.llmWorkingPulseDimOpacity, fallback.llmWorkingPulseDimOpacity, 0.15, 1),
     llmWorkingPulseRingSize: normalizedFiniteNumber(source.llmWorkingPulseRingSize, fallback.llmWorkingPulseRingSize, 0, 16),
     llmWorkingPulseGlowAlpha: normalizedFiniteNumber(source.llmWorkingPulseGlowAlpha, fallback.llmWorkingPulseGlowAlpha, 0, 1),
-    llmLabelPadding: normalizedFiniteNumber(source.llmLabelPadding, fallback.llmLabelPadding, 0, 56),
+    llmLabelPadding: normalizedLlmLabelPadding,
+    llmLabelPaddingMode: 'dot-gap',
     tabHighlight: source.tabHighlight === true,
     tabHighlightAccent: normalizedHexColor(source.tabHighlightAccent, fallback.tabHighlightAccent),
     tabHighlightOpacity: normalizedFiniteNumber(source.tabHighlightOpacity, fallback.tabHighlightOpacity, 0, 1),
@@ -5688,6 +5855,17 @@ function normalizeWorkspaceGlassSettings(value: unknown, enabledFallback = false
     selectedGlowBlur: normalizedFiniteNumber(source.selectedGlowBlur, fallback.selectedGlowBlur, 0, 120),
     selectedGlowSpread: normalizedFiniteNumber(source.selectedGlowSpread, fallback.selectedGlowSpread, -32, 64),
     selectedBadgeSize: normalizedFiniteNumber(source.selectedBadgeSize, fallback.selectedBadgeSize, 0.3, 1.2),
+    selectedBadgeTextColor: normalizedHexColor(source.selectedBadgeTextColor, fallback.selectedBadgeTextColor),
+    selectedBadgeBgAlpha: normalizedFiniteNumber(source.selectedBadgeBgAlpha, fallback.selectedBadgeBgAlpha, 0, 1),
+    selectedBadgeWeight: Math.round(normalizedFiniteNumber(source.selectedBadgeWeight, fallback.selectedBadgeWeight, 100, 1000)),
+    selectedBadgeHeight: normalizedFiniteNumber(source.selectedBadgeHeight, fallback.selectedBadgeHeight, 0, 48),
+    selectedBadgePaddingX: normalizedFiniteNumber(source.selectedBadgePaddingX, fallback.selectedBadgePaddingX, 0, 36),
+    selectedBadgePaddingY: normalizedFiniteNumber(source.selectedBadgePaddingY, fallback.selectedBadgePaddingY, 0, 18),
+    selectedBadgeRadius: normalizedFiniteNumber(source.selectedBadgeRadius, fallback.selectedBadgeRadius, 0, 999),
+    selectedBadgeMarginLeft: normalizedFiniteNumber(source.selectedBadgeMarginLeft, fallback.selectedBadgeMarginLeft, 0, 64),
+    selectedBadgeShiftX: normalizedFiniteNumber(source.selectedBadgeShiftX, fallback.selectedBadgeShiftX, -80, 80),
+    selectedBadgeShiftY: normalizedFiniteNumber(source.selectedBadgeShiftY, fallback.selectedBadgeShiftY, -48, 48),
+    selectedBadgeLineHeight: normalizedFiniteNumber(source.selectedBadgeLineHeight, fallback.selectedBadgeLineHeight, 0.5, 2.5),
     selectedHighlightAccent: normalizedHexColor(source.selectedHighlightAccent, fallback.selectedHighlightAccent),
     selectedHighlightOpacity: normalizedFiniteNumber(source.selectedHighlightOpacity, fallback.selectedHighlightOpacity, 0, 1),
     selectedHighlightStrongAlpha: normalizedFiniteNumber(source.selectedHighlightStrongAlpha, fallback.selectedHighlightStrongAlpha, 0, 1),
@@ -5979,7 +6157,6 @@ function normalizeAppGlassSettings(value: unknown): AppGlassSettings {
     terminalScrollbarThumbHoverAlpha: normalizedFiniteNumber(source.terminalScrollbarThumbHoverAlpha, fallback.terminalScrollbarThumbHoverAlpha, 0, 1),
     terminalScrollbarTrackAlpha: normalizedFiniteNumber(source.terminalScrollbarTrackAlpha, fallback.terminalScrollbarTrackAlpha, 0, 1),
     terminalScrollbarWidth: normalizedFiniteNumber(source.terminalScrollbarWidth, fallback.terminalScrollbarWidth, 4, 18),
-    explorerHorizontalScrollbarBottomGap: normalizedFiniteNumber(source.explorerHorizontalScrollbarBottomGap, fallback.explorerHorizontalScrollbarBottomGap, 0, 28),
     terminalHostOutlineAlpha: normalizedFiniteNumber(source.terminalHostOutlineAlpha, fallback.terminalHostOutlineAlpha, 0, 0.8),
     terminalSplitResizerAlpha: normalizedFiniteNumber(source.terminalSplitResizerAlpha, fallback.terminalSplitResizerAlpha, 0, 0.8),
     explorerRowsRadius: normalizedExplorerRowsRadius,
@@ -6077,7 +6254,7 @@ function effectiveWorkspaceContainerGlassEffectSettings() {
 }
 
 function normalizedDefaultIdeSettings(): IdeSettings {
-  return {
+  const defaults: IdeSettings = {
     ...DEFAULT_IDE_SETTINGS,
     ideBackground: cloneIdeBackgroundSettings(),
     glassEffect: cloneGlassEffectSettings(),
@@ -6086,6 +6263,40 @@ function normalizedDefaultIdeSettings(): IdeSettings {
     extraMaskPatterns: [...DEFAULT_IDE_SETTINGS.extraMaskPatterns],
     widgetWrap: defaultWidgetWrapSettings()
   };
+  return applyBundledGlassThemeDefaults(defaults);
+}
+
+function applyBundledGlassThemeDefaults(settings: IdeSettings): IdeSettings {
+  const theme = BUNDLED_GLASS_THEMES[0];
+  if (!theme) return settings;
+  try {
+    const source = bundledGlassThemeImportSettings(theme);
+    const importedWorkspaceSideDockGlass = typeof source.workspaceSideDockGlass === 'boolean'
+      ? source.workspaceSideDockGlass
+      : settings.workspaceSideDockGlass === true;
+
+    if ('ideBackground' in source) {
+      settings.ideBackground = normalizeIdeBackgroundSettings(source.ideBackground);
+    }
+    if ('glassEffect' in source) {
+      settings.glassEffect = normalizeWorkspaceGlassEffectSettings(source.glassEffect, DEFAULT_COMMON_GLASS_EFFECT_SETTINGS);
+    }
+    if ('workspaceGlass' in source) {
+      settings.workspaceGlass = normalizeWorkspaceGlassSettings(source.workspaceGlass, importedWorkspaceSideDockGlass);
+    } else if ('workspaceSideDockGlass' in source) {
+      settings.workspaceGlass = normalizeWorkspaceGlassSettings({
+        ...settings.workspaceGlass,
+        enabled: importedWorkspaceSideDockGlass
+      }, importedWorkspaceSideDockGlass);
+    }
+    if ('appGlass' in source) {
+      settings.appGlass = normalizeAppGlassSettings(source.appGlass);
+    }
+    settings.workspaceSideDockGlass = settings.workspaceGlass.enabled;
+  } catch {
+    return settings;
+  }
+  return settings;
 }
 
 function defaultWidgetWrapSettings(): WidgetWrapSettings {
@@ -6657,8 +6868,13 @@ function syncIdeBackgroundWallpaperElement(container: HTMLElement, src: string, 
     image.alt = '';
     image.decoding = 'async';
     image.setAttribute('aria-hidden', 'true');
-    image.addEventListener('load', () => scheduleWorkspaceLiquidGlassRefresh({ recapture: true }));
-    image.addEventListener('error', () => scheduleWorkspaceLiquidGlassRefresh({ recapture: true }));
+    const refreshWallpaperGlass = () => {
+      scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+      scheduleExplorerLiquidGlassRefresh({ recapture: true });
+      scheduleAppGlassRefresh({ recapture: true, reason: 'background-image-load' });
+    };
+    image.addEventListener('load', refreshWallpaperGlass);
+    image.addEventListener('error', refreshWallpaperGlass);
     container.prepend(image);
   }
   image.classList.toggle('fit-contain', fit === 'contain');
@@ -6702,6 +6918,8 @@ function applyWorkspaceGlassSettings() {
   setRootStyleProperty('--workspace-glass-row-pad-x', `${glass.rowPaddingX}px`);
   setRootStyleProperty('--workspace-glass-row-pad-y', `${glass.rowPaddingY}px`);
   setRootStyleProperty('--workspace-glass-row-gap', `${glass.rowGap}px`);
+  setRootStyleProperty('--workspace-glass-row-edge-gap', `${Math.max(glass.rowGap, glass.selectedRailGlow)}px`);
+  setRootStyleProperty('--workspace-glass-row-inline-safe-gap', `${glass.selectedRailGlow}px`);
   setRootStyleProperty('--workspace-glass-row-bg', rgbaFromHex('#ffffff', glass.rowBgAlpha));
   setRootStyleProperty('--workspace-glass-row-shadow', `0 ${glass.rowShadowY}px ${glass.rowShadowBlur}px rgba(0, 0, 0, ${glass.rowShadowAlpha.toFixed(3)})`);
   setRootStyleProperty('--workspace-glass-outline-width', `${rowEffect.outlineWidth}px`);
@@ -6782,17 +7000,23 @@ function applyWorkspaceGlassSettings() {
   setRootStyleProperty('--workspace-glass-agent-title', agentTitleColor);
   setRootStyleProperty('--workspace-glass-agent-title-size', `${glass.agentTitleSize}em`);
   setRootStyleProperty('--workspace-glass-agent-title-weight', String(agentTitleWeight));
+  setRootStyleProperty('--workspace-glass-agent-title-line-height', String(glass.agentTitleLineHeight));
   setRootStyleProperty('--workspace-glass-agent-activity', agentActivityColor);
   setRootStyleProperty('--workspace-glass-agent-activity-size', `${glass.agentActivitySize}em`);
   setRootStyleProperty('--workspace-glass-agent-activity-weight', String(agentActivityWeight));
+  setRootStyleProperty('--workspace-glass-agent-activity-line-height', String(glass.agentActivityLineHeight));
   setRootStyleProperty('--workspace-glass-agent-meta', agentMetaColor);
   setRootStyleProperty('--workspace-glass-agent-meta-size', `${glass.agentMetaSize}em`);
   setRootStyleProperty('--workspace-glass-agent-meta-weight', String(agentMetaWeight));
+  setRootStyleProperty('--workspace-glass-agent-meta-line-height', String(glass.agentMetaLineHeight));
   setRootStyleProperty('--workspace-glass-agent-badge-size', `${glass.agentBadgeSize}em`);
   setRootStyleProperty('--workspace-glass-agent-status-size', `${glass.agentStatusSize}em`);
   setRootStyleProperty('--workspace-glass-agent-badge-weight', String(glass.agentBadgeWeight));
   setRootStyleProperty('--workspace-glass-agent-status-weight', String(glass.agentStatusWeight));
   setRootStyleProperty('--workspace-glass-agent-badge-height', `${glass.agentBadgeHeight}px`);
+  setRootStyleProperty('--workspace-glass-agent-badge-pad-x', `${glass.agentBadgePaddingX}px`);
+  setRootStyleProperty('--workspace-glass-agent-badge-radius', `${glass.agentBadgeRadius}px`);
+  setRootStyleProperty('--workspace-glass-agent-badge-border-width', `${glass.agentBadgeBorderWidth}px`);
   setRootStyleProperty('--workspace-glass-agent-status-pad-x', `${glass.agentStatusPaddingX}px`);
   setRootStyleProperty('--workspace-glass-agent-status-radius', `${glass.agentStatusRadius}px`);
   setRootStyleProperty('--workspace-glass-agent-status-border-width', `${glass.agentStatusBorderWidth}px`);
@@ -6814,22 +7038,44 @@ function applyWorkspaceGlassSettings() {
   setRootStyleProperty('--workspace-glass-agent-status-exited', glass.agentStatusExitedColor);
   setRootStyleProperty('--workspace-glass-agent-status-exited-bg', rgbaFromHex(glass.agentStatusExitedColor, glass.agentStatusBgAlpha));
   setRootStyleProperty('--workspace-glass-agent-status-exited-border', rgbaFromHex(glass.agentStatusExitedColor, glass.agentStatusBorderAlpha));
-  setRootStyleProperty('--workspace-glass-agent-type-bg-left', `${glass.agentTypeBgLeft}px`);
-  setRootStyleProperty('--workspace-glass-agent-type-bg-right', `${glass.agentTypeBgRight}px`);
-  setRootStyleProperty('--workspace-glass-agent-type-bg-top', `${glass.agentTypeBgTop}px`);
-  setRootStyleProperty('--workspace-glass-agent-type-bg-bottom', `${glass.agentTypeBgBottom}px`);
-  setRootStyleProperty('--workspace-glass-agent-type-bg-bleed-left', `${glass.agentTypeBgBleedLeft}px`);
-  setRootStyleProperty('--workspace-glass-agent-type-bg-bleed-right', `${glass.agentTypeBgBleedRight}px`);
-  setRootStyleProperty('--workspace-glass-agent-type-bg-width', `${glass.agentTypeBgWidth}%`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-size-left', `${glass.agentTypeBgSizeLeft}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-size-right', `${glass.agentTypeBgSizeRight}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-size-top', `${glass.agentTypeBgSizeTop}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-size-bottom', `${glass.agentTypeBgSizeBottom}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-move-x', `${glass.agentTypeBgMoveX}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-move-y', `${glass.agentTypeBgMoveY}px`);
   setRootStyleProperty('--workspace-glass-agent-type-bg-radius', `${glass.agentTypeBgRadius}px`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-angle', `${glass.agentTypeBgAngle}deg`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-mid-stop', `${glass.agentTypeBgMidStop}%`);
+  setRootStyleProperty('--workspace-glass-agent-type-bg-end-stop', `${glass.agentTypeBgEndStop}%`);
   setRootStyleProperty('--workspace-glass-agent-codex-bg', rgbaFromHex(glass.agentCodexAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-codex-bg-mid', rgbaFromHex(glass.agentCodexAccent, glass.agentTypeBgMidAlpha));
+  setRootStyleProperty('--workspace-glass-agent-codex-bg-end', rgbaFromHex(glass.agentCodexAccent, glass.agentTypeBgEndAlpha));
   setRootStyleProperty('--workspace-glass-agent-claude-bg', rgbaFromHex(glass.agentClaudeAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-bg-mid', rgbaFromHex(glass.agentClaudeAccent, glass.agentTypeBgMidAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-bg-end', rgbaFromHex(glass.agentClaudeAccent, glass.agentTypeBgEndAlpha));
   setRootStyleProperty('--workspace-glass-agent-grok-bg', rgbaFromHex(glass.agentGrokAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-bg-mid', rgbaFromHex(glass.agentGrokAccent, glass.agentTypeBgMidAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-bg-end', rgbaFromHex(glass.agentGrokAccent, glass.agentTypeBgEndAlpha));
   setRootStyleProperty('--workspace-glass-agent-agy-bg', rgbaFromHex(glass.agentAgyAccent, glass.agentTypeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-bg-mid', rgbaFromHex(glass.agentAgyAccent, glass.agentTypeBgMidAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-bg-end', rgbaFromHex(glass.agentAgyAccent, glass.agentTypeBgEndAlpha));
   setRootStyleProperty('--workspace-glass-agent-codex-border', rgbaFromHex(glass.agentCodexAccent, glass.agentTypeBorderAlpha));
   setRootStyleProperty('--workspace-glass-agent-claude-border', rgbaFromHex(glass.agentClaudeAccent, glass.agentTypeBorderAlpha));
   setRootStyleProperty('--workspace-glass-agent-grok-border', rgbaFromHex(glass.agentGrokAccent, glass.agentTypeBorderAlpha));
   setRootStyleProperty('--workspace-glass-agent-agy-border', rgbaFromHex(glass.agentAgyAccent, glass.agentTypeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-codex-badge-bg', rgbaFromHex(glass.agentCodexAccent, glass.agentBadgeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-badge-bg', rgbaFromHex(glass.agentClaudeAccent, glass.agentBadgeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-badge-bg', rgbaFromHex(glass.agentGrokAccent, glass.agentBadgeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-badge-bg', rgbaFromHex(glass.agentAgyAccent, glass.agentBadgeBgAlpha));
+  setRootStyleProperty('--workspace-glass-agent-codex-badge-border', rgbaFromHex(glass.agentCodexAccent, glass.agentBadgeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-badge-border', rgbaFromHex(glass.agentClaudeAccent, glass.agentBadgeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-badge-border', rgbaFromHex(glass.agentGrokAccent, glass.agentBadgeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-badge-border', rgbaFromHex(glass.agentAgyAccent, glass.agentBadgeBorderAlpha));
+  setRootStyleProperty('--workspace-glass-agent-codex-badge-text', rgbaFromHex(glass.agentCodexAccent, glass.agentBadgeTextAlpha));
+  setRootStyleProperty('--workspace-glass-agent-claude-badge-text', rgbaFromHex(glass.agentClaudeAccent, glass.agentBadgeTextAlpha));
+  setRootStyleProperty('--workspace-glass-agent-grok-badge-text', rgbaFromHex(glass.agentGrokAccent, glass.agentBadgeTextAlpha));
+  setRootStyleProperty('--workspace-glass-agent-agy-badge-text', rgbaFromHex(glass.agentAgyAccent, glass.agentBadgeTextAlpha));
   setRootStyleProperty('--workspace-glass-llm-working', glass.llmWorkingColor);
   setRootStyleProperty('--workspace-glass-llm-working-glow', rgbaFromHex(glass.llmWorkingColor, 0.56));
   setRootStyleProperty('--workspace-glass-llm-working-pulse-ring', rgbaFromHex(glass.llmWorkingColor, 0.48));
@@ -6849,10 +7095,12 @@ function applyWorkspaceGlassSettings() {
   setRootStyleProperty('--workspace-glass-status-dot-top', `${glass.llmStatusDotTop}px`);
   setRootStyleProperty('--workspace-glass-status-dot-size', `${glass.llmStatusDotSize}px`);
   setRootStyleProperty('--workspace-glass-status-dot-glow', `${glass.llmStatusDotGlow}px`);
+  setRootStyleProperty('--workspace-glass-status-dot-offset-y', `${glass.llmStatusDotTop - (glass.rowHeight / 2)}px`);
   setRootStyleProperty('--workspace-glass-llm-pulse-duration', `${glass.llmWorkingPulseDuration}s`);
   setRootStyleProperty('--workspace-glass-llm-pulse-dim-opacity', String(glass.llmWorkingPulseDimOpacity));
   setRootStyleProperty('--workspace-glass-llm-pulse-ring-size', `${glass.llmWorkingPulseRingSize}px`);
-  setRootStyleProperty('--workspace-glass-label-status-pad', `${glass.llmLabelPadding}px`);
+  setRootStyleProperty('--workspace-glass-label-status-gap', `${glass.llmLabelPadding}px`);
+  setRootStyleProperty('--workspace-glass-label-status-pad', `${Math.max(0, glass.llmStatusDotLeft + glass.llmStatusDotSize + glass.llmLabelPadding)}px`);
   setRootStyleProperty('--workspace-glass-selected-accent', glass.selectedAccent);
   setRootStyleProperty('--workspace-glass-selected-surface-soft', rgbaFromHex(glass.selectedAccent, glass.selectedFillAlpha));
   setRootStyleProperty('--workspace-glass-selected-surface-strong', rgbaFromHex(glass.selectedAccent, Math.min(1, glass.selectedFillAlpha * 1.7)));
@@ -6872,8 +7120,18 @@ function applyWorkspaceGlassSettings() {
   setRootStyleProperty('--workspace-glass-selected-rail-offset', `${glass.selectedRailOffset}px`);
   setRootStyleProperty('--workspace-glass-selected-rail-radius', `${glass.selectedRailRadius}px`);
   setRootStyleProperty('--workspace-glass-selected-rail-glow', `${glass.selectedRailGlow}px`);
-  setRootStyleProperty('--workspace-glass-selected-badge-bg', glass.selectedAccent);
+  setRootStyleProperty('--workspace-glass-selected-badge-bg', rgbaFromHex(glass.selectedAccent, glass.selectedBadgeBgAlpha));
+  setRootStyleProperty('--workspace-glass-selected-badge-color', glass.selectedBadgeTextColor);
   setRootStyleProperty('--workspace-glass-selected-badge-size', `${glass.selectedBadgeSize}em`);
+  setRootStyleProperty('--workspace-glass-selected-badge-weight', String(glass.selectedBadgeWeight));
+  setRootStyleProperty('--workspace-glass-selected-badge-height', `${glass.selectedBadgeHeight}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-pad-x', `${glass.selectedBadgePaddingX}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-pad-y', `${glass.selectedBadgePaddingY}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-radius', `${glass.selectedBadgeRadius}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-margin-left', `${glass.selectedBadgeMarginLeft}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-shift-x', `${glass.selectedBadgeShiftX}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-shift-y', `${glass.selectedBadgeShiftY}px`);
+  setRootStyleProperty('--workspace-glass-selected-badge-line-height', String(glass.selectedBadgeLineHeight));
   setRootStyleProperty('--workspace-glass-tab-highlight-opacity', String(glass.tabHighlightOpacity));
   setRootStyleProperty('--workspace-glass-tab-highlight-width', `${glass.tabHighlightWidth}%`);
   setRootStyleProperty('--workspace-glass-tab-highlight-left', `${glass.tabHighlightLeft}px`);
@@ -6894,7 +7152,6 @@ function applyWorkspaceGlassSettings() {
   toggleClassIfChanged(el.shell, 'workspace-glass-selected-highlight', active && glass.selectedHighlight);
   toggleClassIfChanged(el.shell, 'workspace-glass-selected-rail', active && glass.selectedRail);
   toggleClassIfChanged(el.shell, 'workspace-glass-selected-badge', active && glass.selectedBadge);
-  toggleClassIfChanged(el.shell, 'workspace-glass-agent-bg-overflow', active && glass.agentTypeBgOverflow);
   toggleClassIfChanged(el.shell, 'workspace-glass-container-lens', active && glass.containerGlassEnabled);
   toggleClassIfChanged(el.shell, 'workspace-glass-row-samples-container', active && glass.containerGlassEnabled && glass.rowSamplesContainer);
   toggleClassIfChanged(el.shell, 'workspace-glass-hover-only', active && glass.rowHoverOnly);
@@ -7135,7 +7392,6 @@ function applyAppGlassSettings() {
   setRootStyleProperty('--app-glass-terminal-scroll-thumb-hover', rgbaFromHex('#a0c6ff', glass.terminalScrollbarThumbHoverAlpha));
   setRootStyleProperty('--app-glass-terminal-scroll-track', rgbaFromHex('#050a12', glass.terminalScrollbarTrackAlpha));
   setRootStyleProperty('--app-glass-terminal-scroll-width', `${glass.terminalScrollbarWidth}px`);
-  setRootStyleProperty('--app-glass-explorer-horizontal-scrollbar-gap', `${glass.explorerHorizontalScrollbarBottomGap}px`);
   setRootStyleProperty('--app-glass-terminal-host-outline', rgbaFromHex('#7fb0ff', glass.terminalHostOutlineAlpha));
   setRootStyleProperty('--app-glass-terminal-split-resizer-bg', rgbaFromHex('#4d8dff', glass.terminalSplitResizerAlpha));
   const explorerRowsEffect = effectiveAppGlassEffectSettings('explorer-rows');
@@ -7230,11 +7486,23 @@ function renderGlassSettingsControls() {
   let currentContainer: DocumentFragment | HTMLElement = fragment;
   let workspaceRowMasterToggleInserted = false;
   let backgroundFileInputInserted = false;
+  const appendWorkspaceRowMasterToggle = (container: DocumentFragment | HTMLElement) => {
+    if (workspaceRowMasterToggleInserted) return;
+    const toggleLabel = el.glassWorkspaceEnabled.closest('label');
+    if (toggleLabel instanceof HTMLLabelElement) {
+      container.append(toggleLabel);
+      container.append(el.glassSettingsStatus);
+      workspaceRowMasterToggleInserted = true;
+    }
+  };
   for (const control of GLASS_SETTINGS_CONTROLS) {
     if (control.type === 'section') {
       const { group, content } = createGlassSettingsGroup(control.label);
       fragment.append(group);
       currentContainer = content;
+      if (control.label === 'Glass 사용 범위') {
+        appendWorkspaceRowMasterToggle(content);
+      }
       if (control.label === '배경 / 조명') {
         const fileLabel = el.glassBackgroundFile.closest('label');
         if (fileLabel instanceof HTMLLabelElement) {
@@ -7263,14 +7531,6 @@ function renderGlassSettingsControls() {
       row.append(title, button);
       currentContainer.append(row);
       continue;
-    }
-    if (control.path === 'workspaceGlass.useCustomEffect' && !workspaceRowMasterToggleInserted) {
-      const toggleLabel = el.glassWorkspaceEnabled.closest('label');
-      if (toggleLabel instanceof HTMLLabelElement) {
-        currentContainer.append(toggleLabel);
-        currentContainer.append(el.glassSettingsStatus);
-        workspaceRowMasterToggleInserted = true;
-      }
     }
     const label = document.createElement('label');
     label.className = `glass-settings-control glass-control-${control.type}`;
@@ -7334,16 +7594,29 @@ function renderGlassSettingsControls() {
     if (fileLabel instanceof HTMLLabelElement) fragment.prepend(fileLabel);
   }
   if (!workspaceRowMasterToggleInserted) {
-    const toggleLabel = el.glassWorkspaceEnabled.closest('label');
-    if (toggleLabel instanceof HTMLLabelElement) {
-      fragment.append(toggleLabel);
-      fragment.append(el.glassSettingsStatus);
-    }
+    appendWorkspaceRowMasterToggle(fragment);
   }
   el.glassSettingsControls.replaceChildren(fragment);
 }
 
+function renderGlassThemeSelect() {
+  if (el.glassThemeSelect.options.length === BUNDLED_GLASS_THEMES.length) return;
+  const fragment = document.createDocumentFragment();
+  for (const theme of BUNDLED_GLASS_THEMES) {
+    const option = document.createElement('option');
+    option.value = theme.id;
+    option.textContent = theme.label;
+    option.title = theme.description;
+    fragment.append(option);
+  }
+  el.glassThemeSelect.replaceChildren(fragment);
+  if (!el.glassThemeSelect.value && BUNDLED_GLASS_THEMES[0]) {
+    el.glassThemeSelect.value = BUNDLED_GLASS_THEMES[0].id;
+  }
+}
+
 function openGlassSettingsPopover() {
+  renderGlassThemeSelect();
   renderGlassSettingsControls();
   syncGlassSettingsPopover();
   el.glassSettingsPopover.classList.remove('hidden');
@@ -7740,10 +8013,92 @@ function currentGlassSettingsSnapshot() {
   };
 }
 
+function readBlobAsDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Blob read failed'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function imageUrlToDataUrl(url: string) {
+  if (!url || url.startsWith('data:image/')) return url;
+  try {
+    const response = await fetch(url, { cache: 'force-cache' });
+    if (!response.ok) return '';
+    const blob = await response.blob();
+    if (!blob.type.startsWith('image/') || blob.size > 3_000_000) return '';
+    return await readBlobAsDataUrl(blob);
+  } catch {
+    return '';
+  }
+}
+
+async function currentGlassThemeSettingsSnapshot() {
+  const snapshot = currentGlassSettingsSnapshot();
+  const background = snapshot.ideBackground;
+  if (!background.customImageSrc && background.customImageUrl) {
+    const dataUrl = await imageUrlToDataUrl(background.customImageUrl);
+    if (dataUrl.startsWith('data:image/') && dataUrl.length < 4_200_000) {
+      snapshot.ideBackground = {
+        ...background,
+        customImageSrc: dataUrl,
+        customImageUrl: ''
+      };
+    }
+  }
+  return snapshot;
+}
+
 function glassSettingsExportFilename() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   return `simple-vibe-glass-settings-${timestamp}.json`;
 }
+
+function glassThemeExportFilename() {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `simple-vibe-glass-theme-${timestamp}.json`;
+}
+
+function bundledGlassThemeById(id: string) {
+  return BUNDLED_GLASS_THEMES.find((theme) => theme.id === id) ?? null;
+}
+
+function bundledGlassThemeImportSettings(theme: BundledGlassTheme) {
+  const source = cloneJson(glassSettingsImportSource(theme.payload)) as Record<string, unknown>;
+  if (theme.backgroundUrl) {
+    const sourceBackground = isPlainRecord(source.ideBackground) ? source.ideBackground : {};
+    source.ideBackground = {
+      ...sourceBackground,
+      enabled: true,
+      preset: 'custom',
+      customImageSrc: '',
+      customImageName: theme.backgroundName ?? theme.label,
+      customImageUrl: theme.backgroundUrl
+    };
+  }
+  return source;
+}
+
+type IdeSaveFilePickerWritable = {
+  write(data: Blob | string): Promise<void>;
+  close(): Promise<void>;
+};
+
+type IdeSaveFilePickerHandle = {
+  createWritable(): Promise<IdeSaveFilePickerWritable>;
+};
+
+type IdeSaveFilePickerWindow = Window & {
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{
+      description: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<IdeSaveFilePickerHandle>;
+};
 
 function downloadTextFile(filename: string, text: string, mimeType = 'application/json') {
   const blob = new Blob([text], { type: `${mimeType};charset=utf-8` });
@@ -7758,7 +8113,33 @@ function downloadTextFile(filename: string, text: string, mimeType = 'applicatio
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function exportGlassSettings() {
+async function saveTextFile(filename: string, text: string, mimeType = 'application/json') {
+  const picker = (window as IdeSaveFilePickerWindow).showSaveFilePicker;
+  if (typeof picker === 'function') {
+    try {
+      const handle = await picker.call(window, {
+        suggestedName: filename,
+        types: [
+          {
+            description: 'JSON settings',
+            accept: { [mimeType]: ['.json'] }
+          }
+        ]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(new Blob([text], { type: `${mimeType};charset=utf-8` }));
+      await writable.close();
+      return 'picked' as const;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return 'cancelled' as const;
+      throw error;
+    }
+  }
+  downloadTextFile(filename, text, mimeType);
+  return 'downloaded' as const;
+}
+
+async function exportGlassSettings() {
   const payload = {
     kind: 'simple-vibe-ide-glass-settings',
     version: 1,
@@ -7766,8 +8147,57 @@ function exportGlassSettings() {
     exportedAt: new Date().toISOString(),
     settings: currentGlassSettingsSnapshot()
   };
-  downloadTextFile(glassSettingsExportFilename(), JSON.stringify(payload, null, 2));
-  setStatus('Glass settings exported');
+  const filename = glassSettingsExportFilename();
+  try {
+    const result = await saveTextFile(filename, JSON.stringify(payload, null, 2));
+    if (result === 'picked') setStatus(`Glass settings exported: ${filename}`);
+    else if (result === 'downloaded') setStatus(`Glass settings downloaded to the browser default downloads folder: ${filename}`);
+    else setStatus('Glass settings export cancelled');
+  } catch (error) {
+    setStatus(`Glass settings export failed: ${String(error)}`, true);
+  }
+}
+
+async function saveGlassTheme() {
+  el.glassSettingsStatus.textContent = 'Glass 테마를 저장하는 중...';
+  try {
+    const payload = {
+      kind: 'simple-vibe-ide-glass-theme',
+      version: 1,
+      app: 'Simple Vibe IDE',
+      exportedAt: new Date().toISOString(),
+      theme: {
+        label: 'Custom Glass Theme'
+      },
+      settings: await currentGlassThemeSettingsSnapshot()
+    };
+    const filename = glassThemeExportFilename();
+    const result = await saveTextFile(filename, JSON.stringify(payload, null, 2));
+    if (result === 'picked') setStatus(`Glass theme saved: ${filename}`);
+    else if (result === 'downloaded') setStatus(`Glass theme downloaded to the browser default downloads folder: ${filename}`);
+    else setStatus('Glass theme save cancelled');
+  } catch (error) {
+    setStatus(`Glass theme save failed: ${String(error)}`, true);
+  }
+}
+
+function applySelectedGlassTheme() {
+  renderGlassThemeSelect();
+  const theme = bundledGlassThemeById(el.glassThemeSelect.value);
+  if (!theme) {
+    setStatus('Glass theme not found', true);
+    return;
+  }
+  try {
+    applyImportedGlassSettings({ settings: bundledGlassThemeImportSettings(theme) });
+    el.glassThemeSelect.value = theme.id;
+    el.glassSettingsStatus.textContent = `${theme.label} 적용됨`;
+    setStatus(`Glass theme applied: ${theme.label}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Glass theme apply failed: ${message}`, true);
+    el.glassSettingsStatus.textContent = `테마 적용 실패: ${message}`;
+  }
 }
 
 function glassSettingsImportSource(payload: unknown) {
@@ -7968,11 +8398,16 @@ function activeWorkspaceHoverOnlyGlassElements() {
     ? workspaceLiquidGlassHoverOnlyTarget
     : hovered;
   if (!(target instanceof HTMLElement) || !target.isConnected) return new Set<HTMLElement>();
+  const active = new Set<HTMLElement>([target]);
   if (target === el.newWorkspaceTab) {
-    return new Set<HTMLElement>([ensureWorkspaceAddGlassPlane()]);
+    active.add(ensureWorkspaceAddGlassPlane());
+    return active;
   }
-  if (target.classList.contains('workspace-tab')) return new Set<HTMLElement>([ensureWorkspaceTabGlassPlane(target)]);
-  return new Set<HTMLElement>();
+  if (target.classList.contains('workspace-tab')) {
+    active.add(ensureWorkspaceTabGlassPlane(target));
+    return active;
+  }
+  return active;
 }
 
 function resetHoverOnlyLiquidGlassLens(lens: LiquidGLLensLike) {
@@ -8273,6 +8708,28 @@ function scheduleWorkspaceLiquidGlassRefresh(options: { recapture?: boolean; del
     workspaceLiquidGlassRefreshRecapture = false;
     void applyWorkspaceLiquidGlass(recapture);
   }, options.delay ?? (options.recapture ? 160 : 60));
+}
+
+function scheduleWorkspaceLiquidGlassResizeRebuild() {
+  if (!workspaceLiquidGlassEligible()) return;
+  if (workspaceLiquidGlassResizeRebuildTimer) window.clearTimeout(workspaceLiquidGlassResizeRebuildTimer);
+  workspaceLiquidGlassResizeRebuildTimer = window.setTimeout(() => {
+    workspaceLiquidGlassResizeRebuildTimer = 0;
+    if (!workspaceLiquidGlassEligible()) return;
+    if (workspaceLiquidGlassApplying) {
+      scheduleWorkspaceLiquidGlassResizeRebuild();
+      return;
+    }
+    const appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+    removeWorkspaceLiquidGlassLenses();
+    appendDiagnosticLog(
+      'glass',
+      'workspace glass resize-rebuild reset row/container lenses',
+      'info',
+      { force: appGlass.diagnostics === true }
+    );
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: 30 });
+  }, 260);
 }
 
 function workspaceLiquidGlassRendererContextLost(renderer: LiquidGLRendererLike | undefined) {
@@ -8631,6 +9088,10 @@ function ensureWorkspaceLiquidGlassCanvasLayer() {
     canvas.dataset.workspaceGlassCanvas = '1';
     canvas.dataset.workspaceGlassLayer = label;
     positionAppGlassViewportLayer(canvas, container, zIndex);
+    // Keep the paint order deterministic even when the container lens is
+    // enabled after row lenses already exist. With equal z-index layers, a
+    // later container canvas can otherwise cover hover-only row renders.
+    container.append(canvas);
   };
   const applyLensOverlayLayer = (
     renderer: LiquidGLRendererLike | undefined,
@@ -8650,13 +9111,13 @@ function ensureWorkspaceLiquidGlassCanvasLayer() {
         patchAppGlassMirrorCreation(lens, overlayContainer);
       }
       if (lens._mirror instanceof HTMLElement) {
-        if (lens._mirror.parentElement !== overlayContainer) overlayContainer.append(lens._mirror);
+        overlayContainer.append(lens._mirror);
         lens._mirror.style.pointerEvents = 'none';
         lens._mirror.style.zIndex = mirrorZ;
         positionAppGlassViewportLayer(lens._mirror, overlayContainer, mirrorZ);
       }
       if (lens._shadowEl instanceof HTMLElement) {
-        if (lens._shadowEl.parentElement !== overlayContainer) overlayContainer.append(lens._shadowEl);
+        overlayContainer.append(lens._shadowEl);
         lens._shadowEl.style.pointerEvents = 'none';
         positionAppGlassShadowLayer(lens._shadowEl, lens.el as HTMLElement, overlayContainer, lens);
         lens._shadowEl.style.zIndex = shadowZ;
@@ -8664,8 +9125,8 @@ function ensureWorkspaceLiquidGlassCanvasLayer() {
     });
   };
   applyCanvasLayer(workspaceContainerLiquidGlassRenderer(), 'container', '1');
-  applyCanvasLayer(window.__liquidGLRenderer__, 'rows', '1');
   applyLensOverlayLayer(workspaceContainerLiquidGlassRenderer(), isWorkspaceContainerLiquidGlassLens, '1', '0');
+  applyCanvasLayer(window.__liquidGLRenderer__, 'rows', '1');
   applyLensOverlayLayer(window.__liquidGLRenderer__, isWorkspaceLiquidGlassLens, '1', '0');
   installWorkspaceHoverOnlyRenderFilter();
 }
@@ -8701,8 +9162,19 @@ function appendWorkspaceLiquidGlassDiagnostic(reason: string, options: { force?:
   const tabsRect = el.workspaceTabs.getBoundingClientRect();
   const addRect = el.newWorkspaceTab.getBoundingClientRect();
   const label = target?.querySelector<HTMLElement>('.workspace-tab-label') ?? null;
+  const labelText = label?.querySelector<HTMLElement>(':scope > .workspace-tab-label-text') ?? null;
+  const labelDot = label?.querySelector<HTMLElement>(':scope > .workspace-tab-status-dot-inline') ?? null;
   const labelStyle = label ? window.getComputedStyle(label) : null;
+  const labelBeforeStyle = label ? window.getComputedStyle(label, '::before') : null;
+  const targetAfterStyle = target ? window.getComputedStyle(target, '::after') : null;
+  const labelTextStyle = labelText ? window.getComputedStyle(labelText) : null;
+  const labelDotStyle = labelDot ? window.getComputedStyle(labelDot) : null;
   const labelRect = label?.getBoundingClientRect();
+  const labelTextRect = labelText?.getBoundingClientRect();
+  const labelDotRect = labelDot?.getBoundingClientRect();
+  const dotGap = labelTextRect && labelDotRect
+    ? Math.round((labelTextRect.left - labelDotRect.right) * 10) / 10
+    : 'none';
   const labelHit = labelRect && labelRect.width > 0 && labelRect.height > 0
     ? document.elementFromPoint(labelRect.left + labelRect.width / 2, labelRect.top + labelRect.height / 2)
     : null;
@@ -8737,7 +9209,19 @@ function appendWorkspaceLiquidGlassDiagnostic(reason: string, options: { force?:
       `listw=${Math.round(tabsRect.width)}`,
       `addw=${Math.round(addRect.width)}`,
       `ld=${labelStyle?.display ?? 'none'}`,
-      `lc=${labelStyle?.color ?? 'none'}`
+      `lc=${labelStyle?.color ?? 'none'}`,
+      `lgap=${labelStyle?.gap ?? 'none'}`,
+      `lpad=${labelStyle?.paddingLeft ?? 'none'}`,
+      `before=${labelBeforeStyle?.display ?? 'none'}/${labelBeforeStyle?.content ?? 'none'}`,
+      `after=${targetAfterStyle?.display ?? 'none'}/${targetAfterStyle?.content ?? 'none'}`,
+      `dot=${labelDotStyle?.display ?? 'none'}`,
+      `dotml=${labelDotStyle?.marginLeft ?? 'none'}`,
+      `dotw=${labelDotStyle?.width ?? 'none'}`,
+      `text=${labelTextStyle?.display ?? 'none'}`,
+      `gap=${dotGap}`,
+      `lr=${labelRect && targetRect ? rectDiagnostic(labelRect, targetRect) : 'none'}`,
+      `dr=${labelDotRect && targetRect ? rectDiagnostic(labelDotRect, targetRect) : 'none'}`,
+      `tr=${labelTextRect && targetRect ? rectDiagnostic(labelTextRect, targetRect) : 'none'}`
     ].join(' '),
     'info',
     { force: options.force === true || appGlass.diagnostics === true }
@@ -10046,7 +10530,7 @@ function appGlassMirrorContainerForLens(lens: LiquidGLLensLike, fallback: HTMLEl
   if (!(lens.el instanceof HTMLElement)) return fallback;
   if (lens.el.classList.contains('app-glass-plane')) return appGlassOverlayContainerForTarget(lens.el);
   if (lens.el.classList.contains('file-row-glass') && lens.el.parentElement instanceof HTMLElement) {
-    return lens.el.parentElement;
+    return fallback;
   }
   return fallback;
 }
@@ -10763,6 +11247,8 @@ function syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer: LiquidGLRende
     }
     syncExplorerLiquidGlassLocalMirror(lens, renderer);
   }
+  syncExplorerSemanticVerticalOverflowGuard();
+  syncExplorerSemanticHorizontalOverflowGuard();
 }
 
 function installExplorerHoverOnlyRenderFilter() {
@@ -10883,6 +11369,12 @@ function disposeExplorerLiquidGlassRenderer() {
 function removeExplorerLiquidGlass() {
   explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
   explorerLiquidGlassHoverOnlyTarget = null;
+  toggleClassIfChanged(el.fileList, 'explorer-semantic-no-y-scroll', false);
+  toggleClassIfChanged(el.fileList, 'explorer-semantic-x-scroll', false);
+  explorerFileListViewportHeight = 0;
+  explorerTitleOverflowGap = 0;
+  getPanel('explorer').style.removeProperty('--explorer-title-overflow-bottom');
+  el.fileList.style.removeProperty('--explorer-file-list-height');
   el.shell.classList.remove('app-glass-explorer-sample-canvas-ready');
   if (explorerLiquidGlassRefreshTimer) {
     window.clearTimeout(explorerLiquidGlassRefreshTimer);
@@ -11102,6 +11594,7 @@ async function applyExplorerLiquidGlass(recaptureSnapshot = false) {
     }
     if (explorerLiquidGlassRenderer && explorerLiquidGlassTargetSignature === signature && !recaptureSnapshot) {
       updateExplorerLiquidGlassEffectOptions();
+      scheduleExplorerScrollDiagnostic(`glass-update targets=${targets.length}`);
       return;
     }
     disposeExplorerLiquidGlassRenderer();
@@ -11149,6 +11642,7 @@ async function applyExplorerLiquidGlass(recaptureSnapshot = false) {
     await renderer.captureSnapshot?.().catch(() => undefined);
     renderer.render?.();
     syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
+    scheduleExplorerScrollDiagnostic(`glass-apply recapture=${recaptureSnapshot ? 1 : 0} targets=${targets.length} lenses=${lenses.length}`);
   } catch (error) {
     for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, 'init-failed');
     console.warn('explorer row liquid glass failed', error);
@@ -12387,7 +12881,7 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
   tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${captureTitle}${keepLiveTitle}${memoryTitle}${llmTitle}`;
   const parts = workspaceTabParts(tab);
   const label = parts.label;
-  setTextContentIfChanged(label, displayLabel);
+  setWorkspaceTabLabelText(label, displayLabel);
   if (label.title !== tab.title) label.title = tab.title;
   setAttributeIfChanged(label, 'aria-label', `Open workspace: ${displayLabel}`);
   parts.detailToggle.textContent = detailOpen ? '▾' : '▸';
@@ -16045,7 +16539,6 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     calculatorExpression: '',
     calculatorHistory: [],
     explorerOpenMode: 'single',
-    explorerAutoOpenEditor: false,
     showFileSizes: DEFAULT_SHOW_FILE_SIZES,
     editorFontSize: 13,
     terminalFontSize: 13,
@@ -16173,7 +16666,6 @@ function createCurrentWorkspaceSnapshot(
     calculatorExpression: state.calculatorExpression,
     calculatorHistory: currentCalculatorHistorySnapshot(),
     explorerOpenMode: state.explorerOpenMode,
-    explorerAutoOpenEditor: state.explorerAutoOpenEditor,
     showFileSizes: state.showFileSizes,
     editorFontSize,
     terminalFontSize,
@@ -16344,7 +16836,6 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${workspaceSignaturePart(snapshot.calculatorExpression)}`;
   signature += `|${calculatorSnapshotHistorySignature(snapshot.calculatorHistory)}`;
   signature += `|${workspaceSignaturePart(snapshot.explorerOpenMode)}`;
-  signature += `|${snapshot.explorerAutoOpenEditor ? '1' : '0'}`;
   signature += `|${snapshot.showFileSizes ? '1' : '0'}`;
   signature += `|${String(snapshot.editorFontSize)}`;
   signature += `|${String(snapshot.terminalFontSize)}`;
@@ -16981,7 +17472,6 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.workspaceOpen = true;
     state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
     state.explorerOpenMode = snapshot.explorerOpenMode ?? 'single';
-    state.explorerAutoOpenEditor = Boolean(snapshot.explorerAutoOpenEditor);
     state.showFileSizes = snapshot.showFileSizes ?? DEFAULT_SHOW_FILE_SIZES;
     state.editorOpenInNewTab = Boolean(snapshot.editorOpenInNewTab);
     state.editorWordWrap = Boolean(snapshot.editorWordWrap);
@@ -17015,7 +17505,6 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     setCheckedIfChanged(el.editorWordWrap, state.editorWordWrap);
     setCheckedIfChanged(el.imageOpenNewTab, state.imageOpenInNewTab);
     updateExplorerOpenMode();
-    updateExplorerAutoEditorToggle();
     updateExplorerFileSizeMode();
 
     const deferExplorerUntilShellReady = profileNeedsExplorerShellReadyGate(profile);
@@ -19835,11 +20324,6 @@ function bindEvents() {
     updateExplorerOpenMode();
     saveActiveWorkspaceSnapshot();
   });
-  el.explorerAutoEditorToggle.addEventListener('click', () => {
-    state.explorerAutoOpenEditor = !state.explorerAutoOpenEditor;
-    updateExplorerAutoEditorToggle();
-    saveActiveWorkspaceSnapshot();
-  });
   el.fileSizeToggle.addEventListener('click', () => {
     state.showFileSizes = !state.showFileSizes;
     updateExplorerFileSizeMode();
@@ -19936,6 +20420,8 @@ function bindEvents() {
   el.glassSettingsExport.addEventListener('click', exportGlassSettings);
   el.glassSettingsImport.addEventListener('click', chooseGlassSettingsImportFile);
   el.glassSettingsImportFile.addEventListener('change', handleGlassSettingsImportFileChange);
+  el.glassThemeApply.addEventListener('click', applySelectedGlassTheme);
+  el.glassThemeSave.addEventListener('click', () => void saveGlassTheme());
   el.glassSettingsClose.addEventListener('click', closeGlassSettingsPopover);
   el.workspaceDockDetailToggle.addEventListener('click', toggleWorkspaceDockDetail);
   el.workspaceDockResizer.addEventListener('pointerdown', startWorkspaceDockResize);
@@ -20041,6 +20527,11 @@ function scheduleWindowResizeWork() {
     requestCodeEditorMeasure();
     scheduleConfigureEdgeViewport();
     scheduleNativeBrowserWebviewSync();
+    if (workspaceLiquidGlassEligible()) {
+      ensureWorkspaceLiquidGlassCanvasLayer();
+      updateWorkspaceLiquidGlassEffectOptions();
+      scheduleWorkspaceLiquidGlassResizeRebuild();
+    }
     if (appGlassCanCaptureSnapshotNow()) {
       if (!scheduleAppGlassActiveOwnerRecaptures('window-resize', { delay: 120 })) {
         scheduleAppGlassRefresh({ recapture: true, delay: 140, reason: 'window-resize' });
@@ -21984,6 +22475,11 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       }
       scheduleExplorerWatch();
     }
+    if (id === 'explorer') {
+      window.requestAnimationFrame(() => {
+        if (!getPanel('explorer').classList.contains('hidden')) syncExplorerViewportGeometry('panel-show');
+      });
+    }
     if (id === 'browser' && !restoringWorkspace) {
       cancelBrowserFrameSuspend();
       if (wasHidden) {
@@ -22147,6 +22643,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
       resizeBottom: resizeSouth
     }, snapGuides), { skipGlassRefresh: true });
     if (panel.dataset.panel === 'editor') requestCodeEditorMeasure();
+    if (panel.dataset.panel === 'explorer') syncExplorerViewportGeometry('panel-resize');
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
@@ -23699,18 +24196,22 @@ function renderExplorer() {
     removeExplorerLiquidGlass();
     return;
   }
+  scheduleExplorerScrollDiagnostic('renderExplorer/start');
   explorerRenderDirty = false;
   const scrollTop = el.fileList.scrollTop;
   updateExplorerFileSizeMode();
   updateExplorerOpenMode();
-  updateExplorerAutoEditorToggle();
   renderExplorerPathRow();
+  renderExportJobs();
 
   rebuildExplorerVisibleRows();
+  updateExplorerSemanticContentWidth();
+  explorerViewportHeight = Math.round(el.fileList.clientHeight);
   renderVirtualExplorerRows(scrollTop, { force: true });
-  renderExportJobs();
+  syncExplorerSemanticHorizontalOverflowGuard();
   queueVisibleExplorerDirectoryPrefetch(900);
   scheduleExplorerLiquidGlassRefresh();
+  scheduleExplorerScrollDiagnostic('renderExplorer/end');
 }
 
 function renderExplorerPathRow() {
@@ -23918,8 +24419,10 @@ function renderVirtualExplorerRows(
   el.fileList.replaceChildren(fragment);
   if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
   explorerLastSelectedPath = state.explorerSelectedPath;
+  syncExplorerSemanticVerticalOverflowGuard();
+  syncExplorerSemanticHorizontalOverflowGuard();
   scheduleExplorerLiquidGlassRefresh();
-  scheduleExplorerScrollDiagnostic('render');
+  scheduleExplorerScrollDiagnostic(`virtual-render force=${options.force ? 1 : 0} shrink=${options.shrink ? 1 : 0} win=${nextStart}-${nextEnd}/${total}`);
 }
 
 function patchVirtualExplorerRows(options: {
@@ -23976,7 +24479,9 @@ function patchVirtualExplorerRows(options: {
   updateExplorerSpacerHeight(explorerBottomSpacer, (total - explorerRenderedEnd) * EXPLORER_ROW_HEIGHT);
   if (el.fileList.scrollTop !== nextScrollTop) el.fileList.scrollTop = nextScrollTop;
   explorerLastSelectedPath = state.explorerSelectedPath;
-  scheduleExplorerScrollDiagnostic('patch');
+  syncExplorerSemanticVerticalOverflowGuard();
+  syncExplorerSemanticHorizontalOverflowGuard();
+  scheduleExplorerScrollDiagnostic(`virtual-patch win=${nextStart}-${nextEnd}/${total}`);
   return true;
 }
 
@@ -24253,15 +24758,19 @@ function bindExplorerListEvents() {
   el.fileList.addEventListener('click', handleExplorerClick);
   el.fileList.addEventListener('dblclick', handleExplorerDoubleClick);
   getPanel('explorer').addEventListener('pointerdown', handleExplorerScrollDiagnosticPointerDown, { capture: true });
-  explorerResizeObserver = new ResizeObserver((entries) => {
-    explorerViewportHeight = Math.round(entries[0]?.contentRect.height ?? el.fileList.clientHeight);
-    scheduleExplorerVirtualRender();
-    scheduleExplorerScrollDiagnostic('resize');
+  explorerResizeObserver = new ResizeObserver(() => {
+    syncExplorerViewportGeometry('resize');
   });
   explorerResizeObserver.observe(el.fileList);
+  explorerResizeObserver.observe(getPanel('explorer'));
+  const explorerTitle = getPanel('explorer').querySelector<HTMLElement>(':scope > .panel-title');
+  if (explorerTitle) explorerResizeObserver.observe(explorerTitle);
+  explorerResizeObserver.observe(el.pathRow);
+  explorerResizeObserver.observe(el.exportList);
 }
 
 function handleExplorerScroll() {
+  syncExplorerSemanticVerticalOverflowGuard();
   markExplorerScrolling();
   scheduleExplorerVirtualRender();
   scheduleExplorerLiquidGlassScrollRender();
@@ -24270,19 +24779,320 @@ function handleExplorerScroll() {
   if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
 }
 
+function explorerHiddenHorizontalContentWidth() {
+  return Math.max(0, explorerSemanticContentRightEdge() - el.fileList.clientWidth);
+}
+
+function explorerSemanticNeedsHorizontalScroll() {
+  return explorerHiddenHorizontalContentWidth() > 0.5;
+}
+
+function explorerNativeHorizontalScrollRange() {
+  return Math.max(0, el.fileList.scrollWidth - el.fileList.clientWidth);
+}
+
+function explorerHorizontalScrollRange() {
+  return Math.ceil(Math.max(explorerNativeHorizontalScrollRange(), explorerHiddenHorizontalContentWidth()));
+}
+
+function syncExplorerHorizontalScrollbar() {
+  // Native file-list scrolling owns horizontal movement again. This remains as
+  // a stable call-site hook for resize/render paths that used to position the
+  // removed glass-attached custom rail.
+}
+
+function explorerSemanticContentHeight() {
+  return explorerVisibleRows.length * EXPLORER_ROW_HEIGHT;
+}
+
+function explorerRowsHideFileSizesForWidth() {
+  const explorer = el.fileList.closest<HTMLElement>('.explorer');
+  return state.showFileSizes !== true || (explorer?.getBoundingClientRect().width ?? 9999) <= 230;
+}
+
+function explorerMeasureTextWidth(text: string, font: string) {
+  if (!text) return 0;
+  if (!explorerMeasureCanvas) explorerMeasureCanvas = document.createElement('canvas');
+  explorerMeasureContext = explorerMeasureContext ?? explorerMeasureCanvas.getContext('2d');
+  if (!explorerMeasureContext) return text.length * 7;
+  explorerMeasureContext.font = font;
+  return explorerMeasureContext.measureText(text).width;
+}
+
+function explorerMeasurementFont() {
+  const style = getComputedStyle(el.fileList);
+  if (style.font) return style.font;
+  return [
+    style.fontStyle || 'normal',
+    style.fontVariant || 'normal',
+    style.fontWeight || '400',
+    style.fontSize || '13px',
+    style.fontFamily || 'system-ui'
+  ].join(' ');
+}
+
+function ensureExplorerMeasureRow() {
+  if (!explorerMeasureHost) {
+    explorerMeasureHost = document.createElement('div');
+    explorerMeasureHost.setAttribute('aria-hidden', 'true');
+    explorerMeasureHost.setAttribute('data-liquid-ignore', '');
+    explorerMeasureHost.style.position = 'fixed';
+    explorerMeasureHost.style.left = '-10000px';
+    explorerMeasureHost.style.top = '-10000px';
+    explorerMeasureHost.style.visibility = 'hidden';
+    explorerMeasureHost.style.pointerEvents = 'none';
+    explorerMeasureHost.style.zIndex = '-1';
+    explorerMeasureHost.style.contain = 'layout style';
+    document.body.append(explorerMeasureHost);
+  }
+  if (!explorerMeasureRow) {
+    explorerMeasureRow = document.createElement('div');
+    explorerMeasureRow.className = 'file-row';
+    explorerMeasureRow.style.position = 'relative';
+    explorerMeasureRow.style.width = 'max-content';
+    explorerMeasureRow.style.minWidth = 'max-content';
+    explorerMeasureRow.style.contain = 'none';
+    explorerMeasureRow.style.pointerEvents = 'none';
+    explorerMeasureDisclosure = document.createElement('span');
+    explorerMeasureDisclosure.className = 'file-disclosure';
+    explorerMeasureName = document.createElement('span');
+    explorerMeasureName.className = 'file-name';
+    explorerMeasureName.style.overflow = 'visible';
+    explorerMeasureName.style.textOverflow = 'clip';
+    explorerMeasureName.style.whiteSpace = 'nowrap';
+    explorerMeasureName.style.minWidth = 'max-content';
+    explorerMeasureSize = document.createElement('small');
+    explorerMeasureRow.append(explorerMeasureDisclosure, explorerMeasureName, explorerMeasureSize);
+    explorerMeasureHost.append(explorerMeasureRow);
+  }
+  if (explorerMeasureRow.parentElement !== explorerMeasureHost) explorerMeasureHost.append(explorerMeasureRow);
+  return {
+    row: explorerMeasureRow,
+    disclosure: explorerMeasureDisclosure!,
+    name: explorerMeasureName!,
+    size: explorerMeasureSize!
+  };
+}
+
+function pruneExplorerRowWidthMeasureCache() {
+  if (explorerRowWidthMeasureCache.size <= 2000) return;
+  const excess = explorerRowWidthMeasureCache.size - 1600;
+  let removed = 0;
+  for (const key of explorerRowWidthMeasureCache.keys()) {
+    explorerRowWidthMeasureCache.delete(key);
+    removed += 1;
+    if (removed >= excess) break;
+  }
+}
+
+function measureExplorerRowContentWidth(rowInfo: ExplorerVisibleRow, hideSizes: boolean, font: string) {
+  const cacheKey = `${hideSizes ? 'h' : 's'}\t${font}\t${rowInfo.staticSignature}`;
+  const cached = explorerRowWidthMeasureCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const parts = ensureExplorerMeasureRow();
+  const entry = rowInfo.entry;
+  parts.row.className = `file-row ${entry?.kind ?? 'loading'}`;
+  parts.row.style.setProperty('--depth', String(rowInfo.depth));
+  parts.row.style.gridTemplateColumns = hideSizes ? '20px max-content' : '22px max-content max-content';
+  parts.row.style.gap = hideSizes ? '5px' : '6px';
+  parts.disclosure.textContent = rowInfo.disclosureText;
+  parts.name.textContent = entry?.name ?? 'Loading...';
+  parts.size.textContent = hideSizes ? '' : rowInfo.sizeText;
+  parts.size.style.display = hideSizes ? 'none' : '';
+  const measured = Math.ceil(parts.row.getBoundingClientRect().width);
+  const fallback = calculateExplorerSemanticRowWidthFallback(rowInfo, hideSizes, font);
+  const width = Math.max(measured, fallback);
+  explorerRowWidthMeasureCache.set(cacheKey, width);
+  pruneExplorerRowWidthMeasureCache();
+  return width;
+}
+
+function calculateExplorerSemanticRowWidthFallback(row: ExplorerVisibleRow, hideSizes: boolean, font: string) {
+  const entry = row.entry;
+  const nameText = entry?.name ?? 'Loading...';
+  const sizeText = hideSizes ? '' : row.sizeText;
+  const depthPadding = 7 + row.depth * 14;
+  const disclosureWidth = hideSizes ? 20 : 22;
+  const gapWidth = hideSizes ? 5 : 6;
+  const baseWidth = depthPadding + disclosureWidth + gapWidth + 7;
+  const sizeWidth = hideSizes ? 0 : gapWidth + explorerMeasureTextWidth(sizeText, font);
+  return Math.ceil(baseWidth + explorerMeasureTextWidth(nameText, font) + sizeWidth + 8);
+}
+
+function calculateExplorerSemanticContentWidth() {
+  if (!explorerVisibleRows.length) return 0;
+  const font = explorerMeasurementFont();
+  const hideSizes = explorerRowsHideFileSizesForWidth();
+  let widest = 0;
+  for (const row of explorerVisibleRows) {
+    widest = Math.max(widest, measureExplorerRowContentWidth(row, hideSizes, font));
+  }
+  return widest;
+}
+
+function updateExplorerSemanticContentWidth() {
+  const nextWidth = calculateExplorerSemanticContentWidth();
+  if (Math.abs(nextWidth - explorerSemanticContentWidth) < 1) return;
+  explorerSemanticContentWidth = nextWidth;
+  const value = nextWidth > 0 ? `${nextWidth}px` : '';
+  if (value) el.fileList.style.setProperty('--explorer-content-width', value);
+  else el.fileList.style.removeProperty('--explorer-content-width');
+}
+
+function syncExplorerTitleOverflowGap() {
+  const panel = getPanel('explorer');
+  const title = panel.querySelector<HTMLElement>(':scope > .panel-title');
+  const active = appGlassEnabled()
+    && panel.classList.contains('app-glass-active-shell')
+    && !panel.classList.contains('hidden')
+    && title instanceof HTMLElement;
+  if (!active || !title) {
+    if (explorerTitleOverflowGap !== 0) explorerTitleOverflowGap = 0;
+    if (panel.style.getPropertyValue('--explorer-title-overflow-bottom')) {
+      panel.style.removeProperty('--explorer-title-overflow-bottom');
+      return true;
+    }
+    return false;
+  }
+
+  const titleRect = title.getBoundingClientRect();
+  if (titleRect.height <= 0) return false;
+  let visualBottom = titleRect.bottom;
+  for (const child of Array.from(title.children)) {
+    if (!(child instanceof HTMLElement)) continue;
+    const style = getComputedStyle(child);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const rect = child.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    visualBottom = Math.max(visualBottom, rect.bottom);
+  }
+  const nextGap = Math.max(0, Math.ceil(visualBottom - titleRect.bottom + 2));
+  if (Math.abs(nextGap - explorerTitleOverflowGap) < 1) return false;
+  explorerTitleOverflowGap = nextGap;
+  if (nextGap > 0) panel.style.setProperty('--explorer-title-overflow-bottom', `${nextGap}px`);
+  else panel.style.removeProperty('--explorer-title-overflow-bottom');
+  return true;
+}
+
+function syncExplorerFileListViewportHeight() {
+  const panel = getPanel('explorer');
+  const active = appGlassEnabled()
+    && panel.classList.contains('app-glass-active-shell')
+    && !panel.classList.contains('hidden');
+  if (!active) {
+    if (explorerFileListViewportHeight !== 0) explorerFileListViewportHeight = 0;
+    if (el.fileList.style.getPropertyValue('--explorer-file-list-height')) {
+      el.fileList.style.removeProperty('--explorer-file-list-height');
+      return true;
+    }
+    return false;
+  }
+
+  const panelRect = panel.getBoundingClientRect();
+  const listRect = el.fileList.getBoundingClientRect();
+  if (panelRect.height <= 0 || listRect.height <= 0) return false;
+  const panelStyle = getComputedStyle(panel);
+  const listStyle = getComputedStyle(el.fileList);
+  const bottomInset = (Number.parseFloat(panelStyle.borderBottomWidth) || 0)
+    + (Number.parseFloat(listStyle.marginBottom) || 0);
+  const nextHeight = Math.max(
+    EXPLORER_ROW_HEIGHT * 2,
+    Math.floor(panelRect.bottom - listRect.top - bottomInset)
+  );
+  if (Math.abs(nextHeight - explorerFileListViewportHeight) < 1) return false;
+  explorerFileListViewportHeight = nextHeight;
+  el.fileList.style.setProperty('--explorer-file-list-height', `${nextHeight}px`);
+  return true;
+}
+
+function syncExplorerViewportGeometry(reason: string) {
+  const previousHeight = explorerViewportHeight;
+  const titleGapChanged = syncExplorerTitleOverflowGap();
+  const heightChanged = syncExplorerFileListViewportHeight() || titleGapChanged;
+  explorerViewportHeight = Math.round(el.fileList.clientHeight);
+  updateExplorerSemanticContentWidth();
+  syncExplorerSemanticVerticalOverflowGuard();
+  syncExplorerSemanticHorizontalOverflowGuard();
+  syncExplorerHorizontalScrollbar();
+  scheduleExplorerVirtualRender();
+  scheduleExplorerScrollDiagnostic(
+    heightChanged
+      ? `${reason} vh=${previousHeight}->${explorerViewportHeight} snapH=${explorerFileListViewportHeight}`
+      : `${reason} vh=${previousHeight}->${explorerViewportHeight}`
+  );
+}
+
+function explorerSemanticNeedsVerticalScroll() {
+  return explorerSemanticContentHeight() > el.fileList.clientHeight + 1;
+}
+
+function explorerFileListLeftPadding() {
+  const style = getComputedStyle(el.fileList);
+  return Number.parseFloat(style.paddingLeft) || 0;
+}
+
+function explorerSemanticContentRightEdge() {
+  return explorerFileListLeftPadding() + explorerSemanticContentWidth;
+}
+
+function explorerHasHorizontalOverflow(contentWidth: number, clientWidth: number) {
+  return Math.ceil(contentWidth) > Math.floor(clientWidth);
+}
+
+function explorerRowsGlassActiveForScrollGuard() {
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  return appGlassEnabled()
+    && glass.explorerRows === true
+    && !getPanel('explorer').classList.contains('hidden');
+}
+
+function explorerGlassActiveForHorizontalScroll() {
+  const panel = getPanel('explorer');
+  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  return appGlassEnabled()
+    && (panel.classList.contains('app-glass-active-shell') || glass.explorerRows === true)
+    && !panel.classList.contains('hidden');
+}
+
+function syncExplorerSemanticVerticalOverflowGuard() {
+  const active = explorerRowsGlassActiveForScrollGuard();
+  const needsVerticalScroll = explorerSemanticNeedsVerticalScroll();
+  toggleClassIfChanged(el.fileList, 'explorer-semantic-no-y-scroll', active && !needsVerticalScroll);
+  if (active && !needsVerticalScroll && el.fileList.scrollTop !== 0) {
+    el.fileList.scrollTop = 0;
+  }
+}
+
+function syncExplorerSemanticHorizontalOverflowGuard() {
+  const active = explorerGlassActiveForHorizontalScroll();
+  const needsHorizontalScroll = explorerSemanticNeedsHorizontalScroll();
+  if (!active) {
+    const changed = toggleClassIfChanged(el.fileList, 'explorer-semantic-x-scroll', false);
+    if (changed) scheduleExplorerScrollDiagnostic('x-guard inactive');
+    return;
+  }
+  const changed = toggleClassIfChanged(el.fileList, 'explorer-semantic-x-scroll', needsHorizontalScroll);
+  if (changed) scheduleExplorerScrollDiagnostic(`x-guard active=1 needs=${needsHorizontalScroll ? 1 : 0}`);
+}
+
 function explorerScrollDiagnosticsEnabled() {
   return state.ideSettings.appGlass?.diagnostics === true || state.ideSettings.debugLogEnabled === true;
 }
 
 function scheduleExplorerScrollDiagnostic(reason: string) {
   if (!explorerScrollDiagnosticsEnabled()) return;
+  explorerScrollDiagnosticPendingReasons.add(reason);
   if (explorerScrollDiagnosticFrame) return;
   explorerScrollDiagnosticFrame = window.requestAnimationFrame(() => {
     explorerScrollDiagnosticFrame = 0;
+    const reasons = Array.from(explorerScrollDiagnosticPendingReasons);
+    explorerScrollDiagnosticPendingReasons.clear();
+    const reasonText = reasons.length ? reasons.join('|') : reason;
     const now = Date.now();
-    if (reason === 'scroll' && now - explorerScrollDiagnosticLastAt < 350) return;
+    if (reasons.length === 1 && reasons[0] === 'scroll' && now - explorerScrollDiagnosticLastAt < 350) return;
     explorerScrollDiagnosticLastAt = now;
-    appendExplorerScrollDiagnostic(reason);
+    appendExplorerScrollDiagnostic(reasonText);
   });
 }
 
@@ -24305,25 +25115,121 @@ function appendExplorerScrollDiagnostic(reason: string) {
   const listRect = fileList.getBoundingClientRect();
   const panelRect = panel.getBoundingClientRect();
   const style = getComputedStyle(fileList);
+  const panelStyle = getComputedStyle(panel);
+  const titleEl = panel.querySelector<HTMLElement>(':scope > .panel-title');
+  const titleRect = titleEl?.getBoundingClientRect();
+  const pathRect = el.pathRow.getBoundingClientRect();
+  const exportRect = el.exportList.getBoundingClientRect();
+  const rowElements = Array.from(fileList.querySelectorAll<HTMLElement>(':scope > .file-row'));
+  const firstRow = rowElements[0] ?? null;
+  const firstRowStyle = firstRow ? getComputedStyle(firstRow) : null;
+  const firstName = firstRow?.querySelector<HTMLElement>(':scope > .file-name') ?? null;
+  const firstNameRect = firstName?.getBoundingClientRect();
+  let widestRowRectWidth = 0;
+  let widestRowScrollWidth = 0;
+  for (const row of rowElements) {
+    widestRowRectWidth = Math.max(widestRowRectWidth, Math.round(row.getBoundingClientRect().width));
+    widestRowScrollWidth = Math.max(widestRowScrollWidth, row.scrollWidth);
+  }
   const southGrip = panel.querySelector<HTMLElement>(':scope > .panel-resize-south');
   const eastGrip = panel.querySelector<HTMLElement>(':scope > .panel-resize-east');
   const southeastGrip = panel.querySelector<HTMLElement>(':scope > .panel-resize-southeast');
+  const contentHeight = explorerSemanticContentHeight();
+  const topSpacerHeight = Math.round(explorerTopSpacer.getBoundingClientRect().height);
+  const bottomSpacerHeight = Math.round(explorerBottomSpacer.getBoundingClientRect().height);
+  const expectedScrollY = contentHeight > fileList.clientHeight + 1 ? 1 : 0;
+  const nativeScrollY = fileList.scrollHeight > fileList.clientHeight + 1 ? 1 : 0;
+  const actualScrollY = style.overflowY === 'hidden' ? 0 : nativeScrollY;
+  const horizontalScrollbarHeight = Math.max(0, fileList.offsetHeight - fileList.clientHeight);
+  const contentRightWidth = explorerSemanticContentRightEdge();
+  const hiddenContentX = Math.max(0, contentRightWidth - fileList.clientWidth);
+  const horizontalRange = explorerHorizontalScrollRange();
+  const nativeHorizontalRange = explorerNativeHorizontalScrollRange();
+  const nativeScrollX = explorerHasHorizontalOverflow(fileList.scrollWidth, fileList.clientWidth) ? 1 : 0;
+  const expectedScrollX = hiddenContentX > 0.5 ? 1 : 0;
+  const actualScrollX = style.overflowX === 'hidden' ? 0 : nativeScrollX;
+  const metrics: Record<string, string | number> = {
+    st: Math.round(fileList.scrollTop),
+    sl: Math.round(fileList.scrollLeft),
+    cw: fileList.clientWidth,
+    sw: fileList.scrollWidth,
+    ch: fileList.clientHeight,
+    sh: fileList.scrollHeight,
+    vh: explorerViewportHeight,
+    rows: explorerVisibleRows.length,
+    win: `${explorerRenderedStart}-${explorerRenderedEnd}/${explorerRenderedTotal}`,
+    child: fileList.childElementCount,
+    rowH: EXPLORER_ROW_HEIGHT,
+    contentH: contentHeight,
+    contentW: explorerSemanticContentWidth,
+    contentOuterW: Math.round(explorerSemanticContentRightEdge()),
+    hiddenContentX: Math.round(hiddenContentX),
+    hBar: horizontalScrollbarHeight,
+    xOff: Math.round(fileList.scrollLeft),
+    xMax: Math.round(horizontalRange),
+    nativeXMax: Math.round(nativeHorizontalRange),
+    expectedX: expectedScrollX,
+    actualX: actualScrollX,
+    nativeX: nativeScrollX,
+    guardX: fileList.classList.contains('explorer-semantic-x-scroll') ? 1 : 0,
+    railX: 0,
+    snapH: explorerFileListViewportHeight,
+    topH: topSpacerHeight,
+    bottomH: bottomSpacerHeight,
+    extraH: fileList.scrollHeight - contentHeight,
+    expectedY: expectedScrollY,
+    actualY: actualScrollY,
+    nativeY: nativeScrollY,
+    guardY: fileList.classList.contains('explorer-semantic-no-y-scroll') ? 1 : 0,
+    glassX: explorerGlassActiveForHorizontalScroll() ? 1 : 0,
+    rowGlass: explorerRowsGlassActiveForScrollGuard() ? 1 : 0,
+    panelGlass: panel.classList.contains('app-glass-active-shell') ? 1 : 0,
+    panelH: Math.round(panelRect.height),
+    panelW: Math.round(panelRect.width),
+    listH: Math.round(listRect.height),
+    listW: Math.round(listRect.width),
+    bottomGap: Math.round(panelRect.bottom - listRect.bottom),
+    titleH: Math.round(titleRect?.height ?? 0),
+    titleGap: explorerTitleOverflowGap,
+    pathH: el.pathRow.classList.contains('hidden') ? 0 : Math.round(pathRect.height),
+    exportH: el.exportList.classList.contains('hidden') ? 0 : Math.round(exportRect.height),
+    firstRowW: Math.round(firstRow?.getBoundingClientRect().width ?? 0),
+    firstRowSW: firstRow?.scrollWidth ?? 0,
+    maxRowW: widestRowRectWidth,
+    maxRowSW: widestRowScrollWidth,
+    nameW: Math.round(firstNameRect?.width ?? 0),
+    nameSW: firstName?.scrollWidth ?? 0,
+    contentVar: style.getPropertyValue('--explorer-content-width').trim() || 'none',
+    cssH: style.height,
+    cssW: style.width,
+    minH: style.minHeight,
+    minW: style.minWidth,
+    maxH: style.maxHeight,
+    offsetW: fileList.offsetWidth,
+    offsetH: fileList.offsetHeight,
+    gutter: style.getPropertyValue('scrollbar-gutter') || 'n/a',
+    gridRows: panelStyle.gridTemplateRows,
+    rowMinW: firstRowStyle?.minWidth ?? 'none',
+    rowWidth: firstRowStyle?.width ?? 'none',
+    rowGrid: firstRowStyle?.gridTemplateColumns ?? 'none',
+    box: style.boxSizing
+  };
+  const changed = explorerScrollDiagnosticChangedFields(metrics);
+  explorerScrollDiagnosticLastMetrics = metrics;
   appendDiagnosticLog(
     'explorer-scroll',
     [
       `reason=${sanitizeDiagnosticLogPart(reason, 80)}`,
-      `st=${Math.round(fileList.scrollTop)}`,
-      `sl=${Math.round(fileList.scrollLeft)}`,
-      `cw=${fileList.clientWidth}`,
-      `sw=${fileList.scrollWidth}`,
-      `ch=${fileList.clientHeight}`,
-      `sh=${fileList.scrollHeight}`,
-      `vh=${explorerViewportHeight}`,
-      `rows=${explorerVisibleRows.length}`,
-      `win=${explorerRenderedStart}-${explorerRenderedEnd}/${explorerRenderedTotal}`,
+      ...Object.entries(metrics).map(([key, value]) => `${key}=${sanitizeDiagnosticLogPart(String(value), 80)}`),
+      `changed=${changed}`,
       `pad=${style.paddingTop}/${style.paddingRight}/${style.paddingBottom}/${style.paddingLeft}`,
       `overflow=${style.overflowX}/${style.overflowY}`,
+      `classes=${sanitizeDiagnosticLogPart(fileList.className, 120)}`,
       `list=${rectDiagnostic(listRect, panelRect)}`,
+      `title=${titleRect ? rectDiagnostic(titleRect, panelRect) : 'none'}`,
+      `path=${rectDiagnostic(pathRect, panelRect)}`,
+      `export=${rectDiagnostic(exportRect, panelRect)}`,
+      `first=${firstRow ? rectDiagnostic(firstRow.getBoundingClientRect(), panelRect) : 'none'}`,
       `south=${elementRectDiagnostic(southGrip, panelRect)}`,
       `east=${elementRectDiagnostic(eastGrip, panelRect)}`,
       `se=${elementRectDiagnostic(southeastGrip, panelRect)}`
@@ -24331,6 +25237,18 @@ function appendExplorerScrollDiagnostic(reason: string) {
     'info',
     { force: state.ideSettings.appGlass?.diagnostics === true }
   );
+}
+
+function explorerScrollDiagnosticChangedFields(metrics: Record<string, string | number>) {
+  if (!explorerScrollDiagnosticLastMetrics) return 'initial';
+  const changed: string[] = [];
+  for (const [key, value] of Object.entries(metrics)) {
+    const previous = explorerScrollDiagnosticLastMetrics[key];
+    if (previous === value) continue;
+    changed.push(`${key}:${sanitizeDiagnosticLogPart(String(previous), 36)}->${sanitizeDiagnosticLogPart(String(value), 36)}`);
+    if (changed.length >= 10) break;
+  }
+  return changed.length ? changed.join(',') : 'none';
 }
 
 function elementRectDiagnostic(element: HTMLElement | null, origin: DOMRect) {
@@ -25598,6 +26516,7 @@ async function refreshExplorerDirectory(
   if (renderOnlyIfChanged && previous === signature) return;
 
   if (path === state.currentDir) {
+    scheduleExplorerScrollDiagnostic(`refresh-current entries=${entries.length} force=${force ? 1 : 0}`);
     state.entries = entries;
     markExplorerEntryLookupDirty();
     state.explorerSignatures.set(path, signature);
@@ -25611,6 +26530,7 @@ async function refreshExplorerDirectory(
   state.explorerSignatures.set(path, signature);
   state.explorerExpanded.add(path);
   restoreExplorerSelection(selected, selectedPaths, selectionAnchor);
+  scheduleExplorerScrollDiagnostic(`refresh-child entries=${entries.length} force=${force ? 1 : 0}`);
   renderExplorer();
 }
 
@@ -25761,8 +26681,10 @@ async function pollExplorerDirectories(options: { manual?: boolean } = {}) {
       restoreExplorerSelection(previousSelection, previousSelectedPaths, previousSelectionAnchor);
       if (!options.manual && shouldPauseExplorerBackgroundWork()) {
         explorerRenderDirty = true;
+        scheduleExplorerScrollDiagnostic(`watch-changed-deferred paths=${pathsNeedingListings.length}`);
         return changed;
       }
+      scheduleExplorerScrollDiagnostic(`watch-changed manual=${options.manual ? 1 : 0} paths=${pathsNeedingListings.length}`);
       renderExplorer();
     }
   } finally {
@@ -25984,7 +26906,7 @@ function setExplorerSelection(paths: Iterable<string>, activePath = '', anchorPa
 
 function maybeAutoOpenExplorerSelection() {
   if (explorerAutoOpenSuppressed) return;
-  if (!state.explorerAutoOpenEditor || state.explorerOpenMode === 'single') return;
+  if (state.explorerOpenMode === 'single') return;
   if (state.explorerSelectedPaths.size > 1) return;
   const entry = findExplorerEntry(state.explorerSelectedPath);
   if (!entry || entry.kind !== 'file' || isWindowsExecutablePath(entry.path)) return;
@@ -26349,16 +27271,6 @@ function updateExplorerOpenMode() {
   el.explorerOpenModeToggle.title = single ? 'Single click opens items' : 'Double click opens items';
   el.explorerOpenModeToggle.classList.toggle('active', !single);
   el.explorerOpenModeToggle.setAttribute('aria-pressed', String(!single));
-}
-
-function updateExplorerAutoEditorToggle() {
-  const enabled = state.explorerAutoOpenEditor;
-  el.explorerAutoEditorToggle.classList.toggle('active', enabled);
-  el.explorerAutoEditorToggle.setAttribute('aria-pressed', String(enabled));
-  el.explorerAutoEditorToggle.textContent = enabled ? 'Auto Edit: on' : 'Auto Edit';
-  el.explorerAutoEditorToggle.title = enabled
-    ? 'Selecting a file opens the Editor automatically'
-    : 'Do not auto-open the Editor when selecting files';
 }
 
 async function goToParentDirectory() {
