@@ -13,7 +13,7 @@ import './styles.css';
 import bundledGlassThemeSettings from '../theme/glass_set_01.json';
 import bundledGlassThemeBackgroundUrl from '../theme/glass_bg_01.jpg?url';
 import { api } from './api';
-import type { AgentAlertDelayedResultEvent, AgentAlertResult, AgentBridgeEvent, AgentBridgeInfo, BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxSession, PortForwardResult, RendererHeartbeatResponse, RendererRecoveryNotice, SnippetItem, SnippetsStore, SnippetTab, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
+import type { AgentAlertDelayedResultEvent, AgentAlertResult, AgentBridgeEvent, AgentBridgeInfo, BrowserWebviewPageLoadEvent, ConnectionProfile, DeletedPathItem, DirectoryListingResult, EdgeDevtoolsSession, ExportJobStatus, ExportProgressEvent, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxSession, LlmTmuxSessionListResult, PortForwardResult, RendererHeartbeatResponse, RendererRecoveryNotice, SnippetItem, SnippetsStore, SnippetTab, SshAuthPromptEvent, TerminalCursorQueryEvent, TerminalDataEvent, TerminalExitEvent } from './types';
 import { configurePrivacyPolicy, parseSecretLines, serializeSecretLines, shouldMaskFile, type SecretLine } from './privacyPolicy';
 
 declare const __SVIDE_BUILD_ID__: string;
@@ -1403,6 +1403,10 @@ type ContextMenuItem = {
   danger?: boolean;
   separator?: boolean;
 };
+type LlmTmuxSessionMenuCacheEntry = {
+  result: LlmTmuxSessionListResult;
+  updatedAt: number;
+};
 type WorkspaceDropTarget = { targetId: string; position: 'before' | 'after' };
 
 interface AgentSessionProgress {
@@ -1660,6 +1664,7 @@ const TERMINAL_RENDER_WATCHDOG_MS = 420;
 const TERMINAL_RENDER_WATCHDOG_STALE_RAF_MS = 500;
 const TERMINAL_RENDER_REFRESH_MIN_MS = 260;
 const TERMINAL_GROK_RENDER_REFRESH_MIN_MS = 80;
+const LLM_TMUX_SESSION_MENU_CACHE_LIMIT = 64;
 const TERMINAL_TMUX_FREEZE_PROBE_INTERVAL_MS = 12_000;
 const TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS = 150;
 const TERMINAL_TMUX_FREEZE_PROBE_MIN_LOG_MS = 20_000;
@@ -3595,6 +3600,8 @@ let keyboardResizeTargetWidgetElement: HTMLElement | null = null;
 let widgetOpacityPopoverTarget: WidgetOpacityTarget | null = null;
 let widgetOpacityPopoverDirty = false;
 let terminalTextTarget: TerminalTextTarget = 'shell';
+let llmTmuxSessionMenuToken = 0;
+const llmTmuxSessionMenuCache = new Map<string, LlmTmuxSessionMenuCacheEntry>();
 const DEFAULT_EDITOR_FONT_SIZE = 13;
 const DEFAULT_TERMINAL_FONT_SIZE = 13;
 const DEFAULT_NOTE_FONT_SIZE = 14;
@@ -17650,7 +17657,8 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     await restoreNoteTabs(snapshot);
     restoreBrowserState(snapshot);
 
-    if (!hasLiveTerminals) {
+    const hasTerminalSnapshots = (snapshot.terminals ?? []).length > 0;
+    if (!hasLiveTerminals && hasTerminalSnapshots) {
       scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken, {
         loadExplorerAfterFirstReady: waitForExplorerShellReady && !explorerRuntimeRestored && isPanelVisible('explorer'),
         loadExplorerPath: state.currentDir
@@ -17658,7 +17666,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     }
     refreshTitle();
     finishWorkspaceCaptureProtectionAfterReveal(snapshot);
-    if (hasLiveTerminals || workspaceHasRunningTerminalBackend(snapshot.id)) {
+    if (hasLiveTerminals || workspaceHasRunningTerminalBackend(snapshot.id) || !hasTerminalSnapshots) {
       setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}`);
     } else {
       setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} restoring: ${snapshot.label} (starting shells)`);
@@ -17734,9 +17742,13 @@ async function restoreWorkspaceTerminals(
   if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
   showTerminalWidgetsForWorkspace(snapshot.id);
   if (!hasActiveWorkspaceTerminalPane()) {
-    const terminalSnapshots = (snapshot.terminals ?? []).length
-      ? snapshot.terminals
-      : [{ title: 'shell', command: null, rect: undefined }];
+    const terminalSnapshots = snapshot.terminals ?? [];
+    if (!terminalSnapshots.length) {
+      state.activePaneId = '';
+      syncActivePaneClass();
+      renderShellTabs();
+      return;
+    }
     const widgetsBySnapshotId = new Map<string, TerminalWidget>();
     const paneIdBySnapshotPaneId = new Map<string, string>();
     let queuedExplorerLoadAfterReady = false;
@@ -20686,6 +20698,7 @@ function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
 
 function showContextMenu(x: number, y: number, items: ContextMenuItem[]) {
   el.contextMenu.innerHTML = '';
+  delete el.contextMenu.dataset.llmTmuxMenuToken;
   for (const item of items) {
     if (item.separator) {
       const separator = document.createElement('div');
@@ -23064,8 +23077,6 @@ async function switchWorkspace(path: string) {
     deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
     setWorkspaceOpen(true, { deferExplorerWatch: true });
     revealWorkspaceOpenSurface();
-    const widget = await createTerminal(null, 'shell', { cwd: path });
-    if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
     loadWorkspaceDirectoryInBackground(path, profile.id, state.activeWorkspaceId);
     saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
     return;
@@ -23075,22 +23086,16 @@ async function switchWorkspace(path: string) {
     deferExplorerDirectoryRestore(path, profile.id, state.activeWorkspaceId);
     setWorkspaceOpen(true, { deferExplorerWatch: true });
     revealWorkspaceOpenSurface();
-    const widget = await createTerminal(null, 'shell', { cwd: path });
-    if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
-    const pane = widget ? activePaneForWidget(widget) : null;
-    if (pane?.backendId) {
-      queueWorkspaceDirectoryLoadAfterShellReady(pane, path, profile);
-    } else {
-      setStatus(`${profile.kind.toUpperCase()} shell did not start; workspace files were not loaded`, true);
-    }
     saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
     return;
   }
   await openWorkspace(path);
   setWorkspaceOpen(true);
   revealWorkspaceOpenSurface();
-  const widget = await createTerminal(null, 'shell', { cwd: path });
-  if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
+  if (IS_TERMINAL_APP) {
+    const widget = await createTerminal(null, 'shell', { cwd: path });
+    if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
+  }
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
 }
 
@@ -27967,6 +27972,10 @@ function activateEditorTab(id: string) {
 }
 
 function closeEditorTab(id: string) {
+  if (isOnlyEmptyEditorTab(id)) {
+    setPanelVisible('editor', false);
+    return;
+  }
   syncActiveEditorTabFromView();
   if (editorTabIndexById(id) < 0) return;
   const pane = editorPaneForTabId(id);
@@ -28006,6 +28015,18 @@ function closeEditorTab(id: string) {
   renderEditorTabs();
   renderEditor();
   saveActiveWorkspaceSnapshot();
+}
+
+function isOnlyEmptyEditorTab(id: string) {
+  const tab = editorTabForId(id);
+  return Boolean(
+    tab
+    && tab.id === id
+    && state.editorTabs.length === 1
+    && !tab.file
+    && !tab.pendingPath
+    && !tab.loading
+  );
 }
 
 function renderEditorTabs(paneId?: string) {
@@ -28529,6 +28550,10 @@ function activateImageTab(id: string) {
 }
 
 function closeImageTab(id: string) {
+  if (isOnlyEmptyImageTab(id)) {
+    setPanelVisible('image', false);
+    return;
+  }
   syncActiveImageTabFromState();
   const index = imageTabIndexById(id);
   if (index < 0) return;
@@ -28546,6 +28571,17 @@ function closeImageTab(id: string) {
   renderImagePreview();
   renderImageHistory();
   saveActiveWorkspaceSnapshot();
+}
+
+function isOnlyEmptyImageTab(id: string) {
+  const tab = imageTabForId(id);
+  return Boolean(
+    tab
+    && tab.id === id
+    && state.imageTabs.length === 1
+    && !tab.sourcePath
+    && !tab.dataUrl
+  );
 }
 
 function renderImageTabs() {
@@ -31438,8 +31474,10 @@ async function createLlmTmuxTabInWidget(
   if (!profile) return null;
   const active = activePaneForWidget(widget);
   const cwd = active?.cwd ?? workspaceShellCwd();
-  const tmuxSessionName = safeLlmTmuxSessionName(options.sessionName)
+  const requestedSessionName = safeLlmTmuxSessionName(options.sessionName);
+  const tmuxSessionName = requestedSessionName
     ?? await nextLlmTmuxSessionName(profile, cwd, widget.workspaceId, llmId);
+  if (!requestedSessionName) invalidateLlmTmuxSessionMenuCache(profile.id, cwd, widget.workspaceId, llmId);
   const agentBridge = await prepareAgentBridgeForLlmLaunch(llmId, profile, cwd);
   const { define, call } = llmLauncherParts(llmId, profile.kind, widget.workspaceId, tmuxSessionName, { agentBridge });
   const title = options.title ?? llmTmuxTabTitle(llmId, tmuxSessionName);
@@ -31472,49 +31510,130 @@ async function showLlmTmuxSessionMenu(widget: TerminalWidget, anchor: HTMLElemen
   if (!llmId || !profile || profile.kind === 'windows') return;
   const active = activePaneForWidget(widget);
   const cwd = active?.cwd ?? workspaceShellCwd();
-  const rect = anchor.getBoundingClientRect();
   const agent = agentAlertAgentLabel(llmId);
-  setStatus(`Loading ${agent} tmux sessions...`);
-  const items: ContextMenuItem[] = [
+  const token = ++llmTmuxSessionMenuToken;
+  const cacheKey = llmTmuxSessionMenuCacheKey(profile.id, cwd, widget.workspaceId, llmId);
+  const cached = llmTmuxSessionMenuCache.get(cacheKey)?.result;
+  if (cached) {
+    showLlmTmuxSessionMenuItems(anchor, token, llmTmuxSessionMenuItemsFromResult(widget, llmId, profile, cwd, cached));
+    setStatus(`Refreshing ${agent} tmux sessions...`);
+  } else {
+    showLlmTmuxSessionMenuItems(anchor, token, [
+      ...baseLlmTmuxSessionMenuItems(widget, llmId, agent),
+      { separator: true },
+      { label: 'Loading existing tmux sessions...', disabled: true }
+    ]);
+    setStatus(`Loading ${agent} tmux sessions...`);
+  }
+  try {
+    const result = await api.listLlmTmuxSessions(profile.id, cwd, widget.workspaceId, llmId);
+    setLlmTmuxSessionMenuCache(cacheKey, result);
+    if (!isCurrentLlmTmuxSessionMenu(token)) return;
+    showLlmTmuxSessionMenuItems(anchor, token, llmTmuxSessionMenuItemsFromResult(widget, llmId, profile, cwd, result));
+    if (result.available) setStatus(`Loaded ${result.sessions.length} ${agent} tmux session${result.sessions.length === 1 ? '' : 's'}`);
+    else setStatus(result.message || `tmux is not available for ${agent}`, true);
+  } catch (error) {
+    if (!isCurrentLlmTmuxSessionMenu(token)) return;
+    showLlmTmuxSessionMenuItems(anchor, token, [
+      ...baseLlmTmuxSessionMenuItems(widget, llmId, agent),
+      { separator: true },
+      { label: `Failed to list tmux sessions: ${String(error)}`, disabled: true }
+    ]);
+    setStatus(`Failed to list ${agent} tmux sessions: ${String(error)}`, true);
+  }
+}
+
+function llmTmuxSessionMenuCacheKey(profileId: string, cwd: string, workspaceId: string, llmId: string) {
+  return `${profileId}\0${cwd}\0${workspaceId}\0${llmId}`;
+}
+
+function setLlmTmuxSessionMenuCache(key: string, result: LlmTmuxSessionListResult) {
+  llmTmuxSessionMenuCache.set(key, { result, updatedAt: Date.now() });
+  if (llmTmuxSessionMenuCache.size <= LLM_TMUX_SESSION_MENU_CACHE_LIMIT) return;
+  const oldest = [...llmTmuxSessionMenuCache.entries()]
+    .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+    .slice(0, llmTmuxSessionMenuCache.size - LLM_TMUX_SESSION_MENU_CACHE_LIMIT);
+  for (const [oldKey] of oldest) llmTmuxSessionMenuCache.delete(oldKey);
+}
+
+function invalidateLlmTmuxSessionMenuCache(profileId: string, cwd: string, workspaceId: string, llmId?: string | null) {
+  const prefix = `${profileId}\0${cwd}\0${workspaceId}\0`;
+  const exact = llmId ? `${prefix}${llmId}` : null;
+  for (const key of [...llmTmuxSessionMenuCache.keys()]) {
+    if (exact ? key === exact : key.startsWith(prefix)) llmTmuxSessionMenuCache.delete(key);
+  }
+}
+
+function showLlmTmuxSessionMenuItems(anchor: HTMLElement, token: number, items: ContextMenuItem[]) {
+  const rect = anchor.getBoundingClientRect();
+  showContextMenu(rect.left, rect.bottom + 4, items);
+  el.contextMenu.dataset.llmTmuxMenuToken = String(token);
+}
+
+function isCurrentLlmTmuxSessionMenu(token: number) {
+  return !el.contextMenu.classList.contains('hidden')
+    && el.contextMenu.dataset.llmTmuxMenuToken === String(token);
+}
+
+function baseLlmTmuxSessionMenuItems(widget: TerminalWidget, llmId: string, agent: string): ContextMenuItem[] {
+  return [
     {
       label: `New ${agent} tmux session`,
       action: () => { void createLlmTmuxTabInWidget(widget, llmId); }
-    },
+    }
+  ];
+}
+
+function llmTmuxSessionMenuItemsFromResult(
+  widget: TerminalWidget,
+  llmId: string,
+  profile: ConnectionProfile,
+  cwd: string,
+  result: LlmTmuxSessionListResult
+): ContextMenuItem[] {
+  const agent = agentAlertAgentLabel(llmId);
+  const items: ContextMenuItem[] = [
+    ...baseLlmTmuxSessionMenuItems(widget, llmId, agent),
     { separator: true }
   ];
-  try {
-    const result = await api.listLlmTmuxSessions(profile.id, cwd, widget.workspaceId, llmId);
-    if (!result.available) {
-      items.push({
-        label: result.message || 'tmux is not available on this profile',
-        disabled: true
-      });
-    } else if (!result.sessions.length) {
-      items.push({ label: 'No existing tmux sessions', disabled: true });
-    } else {
-      for (const session of result.sessions) {
-        items.push({
-          label: `Open ${llmTmuxSessionMenuLabel(session, llmId)}`,
-          action: () => {
-            void createLlmTmuxTabInWidget(widget, llmId, {
-              sessionName: session.name,
-              title: llmTmuxTabTitle(llmId, session.name)
-            });
-          }
-        });
-        items.push({
-          label: `Kill ${llmTmuxSessionMenuLabel(session, llmId)}`,
-          danger: true,
-          action: () => {
-            void killLlmTmuxSessionFromWidget(widget, profile, cwd, session.name);
-          }
+  if (!result.available) {
+    items.push({
+      label: result.message || 'tmux is not available on this profile',
+      disabled: true
+    });
+    return items;
+  }
+  if (!result.sessions.length) {
+    items.push({ label: 'No existing tmux sessions', disabled: true });
+    return items;
+  }
+  items.push({
+    label: `Kill all ${agent} tmux sessions (${result.sessions.length})`,
+    danger: true,
+    action: () => {
+      void killAllLlmTmuxSessionsFromWidget(widget, profile, cwd, llmId, result.sessions);
+    }
+  });
+  items.push({ separator: true });
+  for (const session of result.sessions) {
+    items.push({
+      label: `Open ${llmTmuxSessionMenuLabel(session, llmId)}`,
+      action: () => {
+        void createLlmTmuxTabInWidget(widget, llmId, {
+          sessionName: session.name,
+          title: llmTmuxTabTitle(llmId, session.name)
         });
       }
-    }
-  } catch (error) {
-    items.push({ label: `Failed to list tmux sessions: ${String(error)}`, disabled: true });
+    });
+    items.push({
+      label: `Kill ${llmTmuxSessionMenuLabel(session, llmId)}`,
+      danger: true,
+      action: () => {
+        void killLlmTmuxSessionFromWidget(widget, profile, cwd, session.name);
+      }
+    });
   }
-  showContextMenu(rect.left, rect.bottom + 4, items);
+  return items;
 }
 
 function llmTmuxSessionMenuLabel(session: LlmTmuxSession, llmId: string) {
@@ -31538,11 +31657,44 @@ async function killLlmTmuxSessionFromWidget(
   if (!window.confirm(`Kill tmux session "${safeName}"? Terminal tabs are not killed, but attached tmux clients will detach/exit.`)) return;
   try {
     await api.killLlmTmuxSession(profile.id, cwd, safeName);
+    invalidateLlmTmuxSessionMenuCache(profile.id, cwd, widget.workspaceId, terminalWidgetLauncherLlmId(widget));
     setStatus(`Killed tmux session: ${safeName}`);
     syncTerminalLlmSessionControls(widget);
   } catch (error) {
     setStatus(`Failed to kill tmux session: ${String(error)}`, true);
   }
+}
+
+async function killAllLlmTmuxSessionsFromWidget(
+  widget: TerminalWidget,
+  profile: ConnectionProfile,
+  cwd: string,
+  llmId: string,
+  sessions: LlmTmuxSession[]
+) {
+  const safeNames = Array.from(new Set(sessions.map((session) => safeLlmTmuxSessionName(session.name)).filter(Boolean) as string[]));
+  const agent = agentAlertAgentLabel(llmId);
+  if (!safeNames.length) {
+    setStatus(`No valid ${agent} tmux sessions to kill`, true);
+    return;
+  }
+  const preview = safeNames.length > 8
+    ? `${safeNames.slice(0, 8).join('\n')}\n...and ${safeNames.length - 8} more`
+    : safeNames.join('\n');
+  if (!window.confirm(`Kill ${safeNames.length} ${agent} tmux session${safeNames.length === 1 ? '' : 's'}?\n\n${preview}\n\nTerminal tabs are not killed, but attached tmux clients will detach/exit.`)) return;
+  setStatus(`Killing ${safeNames.length} ${agent} tmux session${safeNames.length === 1 ? '' : 's'}...`);
+  const results = await Promise.allSettled(safeNames.map((name) => api.killLlmTmuxSession(profile.id, cwd, name)));
+  invalidateLlmTmuxSessionMenuCache(profile.id, cwd, widget.workspaceId, llmId);
+  const failed = results
+    .map((result, index) => ({ result, name: safeNames[index] }))
+    .filter((item): item is { result: PromiseRejectedResult; name: string } => item.result.status === 'rejected');
+  syncTerminalLlmSessionControls(widget);
+  if (failed.length) {
+    const previewFailed = failed.slice(0, 3).map((item) => item.name).join(', ');
+    setStatus(`Failed to kill ${failed.length}/${safeNames.length} ${agent} tmux sessions: ${previewFailed}`, true);
+    return;
+  }
+  setStatus(`Killed ${safeNames.length} ${agent} tmux session${safeNames.length === 1 ? '' : 's'}`);
 }
 
 async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDirection) {

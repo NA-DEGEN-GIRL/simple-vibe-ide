@@ -86,6 +86,17 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   terminal helper textarea has focus. Font resize shortcuts now report the
   current percent and pixel size in the status line instead of adding more
   header chrome.
+- LLM terminal `Tmux` menus now open immediately with a loading row while
+  existing sessions are listed asynchronously; recent results are cached per
+  profile/workspace/LLM so repeat opens show the last list immediately while a
+  background refresh runs. The same menu now includes a guarded `Kill all`
+  action for the currently listed sessions of that LLM only.
+- Closing the sole `Empty` tab in Editor or Image Preview now hides that panel,
+  matching the panel/widget `x` button instead of recreating another empty tab.
+- Workspace restore now respects an intentionally empty shell/widget state:
+  if the last saved workspace had no terminal widgets, reopening it no longer
+  creates a fallback `shell`. IDE workspace folder switches also stop
+  auto-spawning a shell; the Terminal app variant keeps its shell-first open.
 - Glass-mode workspace LLM/Agy card color overlays no longer own a separate
   border. `LLM 카드 단일 테두리 강도` now drives the real card outline instead,
   with the same 1px outline on all sides, so background geometry controls
