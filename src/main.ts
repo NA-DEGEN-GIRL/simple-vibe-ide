@@ -3577,12 +3577,16 @@ let keyboardResizeTargetWidgetElement: HTMLElement | null = null;
 let widgetOpacityPopoverTarget: WidgetOpacityTarget | null = null;
 let widgetOpacityPopoverDirty = false;
 let terminalTextTarget: TerminalTextTarget = 'shell';
+const DEFAULT_EDITOR_FONT_SIZE = 13;
+const DEFAULT_TERMINAL_FONT_SIZE = 13;
+const DEFAULT_NOTE_FONT_SIZE = 14;
+const DEFAULT_CALCULATOR_FONT_SIZE = 15;
 let ideScale = 1;
-let editorFontSize = 13;
-let terminalFontSize = 13;
-let noteFontSize = 14;
+let editorFontSize = DEFAULT_EDITOR_FONT_SIZE;
+let terminalFontSize = DEFAULT_TERMINAL_FONT_SIZE;
+let noteFontSize = DEFAULT_NOTE_FONT_SIZE;
 let noteOpacity = 100;
-let calculatorFontSize = 15;
+let calculatorFontSize = DEFAULT_CALCULATOR_FONT_SIZE;
 let restoringWorkspace = false;
 let storedActiveWorkspaceId = '';
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
@@ -11712,6 +11716,10 @@ function ideScaleLabel() {
   return `${Math.round(ideScale * 100)}%`;
 }
 
+function fontScaleLabel(size: number, baseSize: number) {
+  return `${Math.round((size / baseSize) * 100)}% (${size}px)`;
+}
+
 function syncIdeScaleSettings() {
   setTextContentIfChanged(el.settingsIdeScaleValue, ideScaleLabel());
   setDisabledIfChanged(el.settingsIdeScaleReset, Math.abs(ideScale - 1) < 0.001);
@@ -16561,10 +16569,10 @@ function blankWorkspaceSnapshot(id: string): WorkspaceSnapshot {
     calculatorHistory: [],
     explorerOpenMode: 'single',
     showFileSizes: DEFAULT_SHOW_FILE_SIZES,
-    editorFontSize: 13,
-    terminalFontSize: 13,
-    noteFontSize: 14,
-    calculatorFontSize: 15,
+    editorFontSize: DEFAULT_EDITOR_FONT_SIZE,
+    terminalFontSize: DEFAULT_TERMINAL_FONT_SIZE,
+    noteFontSize: DEFAULT_NOTE_FONT_SIZE,
+    calculatorFontSize: DEFAULT_CALCULATOR_FONT_SIZE,
     ideScale: 1
   };
 }
@@ -17505,10 +17513,10 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.calculatorExpression = snapshot.calculatorExpression || '';
     state.calculatorHistory = Array.isArray(snapshot.calculatorHistory) ? snapshot.calculatorHistory.slice(0, 20) : [];
     state.calculatorResult = '';
-    editorFontSize = clamp(snapshot.editorFontSize || 13, 10, 24);
-    terminalFontSize = clamp(snapshot.terminalFontSize || 13, 9, 24);
-    noteFontSize = clamp(snapshot.noteFontSize || 14, 10, 28);
-    calculatorFontSize = clamp(snapshot.calculatorFontSize || 15, 10, 28);
+    editorFontSize = clamp(snapshot.editorFontSize || DEFAULT_EDITOR_FONT_SIZE, 10, 24);
+    terminalFontSize = clamp(snapshot.terminalFontSize || DEFAULT_TERMINAL_FONT_SIZE, 9, 24);
+    noteFontSize = clamp(snapshot.noteFontSize || DEFAULT_NOTE_FONT_SIZE, 10, 28);
+    calculatorFontSize = clamp(snapshot.calculatorFontSize || DEFAULT_CALCULATOR_FONT_SIZE, 10, 28);
     ideScale = clamp(snapshot.ideScale || 1, 0.72, 1.45);
     setRootStyleProperty('--editor-font-size', `${editorFontSize}px`);
     setRootStyleProperty('--ide-scale', ideScale.toFixed(3));
@@ -21802,6 +21810,7 @@ function resizeEditorFont(direction: number) {
   editorFontSize = clamp(editorFontSize + direction, 10, 24);
   setRootStyleProperty('--editor-font-size', `${editorFontSize}px`);
   requestCodeEditorMeasure();
+  setStatus(`Editor font ${fontScaleLabel(editorFontSize, DEFAULT_EDITOR_FONT_SIZE)}`);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -21812,12 +21821,14 @@ function resizeTerminalFont(direction: number) {
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
   }
+  setStatus(`Terminal font ${fontScaleLabel(terminalFontSize, DEFAULT_TERMINAL_FONT_SIZE)}`);
   saveActiveWorkspaceSnapshot();
 }
 
 function resizeNoteFont(direction: number) {
   noteFontSize = clamp(noteFontSize + direction, 10, 28);
   applyNoteFontSize();
+  setStatus(`Notes font ${fontScaleLabel(noteFontSize, DEFAULT_NOTE_FONT_SIZE)}`);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -21961,6 +21972,7 @@ function syncBrowserPreviewScaleBox() {
 function resizeCalculatorFont(direction: number) {
   calculatorFontSize = clamp(calculatorFontSize + direction, 10, 28);
   applyCalculatorFontSize();
+  setStatus(`Calculator font ${fontScaleLabel(calculatorFontSize, DEFAULT_CALCULATOR_FONT_SIZE)}`);
   saveActiveWorkspaceSnapshot();
 }
 
@@ -31919,6 +31931,17 @@ function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
     event.stopPropagation();
     focusTerminalTypingPad(widget);
     return false;
+  }
+
+  if (event.type === 'keydown' && (event.ctrlKey || event.metaKey) && !event.altKey) {
+    const resizeDirection = shortcutResizeDirection(event);
+    if (resizeDirection) {
+      event.preventDefault();
+      event.stopPropagation();
+      setKeyboardResizeTarget({ kind: 'terminal', paneId: pane.paneId });
+      resizeTerminalFont(resizeDirection);
+      return false;
+    }
   }
 
   if (event.type !== 'keydown' || !(event.ctrlKey || event.metaKey) || event.altKey) return true;

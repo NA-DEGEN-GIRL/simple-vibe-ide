@@ -54,6 +54,11 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 ### 2026-07-05 - Simplify LLM card background controls
 
 #### Changed (`src/main.ts`, `src/styles.css`)
+- Terminal-focused `Ctrl++` / `Ctrl+-` now resize the terminal font before
+  xterm can treat the key as shell input, so the shortcut works even when the
+  terminal helper textarea has focus. Font resize shortcuts now report the
+  current percent and pixel size in the status line instead of adding more
+  header chrome.
 - Glass-mode workspace LLM/Agy card color overlays no longer own a separate
   border. `LLM 카드 단일 테두리 강도` now drives the real card outline instead,
   with the same 1px outline on all sides, so background geometry controls
