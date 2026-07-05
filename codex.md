@@ -228,6 +228,10 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 - Background image load/error events now recapture workspace, Explorer, and app
   glass surfaces, so applying a theme with a bundled wallpaper refreshes all
   glass snapshots after the image is actually available.
+- Grok hook-tracked panes now only use Grok title/OSC signals as a waiting
+  supplement; title `working`/`idle` no longer overrides the hook source. Grok
+  symbol-only logo/art repaint frames also no longer extend an existing
+  ambiguous `working` window.
 
 #### Verification
 - `npm run check`

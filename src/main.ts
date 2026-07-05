@@ -13325,6 +13325,7 @@ function markWorkspaceLlmOutputActivityForPane(
   // Resize/focus/background workspace checks can make PTYs repaint a prompt or status footer.
   // Ambiguous output may extend this pane's existing working window, but only explicit
   // active-work text/title signals may start a new working state.
+  if (!looksActive && llmId === 'grok' && grokOutputLooksLikeAmbientLogoFrame(data)) return;
   if (!looksActive && previousStatus !== 'working') return;
   if (!looksActive && previousStatus === 'working' && llmOutputLooksLikeTurnFinished(data)) {
     clearWorkspaceLlmWaitingForPane(pane);
@@ -14803,7 +14804,7 @@ function scheduleWorkspaceLlmTitleSignal(
   options: { trustedTmuxPoll?: boolean } = {}
 ) {
   if (!terminalPaneLlmId(pane) || !pane.workspaceId) return;
-  if (terminalPaneUsesHookLlmStatus(pane) && terminalPaneLlmId(pane) === 'grok' && signal === 'idle') return;
+  if (terminalPaneUsesHookLlmStatus(pane) && terminalPaneLlmId(pane) === 'grok' && signal !== 'waiting') return;
   if (signal === 'idle' && !options.trustedTmuxPoll) {
     const suppressUntil = workspaceLlmTitleDoneSuppressUntil(pane);
     if (suppressUntil > Date.now()) {
@@ -15499,6 +15500,7 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string, options: { no
   if (!workspaceLlmSupportsWaitingDetection(llmId)) return false;
   const text = (options.normalized ? data : normalizeTerminalOutputForLlmWaitingDetection(data)).trim();
   if (!text) return false;
+  if (llmId === 'grok' && grokOutputLooksLikeAmbientLogoFrame(text, { normalized: true })) return false;
   if (llmOutputHasIncompleteAgentProgress(text)) return true;
   const activeProgressPatterns = [
     // Claude's newer status line is intentionally whimsical: "Simmering…",
@@ -15540,6 +15542,25 @@ function llmOutputLooksLikeActiveWork(llmId: string, data: string, options: { no
       || /(?:요청|작업|파일|도구).{0,40}(?:분석|실행|생성|처리)\s*중/i.test(text);
   }
   return false;
+}
+
+function grokOutputLooksLikeAmbientLogoFrame(data: string, options: { normalized?: boolean } = {}) {
+  const text = (options.normalized ? data : normalizeTerminalOutputForLlmWaitingDetection(data)).trim();
+  if (!text) return false;
+  const compact = text.replace(/\s+/g, '');
+  const chars = Array.from(compact);
+  if (chars.length < 8) return false;
+  if (chars.some((char) => /[\p{L}\p{N}]/u.test(char))) return false;
+  let drawable = 0;
+  for (const char of chars) {
+    if (
+      /[\u2500-\u259f\u2800-\u28ff]/u.test(char)
+      || '·•∙.・●○◦∘◌◍◎◯/\\|_-+*`\'":,;()[]{}<>~=^'.includes(char)
+    ) {
+      drawable += 1;
+    }
+  }
+  return drawable / chars.length >= 0.85;
 }
 
 function llmOutputHasIncompleteAgentProgress(text: string) {
