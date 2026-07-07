@@ -3843,6 +3843,7 @@ const workspaceLlmActivityTimers = new Map<string, number>();
 const workspaceLlmWaitingByPaneId = new Map<string, { workspaceId: string; llmId: string; detectedAt: number }>();
 const workspaceLlmTitleActivityByPaneId = new Map<string, { workspaceId: string; llmId: string; expiresAt: number }>();
 const workspaceLlmTitleActivityTimers = new Map<string, number>();
+const workspaceDoneUnreadIds = new Set<string>();
 const agentSessionProgressByPaneId = new Map<string, AgentSessionProgress>();
 const agentSessionProgressTimers = new Map<string, number>();
 const agentAlertLastByPaneId = new Map<string, { kind: AgentAlertKind; at: number }>();
@@ -3958,14 +3959,20 @@ let workspaceLiquidGlassHoverOnlyTarget: HTMLElement | null = null;
 let appGlassRefreshTimer = 0;
 let appGlassRefreshRecapture = false;
 let appGlassDeferredRecapture = false;
+let appGlassDeferredRecaptureFlushTimer = 0;
+let appGlassDeferredRecaptureFlushReason = '';
+let appGlassWindowResumeRecaptureDeferUntil = 0;
 let appGlassApplying = false;
 let appGlassAppliedTopologySignature = '\0';
 let appGlassGeometryFrame = 0;
 let appGlassInitFailedRetryTimer = 0;
 let appGlassInitFailedRetryDueAt = 0;
+const APP_GLASS_HIDDEN_TERMINAL_CACHE_MS = 5 * 60 * 1000;
+const EXPLORER_GLASS_WORKSPACE_SWITCH_PREWARM_DELAY_MS = 900;
 const appGlassOwnerGeometryFrames = new WeakMap<HTMLElement, number>();
 const appGlassOwnerRefreshTimers = new WeakMap<HTMLElement, number>();
 const appGlassOwnerRefreshRecapture = new WeakMap<HTMLElement, boolean>();
+const appGlassHiddenOwnerCleanupTimers = new WeakMap<HTMLElement, number>();
 const appGlassRenderers = new Map<string, LiquidGLRendererLike>();
 let appGlassSharedRenderer: LiquidGLRendererLike | undefined;
 const appGlassRendererViewportSignatures = new WeakMap<LiquidGLRendererLike, string>();
@@ -4951,20 +4958,17 @@ async function init() {
   await currentWindow.onFocusChanged((event) => {
     if (event.payload) {
       focusActiveTerminalPaneWhenItOwnsKeyboard();
-      flushDeferredAppGlassRecapture('window-focus');
-      scheduleGlassResumeGeometry('window-focus');
+      resumeGlassAfterWindowWake('window-focus');
     }
   });
   window.addEventListener('focus', () => {
     focusActiveTerminalPaneWhenItOwnsKeyboard();
-    flushDeferredAppGlassRecapture('window-focus');
-    scheduleGlassResumeGeometry('window-focus');
+    resumeGlassAfterWindowWake('window-focus');
   });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       focusActiveTerminalPaneWhenItOwnsKeyboard();
-      flushDeferredAppGlassRecapture('visible');
-      scheduleGlassResumeGeometry('visible');
+      resumeGlassAfterWindowWake('visible');
     }
     else saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
   });
@@ -9744,17 +9748,24 @@ function syncAppGlassOwnerTargets(owner: HTMLElement) {
 function syncAppGlassTarget(plane: HTMLElement) {
   const scope = plane.dataset.appGlassScope || '';
   const owner = plane.parentElement as HTMLElement | null;
-  const active = appGlassEnabled()
+  const eligible = appGlassEnabled()
     && owner !== null
     && appGlassScopeEnabled(scope)
-    && appGlassPlaneAllowedForCurrentLayout(plane)
-    && appGlassOwnerVisible(owner);
+    && appGlassPlaneAllowedForCurrentLayout(plane);
+  const active = eligible && owner !== null && appGlassOwnerVisible(owner);
   plane.dataset.appGlassActive = active ? '1' : '0';
   plane.classList.toggle('app-glass-active', active);
   owner?.classList.toggle('app-glass-active-shell', active);
-  if (active && owner) ensureAppGlassOwnerAboveSharedLayer(owner);
+  if (active && owner) {
+    cancelAppGlassHiddenOwnerCleanup(owner);
+    ensureAppGlassOwnerAboveSharedLayer(owner);
+  }
   if (!active) {
-    cleanupAppGlassTarget(plane);
+    if (eligible && owner && shouldCacheHiddenAppGlassOwner(owner, plane)) {
+      scheduleAppGlassHiddenOwnerCleanup(owner, 'hidden');
+    } else {
+      cleanupAppGlassTarget(plane);
+    }
   }
   return active;
 }
@@ -9772,6 +9783,33 @@ function appGlassOwnerVisible(owner: HTMLElement) {
   const hiddenAncestor = owner.closest<HTMLElement>('.hidden');
   if (hiddenAncestor && hiddenAncestor !== owner) return false;
   return true;
+}
+
+function shouldCacheHiddenAppGlassOwner(owner: HTMLElement, plane: HTMLElement) {
+  if (!owner.isConnected || !owner.classList.contains('hidden')) return false;
+  if (!owner.classList.contains('terminal-card')) return false;
+  if (plane.dataset.appGlassLens !== 'liquidgl') return false;
+  return Boolean(appGlassRendererForTarget(plane));
+}
+
+function cancelAppGlassHiddenOwnerCleanup(owner: HTMLElement) {
+  const timer = appGlassHiddenOwnerCleanupTimers.get(owner);
+  if (!timer) return;
+  window.clearTimeout(timer);
+  appGlassHiddenOwnerCleanupTimers.delete(owner);
+}
+
+function scheduleAppGlassHiddenOwnerCleanup(owner: HTMLElement, reason: string) {
+  if (appGlassHiddenOwnerCleanupTimers.get(owner)) return;
+  const timer = window.setTimeout(() => {
+    appGlassHiddenOwnerCleanupTimers.delete(owner);
+    for (const plane of appGlassPlanesForOwner(owner)) {
+      if (plane.dataset.appGlassActive === '1') continue;
+      cleanupAppGlassTarget(plane);
+    }
+    appendAppGlassDiagnostic(`hidden-cleanup/${reason}`);
+  }, APP_GLASS_HIDDEN_TERMINAL_CACHE_MS);
+  appGlassHiddenOwnerCleanupTimers.set(owner, timer);
 }
 
 function appGlassPlaneElements() {
@@ -10133,6 +10171,15 @@ function scheduleGlassResumeGeometry(reason: string) {
   if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) scheduleExplorerLiquidGlassRefresh({ delay: 110 });
 }
 
+function resumeGlassAfterWindowWake(reason: string) {
+  appGlassWindowResumeRecaptureDeferUntil = Math.max(
+    appGlassWindowResumeRecaptureDeferUntil,
+    performance.now() + 1100
+  );
+  flushDeferredAppGlassRecapture(reason, { delay: 700, stagger: 64 });
+  scheduleGlassResumeGeometry(reason);
+}
+
 function deferAppGlassRecapture(reason = 'deferred') {
   appGlassDeferredRecapture = true;
   appendAppGlassDiagnostic(`recapture-deferred/${reason}`);
@@ -10160,10 +10207,38 @@ function scheduleAppGlassActiveOwnerRecaptures(reason: string, options: { delay?
   return true;
 }
 
-function flushDeferredAppGlassRecapture(reason = 'visible') {
+function flushDeferredAppGlassRecapture(
+  reason = 'visible',
+  options: { delay?: number; stagger?: number; baseDelay?: number } = {}
+) {
   if (!appGlassDeferredRecapture || !appGlassCanCaptureSnapshotNow()) return;
+  const delay = options.delay ?? 0;
+  if (delay > 0) {
+    appGlassDeferredRecaptureFlushReason = reason;
+    if (!appGlassDeferredRecaptureFlushTimer) {
+      appGlassDeferredRecaptureFlushTimer = window.setTimeout(() => {
+        const delayedReason = appGlassDeferredRecaptureFlushReason || reason;
+        appGlassDeferredRecaptureFlushTimer = 0;
+        appGlassDeferredRecaptureFlushReason = '';
+        flushDeferredAppGlassRecapture(delayedReason, {
+          baseDelay: 90,
+          stagger: options.stagger ?? 64
+        });
+      }, delay);
+      appendAppGlassDiagnostic(`recapture-delay/${reason}`);
+    }
+    return;
+  }
+  if (appGlassDeferredRecaptureFlushTimer) {
+    window.clearTimeout(appGlassDeferredRecaptureFlushTimer);
+    appGlassDeferredRecaptureFlushTimer = 0;
+    appGlassDeferredRecaptureFlushReason = '';
+  }
   appGlassDeferredRecapture = false;
-  if (!scheduleAppGlassActiveOwnerRecaptures(`deferred-${reason}`)) {
+  if (!scheduleAppGlassActiveOwnerRecaptures(`deferred-${reason}`, {
+    delay: options.baseDelay,
+    stagger: options.stagger
+  })) {
     scheduleAppGlassRefresh({ recapture: true, delay: 140, reason });
     return;
   }
@@ -10268,8 +10343,15 @@ async function applyAppLiquidGlass(recaptureSnapshot = false) {
     }
     const targets = prioritizedAppGlassTargets(appGlassActiveTargets());
     const activeIds = new Set(targets.map((target) => target.dataset.appGlassId || '').filter(Boolean));
+    const cachedHiddenIds = new Set(appGlassPlaneElements()
+      .filter((target) => {
+        const owner = target.parentElement as HTMLElement | null;
+        return owner ? shouldCacheHiddenAppGlassOwner(owner, target) : false;
+      })
+      .map((target) => target.dataset.appGlassId || '')
+      .filter(Boolean));
     for (const id of Array.from(appGlassRenderers.keys())) {
-      if (!activeIds.has(id)) removeAppGlassRenderer(id);
+      if (!activeIds.has(id) && !cachedHiddenIds.has(id)) removeAppGlassRenderer(id);
     }
     if (!targets.length) return;
     await loadLiquidGLScripts();
@@ -10973,6 +11055,7 @@ function cleanupAppGlassOwner(owner: HTMLElement) {
   if (timer) window.clearTimeout(timer);
   appGlassOwnerRefreshTimers.delete(owner);
   appGlassOwnerRefreshRecapture.delete(owner);
+  cancelAppGlassHiddenOwnerCleanup(owner);
   for (const plane of appGlassPlanesForOwner(owner)) {
     plane.classList.remove('app-glass-active');
     delete plane.dataset.appGlassActive;
@@ -11552,12 +11635,15 @@ function scheduleExplorerLiquidGlassRefresh(options: { recapture?: boolean; dela
   if (explorerLiquidGlassRefreshTimer) window.clearTimeout(explorerLiquidGlassRefreshTimer);
   explorerLiquidGlassRefreshRecapture = explorerLiquidGlassRefreshRecapture || options.recapture === true;
   const scrollingDelay = Date.now() < explorerScrollingUntil ? Math.max(120, explorerScrollingUntil - Date.now() + 60) : 70;
+  const workspaceSwitchDelay = restoringWorkspace && options.delay === undefined
+    ? EXPLORER_GLASS_WORKSPACE_SWITCH_PREWARM_DELAY_MS
+    : null;
   explorerLiquidGlassRefreshTimer = window.setTimeout(() => {
     const recapture = explorerLiquidGlassRefreshRecapture;
     explorerLiquidGlassRefreshTimer = 0;
     explorerLiquidGlassRefreshRecapture = false;
     void applyExplorerLiquidGlass(recapture);
-  }, options.delay ?? (options.recapture ? 160 : scrollingDelay));
+  }, options.delay ?? workspaceSwitchDelay ?? (options.recapture ? 160 : scrollingDelay));
 }
 
 function scheduleExplorerLiquidGlassScrollRender() {
@@ -13504,6 +13590,17 @@ function agentSessionCompletionStatusForWorkspace(
   return 'done-unread';
 }
 
+function markWorkspaceDoneUnread(workspaceId: string, reason: string) {
+  if (!workspaceId) return false;
+  const hadUnread = workspaceDoneUnreadIds.has(workspaceId);
+  workspaceDoneUnreadIds.add(workspaceId);
+  if (!hadUnread) {
+    appendDiagnosticLog('agent', `workspace done-unread marked workspace=${workspaceId.slice(0, 8)} reason=${reason}`);
+    renderWorkspaceLlmActivityTab(workspaceId);
+  }
+  return !hadUnread;
+}
+
 function updateAgentSessionProgressForPane(
   pane: TerminalPane,
   patch: {
@@ -13543,6 +13640,9 @@ function updateAgentSessionProgressForPane(
     doneAlertOnExpire: patch.doneAlertOnExpire ?? previous?.doneAlertOnExpire,
     redacted: patch.redacted ?? previous?.redacted
   };
+  if (status === 'done-unread') {
+    workspaceDoneUnreadIds.add(pane.workspaceId);
+  }
   if (status === 'working') {
     next.expiresAt = patch.expiresAt ?? previous?.expiresAt ?? Date.now() + WORKSPACE_LLM_OUTPUT_ACTIVE_MS;
   }
@@ -13574,7 +13674,7 @@ function defaultAgentActivityForStatus(status: AgentSessionStatus) {
 
 function acknowledgeWorkspaceDoneUnread(workspaceId: string) {
   if (!workspaceId) return false;
-  let changed = false;
+  let changed = workspaceDoneUnreadIds.delete(workspaceId);
   for (const [paneId, progress] of agentSessionProgressByPaneId) {
     if (progress.workspaceId !== workspaceId || progress.status !== 'done-unread') continue;
     const nextStatus: AgentSessionStatus = progress.backendId ? 'idle' : 'exited';
@@ -13610,6 +13710,9 @@ function maybeSendAgentProgressAlert(
   else if (nextStatus === 'error' && previousStatus !== 'error') kind = 'error';
   else if ((nextStatus === 'idle' || nextStatus === 'done-unread' || nextStatus === 'exited') && previousStatus === 'working') kind = 'done';
   if (!kind) return;
+  if (kind === 'done' && next.workspaceId && !workspaceIsUserActive(next.workspaceId)) {
+    markWorkspaceDoneUnread(next.workspaceId, `alert-${next.agentId}`);
+  }
   if (kind === 'waiting') {
     const signature = agentWaitingAlertSignature(next);
     if (agentWaitingAlertSignatureByPaneId.get(pane.paneId) === signature) {
@@ -14303,7 +14406,7 @@ function workspaceAgentCardOrder(agentId: string) {
 
 function workspaceAgentAggregateState(workspaceId: string): WorkspaceLlmIndicatorState {
   const sessions = agentSessionProgressForWorkspace(workspaceId);
-  if (!sessions.length) return 'none';
+  if (!sessions.length) return workspaceDoneUnreadIds.has(workspaceId) ? 'done-unread' : 'none';
   let best: WorkspaceLlmIndicatorState = 'none';
   let bestPriority = Number.POSITIVE_INFINITY;
   for (const progress of sessions) {
@@ -14313,6 +14416,9 @@ function workspaceAgentAggregateState(workspaceId: string): WorkspaceLlmIndicato
       bestPriority = priority;
       best = status;
     }
+  }
+  if (workspaceDoneUnreadIds.has(workspaceId) && bestPriority > agentStatusPriority('done-unread')) {
+    return 'done-unread';
   }
   return best;
 }
@@ -16541,6 +16647,7 @@ async function closeWorkspaceTab(id: string) {
   workspaceLastActiveAt.delete(id);
   workspaceLastOutputAt.delete(id);
   workspaceMemorySleepingIds.delete(id);
+  workspaceDoneUnreadIds.delete(id);
   removeWorkspaceSnapshotById(id);
   if (wasActive) {
     const next = state.workspaceSnapshots[0];
@@ -20573,7 +20680,7 @@ function bindEvents() {
       hideNativeBrowserWebview();
       suspendBrowserFramesForAllWorkspaces();
     } else if (state.workspaceOpen) {
-      flushDeferredAppGlassRecapture('visible');
+      resumeGlassAfterWindowWake('visible');
       cancelBrowserFrameSuspend();
       scheduleExplorerWatch(1200);
       queueVisibleExplorerDirectoryPrefetch(900);
@@ -20586,7 +20693,7 @@ function bindEvents() {
       scheduleWslProfilesBackgroundLoad(1200);
       if (!isBrowserPanelHidden()) ensureActiveBrowserFrame();
     } else {
-      flushDeferredAppGlassRecapture('visible');
+      resumeGlassAfterWindowWake('visible');
       cancelBrowserFrameSuspend();
       scheduleMarketTickerStart(MARKET_TICKER_VISIBLE_RESUME_DELAY_MS);
       scheduleMarketTickerRender();
@@ -20642,10 +20749,15 @@ function scheduleWindowResizeWork() {
       scheduleWorkspaceLiquidGlassResizeRebuild();
     }
     if (appGlassCanCaptureSnapshotNow()) {
-      if (!scheduleAppGlassActiveOwnerRecaptures('window-resize', { delay: 120 })) {
-        scheduleAppGlassRefresh({ recapture: true, delay: 140, reason: 'window-resize' });
+      if (performance.now() < appGlassWindowResumeRecaptureDeferUntil) {
+        deferAppGlassRecapture('window-resize-resume');
+        flushDeferredAppGlassRecapture('window-resize-resume', { delay: 700, stagger: 64 });
+      } else {
+        if (!scheduleAppGlassActiveOwnerRecaptures('window-resize', { delay: 120 })) {
+          scheduleAppGlassRefresh({ recapture: true, delay: 140, reason: 'window-resize' });
+        }
+        flushDeferredAppGlassRecapture('window-resize');
       }
-      flushDeferredAppGlassRecapture('window-resize');
     } else {
       deferAppGlassRecapture('window-resize');
     }

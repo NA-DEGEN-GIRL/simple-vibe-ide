@@ -2362,9 +2362,9 @@ body.workspace-dock-resizing * {
   box-shadow: 0 0 9px rgba(255, 154, 61, 0.56);
 }
 .workspace-tab.llm-done-unread::after {
-  background: #ffd24d;
+  background: var(--workspace-glass-llm-done-unread, #ffd24d);
   opacity: 1;
-  box-shadow: 0 0 0 1px rgba(255, 210, 77, 0.34), 0 0 12px rgba(255, 210, 77, 0.58);
+  box-shadow: 0 0 0 1px rgba(255, 210, 77, 0.34), 0 0 12px var(--workspace-glass-llm-done-unread-glow, rgba(255, 210, 77, 0.58));
 }
 .workspace-tab.llm-exited::after {
   background: #7b8798;
