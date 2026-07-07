@@ -3968,6 +3968,8 @@ let workspaceLiquidGlassApplying = false;
 let workspaceLiquidGlassLastDiagnosticAt = 0;
 let workspaceLiquidGlassLastHoverDiagnosticAt = 0;
 let workspaceLiquidGlassHoverOnlyTarget: HTMLElement | null = null;
+let workspaceLiquidGlassHoverPointerX = Number.NaN;
+let workspaceLiquidGlassHoverPointerY = Number.NaN;
 let appGlassRefreshTimer = 0;
 let appGlassRefreshRecapture = false;
 let appGlassDeferredRecapture = false;
@@ -8462,6 +8464,26 @@ function hoveredWorkspaceGlassTarget() {
   return document.querySelector<HTMLElement>('.workspace-tab:hover, #new-workspace-tab:hover');
 }
 
+function workspaceHoverOnlyTargetFromLastPointer() {
+  if (!Number.isFinite(workspaceLiquidGlassHoverPointerX) || !Number.isFinite(workspaceLiquidGlassHoverPointerY)) return null;
+  if (
+    workspaceLiquidGlassHoverPointerX < 0
+    || workspaceLiquidGlassHoverPointerY < 0
+    || workspaceLiquidGlassHoverPointerX > window.innerWidth
+    || workspaceLiquidGlassHoverPointerY > window.innerHeight
+  ) {
+    return null;
+  }
+  return workspaceHoverOnlyTargetFromEventTarget(
+    document.elementFromPoint(workspaceLiquidGlassHoverPointerX, workspaceLiquidGlassHoverPointerY)
+  );
+}
+
+function rememberWorkspaceHoverOnlyPointer(event: PointerEvent) {
+  workspaceLiquidGlassHoverPointerX = event.clientX;
+  workspaceLiquidGlassHoverPointerY = event.clientY;
+}
+
 function resetHoverOnlyLiquidGlassLens(lens: LiquidGLLensLike) {
   try {
     lens._destroyMirrorCanvas?.();
@@ -8540,7 +8562,7 @@ function setWorkspaceHoverOnlyTarget(target: HTMLElement | null) {
 
 function restoreWorkspaceHoverOnlyTargetFromCssHover() {
   if (!workspaceGlassHoverOnlyEnabled()) return;
-  const hovered = hoveredWorkspaceGlassTarget();
+  const hovered = hoveredWorkspaceGlassTarget() ?? workspaceHoverOnlyTargetFromLastPointer();
   if (hovered) {
     setWorkspaceHoverOnlyTarget(hovered);
     return;
@@ -8552,12 +8574,14 @@ function restoreWorkspaceHoverOnlyTargetFromCssHover() {
 
 function handleWorkspaceHoverOnlyPointerOver(event: PointerEvent) {
   if (!workspaceGlassHoverOnlyEnabled()) return;
+  rememberWorkspaceHoverOnlyPointer(event);
   const target = workspaceHoverOnlyTargetFromEventTarget(event.target);
   if (target) setWorkspaceHoverOnlyTarget(target);
 }
 
 function handleWorkspaceHoverOnlyPointerOut(event: PointerEvent) {
   if (!workspaceGlassHoverOnlyEnabled()) return;
+  rememberWorkspaceHoverOnlyPointer(event);
   const target = workspaceHoverOnlyTargetFromEventTarget(event.target);
   if (!target || target !== workspaceLiquidGlassHoverOnlyTarget) return;
   const related = workspaceHoverOnlyTargetFromEventTarget(event.relatedTarget);
@@ -8567,6 +8591,7 @@ function handleWorkspaceHoverOnlyPointerOut(event: PointerEvent) {
 
 function handleWorkspaceHoverOnlyPointerMove(event: PointerEvent) {
   if (!workspaceGlassHoverOnlyEnabled()) return;
+  rememberWorkspaceHoverOnlyPointer(event);
   const hit = document.elementFromPoint(event.clientX, event.clientY);
   const target = workspaceHoverOnlyTargetFromEventTarget(hit);
   if (target !== workspaceLiquidGlassHoverOnlyTarget) setWorkspaceHoverOnlyTarget(target);
