@@ -186,6 +186,11 @@ interface TerminalPane {
   suppressTerminalQueryResponsesUntil?: number;
   seenPorts: Set<number>;
   fitFrame?: number;
+  pendingFitWidth?: number;
+  pendingFitHeight?: number;
+  pendingFitRows?: number;
+  pendingFitCols?: number;
+  pendingFitStableFrames?: number;
   writeFrame?: number;
   writeTimer?: number;
   shellReadyFallbackTimer?: number;
@@ -1696,6 +1701,8 @@ const TERMINAL_WRITE_FORCE_FLUSH_CHARS = 64 * 1024;
 const TERMINAL_VISIBLE_WRITE_CHUNK_CHARS = 16 * 1024;
 const TERMINAL_HIDDEN_WRITE_CHUNK_CHARS = 8 * 1024;
 const TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS = 2 * 1024;
+const TERMINAL_WAKE_WRITE_CHUNK_CHARS = 64 * 1024;
+const TERMINAL_WAKE_PENDING_TERM_WRITES = 8;
 const TERMINAL_OSC52_CLIPBOARD_MAX_BYTES = 1024 * 1024;
 const TERMINAL_OSC52_CLIPBOARD_MAX_BASE64_CHARS = Math.ceil(TERMINAL_OSC52_CLIPBOARD_MAX_BYTES / 3) * 4 + 16;
 const TERMINAL_CURSOR_QUERY_FLUSH_LIMIT_CHARS = 64 * 1024;
@@ -3920,6 +3927,11 @@ let explorerLiquidGlassOverlayHost: HTMLDivElement | null = null;
 let appShutdownStarted = false;
 let appCloseFallbackTimer = 0;
 let terminalCwdSaveTimer = 0;
+let terminalWindowWakeCatchingUpActive = false;
+let terminalWindowWakeRefreshFrame = 0;
+let terminalWindowWakeRefreshReason = '';
+let terminalTinyWindowLayoutActive = false;
+let workspaceGlassSkipNextResizeRebuildAfterTinyRestore = false;
 let rendererHeartbeatTimer = 0;
 let rendererRecoveryNotice: RendererRecoveryNotice | null = null;
 let marketTickerSocket: WebSocket | null = null;
@@ -4957,16 +4969,19 @@ async function init() {
   });
   await currentWindow.onFocusChanged((event) => {
     if (event.payload) {
+      resumeTerminalsAfterWindowWake('window-focus');
       focusActiveTerminalPaneWhenItOwnsKeyboard();
       resumeGlassAfterWindowWake('window-focus');
     }
   });
   window.addEventListener('focus', () => {
+    resumeTerminalsAfterWindowWake('window-focus');
     focusActiveTerminalPaneWhenItOwnsKeyboard();
     resumeGlassAfterWindowWake('window-focus');
   });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
+      resumeTerminalsAfterWindowWake('visible');
       focusActiveTerminalPaneWhenItOwnsKeyboard();
       resumeGlassAfterWindowWake('visible');
     }
@@ -8426,7 +8441,7 @@ function isWorkspaceHoverOnlyLens(lens: LiquidGLLensLike) {
 
 function activeWorkspaceHoverOnlyGlassElements() {
   if (!workspaceGlassHoverOnlyEnabled()) return null;
-  const hovered = document.querySelector<HTMLElement>('.workspace-tab:hover, #new-workspace-tab:hover');
+  const hovered = hoveredWorkspaceGlassTarget();
   const target = workspaceLiquidGlassHoverOnlyTarget?.isConnected
     ? workspaceLiquidGlassHoverOnlyTarget
     : hovered;
@@ -8441,6 +8456,10 @@ function activeWorkspaceHoverOnlyGlassElements() {
     return active;
   }
   return active;
+}
+
+function hoveredWorkspaceGlassTarget() {
+  return document.querySelector<HTMLElement>('.workspace-tab:hover, #new-workspace-tab:hover');
 }
 
 function resetHoverOnlyLiquidGlassLens(lens: LiquidGLLensLike) {
@@ -8517,6 +8536,18 @@ function setWorkspaceHoverOnlyTarget(target: HTMLElement | null) {
   workspaceLiquidGlassHoverOnlyTarget = next;
   workspaceLiquidGlassHoverOnlyTarget?.classList.add('glass-hover-active');
   renderWorkspaceHoverOnlyNow();
+}
+
+function restoreWorkspaceHoverOnlyTargetFromCssHover() {
+  if (!workspaceGlassHoverOnlyEnabled()) return;
+  const hovered = hoveredWorkspaceGlassTarget();
+  if (hovered) {
+    setWorkspaceHoverOnlyTarget(hovered);
+    return;
+  }
+  if (workspaceLiquidGlassHoverOnlyTarget && !workspaceLiquidGlassHoverOnlyTarget.isConnected) {
+    setWorkspaceHoverOnlyTarget(null);
+  }
 }
 
 function handleWorkspaceHoverOnlyPointerOver(event: PointerEvent) {
@@ -8754,6 +8785,17 @@ function scheduleWorkspaceLiquidGlassResizeRebuild() {
       return;
     }
     const appGlass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+    if (terminalTinyWindowLayoutActive || workspaceGlassSkipNextResizeRebuildAfterTinyRestore) {
+      workspaceGlassSkipNextResizeRebuildAfterTinyRestore = false;
+      appendDiagnosticLog(
+        'glass',
+        'workspace glass resize-rebuild skipped for tiny-window transition; refreshing row/container lenses',
+        'info',
+        { force: appGlass.diagnostics === true }
+      );
+      scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
+      return;
+    }
     removeWorkspaceLiquidGlassLenses();
     appendDiagnosticLog(
       'glass',
@@ -8984,6 +9026,7 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
     renderer?.lenses?.forEach((lens) => {
       if (isWorkspaceLiquidGlassLens(lens)) lens.updateMetrics?.();
     });
+    restoreWorkspaceHoverOnlyTargetFromCssHover();
     if (recaptureSnapshot && renderer?.captureSnapshot) {
       syncWorkspaceGlassSnapshotStage();
       syncWorkspaceGlassRendererSnapshotTarget();
@@ -20681,13 +20724,10 @@ function bindEvents() {
       suspendBrowserFramesForAllWorkspaces();
     } else if (state.workspaceOpen) {
       resumeGlassAfterWindowWake('visible');
+      resumeTerminalsAfterWindowWake('visible');
       cancelBrowserFrameSuspend();
       scheduleExplorerWatch(1200);
       queueVisibleExplorerDirectoryPrefetch(900);
-      forEachActiveWorkspaceTerminalWidget((widget) => {
-        flushVisibleTerminalWidgetPanes(widget);
-        scheduleFitTerminalWidget(widget, { activeOnly: true });
-      });
       scheduleMarketTickerStart(MARKET_TICKER_VISIBLE_RESUME_DELAY_MS);
       scheduleMarketTickerRender();
       scheduleWslProfilesBackgroundLoad(1200);
@@ -20724,6 +20764,7 @@ function scheduleWindowResizeWork() {
   if (windowResizeFrame) return;
   windowResizeFrame = window.requestAnimationFrame(() => {
     windowResizeFrame = 0;
+    const terminalTinyLayout = updateTerminalTinyWindowLayout('window-resize');
     hideContextMenu();
     hideWidgetOpacityPopover();
     applyWorkspaceDockSettings({ skipLayoutRefresh: true });
@@ -20737,7 +20778,9 @@ function scheduleWindowResizeWork() {
       if (widget.element.classList.contains('hidden')) return;
       syncAppGlassOwnerTargets(widget.element);
       applyStoredLayoutRatio(widget.element);
-      scheduleFitTerminalWidget(widget);
+      if (!terminalTinyLayout) {
+        scheduleFitTerminalWidget(widget, { windowWake: terminalWindowWakeCatchingUp() });
+      }
     });
     scheduleExplorerVirtualRender();
     requestCodeEditorMeasure();
@@ -23870,7 +23913,7 @@ function showTerminalWidgetsForWorkspace(workspaceId: string) {
   }
 }
 
-function flushVisibleTerminalWidgetPanes(widget: TerminalWidget) {
+function flushVisibleTerminalWidgetPanes(widget: TerminalWidget, options: { reason?: string } = {}) {
   const activeGroup = activeTerminalGroupForWidget(widget);
   const paneIds = activeGroup ? terminalGroupPaneIds(activeGroup) : [widget.activePaneId];
   let flushed = 0;
@@ -23883,7 +23926,10 @@ function flushVisibleTerminalWidgetPanes(widget: TerminalWidget) {
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     flushed += 1;
   }
-  if (flushed) appendDiagnosticLog('terminal', `workspace show flushed ${flushed} visible pane${flushed === 1 ? '' : 's'} widget=${widget.widgetId.slice(0, 6)}`);
+  if (flushed) {
+    const reason = options.reason ?? 'workspace show';
+    appendDiagnosticLog('terminal', `${reason} flushed ${flushed} visible pane${flushed === 1 ? '' : 's'} widget=${widget.widgetId.slice(0, 6)}`);
+  }
 }
 
 function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {}) {
@@ -32255,22 +32301,76 @@ function terminalInputCountsAsWorkspaceLlmActivity(data: string) {
   return /[\r\n]/.test(meaningful) || /[^\x00-\x1F\x7F]/.test(meaningful);
 }
 
-function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly?: boolean } = {}) {
+function resumeTerminalsAfterWindowWake(reason: string) {
+  terminalWindowWakeCatchingUpActive = true;
+  drainTerminalWindowWakeBacklog(reason);
+  scheduleTerminalWindowWakeRefresh(reason);
+}
+
+function terminalWindowWakeCatchingUp() {
+  return terminalWindowWakeCatchingUpActive;
+}
+
+function drainTerminalWindowWakeBacklog(reason: string) {
+  let flushed = 0;
+  forEachActiveWorkspaceTerminalWidget((widget) => {
+    const activeGroup = activeTerminalGroupForWidget(widget);
+    const paneIds = activeGroup ? terminalGroupPaneIds(activeGroup) : [widget.activePaneId];
+    for (const paneId of paneIds) {
+      const pane = terminalPaneById.get(paneId);
+      if (!pane || terminalPaneVisibility(pane) !== 'visible') continue;
+      if (!pane.writeBuffer && !pane.writeFrame && !pane.writeTimer) continue;
+      flushTerminalWriteBuffer(pane);
+      scheduleTerminalRenderWatchdog(pane);
+      flushed += 1;
+    }
+  });
+  if (flushed) {
+    appendDiagnosticLog('terminal', `window wake catch-up reason=${reason} panes=${flushed}`);
+  }
+}
+
+function scheduleTerminalWindowWakeRefresh(reason: string) {
+  terminalWindowWakeRefreshReason = reason;
+  if (terminalWindowWakeRefreshFrame) return;
+  terminalWindowWakeRefreshFrame = window.requestAnimationFrame(() => {
+    const delayedReason = terminalWindowWakeRefreshReason || reason;
+    terminalWindowWakeRefreshFrame = 0;
+    terminalWindowWakeRefreshReason = '';
+    let pendingWrites = false;
+    forEachActiveWorkspaceTerminalWidget((widget) => {
+      flushVisibleTerminalWidgetPanes(widget, { reason: 'window wake' });
+      scheduleFitTerminalWidget(widget, { activeOnly: true, windowWake: true });
+      for (const pane of terminalPanesForWidget(widget)) {
+        if (terminalPaneVisibility(pane) !== 'visible') continue;
+        pendingWrites ||= Boolean(pane.writeBuffer || pane.writeFrame || pane.writeTimer || (pane.pendingTerminalWrites ?? 0) > 0);
+      }
+    });
+    appendDiagnosticLog('terminal', `window wake terminal refresh reason=${delayedReason} pending=${pendingWrites ? 1 : 0}`);
+    if (pendingWrites) {
+      scheduleTerminalWindowWakeRefresh(`${delayedReason}/pending`);
+    } else {
+      terminalWindowWakeCatchingUpActive = false;
+    }
+  });
+}
+
+function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly?: boolean; windowWake?: boolean } = {}) {
   if (options.activeOnly) {
     const group = activeTerminalGroupForWidget(widget);
     const paneIds = group ? terminalGroupPaneIds(group) : [];
     if (paneIds.length > 1) {
       for (const paneId of paneIds) {
         const pane = terminalPaneById.get(paneId);
-        if (pane) scheduleFitTerminal(pane);
+        if (pane) scheduleFitTerminal(pane, { windowWake: options.windowWake });
       }
     } else {
       const pane = activePaneForWidget(widget);
-      if (pane) scheduleFitTerminal(pane);
+      if (pane) scheduleFitTerminal(pane, { windowWake: options.windowWake });
     }
     return;
   }
-  for (const pane of terminalPanesForWidget(widget)) scheduleFitTerminal(pane);
+  for (const pane of terminalPanesForWidget(widget)) scheduleFitTerminal(pane, { windowWake: options.windowWake });
 }
 
 function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
@@ -32487,13 +32587,13 @@ function rememberedTerminalSpawnSize() {
   };
 }
 
-function scheduleFitTerminal(pane: TerminalPane) {
+function scheduleFitTerminal(pane: TerminalPane, options: { windowWake?: boolean } = {}) {
   if (!terminalPaneCanFit(pane)) return;
   if (terminalImeCompositionGuardActive(pane)) return;
   if (pane.fitFrame) return;
   pane.fitFrame = requestAnimationFrame(() => {
     pane.fitFrame = undefined;
-    fitTerminal(pane);
+    fitTerminal(pane, { windowWake: options.windowWake });
   });
 }
 
@@ -32513,20 +32613,119 @@ function queueTerminalFitBurst(pane: TerminalPane) {
   window.setTimeout(() => scheduleFitTerminal(pane), 160);
 }
 
+function terminalWindowLayoutTooSmallForFit() {
+  const heights = [
+    window.innerHeight,
+    document.documentElement?.clientHeight ?? 0,
+    document.body?.clientHeight ?? 0
+  ].filter((height) => Number.isFinite(height) && height > 0);
+  const viewportHeight = heights.length ? Math.min(...heights) : window.innerHeight;
+  return viewportHeight > 0 && viewportHeight < terminalMinHeight();
+}
+
+function updateTerminalTinyWindowLayout(reason: string) {
+  const tiny = terminalWindowLayoutTooSmallForFit();
+  if (tiny) {
+    if (!terminalTinyWindowLayoutActive) {
+      terminalTinyWindowLayoutActive = true;
+      appendDiagnosticLog(
+        'terminal',
+        `tiny window layout active reason=${reason} innerH=${Math.round(window.innerHeight)} docH=${Math.round(document.documentElement?.clientHeight ?? 0)}`
+      );
+    }
+    return true;
+  }
+  if (terminalTinyWindowLayoutActive) {
+    terminalTinyWindowLayoutActive = false;
+    workspaceGlassSkipNextResizeRebuildAfterTinyRestore = true;
+    appendDiagnosticLog(
+      'terminal',
+      `tiny window layout restored reason=${reason} innerH=${Math.round(window.innerHeight)} docH=${Math.round(document.documentElement?.clientHeight ?? 0)}`
+    );
+    resumeTerminalsAfterWindowWake(`${reason}-restored`);
+  }
+  return false;
+}
+
 function terminalPaneCanFit(pane: TerminalPane) {
   const widget = terminalWidgetForPane(pane);
+  const rect = pane.host.getBoundingClientRect();
   return pane.workspaceId === state.activeWorkspaceId
     && !pane.element.classList.contains('hidden')
     && pane.host.isConnected
     && !pane.host.classList.contains('hidden')
+    && !terminalWindowLayoutTooSmallForFit()
+    && rect.width > 2
+    && rect.height > 2
     && !(widget && terminalSplitResizeWidgetIds.has(widget.widgetId));
 }
 
-function fitTerminal(pane: TerminalPane) {
+type TerminalFitProposal = { rows: number; cols: number };
+
+function proposeTerminalFitDimensions(pane: TerminalPane): TerminalFitProposal | null {
+  try {
+    const fit = pane.fit as XTermFitAddon & {
+      proposeDimensions?: () => TerminalFitProposal | undefined;
+    };
+    const proposed = fit.proposeDimensions?.();
+    if (!proposed) return null;
+    if (!Number.isFinite(proposed.rows) || !Number.isFinite(proposed.cols)) return null;
+    if (proposed.rows < 2 || proposed.cols < 2) return null;
+    return { rows: Math.floor(proposed.rows), cols: Math.floor(proposed.cols) };
+  } catch {
+    return null;
+  }
+}
+
+function clearTerminalPendingFit(pane: TerminalPane) {
+  pane.pendingFitWidth = undefined;
+  pane.pendingFitHeight = undefined;
+  pane.pendingFitRows = undefined;
+  pane.pendingFitCols = undefined;
+  pane.pendingFitStableFrames = undefined;
+}
+
+function terminalFitProposalStable(pane: TerminalPane, proposed: TerminalFitProposal, rect: DOMRect) {
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
+  const sameProposal = pane.pendingFitRows === proposed.rows
+    && pane.pendingFitCols === proposed.cols
+    && pane.pendingFitWidth === width
+    && pane.pendingFitHeight === height;
+  if (!sameProposal) {
+    pane.pendingFitRows = proposed.rows;
+    pane.pendingFitCols = proposed.cols;
+    pane.pendingFitWidth = width;
+    pane.pendingFitHeight = height;
+    pane.pendingFitStableFrames = 1;
+    return false;
+  }
+  pane.pendingFitStableFrames = (pane.pendingFitStableFrames ?? 1) + 1;
+  return pane.pendingFitStableFrames >= 2;
+}
+
+function fitTerminal(pane: TerminalPane, options: { windowWake?: boolean } = {}) {
   if (!terminalPaneCanFit(pane)) return;
   if (terminalImeCompositionGuardActive(pane)) return;
+  const rect = pane.host.getBoundingClientRect();
   try {
+    const proposed = proposeTerminalFitDimensions(pane);
+    if (options.windowWake && proposed && !terminalFitProposalStable(pane, proposed, rect)) {
+      scheduleFitTerminal(pane, { windowWake: true });
+      return;
+    }
+    if (
+      proposed
+      && pane.lastRows === proposed.rows
+      && pane.lastCols === proposed.cols
+      && pane.term.rows === proposed.rows
+      && pane.term.cols === proposed.cols
+    ) {
+      clearTerminalPendingFit(pane);
+      return;
+    }
     pane.fit.fit();
+    clearTerminalPendingFit(pane);
     if (pane.lastRows === pane.term.rows && pane.lastCols === pane.term.cols) return;
     pane.lastRows = pane.term.rows;
     pane.lastCols = pane.term.cols;
@@ -33883,7 +34082,7 @@ function flushTerminalWriteBuffer(pane: TerminalPane) {
   }
   if (!pane.writeBuffer) return;
   const visibility = terminalPaneVisibility(pane);
-  if ((pane.pendingTerminalWrites ?? 0) >= TERMINAL_MAX_PENDING_TERM_WRITES) {
+  if ((pane.pendingTerminalWrites ?? 0) >= terminalMaxPendingTermWrites(pane, visibility)) {
     scheduleTerminalWriteContinuation(pane, visibility);
     return;
   }
@@ -33922,9 +34121,19 @@ function terminalWriteChunkSize(pane: TerminalPane, visibility: TerminalVisibili
   if (visibility === 'visible' && terminalHasRecentUserInput(pane)) {
     return TERMINAL_RECENT_INPUT_WRITE_CHUNK_CHARS;
   }
+  if (visibility === 'visible' && terminalWindowWakeCatchingUp()) {
+    return TERMINAL_WAKE_WRITE_CHUNK_CHARS;
+  }
   return visibility === 'visible'
     ? TERMINAL_VISIBLE_WRITE_CHUNK_CHARS
     : TERMINAL_HIDDEN_WRITE_CHUNK_CHARS;
+}
+
+function terminalMaxPendingTermWrites(pane: TerminalPane, visibility: TerminalVisibility) {
+  if (visibility === 'visible' && terminalWindowWakeCatchingUp() && !terminalHasRecentUserInput(pane)) {
+    return TERMINAL_WAKE_PENDING_TERM_WRITES;
+  }
+  return TERMINAL_MAX_PENDING_TERM_WRITES;
 }
 
 function terminalHasRecentUserInput(pane: TerminalPane) {
