@@ -143,8 +143,7 @@ const WSL_WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WSL_WARMUP_CACHE_TTL: Duration = Duration::from_secs(30);
 const WSL_DISTRO_LIST_TIMEOUT: Duration = Duration::from_secs(4);
 const WSL_DISTRO_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
-const WSL_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
-const WSL_TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(450);
+const WSL_TRANSIENT_RETRY_ATTEMPTS: usize = 4;
 const REMOTE_SHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const REMOTE_DIRECTORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(18);
 const LLM_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
@@ -165,7 +164,7 @@ type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 
 static WSL_HOME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static WSL_WARMUP_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-static WSL_WARMUP_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static WSL_WARMUP_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static WSL_DISTRO_LIST_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
 
 struct IdeState {
@@ -446,18 +445,18 @@ fn default_windows_root() -> String {
         .unwrap_or_else(|| "C:\\\\".to_string())
 }
 
-fn default_wsl_root(distro: &str) -> String {
+fn cached_or_detect_wsl_home(distro: &str) -> Option<String> {
     let cache = WSL_HOME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
         if let Some(root) = guard.get(distro) {
-            return root.clone();
+            return Some(root.clone());
         }
     }
-    let root = detect_wsl_home(distro).unwrap_or_else(|| "/home".to_string());
+    let root = detect_wsl_home(distro)?;
     if let Ok(mut guard) = cache.lock() {
         guard.insert(distro.to_string(), root.clone());
     }
-    root
+    Some(root)
 }
 
 fn wsl_start_directory_arg(cwd: &str, fallback_cwd: &str) -> String {
@@ -3129,12 +3128,12 @@ fn resolve_profile_path_blocking(profile_id: String, path: String) -> Result<Str
     let trimmed = path.trim();
     if profile.kind == "wsl" && (trimmed.is_empty() || trimmed == "~") {
         let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
-        return Ok(default_wsl_root(distro));
+        return resolve_wsl_home(distro);
     }
     if profile.kind == "wsl" {
         if let Some(rest) = trimmed.strip_prefix("~/") {
             let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
-            return Ok(join_posix(&default_wsl_root(distro), rest));
+            return Ok(join_posix(&resolve_wsl_home(distro)?, rest));
         }
     }
     if profile.kind == "windows" && trimmed.is_empty() {
@@ -5350,7 +5349,7 @@ fn detect_wsl_distros() -> Vec<String> {
     if !output.status.success() {
         return cached_wsl_distros(true).unwrap_or_default();
     }
-    let raw = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+    let raw = decode_wsl_text(&output.stdout);
     let distros: Vec<String> = raw
         .lines()
         .map(str::trim)
@@ -5426,7 +5425,7 @@ fn detect_wsl_home_from_output(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+    let text = decode_wsl_text(&output.stdout);
     for line in text.lines() {
         let home = line.trim();
         if home.starts_with('/') && home.len() > 1 {
@@ -5449,7 +5448,7 @@ fn detect_wsl_user(distro: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+    let text = decode_wsl_text(&output.stdout);
     let user = text.trim();
     (!user.is_empty()
         && !user.contains('/')
@@ -5534,7 +5533,10 @@ fn profile_from_id(profile_id: &str) -> ConnectionProfile {
             id: profile_id.to_string(),
             label: format!("WSL: {distro}"),
             kind: "wsl".to_string(),
-            root: default_wsl_root(distro),
+            // Keep profile construction side-effect free. Resolving the actual
+            // home belongs after the coordinated WSL warmup; "~" is also the
+            // only correct common fallback for both regular and root users.
+            root: "~".to_string(),
             shell: "bash -l".to_string(),
             distro: Some(distro.to_string()),
             ssh_alias: None,
@@ -7188,7 +7190,12 @@ fn stream_profile_shell_to_file(
         if profile.kind == "ssh" {
             clear_ssh_askpass_cache_for_profile(profile);
         }
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        let message = if profile.kind == "wsl" {
+            decode_wsl_text(&output.stderr)
+        } else {
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        };
+        return Err(message);
     }
     Ok(())
 }
@@ -7664,7 +7671,7 @@ fn run_profile_shell_with_timeout(
                     && attempt + 1 < attempts =>
             {
                 last_error = Some(error);
-                thread::sleep(WSL_TRANSIENT_RETRY_DELAY);
+                thread::sleep(wsl_transient_retry_delay(attempt));
             }
             Err(error) => return Err(error),
         }
@@ -7766,7 +7773,12 @@ fn run_profile_shell_once(
         if profile.kind == "ssh" {
             clear_ssh_askpass_cache_for_profile(profile);
         }
-        return Err(String::from_utf8_lossy(&stderr).trim().to_string());
+        let message = if profile.kind == "wsl" {
+            decode_wsl_text(&stderr)
+        } else {
+            String::from_utf8_lossy(&stderr).trim().to_string()
+        };
+        return Err(message);
     }
     stdin_result?;
     Ok(stdout)
@@ -7778,13 +7790,7 @@ fn warm_wsl_profile(profile: &ConnectionProfile) -> Result<(), String> {
     }
 
     let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
-    if wsl_warmup_recent(distro) || !begin_wsl_warmup(distro) {
-        return Ok(());
-    }
-
-    let result = warm_wsl_distro(distro);
-    finish_wsl_warmup(distro, result.is_ok());
-    result
+    warm_wsl_distro_coordinated(distro)
 }
 
 fn warm_wsl_distro(distro: &str) -> Result<(), String> {
@@ -7805,7 +7811,7 @@ fn warm_wsl_distro(distro: &str) -> Result<(), String> {
                 let error = command_output_error_message(&output);
                 if is_wsl_transient_error(&error) && attempt + 1 < WSL_TRANSIENT_RETRY_ATTEMPTS {
                     last_error = Some(error);
-                    thread::sleep(WSL_TRANSIENT_RETRY_DELAY);
+                    thread::sleep(wsl_transient_retry_delay(attempt));
                     continue;
                 }
                 return Err(format!("WSL warmup failed: {error}"));
@@ -7814,7 +7820,7 @@ fn warm_wsl_distro(distro: &str) -> Result<(), String> {
                 if is_wsl_transient_error(&error) && attempt + 1 < WSL_TRANSIENT_RETRY_ATTEMPTS =>
             {
                 last_error = Some(error);
-                thread::sleep(WSL_TRANSIENT_RETRY_DELAY);
+                thread::sleep(wsl_transient_retry_delay(attempt));
             }
             Err(error) => return Err(format!("WSL warmup failed: {error}")),
         }
@@ -7834,36 +7840,113 @@ fn wsl_warmup_recent(distro: &str) -> bool {
         .is_some_and(|instant| instant.elapsed() < WSL_WARMUP_CACHE_TTL)
 }
 
-fn begin_wsl_warmup(distro: &str) -> bool {
-    let in_flight = WSL_WARMUP_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut guard) = in_flight.lock() else {
-        return true;
-    };
-    guard.insert(distro.to_string())
+fn wsl_warmup_lock(distro: &str) -> Arc<Mutex<()>> {
+    let locks = WSL_WARMUP_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(distro.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
-fn finish_wsl_warmup(distro: &str, succeeded: bool) {
-    if let Some(in_flight) = WSL_WARMUP_IN_FLIGHT.get() {
-        if let Ok(mut guard) = in_flight.lock() {
-            guard.remove(distro);
-        }
-    }
-    if !succeeded {
-        return;
-    }
+fn record_wsl_warmup_success(distro: &str) {
     let cache = WSL_WARMUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
         guard.insert(distro.to_string(), Instant::now());
     }
 }
 
+fn warm_wsl_distro_coordinated(distro: &str) -> Result<(), String> {
+    if wsl_warmup_recent(distro) {
+        return Ok(());
+    }
+    let lock = wsl_warmup_lock(distro);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if wsl_warmup_recent(distro) {
+        return Ok(());
+    }
+    warm_wsl_distro(distro)?;
+    record_wsl_warmup_success(distro);
+    Ok(())
+}
+
+fn resolve_wsl_home(distro: &str) -> Result<String, String> {
+    warm_wsl_distro_coordinated(distro)?;
+    cached_or_detect_wsl_home(distro)
+        .ok_or_else(|| format!("failed to resolve WSL home for distro {distro}"))
+}
+
+fn wsl_transient_retry_delay(attempt: usize) -> Duration {
+    const DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
+    Duration::from_millis(DELAYS_MS[attempt.min(DELAYS_MS.len() - 1)])
+}
+
 fn is_wsl_transient_error(message: &str) -> bool {
-    message.contains("Wsl/Service/E_UNEXPECTED") || message.contains("E_UNEXPECTED")
+    let normalized = message
+        .chars()
+        .filter(|character| *character != '\0')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("wsl/service/e_unexpected")
+        || normalized.contains("e_unexpected")
+        || normalized.contains("0x8000ffff")
+}
+
+fn decode_wsl_text(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+
+    let utf16_endianness = if bytes.starts_with(&[0xff, 0xfe]) {
+        Some(true)
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        Some(false)
+    } else {
+        let pair_count = bytes.len() / 2;
+        let even_nuls = bytes.chunks_exact(2).filter(|pair| pair[0] == 0).count();
+        let odd_nuls = bytes.chunks_exact(2).filter(|pair| pair[1] == 0).count();
+        if pair_count >= 2 && odd_nuls >= 2 && odd_nuls * 4 >= pair_count {
+            Some(true)
+        } else if pair_count >= 2 && even_nuls >= 2 && even_nuls * 4 >= pair_count {
+            Some(false)
+        } else if bytes.len() % 2 == 0 && std::str::from_utf8(bytes).is_err() {
+            // Localized wsl.exe service errors can be UTF-16 without a BOM.
+            Some(true)
+        } else {
+            None
+        }
+    };
+
+    let text = match utf16_endianness {
+        Some(little_endian) => {
+            let start =
+                usize::from(bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]))
+                    * 2;
+            let units = bytes[start..]
+                .chunks_exact(2)
+                .map(|pair| {
+                    if little_endian {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    } else {
+                        u16::from_be_bytes([pair[0], pair[1]])
+                    }
+                })
+                .collect::<Vec<_>>();
+            String::from_utf16_lossy(&units)
+        }
+        None => String::from_utf8_lossy(bytes).to_string(),
+    };
+    text.trim_matches(['\u{feff}', '\0'])
+        .replace('\0', "")
+        .trim()
+        .to_string()
 }
 
 fn command_output_error_message(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = decode_wsl_text(&output.stdout);
+    let stderr = decode_wsl_text(&output.stderr);
     match (stderr.is_empty(), stdout.is_empty()) {
         (false, false) => format!("{stderr}\n{stdout}"),
         (false, true) => stderr,
@@ -8521,6 +8604,52 @@ fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &st
     };
     name.trim().eq_ignore_ascii_case(expected_name)
         && value.trim().eq_ignore_ascii_case(expected_value)
+}
+
+#[cfg(test)]
+mod wsl_recovery_tests {
+    use super::*;
+
+    fn utf16_le_bytes(value: &str) -> Vec<u8> {
+        value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn decodes_localized_utf16_wsl_service_errors_without_mojibake() {
+        let message = "요청한 작업을 처리하는 동안 오류가 발생했습니다.\r\n오류 코드: Wsl/Service/E_UNEXPECTED";
+        let decoded = decode_wsl_text(&utf16_le_bytes(message));
+
+        assert_eq!(decoded, message);
+        assert!(is_wsl_transient_error(&decoded));
+    }
+
+    #[test]
+    fn preserves_utf8_linux_output() {
+        let message = "bash: 테스트 파일을 찾을 수 없습니다";
+        assert_eq!(decode_wsl_text(message.as_bytes()), message);
+    }
+
+    #[test]
+    fn detects_nul_interleaved_and_hresult_transient_errors() {
+        assert!(is_wsl_transient_error(
+            "W\0s\0l\0/\0S\0e\0r\0v\0i\0c\0e\0/\0E\0_\0U\0N\0E\0X\0P\0E\0C\0T\0E\0D\0"
+        ));
+        assert!(is_wsl_transient_error("Catastrophic failure 0x8000FFFF"));
+    }
+
+    #[test]
+    fn wsl_profiles_use_shell_home_until_resolution() {
+        let profile = profile_from_id("wsl:Example");
+        assert_eq!(profile.root, "~");
+    }
+
+    #[test]
+    fn transient_retry_uses_bounded_backoff() {
+        assert_eq!(wsl_transient_retry_delay(0), Duration::from_millis(500));
+        assert_eq!(wsl_transient_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(wsl_transient_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(wsl_transient_retry_delay(99), Duration::from_secs(2));
+    }
 }
 
 #[cfg(test)]

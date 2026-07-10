@@ -101,6 +101,8 @@ interface TerminalPane {
   groupId: string;
   workspaceId: string;
   backendId?: string;
+  startupState: 'starting' | 'ready' | 'failed';
+  startupError?: string;
   title: string;
   customTitle?: string;
   command: string | null;
@@ -1690,6 +1692,8 @@ const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
 const TERMINAL_START_TIMEOUT_WINDOWS_MS = 15000;
 const TERMINAL_START_TIMEOUT_WSL_MS = 60000;
 const TERMINAL_START_TIMEOUT_SSH_MS = 45000;
+const TERMINAL_WSL_START_ATTEMPTS = 2;
+const TERMINAL_WSL_START_RETRY_DELAY_MS = 1400;
 const TERMINAL_STARTUP_NOTICE_MS = 900;
 const TERMINAL_STARTUP_STALL_MS = 10000;
 const TERMINAL_CLOSE_BACKEND_TIMEOUT_MS = 2500;
@@ -3922,6 +3926,7 @@ const terminalWidgetTabsRenderSignatures = new WeakMap<TerminalWidget, string>()
 const terminalWidgetTabsOrderRenderSignatures = new WeakMap<TerminalWidget, string>();
 const terminalWidgetTabElementCaches = new WeakMap<TerminalWidget, Map<string, HTMLElement>>();
 let workspaceTerminalRestoreToken = 0;
+const workspaceTerminalRetryInFlightIds = new Set<string>();
 let inactiveEditorHydrationToken = 0;
 let noteHydrationToken = 0;
 let explorerVisiblePrefetchToken = 0;
@@ -17300,6 +17305,27 @@ async function closeWorkspaceTab(id: string) {
 async function activateWorkspaceTab(id: string) {
   if (id === state.activeWorkspaceId && state.workspaceOpen) {
     acknowledgeWorkspaceDoneUnread(id);
+    const snapshot = workspaceSnapshotForId(id);
+    const profile = snapshot ? profileForId(snapshot.profileId) : null;
+    const hasFailedShell = state.terminals.some((pane) => (
+      pane.workspaceId === id && pane.startupState === 'failed'
+    ));
+    if (
+      snapshot
+      && profile
+      && hasFailedShell
+      && (snapshot.terminals ?? []).length > 0
+      && !workspaceHasRunningTerminalBackend(id)
+      && !workspaceTerminalRetryInFlightIds.has(id)
+    ) {
+      workspaceTerminalRetryInFlightIds.add(id);
+      try {
+        setStatus(`Retrying failed shells: ${snapshot.label}`);
+        await restoreWorkspaceTerminals(snapshot, profile);
+      } finally {
+        workspaceTerminalRetryInFlightIds.delete(id);
+      }
+    }
     return;
   }
   const snapshot = workspaceSnapshotForId(id);
@@ -18351,7 +18377,9 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     await yieldToUi();
     if (state.activeWorkspaceId !== snapshot.id) return;
 
-    const hasLiveTerminals = state.terminals.some((pane) => pane.workspaceId === snapshot.id);
+    const hasLiveTerminals = state.terminals.some((pane) => (
+      pane.workspaceId === snapshot.id && pane.startupState !== 'failed'
+    ));
     if (hasLiveTerminals) {
       await restoreWorkspaceTerminals(snapshot, profile);
       await nextAnimationFrame();
@@ -18471,6 +18499,17 @@ async function restoreWorkspaceTerminals(
   if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
   showTerminalWidgetsForWorkspace(snapshot.id);
   if (!hasActiveWorkspaceTerminalPane()) {
+    const failedPaneIds = state.terminals
+      .filter((pane) => pane.workspaceId === snapshot.id && pane.startupState === 'failed')
+      .map((pane) => pane.paneId);
+    for (const paneId of failedPaneIds) {
+      await closeTerminalPane(paneId, {
+        backgroundKill: true,
+        saveSnapshot: false,
+        renderShellTabs: false
+      });
+    }
+    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
     const terminalSnapshots = snapshot.terminals ?? [];
     if (!terminalSnapshots.length) {
       state.activePaneId = '';
@@ -20739,6 +20778,13 @@ function terminalStartTimeoutMs(profile: ConnectionProfile) {
   if (profile.kind === 'wsl') return TERMINAL_START_TIMEOUT_WSL_MS;
   if (profile.kind === 'ssh') return TERMINAL_START_TIMEOUT_SSH_MS;
   return TERMINAL_START_TIMEOUT_WINDOWS_MS;
+}
+
+function isWslTransientStartupError(error: unknown) {
+  const normalized = String(error).replaceAll('\0', '').toLowerCase();
+  return normalized.includes('wsl/service/e_unexpected')
+    || normalized.includes('e_unexpected')
+    || normalized.includes('0x8000ffff');
 }
 
 function yieldToUi() {
@@ -24215,6 +24261,8 @@ function queueTerminalShellReadyAction(
 
 function markTerminalShellReady(pane: TerminalPane) {
   if (!pane.backendId || !isTerminalPaneAlive(pane)) return;
+  pane.startupState = 'ready';
+  pane.startupError = undefined;
   if (!pane.shellReadyAt) pane.shellReadyAt = performance.now();
   clearTerminalStartupWatch(pane);
   clearTerminalShellReadyFallback(pane);
@@ -24229,10 +24277,15 @@ function markTerminalShellReady(pane: TerminalPane) {
 
 function handleTerminalExitEvent(pane: TerminalPane) {
   const workspaceId = pane.workspaceId;
+  const exitedDuringStartup = pane.startupState === 'starting';
   clearTerminalStartupWatch(pane);
   flushTerminalWriteBuffer(pane);
   failPendingTerminalShellReadyActions(pane, 'shell exited before it became ready');
   setTerminalBackendId(pane, undefined);
+  if (exitedDuringStartup) {
+    pane.startupState = 'failed';
+    pane.startupError = 'Shell exited before it became ready';
+  }
   pane.title = `${pane.title} (exited)`;
   const widget = terminalWidgetForPane(pane);
   if (widget) renderTerminalWidgetTabs(widget);
@@ -31362,6 +31415,7 @@ async function createTerminalTab(
     widgetId: widget.widgetId,
     groupId: initialGroupId,
     workspaceId: widget.workspaceId,
+    startupState: 'starting',
     title,
     command,
     llmId: terminalLlmId,
@@ -31454,26 +31508,57 @@ async function createTerminalTab(
         updateTerminalWidgetTitle(widget);
       }
     }
-    const spawnPromise = api.spawnTerminal(terminalProfile.id, pane.cwd, command, term.rows, term.cols, widget.workspaceId, title);
-    let spawnTimedOut = false;
-    spawnPromise.then((lateBackendId) => {
-      if ((spawnTimedOut || !isTerminalPaneAlive(pane)) && !pane.backendId) {
-        void api.killTerminal(lateBackendId).catch(() => undefined);
+    const attempts = terminalProfile.kind === 'wsl' ? TERMINAL_WSL_START_ATTEMPTS : 1;
+    let backendId = '';
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      let disposeLateBackend = false;
+      const spawnPromise = api.spawnTerminal(
+        terminalProfile.id,
+        pane.cwd,
+        command,
+        term.rows,
+        term.cols,
+        widget.workspaceId,
+        title
+      );
+      spawnPromise.then((lateBackendId) => {
+        if (disposeLateBackend || !isTerminalPaneAlive(pane)) {
+          void api.killTerminal(lateBackendId).catch(() => undefined);
+        }
+      }).catch(() => undefined);
+      try {
+        backendId = await withTimeout(
+          spawnPromise,
+          terminalStartTimeoutMs(terminalProfile),
+          `${terminalProfile.kind.toUpperCase()} shell start`
+        );
+        break;
+      } catch (error) {
+        disposeLateBackend = String(error).includes('timed out');
+        const canRetry = terminalProfile.kind === 'wsl'
+          && isWslTransientStartupError(error)
+          && attempt + 1 < attempts
+          && isTerminalPaneAlive(pane);
+        if (!canRetry) throw error;
+        term.write('\r\n\x1b[2mWSL service returned a temporary error. Retrying this shell...\x1b[0m\r\n');
+        setStatus(`WSL startup retry ${attempt + 2}/${attempts}: ${terminalProfile.label}`);
+        await delay(TERMINAL_WSL_START_RETRY_DELAY_MS);
+        if (!isTerminalPaneAlive(pane)) return pane;
       }
-    }).catch(() => undefined);
-    const backendId = await withTimeout(
-      spawnPromise,
-      terminalStartTimeoutMs(terminalProfile),
-      `${terminalProfile.kind.toUpperCase()} shell start`
-    ).catch((error) => {
-      spawnTimedOut = String(error).includes('timed out');
-      throw error;
-    });
+    }
+    if (!backendId) throw new Error('WSL shell start returned no terminal session');
     if (!isTerminalPaneAlive(pane)) {
       void api.killTerminal(backendId).catch(() => undefined);
       return pane;
     }
     setTerminalBackendId(pane, backendId);
+    if (pane.backendId !== backendId) {
+      throw new Error(`${terminalProfile.kind.toUpperCase()} shell exited during startup`);
+    }
+    if (terminalProfile.kind !== 'wsl') {
+      pane.startupState = 'ready';
+      pane.startupError = undefined;
+    }
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
@@ -31485,6 +31570,8 @@ async function createTerminalTab(
   } catch (error) {
     clearTerminalStartupWatch(pane);
     if (!isTerminalPaneAlive(pane)) return pane;
+    pane.startupState = 'failed';
+    pane.startupError = String(error);
     if (terminalPaneLlmId(pane)) {
       updateAgentSessionProgressForPane(pane, {
         status: 'error',
@@ -32074,7 +32161,7 @@ function firstActiveWorkspaceTerminalWidget() {
 
 function hasActiveWorkspaceTerminalPane() {
   for (const pane of state.terminals) {
-    if (pane.workspaceId === state.activeWorkspaceId) return true;
+    if (pane.workspaceId === state.activeWorkspaceId && pane.startupState !== 'failed') return true;
   }
   return false;
 }

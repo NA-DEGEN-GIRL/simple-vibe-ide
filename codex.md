@@ -51,6 +51,35 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-10 - Recover transient WSL service startup failures
+
+#### Changed (`src-tauri/src/lib.rs`, `src/main.ts`)
+- Localized `wsl.exe` output is decoded as UTF-16 when appropriate, so service
+  failures remain readable and `Wsl/Service/E_UNEXPECTED` can be classified
+  instead of being hidden by mojibake and interleaved NUL characters.
+- Transient WSL commands and warmup now use four bounded attempts with
+  0.5/1/2-second backoff. Concurrent starts for one distro wait on the same
+  warmup rather than allowing later PTY launches to race ahead of it.
+- WSL profiles keep `~` as their neutral root until the distro has warmed.
+  Successful home detection is cached afterward, so a transient probe failure
+  no longer permanently substitutes `/home` for a root-default distro.
+- A terminal retries one `E_UNEXPECTED` start in the same pane. A pane whose
+  start ultimately failed no longer blocks workspace terminal restoration, and
+  clicking the already-active workspace retries its failed saved shells when
+  no terminal backend is running.
+- Recovery remains non-destructive: the IDE does not automatically terminate a
+  distro or run a global `wsl --shutdown`.
+
+#### Verified
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo test --manifest-path src-tauri/Cargo.toml` (10 passed)
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Real Windows/Tauri WSL failure-and-recovery smoke is still required.
+
 ### 2026-07-10 - Reduce Glass recapture and Explorer hover churn
 
 #### Changed (`src/main.ts`, `public/vendor/liquidgl/liquidGL.js`, `theme/glass_set_01.json`)
