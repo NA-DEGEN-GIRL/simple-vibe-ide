@@ -47,7 +47,8 @@ type LiquidGLLensLike = {
   _appGlassTiltObserver?: MutationObserver | null;
   _appGlassTiltFollowers?: HTMLElement[];
   _destroyMirrorCanvas?: () => void;
-  _sizeObs?: ResizeObserver;
+  _sizeObs?: ResizeObserver | null;
+  _dispose?: () => void;
 };
 
 type LiquidGLRendererLike = {
@@ -58,21 +59,27 @@ type LiquidGLRendererLike = {
   staticSnapshotCanvas?: HTMLCanvasElement;
   scaleFactor?: number;
   useExternalTicker?: boolean;
-  _uploadTexture?: (canvas: HTMLCanvasElement) => void;
-  captureSnapshot?: () => Promise<unknown>;
+  _uploadTexture?: (canvas: HTMLCanvasElement) => boolean;
+  captureSnapshot?: (options?: { trailing?: boolean; forceRecapture?: boolean }) => Promise<unknown>;
   render?: () => void;
   dispose?: () => void;
   _rafId?: number | null;
   _resizeCanvas?: () => void;
-  _resizeHandler?: EventListenerOrEventListenerObject | null;
+  _resizeHandler?: (EventListenerOrEventListenerObject & { cancel?: () => void }) | null;
   _resizeObserver?: ResizeObserver | null;
   _scrollRafId?: number | null;
   _scrollTimeout?: number | null;
   _isScrolling?: boolean;
+  _pendingReveal?: LiquidGLLensLike[];
   _sviWorkspaceHoverOnlyFilterInstalled?: boolean;
   _sviWorkspaceHoverOnlyOriginalRender?: (...args: unknown[]) => unknown;
   _sviExplorerHoverOnlyFilterInstalled?: boolean;
   _sviExplorerHoverOnlyOriginalRender?: (...args: unknown[]) => unknown;
+  _sviExplorerHoverOnlyMode?: boolean;
+  _sviExplorerEffectSignature?: string;
+  _sviAppActiveFilterInstalled?: boolean;
+  _sviAppActiveOriginalRender?: (...args: unknown[]) => unknown;
+  addLens?: (element: Element, options: Record<string, unknown>) => LiquidGLLensLike;
 };
 
 declare global {
@@ -1634,6 +1641,7 @@ const WORKSPACE_IMAGE_DATA_URL_PERSIST_MAX_CHARS = 6 * 1024 * 1024;
 const WORKSPACE_IMAGE_STORE_MAX_CHARS = 16 * 1024 * 1024;
 const MARKET_TICKER_STORE_KEY = `${APP_STORAGE_PREFIX}.marketTicker.v1`;
 const IDE_SETTINGS_KEY = `${APP_STORAGE_PREFIX}.settings.v1`;
+const GLASS_DIAGNOSTICS_DEFAULT_OFF_MIGRATION_KEY = `${APP_STORAGE_PREFIX}.glassDiagnosticsDefaultOff.v1`;
 const DIAGNOSTIC_SESSION_STORAGE_KEY = `${APP_STORAGE_PREFIX}.diagnosticSession.v1`;
 const NOTES_MEMORY_STORE_KEY = `${APP_STORAGE_PREFIX}.notesMemory.v1`;
 const NOTES_MEMORY_LIMIT = 200;
@@ -3921,7 +3929,6 @@ let explorerLiquidGlassRenderer: LiquidGLRendererLike | undefined;
 let explorerLiquidGlassRefreshTimer = 0;
 let explorerLiquidGlassRefreshRecapture = false;
 let explorerLiquidGlassApplying = false;
-let explorerLiquidGlassTargetSignature = '';
 let explorerLiquidGlassScrollFrame = 0;
 let explorerLiquidGlassOverlayHost: HTMLDivElement | null = null;
 let appShutdownStarted = false;
@@ -3970,6 +3977,8 @@ let workspaceLiquidGlassLastHoverDiagnosticAt = 0;
 let workspaceLiquidGlassHoverOnlyTarget: HTMLElement | null = null;
 let workspaceLiquidGlassHoverPointerX = Number.NaN;
 let workspaceLiquidGlassHoverPointerY = Number.NaN;
+let workspaceLiquidGlassHoverOnlyRuntime = false;
+let workspaceLiquidGlassTickerFrame = 0;
 let appGlassRefreshTimer = 0;
 let appGlassRefreshRecapture = false;
 let appGlassDeferredRecapture = false;
@@ -3990,6 +3999,16 @@ const appGlassHiddenOwnerCleanupTimers = new WeakMap<HTMLElement, number>();
 const appGlassRenderers = new Map<string, LiquidGLRendererLike>();
 let appGlassSharedRenderer: LiquidGLRendererLike | undefined;
 const appGlassRendererViewportSignatures = new WeakMap<LiquidGLRendererLike, string>();
+const glassRendererSnapshotSignatures = new WeakMap<LiquidGLRendererLike, string>();
+const glassSnapshotStageVersions = new WeakMap<Element, number>();
+const glassSnapshotCache = new WeakMap<Element, {
+  signature: string;
+  canvas?: HTMLCanvasElement;
+  scaleFactor?: number;
+  promise?: Promise<boolean>;
+}>();
+let glassWindowWakeTimer = 0;
+const glassWindowWakeReasons = new Set<string>();
 const appGlassTiltFollowerOriginalStyles = new WeakMap<HTMLElement, {
   transform: string;
   transition: string;
@@ -4002,6 +4021,13 @@ const appGlassTiltFollowerOriginalStyles = new WeakMap<HTMLElement, {
 type AppGlassTiltSuspension = { lens: LiquidGLLensLike; tiltEnabled: boolean };
 let appGlassLastDiagnosticAt = 0;
 let explorerLiquidGlassHoverOnlyTarget: HTMLElement | null = null;
+let explorerLiquidGlassHoverOnlyRuntime = false;
+let explorerLiquidGlassHoverMoveFrame = 0;
+let explorerLiquidGlassHoverMoveX = Number.NaN;
+let explorerLiquidGlassHoverMoveY = Number.NaN;
+let explorerLiquidGlassLensByTarget = new WeakMap<HTMLElement, LiquidGLLensLike>();
+let workspaceContainerCompositeSignature = '';
+let explorerPanelCompositeSignature = '';
 let suppressWorkspaceTabClick = false;
 let fileOpenToken = 0;
 let editorLoadingTimer = 0;
@@ -4987,7 +5013,10 @@ async function init() {
       focusActiveTerminalPaneWhenItOwnsKeyboard();
       resumeGlassAfterWindowWake('visible');
     }
-    else saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+    else {
+      stopWorkspaceGlassTicker();
+      saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+    }
   });
 
   setProfiles(await api.listProfiles());
@@ -6506,7 +6535,22 @@ function loadIdeSettings() {
   } catch {
     state.ideSettings = normalizedDefaultIdeSettings();
   }
+  migrateGlassDiagnosticsDefaultOff();
   applyIdeSettings();
+}
+
+function migrateGlassDiagnosticsDefaultOff() {
+  try {
+    if (localStorage.getItem(GLASS_DIAGNOSTICS_DEFAULT_OFF_MIGRATION_KEY) === '1') return;
+    state.ideSettings.appGlass = normalizeAppGlassSettings({
+      ...state.ideSettings.appGlass,
+      diagnostics: false
+    });
+    localStorage.setItem(GLASS_DIAGNOSTICS_DEFAULT_OFF_MIGRATION_KEY, '1');
+    persistIdeSettings();
+  } catch {
+    // Settings migration is best effort; diagnostics still default off for new installs.
+  }
 }
 
 function persistIdeSettings() {
@@ -6888,6 +6932,7 @@ function applyIdeBackgroundSettings() {
   ].join('\t');
   if (ideBackgroundAppliedSignature !== signature) {
     ideBackgroundAppliedSignature = signature;
+    bumpAllGlassSnapshotStages();
     scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
   }
 }
@@ -6919,6 +6964,8 @@ function syncIdeBackgroundWallpaperElement(container: HTMLElement, src: string, 
     image.decoding = 'async';
     image.setAttribute('aria-hidden', 'true');
     const refreshWallpaperGlass = () => {
+      bumpGlassSnapshotStage(container);
+      if (container !== el.ideGlassSnapshotStage) bumpGlassSnapshotStage(el.ideGlassSnapshotStage);
       scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
       scheduleExplorerLiquidGlassRefresh({ recapture: true });
       scheduleAppGlassRefresh({ recapture: true, reason: 'background-image-load' });
@@ -6943,6 +6990,10 @@ function applyWorkspaceGlassSettings() {
   const containerRadius = containerEffect.radius;
   state.ideSettings.workspaceGlass = glass;
   state.ideSettings.workspaceSideDockGlass = glass.enabled;
+  workspaceLiquidGlassHoverOnlyRuntime = !IS_TERMINAL_APP
+    && appGlassEnabled()
+    && glass.enabled === true
+    && glass.rowHoverOnly === true;
   const active = appGlassEnabled() && glass.enabled === true;
   setRootStyleProperty('--workspace-glass-dock-padding', `${glass.dockPadding}px`);
   setRootStyleProperty('--workspace-glass-dock-gap', `${glass.dockGap}px`);
@@ -7270,6 +7321,9 @@ function applyAppGlassSettings() {
   state.ideSettings.appGlass = glass;
   const commonEffect = commonGlassEffectSettings();
   const enabled = !IS_TERMINAL_APP && glass.enabled === true;
+  explorerLiquidGlassHoverOnlyRuntime = enabled
+    && glass.explorerRows === true
+    && glass.explorerRowsHoverOnly === true;
   const topologySignature = [
     enabled ? '1' : '0',
     glass.titlebar ? '1' : '0',
@@ -7984,15 +8038,16 @@ function handleGlassSettingsControlChange(event: Event) {
   if (path.startsWith('glassEffect.')) {
     updateExplorerLiquidGlassEffectOptions();
   }
+  applyIdeSettings();
   if (path === 'workspaceGlass.rowHoverOnly') {
     setWorkspaceHoverOnlyTarget(null);
     renderWorkspaceHoverOnlyNow();
+    syncWorkspaceGlassTicker();
   }
   if (path === 'appGlass.explorerRowsHoverOnly') {
     setExplorerHoverOnlyTarget(null);
     renderExplorerHoverOnlyNow();
   }
-  applyIdeSettings();
   syncGlassSettingsPopover();
   schedulePersistIdeSettings(event.type === 'change' ? 80 : 360);
   setStatus('Glass settings saved');
@@ -8425,9 +8480,58 @@ function workspaceGlassUsesContainerSnapshot() {
 }
 
 function workspaceGlassHoverOnlyEnabled() {
-  if (!workspaceLiquidGlassEligible()) return false;
-  const glass = normalizeWorkspaceGlassSettings(state.ideSettings.workspaceGlass, true);
-  return glass.rowHoverOnly === true;
+  return workspaceLiquidGlassHoverOnlyRuntime && workspaceLiquidGlassEligible();
+}
+
+function workspaceGlassTickerCanRun() {
+  return workspaceLiquidGlassEligible() && !document.hidden && document.visibilityState !== 'hidden';
+}
+
+function workspaceRowGlassSpecularTickerNeeded() {
+  if (!workspaceGlassTickerCanRun()) return false;
+  const renderer = window.__liquidGLRenderer__;
+  const hoverOnly = workspaceGlassHoverOnlyEnabled();
+  const active = hoverOnly ? activeWorkspaceHoverOnlyGlassElements() : null;
+  return renderer?.lenses?.some((lens) => (
+    isWorkspaceLiquidGlassLens(lens)
+    && lens.options?.specular === true
+    && (!hoverOnly || active?.has(lens.el as HTMLElement) === true)
+  )) === true;
+}
+
+function workspaceContainerGlassSpecularTickerNeeded() {
+  if (!workspaceGlassTickerCanRun()) return false;
+  return workspaceContainerLiquidGlassRenderer()?.lenses?.some((lens) => (
+    isWorkspaceContainerLiquidGlassLens(lens) && lens.options?.specular === true
+  )) === true;
+}
+
+function workspaceGlassSpecularTickerNeeded() {
+  return workspaceRowGlassSpecularTickerNeeded() || workspaceContainerGlassSpecularTickerNeeded();
+}
+
+function stopWorkspaceGlassTicker() {
+  if (!workspaceLiquidGlassTickerFrame) return;
+  window.cancelAnimationFrame(workspaceLiquidGlassTickerFrame);
+  workspaceLiquidGlassTickerFrame = 0;
+}
+
+function syncWorkspaceGlassTicker() {
+  if (!workspaceGlassSpecularTickerNeeded()) {
+    stopWorkspaceGlassTicker();
+    return;
+  }
+  if (workspaceLiquidGlassTickerFrame) return;
+  const tick = () => {
+    workspaceLiquidGlassTickerFrame = 0;
+    const containerNeedsTick = workspaceContainerGlassSpecularTickerNeeded();
+    const rowsNeedTick = workspaceRowGlassSpecularTickerNeeded();
+    if (!containerNeedsTick && !rowsNeedTick) return;
+    if (containerNeedsTick) workspaceContainerLiquidGlassRenderer()?.render?.();
+    if (rowsNeedTick) window.__liquidGLRenderer__?.render?.();
+    workspaceLiquidGlassTickerFrame = window.requestAnimationFrame(tick);
+  };
+  workspaceLiquidGlassTickerFrame = window.requestAnimationFrame(tick);
 }
 
 function isWorkspaceHoverOnlyLens(lens: LiquidGLLensLike) {
@@ -8550,6 +8654,7 @@ function setWorkspaceHoverOnlyTarget(target: HTMLElement | null) {
     workspaceLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
     workspaceLiquidGlassHoverOnlyTarget = null;
     renderWorkspaceHoverOnlyNow();
+    syncWorkspaceGlassTicker();
     return;
   }
   const next = target instanceof HTMLElement && target.isConnected ? target : null;
@@ -8558,6 +8663,7 @@ function setWorkspaceHoverOnlyTarget(target: HTMLElement | null) {
   workspaceLiquidGlassHoverOnlyTarget = next;
   workspaceLiquidGlassHoverOnlyTarget?.classList.add('glass-hover-active');
   renderWorkspaceHoverOnlyNow();
+  syncWorkspaceGlassTicker();
 }
 
 function restoreWorkspaceHoverOnlyTargetFromCssHover() {
@@ -8625,6 +8731,128 @@ function workspaceLiquidGlassSnapshotTargetElement() {
     : el.ideGlassSnapshotStage;
 }
 
+function glassSnapshotStageVersion(stage: Element) {
+  return glassSnapshotStageVersions.get(stage) ?? 0;
+}
+
+function bumpGlassSnapshotStage(stage: Element) {
+  glassSnapshotStageVersions.set(stage, glassSnapshotStageVersion(stage) + 1);
+  glassSnapshotCache.delete(stage);
+}
+
+function bumpAllGlassSnapshotStages() {
+  bumpGlassSnapshotStage(el.ideGlassSnapshotStage);
+  bumpGlassSnapshotStage(el.ideGlassContainerSnapshotStage);
+  bumpGlassSnapshotStage(el.ideGlassExplorerSnapshotStage);
+}
+
+function glassSnapshotStageSignature(stage: Element) {
+  const rect = stage.getBoundingClientRect();
+  const htmlStage = stage instanceof HTMLElement ? stage : null;
+  const width = htmlStage?.scrollWidth ?? Math.round(rect.width);
+  const height = htmlStage?.scrollHeight ?? Math.round(rect.height);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const stageKey = stage instanceof HTMLElement && stage.id
+    ? `#${stage.id}`
+    : stage.tagName.toLowerCase();
+  return [
+    stageKey,
+    glassSnapshotStageVersion(stage),
+    `${width}x${height}`,
+    `${Math.round(rect.width * 100) / 100}x${Math.round(rect.height * 100) / 100}`,
+    `dpr=${dpr}`,
+    `scale=${ideScale.toFixed(3)}`
+  ].join('|');
+}
+
+function glassInitialSnapshotOptions(stage: Element): Record<string, unknown> {
+  const signature = glassSnapshotStageSignature(stage);
+  const cached = glassSnapshotCache.get(stage);
+  if (cached?.signature === signature && cached.canvas instanceof HTMLCanvasElement) {
+    return {
+      initialSnapshot: cached.canvas,
+      initialSnapshotScale: cached.scaleFactor,
+      deferInitialSnapshot: true
+    };
+  }
+  // App-owned snapshot scheduling lets renderers that share a stage join the
+  // same html2canvas capture instead of each constructor starting its own.
+  return { deferInitialSnapshot: true };
+}
+
+function uploadCachedGlassSnapshot(
+  renderer: LiquidGLRendererLike,
+  signature: string,
+  canvas: HTMLCanvasElement,
+  scaleFactor = 1
+) {
+  if (glassRendererSnapshotSignatures.get(renderer) === signature) return false;
+  if (typeof renderer._uploadTexture !== 'function') return false;
+  if (renderer.staticSnapshotCanvas === canvas) {
+    glassRendererSnapshotSignatures.set(renderer, signature);
+    return false;
+  }
+  renderer.scaleFactor = scaleFactor;
+  try {
+    if (renderer._uploadTexture(canvas) !== true) return false;
+    glassRendererSnapshotSignatures.set(renderer, signature);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureLiquidGlassRendererSnapshot(renderer: LiquidGLRendererLike | undefined, retry = 0): Promise<boolean> {
+  const stage = renderer?.snapshotTarget;
+  if (!renderer || !(stage instanceof Element) || typeof renderer.captureSnapshot !== 'function') return false;
+  const signature = glassSnapshotStageSignature(stage);
+  const cached = glassSnapshotCache.get(stage);
+  if (cached?.signature === signature && cached.canvas instanceof HTMLCanvasElement) {
+    return uploadCachedGlassSnapshot(renderer, signature, cached.canvas, cached.scaleFactor);
+  }
+  if (cached?.signature === signature && cached.promise) {
+    await cached.promise;
+    if (glassSnapshotStageSignature(stage) !== signature && retry < 1) {
+      return ensureLiquidGlassRendererSnapshot(renderer, retry + 1);
+    }
+    const completed = glassSnapshotCache.get(stage);
+    if (completed?.signature === signature && completed.canvas instanceof HTMLCanvasElement) {
+      return uploadCachedGlassSnapshot(renderer, signature, completed.canvas, completed.scaleFactor);
+    }
+  }
+
+  const entry: {
+    signature: string;
+    canvas?: HTMLCanvasElement;
+    scaleFactor?: number;
+    promise?: Promise<boolean>;
+  } = { signature };
+  entry.promise = (async () => {
+    try {
+      const result = await renderer.captureSnapshot?.({ trailing: true });
+      if (result !== true) return false;
+      if (glassSnapshotStageSignature(stage) !== signature) return false;
+      const canvas = renderer.staticSnapshotCanvas;
+      if (!(canvas instanceof HTMLCanvasElement) || canvas.width <= 0 || canvas.height <= 0) return false;
+      entry.canvas = canvas;
+      entry.scaleFactor = Math.max(0.1, Number(renderer.scaleFactor) || 1);
+      glassRendererSnapshotSignatures.set(renderer, signature);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  glassSnapshotCache.set(stage, entry);
+  const captured = await entry.promise;
+  entry.promise = undefined;
+  if (captured) return true;
+  if (glassSnapshotStageSignature(stage) !== signature && retry < 1) {
+    return ensureLiquidGlassRendererSnapshot(renderer, retry + 1);
+  }
+  if (glassSnapshotCache.get(stage) === entry) glassSnapshotCache.delete(stage);
+  return false;
+}
+
 function syncWorkspaceGlassSnapshotStage() {
   const enabled = workspaceLiquidGlassEligible() || appGlassEnabled();
   const useContainerSnapshot = workspaceGlassUsesContainerSnapshot();
@@ -8644,6 +8872,7 @@ function syncWorkspaceGlassRendererSnapshotTarget() {
   const target = workspaceLiquidGlassSnapshotTargetElement();
   if (renderer.snapshotTarget !== target) {
     renderer.snapshotTarget = target;
+    glassRendererSnapshotSignatures.delete(renderer);
   }
 }
 
@@ -8659,6 +8888,30 @@ function syncWorkspaceGlassContainerSnapshotSurface() {
   const source = renderer?.staticSnapshotCanvas;
   const rendererCanvas = renderer?.canvas;
   const canvas = el.ideGlassContainerSampleCanvas;
+  const containerEffect = effectiveWorkspaceContainerGlassEffectSettings();
+  const compositeSignature = [
+    glassSnapshotStageSignature(el.ideGlassSnapshotStage),
+    renderer ? glassRendererSnapshotSignatures.get(renderer) ?? 'uncaptured' : 'missing',
+    `${Math.round(shellRect.width)}x${Math.round(shellRect.height)}`,
+    `${Math.round(dockRect.left - shellRect.left)},${Math.round(dockRect.top - shellRect.top)},${Math.round(dockRect.width)},${Math.round(dockRect.height)}`,
+    containerEffect.refraction,
+    containerEffect.bevelDepth,
+    containerEffect.bevelWidth,
+    containerEffect.frost,
+    containerEffect.magnify,
+    containerEffect.radius,
+    containerEffect.specular ? 1 : 0,
+    containerEffect.tilt ? 1 : 0,
+    containerEffect.tiltFactor
+  ].join('|');
+  if (
+    workspaceContainerCompositeSignature === compositeSignature
+    && el.shell.classList.contains('workspace-glass-container-sample-canvas-ready')
+    && canvas.width > 0
+    && canvas.height > 0
+  ) {
+    return true;
+  }
   const scale = Math.max(0.1, Number(renderer?.scaleFactor) || window.devicePixelRatio || 1);
   const width = Math.max(1, Math.round(shellRect.width * scale));
   const height = Math.max(1, Math.round(shellRect.height * scale));
@@ -8673,6 +8926,7 @@ function syncWorkspaceGlassContainerSnapshotSurface() {
   }
   ctx.clearRect(0, 0, width, height);
   try {
+    renderer?.render?.();
     if (source instanceof HTMLCanvasElement && source.width > 0 && source.height > 0) {
       ctx.drawImage(source, 0, 0, source.width, source.height, 0, 0, width, height);
     }
@@ -8690,6 +8944,8 @@ function syncWorkspaceGlassContainerSnapshotSurface() {
     console.warn('workspace glass container composite failed', error);
     return false;
   }
+  workspaceContainerCompositeSignature = compositeSignature;
+  bumpGlassSnapshotStage(el.ideGlassContainerSnapshotStage);
   el.shell.classList.add('workspace-glass-container-sample-canvas-ready');
   return true;
 }
@@ -8700,8 +8956,7 @@ async function refreshWorkspaceContainerGlassComposite() {
     syncWorkspaceGlassContainerSnapshotSurface();
     return false;
   }
-  await renderer.captureSnapshot?.().catch(() => undefined);
-  renderer.render?.();
+  await ensureLiquidGlassRendererSnapshot(renderer);
   return syncWorkspaceGlassContainerSnapshotSurface();
 }
 
@@ -8742,6 +8997,30 @@ function syncExplorerGlassPanelSnapshotSurface() {
   const source = renderer?.staticSnapshotCanvas;
   const rendererCanvas = renderer?.canvas;
   const canvas = el.ideGlassExplorerSampleCanvas;
+  const panelEffect = effectiveAppGlassEffectSettings('explorer-panel');
+  const compositeSignature = [
+    glassSnapshotStageSignature(el.ideGlassSnapshotStage),
+    renderer ? glassRendererSnapshotSignatures.get(renderer) ?? 'uncaptured' : 'missing',
+    `${Math.round(shellRect.width)}x${Math.round(shellRect.height)}`,
+    `${Math.round(panelRect.left - shellRect.left)},${Math.round(panelRect.top - shellRect.top)},${Math.round(panelRect.width)},${Math.round(panelRect.height)}`,
+    panelEffect.refraction,
+    panelEffect.bevelDepth,
+    panelEffect.bevelWidth,
+    panelEffect.frost,
+    panelEffect.magnify,
+    panelEffect.radius,
+    panelEffect.specular ? 1 : 0,
+    panelEffect.tilt ? 1 : 0,
+    panelEffect.tiltFactor
+  ].join('|');
+  if (
+    explorerPanelCompositeSignature === compositeSignature
+    && el.shell.classList.contains('app-glass-explorer-sample-canvas-ready')
+    && canvas.width > 0
+    && canvas.height > 0
+  ) {
+    return true;
+  }
   const scale = Math.max(0.1, Number(renderer?.scaleFactor) || window.devicePixelRatio || 1);
   const width = Math.max(1, Math.round(shellRect.width * scale));
   const height = Math.max(1, Math.round(shellRect.height * scale));
@@ -8756,6 +9035,7 @@ function syncExplorerGlassPanelSnapshotSurface() {
   }
   ctx.clearRect(0, 0, width, height);
   try {
+    renderer?.render?.();
     if (source instanceof HTMLCanvasElement && source.width > 0 && source.height > 0) {
       ctx.drawImage(source, 0, 0, source.width, source.height, 0, 0, width, height);
     }
@@ -8773,6 +9053,8 @@ function syncExplorerGlassPanelSnapshotSurface() {
     console.warn('explorer glass panel composite failed', error);
     return false;
   }
+  explorerPanelCompositeSignature = compositeSignature;
+  bumpGlassSnapshotStage(el.ideGlassExplorerSnapshotStage);
   el.shell.classList.add('app-glass-explorer-sample-canvas-ready');
   return true;
 }
@@ -8783,8 +9065,7 @@ async function refreshExplorerPanelGlassComposite() {
     syncExplorerGlassPanelSnapshotSurface();
     return false;
   }
-  await renderer.captureSnapshot?.().catch(() => undefined);
-  renderer.render?.();
+  await ensureLiquidGlassRendererSnapshot(renderer);
   return syncExplorerGlassPanelSnapshotSurface();
 }
 
@@ -8821,10 +9102,9 @@ function scheduleWorkspaceLiquidGlassResizeRebuild() {
       scheduleWorkspaceLiquidGlassRefresh({ recapture: true });
       return;
     }
-    removeWorkspaceLiquidGlassLenses();
     appendDiagnosticLog(
       'glass',
-      'workspace glass resize-rebuild reset row/container lenses',
+      'workspace glass resize-settle refreshed row/container lenses in place',
       'info',
       { force: appGlass.diagnostics === true }
     );
@@ -8882,7 +9162,16 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
       removeWorkspaceLiquidGlassLenses();
       return;
     }
+    if (!appGlassCanCaptureSnapshotNow()) {
+      if (recaptureSnapshot) deferAppGlassRecapture('workspace-hidden');
+      return;
+    }
     await loadLiquidGLScripts();
+    if (!workspaceLiquidGlassEligible() || !appGlassCanCaptureSnapshotNow()) {
+      if (!workspaceLiquidGlassEligible()) removeWorkspaceLiquidGlassLenses();
+      else if (recaptureSnapshot) deferAppGlassRecapture('workspace-await-hidden');
+      return;
+    }
     cleanupLegacyWorkspaceLiquidGlassChildLenses();
     cleanupLegacyWorkspaceTabTargetLenses();
     cleanupDetachedWorkspaceLiquidGlassLenses();
@@ -8907,6 +9196,7 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
       try {
         const isolated = createIsolatedWorkspaceLiquidGL({
           snapshot: '#ide-glass-snapshot-stage',
+          ...glassInitialSnapshotOptions(el.ideGlassSnapshotStage),
           target: '#workspace-container-glass-plane.workspace-glass-pending',
           resolution: 1,
           refraction: containerEffect.refraction,
@@ -8953,12 +9243,24 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
       }
     } else if (wantsContainerSnapshot) {
       await refreshWorkspaceContainerGlassComposite();
+    } else {
+      const containerRenderer = workspaceContainerLiquidGlassRenderer();
+      if (containerRenderer) {
+        const snapshotRendered = await ensureLiquidGlassRendererSnapshot(containerRenderer);
+        if (!snapshotRendered) containerRenderer.render?.();
+      }
+    }
+    if (!workspaceLiquidGlassEligible() || !appGlassCanCaptureSnapshotNow()) {
+      if (!workspaceLiquidGlassEligible()) removeWorkspaceLiquidGlassLenses();
+      else if (recaptureSnapshot) deferAppGlassRecapture('workspace-composite-hidden');
+      return;
     }
     if (pendingTargets.length && window.liquidGL) {
       let result: unknown;
       try {
         result = window.liquidGL({
           snapshot: rowSnapshotSelector,
+          ...glassInitialSnapshotOptions(workspaceLiquidGlassSnapshotTargetElement()),
           target: '.workspace-tab-glass-plane.credit-card-glass.workspace-glass-pending',
           resolution: 1,
           refraction: effect.refraction,
@@ -8999,6 +9301,7 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
       try {
         result = window.liquidGL({
           snapshot: rowSnapshotSelector,
+          ...glassInitialSnapshotOptions(workspaceLiquidGlassSnapshotTargetElement()),
           target: '#new-workspace-tab .workspace-tab-add-glass-plane.credit-card-glass.workspace-glass-pending',
           resolution: 1,
           refraction: effect.refraction,
@@ -9033,7 +9336,7 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
         markWorkspaceGlassTargetCssFallback(pendingAddButton);
       }
     }
-    updateWorkspaceLiquidGlassEffectOptions();
+    updateWorkspaceLiquidGlassEffectOptions({ render: false });
     ensureWorkspaceLiquidGlassCanvasLayer();
     const renderer = window.__liquidGLRenderer__;
     if (workspaceLiquidGlassRendererContextLost(renderer)) {
@@ -9048,17 +9351,21 @@ async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
       scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: 1800 });
       return;
     }
-    renderer?.lenses?.forEach((lens) => {
-      if (isWorkspaceLiquidGlassLens(lens)) lens.updateMetrics?.();
-    });
     restoreWorkspaceHoverOnlyTargetFromCssHover();
-    if (recaptureSnapshot && renderer?.captureSnapshot) {
+    let snapshotRendered = false;
+    if (renderer) {
       syncWorkspaceGlassSnapshotStage();
       syncWorkspaceGlassRendererSnapshotTarget();
       if (workspaceGlassUsesContainerSnapshot()) await refreshWorkspaceContainerGlassComposite();
-      await renderer.captureSnapshot().catch(() => undefined);
+      snapshotRendered = await ensureLiquidGlassRendererSnapshot(renderer);
     }
-    renderer?.render?.();
+    if (!workspaceLiquidGlassEligible() || !appGlassCanCaptureSnapshotNow()) {
+      if (!workspaceLiquidGlassEligible()) removeWorkspaceLiquidGlassLenses();
+      else if (recaptureSnapshot) deferAppGlassRecapture('workspace-capture-hidden');
+      return;
+    }
+    if (!snapshotRendered) renderer?.render?.();
+    syncWorkspaceGlassTicker();
     appendWorkspaceLiquidGlassDiagnostic(recaptureSnapshot ? 'apply/recapture' : 'apply');
   } finally {
     workspaceLiquidGlassApplying = false;
@@ -9181,8 +9488,11 @@ function workspaceLiquidGlassCanvasElement() {
 
 function ensureWorkspaceLiquidGlassCanvasLayer() {
   const applyCanvasLayer = (renderer: LiquidGLRendererLike | undefined, label: 'container' | 'rows', zIndex: string) => {
-    const canvas = renderer?.canvas;
+    if (!renderer) return;
+    const canvas = renderer.canvas;
     if (!(canvas instanceof HTMLElement)) return;
+    disableAppGlassRendererInternalObservers(renderer);
+    resizeAppGlassRendererCanvasForViewport(renderer);
     bindWorkspaceLiquidGlassContextEvents(renderer, label);
     const container = el.workspaceDock;
     if (canvas.parentElement !== container) container.append(canvas);
@@ -9230,6 +9540,7 @@ function ensureWorkspaceLiquidGlassCanvasLayer() {
   applyCanvasLayer(window.__liquidGLRenderer__, 'rows', '1');
   applyLensOverlayLayer(window.__liquidGLRenderer__, isWorkspaceLiquidGlassLens, '1', '0');
   installWorkspaceHoverOnlyRenderFilter();
+  syncWorkspaceGlassTicker();
 }
 
 function glassDiagnosticElementName(element: Element | null) {
@@ -9440,6 +9751,7 @@ function cleanupDetachedWorkspaceLiquidGlassLenses() {
 }
 
 function removeWorkspaceLiquidGlassLenses() {
+  stopWorkspaceGlassTicker();
   workspaceLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
   workspaceLiquidGlassHoverOnlyTarget = null;
   removeWorkspaceDetailButtonGlassMarkers();
@@ -9496,6 +9808,9 @@ function removeWorkspaceContainerGlassLenses() {
   }
   if (renderer?.canvas instanceof HTMLElement) renderer.canvas.remove();
   window.__sviWorkspaceContainerLiquidGLRenderer__ = null;
+  syncWorkspaceGlassTicker();
+  workspaceContainerCompositeSignature = '';
+  bumpGlassSnapshotStage(el.ideGlassContainerSnapshotStage);
   el.shell.classList.remove('workspace-glass-container-sample-canvas-ready');
   const ctx = el.ideGlassContainerSampleCanvas.getContext('2d', { alpha: true });
   ctx?.clearRect(0, 0, el.ideGlassContainerSampleCanvas.width, el.ideGlassContainerSampleCanvas.height);
@@ -9514,11 +9829,15 @@ function removeWorkspaceContainerGlassLensesFromRowRenderer() {
 
 function cleanupWorkspaceLiquidGlassLens(lens: LiquidGLLensLike) {
   try {
-    lens.setTilt?.(false);
-    lens.setShadow?.(false);
-    lens._destroyMirrorCanvas?.();
-    lens._shadowEl?.remove();
-    lens._sizeObs?.disconnect?.();
+    if (typeof lens._dispose === 'function') {
+      lens._dispose();
+    } else {
+      lens.setTilt?.(false);
+      lens.setShadow?.(false);
+      lens._destroyMirrorCanvas?.();
+      lens._shadowEl?.remove();
+      lens._sizeObs?.disconnect?.();
+    }
   } catch {
     // Best effort cleanup for the third-party lens object.
   }
@@ -9580,7 +9899,7 @@ function clearWorkspaceLiquidGlassInlineStyles(element: HTMLElement) {
   element.style.removeProperty('-webkit-backdrop-filter');
 }
 
-function updateWorkspaceLiquidGlassEffectOptions() {
+function updateWorkspaceLiquidGlassEffectOptions(options: { render?: boolean } = {}) {
   const effect = effectiveWorkspaceGlassEffectSettings(state.ideSettings.workspaceSideDockGlass === true);
   const renderer = window.__liquidGLRenderer__;
   ensureWorkspaceLiquidGlassCanvasLayer();
@@ -9588,9 +9907,8 @@ function updateWorkspaceLiquidGlassEffectOptions() {
     for (const lens of renderer.lenses) {
       if (!isWorkspaceLiquidGlassLens(lens)) continue;
       applyWorkspaceGlassLensOptions(lens, effect);
-      lens.updateMetrics?.();
     }
-    renderer.render?.();
+    if (options.render !== false) renderer.render?.();
   }
   const containerRenderer = workspaceContainerLiquidGlassRenderer();
   if (containerRenderer?.lenses) {
@@ -9598,10 +9916,10 @@ function updateWorkspaceLiquidGlassEffectOptions() {
     for (const lens of containerRenderer.lenses) {
       if (!isWorkspaceContainerLiquidGlassLens(lens)) continue;
       applyWorkspaceGlassLensOptions(lens, containerEffect);
-      lens.updateMetrics?.();
     }
-    containerRenderer.render?.();
+    if (options.render !== false) containerRenderer.render?.();
   }
+  syncWorkspaceGlassTicker();
 }
 
 function applyWorkspaceGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlassEffectSettings) {
@@ -9632,6 +9950,7 @@ function applyWorkspaceGlassLensOptions(lens: LiquidGLLensLike, effect: Workspac
   };
   lens.setShadow?.(effect.shadow);
   lens.setTilt?.(effect.tilt);
+  disableManagedGlassLensResizeObserver(lens);
   if (target && (
     target.classList.contains('workspace-tab-glass-plane')
     || target.classList.contains('workspace-tab-add-glass-plane')
@@ -9957,6 +10276,31 @@ function uniqueAppGlassRenderers() {
   return Array.from(new Set(appGlassRenderers.values()));
 }
 
+function disableManagedGlassLensResizeObserver(lens: LiquidGLLensLike) {
+  lens._sizeObs?.disconnect?.();
+  lens._sizeObs = null;
+}
+
+function installAppGlassActiveRenderFilter(renderer: LiquidGLRendererLike | undefined) {
+  if (!renderer || renderer._sviAppActiveFilterInstalled) return;
+  const originalRender = renderer.render?.bind(renderer);
+  if (typeof originalRender !== 'function') return;
+  renderer._sviAppActiveOriginalRender = originalRender;
+  renderer.render = () => {
+    const all = renderer.lenses ?? [];
+    renderer.lenses = all.filter((lens) => {
+      const target = appGlassTargetForLens(lens);
+      return !target || (target.isConnected && target.dataset.appGlassActive === '1');
+    });
+    try {
+      return originalRender();
+    } finally {
+      renderer.lenses = all;
+    }
+  };
+  renderer._sviAppActiveFilterInstalled = true;
+}
+
 function appGlassTargetsForRenderer(renderer: LiquidGLRendererLike | undefined) {
   if (!renderer?.lenses) return [];
   return renderer.lenses
@@ -10240,12 +10584,24 @@ function scheduleGlassResumeGeometry(reason: string) {
 }
 
 function resumeGlassAfterWindowWake(reason: string) {
+  glassWindowWakeReasons.add(reason);
+  if (glassWindowWakeTimer) return;
+  glassWindowWakeTimer = window.setTimeout(() => {
+    glassWindowWakeTimer = 0;
+    const reasons = Array.from(glassWindowWakeReasons);
+    glassWindowWakeReasons.clear();
+    runGlassAfterWindowWake(reasons.join('+') || reason);
+  }, 48);
+}
+
+function runGlassAfterWindowWake(reason: string) {
   appGlassWindowResumeRecaptureDeferUntil = Math.max(
     appGlassWindowResumeRecaptureDeferUntil,
     performance.now() + 1100
   );
   flushDeferredAppGlassRecapture(reason, { delay: 700, stagger: 64 });
   scheduleGlassResumeGeometry(reason);
+  syncWorkspaceGlassTicker();
 }
 
 function deferAppGlassRecapture(reason = 'deferred') {
@@ -10258,14 +10614,7 @@ function scheduleAppGlassActiveOwnerRecaptures(reason: string, options: { delay?
   const owners = appGlassActiveOwners();
   if (!owners.length) return false;
   const baseDelay = options.delay ?? 90;
-  const stagger = options.stagger ?? 24;
-  owners.forEach((owner, index) => {
-    scheduleAppGlassOwnerRefresh(owner, {
-      recapture: true,
-      delay: baseDelay + index * stagger,
-      reason
-    });
-  });
+  scheduleAppGlassRefresh({ recapture: true, delay: baseDelay, reason });
   if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) {
     scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: baseDelay + 30 });
   }
@@ -10356,13 +10705,24 @@ async function applyAppLiquidGlassForOwner(owner: HTMLElement, recaptureSnapshot
     cleanupAppGlassOwner(owner);
     return;
   }
+  if (!appGlassCanCaptureSnapshotNow()) {
+    if (recaptureSnapshot) deferAppGlassRecapture(`owner-${reason}`);
+    return;
+  }
   syncWorkspaceGlassSnapshotStage();
-  const activeTargets = prioritizedAppGlassTargets(targets.filter((target) => syncAppGlassTarget(target)));
+  let activeTargets = prioritizedAppGlassTargets(targets.filter((target) => syncAppGlassTarget(target)));
   if (!activeTargets.length) {
     appendAppGlassDiagnostic(`local/${reason}`);
     return;
   }
   await loadLiquidGLScripts();
+  if (!appGlassEnabled() || !owner.isConnected || !appGlassCanCaptureSnapshotNow()) {
+    if (recaptureSnapshot && appGlassEnabled()) deferAppGlassRecapture(`owner-await-${reason}`);
+    return;
+  }
+  activeTargets = prioritizedAppGlassTargets(syncAppGlassOwnerTargets(owner).filter((target) => syncAppGlassTarget(target)));
+  if (!activeTargets.length) return;
+  const renderers = new Set<LiquidGLRendererLike>();
   for (const target of activeTargets) {
     const id = target.dataset.appGlassId;
     if (!id) continue;
@@ -10381,13 +10741,25 @@ async function applyAppLiquidGlassForOwner(owner: HTMLElement, recaptureSnapshot
       delete target.dataset.appGlassFallbackReason;
     }
     if (!rendererExists || target.dataset.appGlassLens !== 'liquidgl') {
-      await createAppGlassRendererForTarget(target, effect);
+      renderer = await createAppGlassRendererForTarget(target, effect);
+      if (renderer) renderers.add(renderer);
       continue;
     }
     applyAppGlassLensOptionsForRenderer(renderer, effect, target);
-    renderer?.lenses?.forEach((lens) => lens.updateMetrics?.());
-    if (recaptureSnapshot) await renderer?.captureSnapshot?.().catch(() => undefined);
-    renderer?.render?.();
+    if (renderer) renderers.add(renderer);
+  }
+  for (const renderer of renderers) {
+    if (!appGlassCanCaptureSnapshotNow()) {
+      if (recaptureSnapshot) deferAppGlassRecapture(`owner-render-${reason}`);
+      return;
+    }
+    ensureAppGlassRendererLayer(renderer);
+    const snapshotRendered = await ensureLiquidGlassRendererSnapshot(renderer);
+    if (!appGlassCanCaptureSnapshotNow()) {
+      if (recaptureSnapshot) deferAppGlassRecapture(`owner-capture-${reason}`);
+      return;
+    }
+    if (!snapshotRendered) renderer.render?.();
   }
   appendAppGlassDiagnostic(recaptureSnapshot ? `local-recapture/${reason}` : `local/${reason}`);
 }
@@ -10397,8 +10769,8 @@ async function applyAppLiquidGlass(recaptureSnapshot = false) {
     scheduleAppGlassRefresh({ recapture: recaptureSnapshot, reason: 'apply-pending' });
     return;
   }
-  if (recaptureSnapshot && !appGlassCanCaptureSnapshotNow()) {
-    deferAppGlassRecapture('apply-hidden');
+  if (!appGlassCanCaptureSnapshotNow()) {
+    if (recaptureSnapshot) deferAppGlassRecapture('apply-hidden');
     return;
   }
   appGlassApplying = true;
@@ -10409,7 +10781,7 @@ async function applyAppLiquidGlass(recaptureSnapshot = false) {
       removeAppLiquidGlass();
       return;
     }
-    const targets = prioritizedAppGlassTargets(appGlassActiveTargets());
+    let targets = prioritizedAppGlassTargets(appGlassActiveTargets());
     const activeIds = new Set(targets.map((target) => target.dataset.appGlassId || '').filter(Boolean));
     const cachedHiddenIds = new Set(appGlassPlaneElements()
       .filter((target) => {
@@ -10423,33 +10795,50 @@ async function applyAppLiquidGlass(recaptureSnapshot = false) {
     }
     if (!targets.length) return;
     await loadLiquidGLScripts();
-  for (const target of targets) {
-    const id = target.dataset.appGlassId;
-    if (!id) continue;
-    const effect = effectiveAppGlassEffectSettings(target.dataset.appGlassScope || '');
-    let renderer = appGlassRenderers.get(id);
-    if (renderer && appGlassRendererNeedsRebuild(renderer)) {
-      appendAppGlassDiagnostic(`rebuild/${target.dataset.appGlassScope || 'default'}`);
-      disposeAppGlassRendererInstance(renderer);
-      renderer = undefined;
+    if (!appGlassEnabled() || !appGlassCanCaptureSnapshotNow()) {
+      if (recaptureSnapshot && appGlassEnabled()) deferAppGlassRecapture('apply-await-hidden');
+      return;
     }
-    const rendererExists = Boolean(renderer);
-    const lensState = target.dataset.appGlassLens;
-    if (lensState === 'css') {
-      if (appGlassRecoverableFallbackReason(target.dataset.appGlassFallbackReason) && !prepareAppGlassInitFailedRetry(target)) continue;
+    syncAppGlassTargets();
+    targets = prioritizedAppGlassTargets(appGlassActiveTargets());
+    if (!targets.length) return;
+    const renderers = new Set<LiquidGLRendererLike>();
+    for (const target of targets) {
+      const id = target.dataset.appGlassId;
+      if (!id) continue;
+      const effect = effectiveAppGlassEffectSettings(target.dataset.appGlassScope || '');
+      let renderer = appGlassRenderers.get(id);
+      if (renderer && appGlassRendererNeedsRebuild(renderer)) {
+        appendAppGlassDiagnostic(`rebuild/${target.dataset.appGlassScope || 'default'}`);
+        disposeAppGlassRendererInstance(renderer);
+        renderer = undefined;
+      }
+      const rendererExists = Boolean(renderer);
+      const lensState = target.dataset.appGlassLens;
+      if (lensState === 'css') {
+        if (appGlassRecoverableFallbackReason(target.dataset.appGlassFallbackReason) && !prepareAppGlassInitFailedRetry(target)) continue;
         delete target.dataset.appGlassLens;
         delete target.dataset.appGlassFallbackReason;
       }
-    if (!rendererExists || target.dataset.appGlassLens !== 'liquidgl') {
-      await createAppGlassRendererForTarget(target, effect);
-    } else {
-      applyAppGlassLensOptionsForRenderer(renderer, effect, target);
-      if (recaptureSnapshot) {
-          renderer?.lenses?.forEach((lens) => lens.updateMetrics?.());
-          await renderer?.captureSnapshot?.().catch(() => undefined);
-        }
-        renderer?.render?.();
+      if (!rendererExists || target.dataset.appGlassLens !== 'liquidgl') {
+        renderer = await createAppGlassRendererForTarget(target, effect);
+      } else {
+        applyAppGlassLensOptionsForRenderer(renderer, effect, target);
       }
+      if (renderer) renderers.add(renderer);
+    }
+    for (const renderer of renderers) {
+      if (!appGlassCanCaptureSnapshotNow()) {
+        if (recaptureSnapshot) deferAppGlassRecapture('apply-render-hidden');
+        return;
+      }
+      ensureAppGlassRendererLayer(renderer);
+      const snapshotRendered = await ensureLiquidGlassRendererSnapshot(renderer);
+      if (!appGlassCanCaptureSnapshotNow()) {
+        if (recaptureSnapshot) deferAppGlassRecapture('apply-capture-hidden');
+        return;
+      }
+      if (!snapshotRendered) renderer.render?.();
     }
     appendAppGlassDiagnostic(recaptureSnapshot ? 'apply/recapture' : 'apply');
   } finally {
@@ -10457,9 +10846,12 @@ async function applyAppLiquidGlass(recaptureSnapshot = false) {
   }
 }
 
-async function createAppGlassRendererForTarget(target: HTMLElement, effect: WorkspaceGlassEffectSettings) {
+async function createAppGlassRendererForTarget(
+  target: HTMLElement,
+  effect: WorkspaceGlassEffectSettings
+): Promise<LiquidGLRendererLike | undefined> {
   const id = target.dataset.appGlassId;
-  if (!id || !window.liquidGL) return;
+  if (!id || !window.liquidGL) return undefined;
   syncWorkspaceGlassSnapshotStage();
   removeAppGlassRenderer(id);
   target.classList.add('app-glass-pending', 'credit-card-glass');
@@ -10469,6 +10861,7 @@ async function createAppGlassRendererForTarget(target: HTMLElement, effect: Work
   try {
     const isolated = createSharedAppLiquidGL({
       snapshot: '#ide-glass-snapshot-stage',
+      ...glassInitialSnapshotOptions(el.ideGlassSnapshotStage),
       target: `[data-app-glass-id="${id}"]`,
       resolution: 1,
       refraction: effect.refraction,
@@ -10489,7 +10882,7 @@ async function createAppGlassRendererForTarget(target: HTMLElement, effect: Work
     const lenses = liquidLensArray(isolated.result);
     if (!renderer || !lenses.length) {
       markAppGlassTargetCssFallback(target, 'init-failed');
-      return;
+      return undefined;
     }
     appGlassRenderers.set(id, renderer);
     for (const lens of lenses) {
@@ -10502,12 +10895,11 @@ async function createAppGlassRendererForTarget(target: HTMLElement, effect: Work
       delete lensTarget.dataset.appGlassRetryAt;
       applyAppGlassLensOptions(lens, effect);
     }
-    ensureAppGlassRendererLayer(renderer);
-    await renderer.captureSnapshot?.().catch(() => undefined);
-    renderer.render?.();
+    return renderer;
   } catch (error) {
     markAppGlassTargetCssFallback(target, 'init-failed');
     console.warn('app glass target failed', error);
+    return undefined;
   }
 }
 
@@ -10521,7 +10913,6 @@ function applyAppGlassLensOptionsForRenderer(
       applyAppGlassLensOptions(lens, effect);
     }
   });
-  if (renderer) ensureAppGlassRendererLayer(renderer);
 }
 
 function applyAppGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlassEffectSettings) {
@@ -10546,6 +10937,7 @@ function applyAppGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlass
   };
   lens.setShadow?.(effect.shadow);
   lens.setTilt?.(tiltEnabled);
+  disableManagedGlassLensResizeObserver(lens);
 }
 
 function updateAppLiquidGlassEffectOptions(scopeFilter: string | null = null) {
@@ -10559,7 +10951,6 @@ function updateAppLiquidGlassEffectOptions(scopeFilter: string | null = null) {
       const scope = target.dataset.appGlassScope || '';
       if (scopeFilter !== null && scope !== scopeFilter) return;
       applyAppGlassLensOptions(lens, effectiveAppGlassEffectSettings(scope));
-      lens.updateMetrics?.();
       rendererChanged = true;
     });
     if (!rendererChanged) continue;
@@ -10615,6 +11006,7 @@ function disableAppGlassRendererInternalObservers(renderer: LiquidGLRendererLike
   }
   renderer._isScrolling = false;
   if (renderer._resizeHandler) {
+    renderer._resizeHandler.cancel?.();
     window.removeEventListener('resize', renderer._resizeHandler);
     renderer._resizeHandler = null;
   }
@@ -10726,6 +11118,7 @@ function patchAppGlassMirrorCreation(lens: LiquidGLLensLike, container: HTMLElem
   if (!lens._appGlassMirrorDestroyPatched && typeof lens._destroyMirrorCanvas === 'function') {
     const destroyMirrorCanvas = lens._destroyMirrorCanvas.bind(lens);
     lens._destroyMirrorCanvas = () => {
+      const hadMirror = lens._mirror instanceof HTMLElement || lens._mirrorActive === true;
       destroyMirrorCanvas();
       if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
         if (lens.el instanceof HTMLElement && lens.el.classList.contains('file-row-glass')) {
@@ -10737,6 +11130,7 @@ function patchAppGlassMirrorCreation(lens: LiquidGLLensLike, container: HTMLElem
         }
       }
       lens._baseRect = null;
+      if (!hadMirror) return;
       lens.updateMetrics?.();
       if (lens.el instanceof HTMLElement && lens.el.classList.contains('app-glass-plane')) {
         syncAppGlassTiltFollowers(lens);
@@ -11007,6 +11401,7 @@ function installAppGlassTiltFollowers(lens: LiquidGLLensLike) {
 function ensureAppGlassRendererLayer(renderer: LiquidGLRendererLike | undefined) {
   if (!renderer) return;
   disableAppGlassRendererInternalObservers(renderer);
+  installAppGlassActiveRenderFilter(renderer);
   bindAppGlassRendererContextEvents(renderer);
   resizeAppGlassRendererCanvasForViewport(renderer);
   sortAppGlassRendererLensesForPaintOrder(renderer);
@@ -11160,11 +11555,15 @@ function cleanupAppGlassLens(lens: LiquidGLLensLike) {
   try {
     clearAppGlassLocalMirror(lens);
     restoreAppGlassTiltFollowers(lens);
-    lens.setTilt?.(false);
-    lens.setShadow?.(false);
-    lens._destroyMirrorCanvas?.();
-    lens._shadowEl?.remove();
-    lens._sizeObs?.disconnect?.();
+    if (typeof lens._dispose === 'function') {
+      lens._dispose();
+    } else {
+      lens.setTilt?.(false);
+      lens.setShadow?.(false);
+      lens._destroyMirrorCanvas?.();
+      lens._shadowEl?.remove();
+      lens._sizeObs?.disconnect?.();
+    }
   } catch {
     // Best effort cleanup for third-party lens internals.
   }
@@ -11298,6 +11697,10 @@ function ensureExplorerLiquidGlassLocalMirror(lens: LiquidGLLensLike) {
     clearExplorerLiquidGlassLocalMirror(lens);
     return;
   }
+  if (explorerLiquidGlassHoverOnlyRuntime && activeExplorerHoverOnlyLens() !== lens) {
+    clearExplorerLiquidGlassLocalMirror(lens);
+    return;
+  }
   let mirror = lens._appGlassLocalMirror;
   if (!(mirror instanceof HTMLCanvasElement) || !mirror.isConnected) {
     mirror = document.createElement('canvas');
@@ -11369,7 +11772,7 @@ function syncExplorerLiquidGlassLocalMirror(lens: LiquidGLLensLike, renderer: Li
 }
 
 function explorerLiquidGlassEligible() {
-  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
+  const glass = state.ideSettings.appGlass;
   const panel = getPanel('explorer');
   return appGlassEnabled()
     && glass.explorerRows === true
@@ -11379,8 +11782,7 @@ function explorerLiquidGlassEligible() {
 }
 
 function explorerGlassHoverOnlyEnabled() {
-  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
-  return explorerLiquidGlassEligible() && glass.explorerRowsHoverOnly === true;
+  return explorerLiquidGlassHoverOnlyRuntime && explorerLiquidGlassEligible();
 }
 
 function activeExplorerHoverOnlyGlassElements() {
@@ -11394,17 +11796,38 @@ function activeExplorerHoverOnlyGlassElements() {
   return new Set<HTMLElement>(glass ? [glass] : []);
 }
 
+function explorerLiquidGlassLensForTarget(target: HTMLElement | null) {
+  if (!target) return null;
+  return explorerLiquidGlassLensByTarget.get(target)
+    ?? explorerLiquidGlassRenderer?.lenses?.find((lens) => lens.el === target)
+    ?? null;
+}
+
+function explorerLiquidGlassLensForRow(row: HTMLElement | null) {
+  const target = row?.querySelector<HTMLElement>(':scope > .file-row-glass') ?? null;
+  return explorerLiquidGlassLensForTarget(target);
+}
+
+function activeExplorerHoverOnlyLens() {
+  if (!explorerGlassHoverOnlyEnabled()) return null;
+  const row = explorerLiquidGlassHoverOnlyTarget?.isConnected
+    ? explorerLiquidGlassHoverOnlyTarget
+    : el.fileList.querySelector<HTMLElement>('.file-row:hover');
+  return explorerLiquidGlassLensForRow(row);
+}
+
 function isExplorerHoverOnlyLens(lens: LiquidGLLensLike) {
   return lens.el instanceof HTMLElement
     && lens.el.classList.contains('file-row-glass')
     && lens.el.dataset.explorerGlassLens === 'liquidgl';
 }
 
-function resetInactiveExplorerHoverOnlyLenses(active = activeExplorerHoverOnlyGlassElements()) {
+function resetInactiveExplorerHoverOnlyLensesOnce() {
   const renderer = explorerLiquidGlassRenderer;
   if (!renderer?.lenses) return;
+  const activeLens = activeExplorerHoverOnlyLens();
   for (const lens of renderer.lenses) {
-    if (!isExplorerHoverOnlyLens(lens) || active?.has(lens.el as HTMLElement)) continue;
+    if (!isExplorerHoverOnlyLens(lens) || lens === activeLens) continue;
     resetHoverOnlyLiquidGlassLens(lens);
     if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
       lens._appGlassLocalMirror.style.opacity = '0';
@@ -11414,18 +11837,11 @@ function resetInactiveExplorerHoverOnlyLenses(active = activeExplorerHoverOnlyGl
 
 function syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer: LiquidGLRendererLike | undefined = explorerLiquidGlassRenderer) {
   if (!renderer?.lenses) return;
-  const hoverOnly = explorerGlassHoverOnlyEnabled();
-  const active = hoverOnly ? activeExplorerHoverOnlyGlassElements() : null;
-  for (const lens of renderer.lenses) {
-    if (!isExplorerLiquidGlassLens(lens)) continue;
-    const target = explorerLiquidGlassTargetForLens(lens);
-    if (hoverOnly && (!target || active?.has(target) !== true)) {
-      if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
-        lens._appGlassLocalMirror.style.opacity = '0';
-      }
-      continue;
+  if (explorerGlassHoverOnlyEnabled()) {
+    const activeLens = activeExplorerHoverOnlyLens();
+    if (activeLens?._appGlassLocalMirror instanceof HTMLCanvasElement && !activeLens._mirrorActive) {
+      activeLens._appGlassLocalMirror.style.opacity = '1';
     }
-    syncExplorerLiquidGlassLocalMirror(lens, renderer);
   }
   syncExplorerSemanticVerticalOverflowGuard();
   syncExplorerSemanticHorizontalOverflowGuard();
@@ -11439,9 +11855,9 @@ function installExplorerHoverOnlyRenderFilter() {
   renderer._sviExplorerHoverOnlyOriginalRender = originalRender;
   renderer.render = () => {
     if (!explorerGlassHoverOnlyEnabled()) return originalRender();
-    const active = activeExplorerHoverOnlyGlassElements();
     const all = renderer.lenses ?? [];
-    renderer.lenses = all.filter((lens) => !isExplorerHoverOnlyLens(lens) || active?.has(lens.el as HTMLElement));
+    const activeLens = activeExplorerHoverOnlyLens();
+    renderer.lenses = activeLens ? [activeLens] : [];
     try {
       return originalRender();
     } finally {
@@ -11455,32 +11871,39 @@ function renderExplorerHoverOnlyNow() {
   const renderer = explorerLiquidGlassRenderer;
   if (!renderer) return;
   installExplorerHoverOnlyRenderFilter();
-  if (explorerGlassHoverOnlyEnabled()) resetInactiveExplorerHoverOnlyLenses();
+  ensureExplorerLiquidGlassCanvasLayer();
   renderer.render?.();
   syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
 }
 
 function setExplorerHoverOnlyTarget(row: HTMLElement | null) {
+  const previousRow = explorerLiquidGlassHoverOnlyTarget;
   if (!explorerGlassHoverOnlyEnabled()) {
-    explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+    previousRow?.classList.remove('glass-hover-active');
+    const previousLens = explorerLiquidGlassLensForRow(previousRow);
+    if (previousLens) {
+      resetHoverOnlyLiquidGlassLens(previousLens);
+      if (previousLens._appGlassLocalMirror instanceof HTMLCanvasElement) {
+        previousLens._appGlassLocalMirror.style.opacity = '0';
+      }
+    }
     explorerLiquidGlassHoverOnlyTarget = null;
     renderExplorerHoverOnlyNow();
     return;
   }
   const next = row instanceof HTMLElement && row.isConnected ? row : null;
   if (explorerLiquidGlassHoverOnlyTarget === next) return;
-  explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+  previousRow?.classList.remove('glass-hover-active');
+  const previousLens = explorerLiquidGlassLensForRow(previousRow);
+  if (previousLens) {
+    resetHoverOnlyLiquidGlassLens(previousLens);
+    if (previousLens._appGlassLocalMirror instanceof HTMLCanvasElement) {
+      previousLens._appGlassLocalMirror.style.opacity = '0';
+    }
+  }
   explorerLiquidGlassHoverOnlyTarget = next;
   explorerLiquidGlassHoverOnlyTarget?.classList.add('glass-hover-active');
   renderExplorerHoverOnlyNow();
-}
-
-function explorerLiquidGlassSignature(targets = explorerLiquidGlassTargets()) {
-  return targets
-    .map((target) => target.parentElement instanceof HTMLElement
-      ? target.parentElement.dataset.pathKey || target.parentElement.dataset.path || ''
-      : '')
-    .join('\n');
 }
 
 function isExplorerLiquidGlassLens(lens: LiquidGLLensLike) {
@@ -11515,15 +11938,22 @@ function cleanupExplorerLiquidGlassTarget(target: HTMLElement) {
 function cleanupExplorerLiquidGlassLens(lens: LiquidGLLensLike) {
   try {
     clearExplorerLiquidGlassLocalMirror(lens);
-    lens.setTilt?.(false);
-    lens.setShadow?.(false);
-    lens._destroyMirrorCanvas?.();
-    lens._shadowEl?.remove();
-    lens._sizeObs?.disconnect?.();
+    if (typeof lens._dispose === 'function') {
+      lens._dispose();
+    } else {
+      lens.setTilt?.(false);
+      lens.setShadow?.(false);
+      lens._destroyMirrorCanvas?.();
+      lens._shadowEl?.remove();
+      lens._sizeObs?.disconnect?.();
+    }
   } catch {
     // Best effort cleanup for the third-party lens object.
   }
-  if (lens.el instanceof HTMLElement) cleanupExplorerLiquidGlassTarget(lens.el);
+  if (lens.el instanceof HTMLElement) {
+    explorerLiquidGlassLensByTarget.delete(lens.el);
+    cleanupExplorerLiquidGlassTarget(lens.el);
+  }
 }
 
 function disposeExplorerLiquidGlassRenderer() {
@@ -11543,7 +11973,7 @@ function disposeExplorerLiquidGlassRenderer() {
   }
   if (renderer.canvas instanceof HTMLElement) renderer.canvas.remove();
   explorerLiquidGlassRenderer = undefined;
-  explorerLiquidGlassTargetSignature = '';
+  explorerLiquidGlassLensByTarget = new WeakMap<HTMLElement, LiquidGLLensLike>();
 }
 
 function removeExplorerLiquidGlass() {
@@ -11565,9 +11995,14 @@ function removeExplorerLiquidGlass() {
     window.cancelAnimationFrame(explorerLiquidGlassScrollFrame);
     explorerLiquidGlassScrollFrame = 0;
   }
+  if (explorerLiquidGlassHoverMoveFrame) {
+    window.cancelAnimationFrame(explorerLiquidGlassHoverMoveFrame);
+    explorerLiquidGlassHoverMoveFrame = 0;
+  }
   disposeExplorerLiquidGlassRenderer();
   explorerLiquidGlassOverlayHost?.remove();
   explorerLiquidGlassOverlayHost = null;
+  explorerPanelCompositeSignature = '';
   for (const target of explorerLiquidGlassTargets()) cleanupExplorerLiquidGlassTarget(target);
 }
 
@@ -11583,12 +12018,34 @@ function markExplorerGlassTargetsCssFallback(reason = 'fallback') {
   for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, reason);
 }
 
-function applyExplorerGlassLensOptions(lens: LiquidGLLensLike, effect: WorkspaceGlassEffectSettings) {
+function applyExplorerGlassLensOptions(
+  lens: LiquidGLLensLike,
+  effect: WorkspaceGlassEffectSettings,
+  lensOptions = explorerLiquidGlassLensOptions(effect)
+) {
   const target = lens.el instanceof HTMLElement ? lens.el : null;
   const panel = getPanel('explorer');
   const tiltEnabled = effect.tilt && !panel.classList.contains('dragging') && !panel.classList.contains('resizing');
   lens.options = {
     ...(lens.options ?? {}),
+    ...lensOptions,
+    tilt: tiltEnabled,
+  };
+  lens.setShadow?.(effect.shadow);
+  lens.setTilt?.(tiltEnabled);
+  disableManagedGlassLensResizeObserver(lens);
+  if (target) {
+    target.style.pointerEvents = 'none';
+  }
+}
+
+function explorerLiquidGlassLensOptions(
+  effect: WorkspaceGlassEffectSettings,
+  overlayContainer = explorerLiquidGlassOverlayContainer()
+): Record<string, unknown> {
+  const panel = getPanel('explorer');
+  const tiltEnabled = effect.tilt && !panel.classList.contains('dragging') && !panel.classList.contains('resizing');
+  return {
     refraction: effect.refraction,
     bevelDepth: effect.bevelDepth,
     bevelWidth: effect.bevelWidth,
@@ -11599,15 +12056,95 @@ function applyExplorerGlassLensOptions(lens: LiquidGLLensLike, effect: Workspace
     reveal: effect.reveal,
     tilt: tiltEnabled,
     tiltFactor: effect.tiltFactor,
-    overlayContainer: explorerLiquidGlassOverlayContainer(),
+    overlayContainer,
     preserveTargetOpacity: true,
     preservePointerEvents: true
   };
-  lens.setShadow?.(effect.shadow);
-  lens.setTilt?.(tiltEnabled);
-  if (target) {
+}
+
+function explorerLiquidGlassEffectSignature(effect: WorkspaceGlassEffectSettings) {
+  const panel = getPanel('explorer');
+  const tiltEnabled = effect.tilt && !panel.classList.contains('dragging') && !panel.classList.contains('resizing');
+  return [
+    effect.refraction,
+    effect.bevelDepth,
+    effect.bevelWidth,
+    effect.frost,
+    effect.magnify,
+    effect.shadow ? 1 : 0,
+    effect.specular ? 1 : 0,
+    effect.reveal,
+    tiltEnabled ? 1 : 0,
+    effect.tiltFactor
+  ].join('|');
+}
+
+function syncExplorerLiquidGlassRendererSnapshotTarget(renderer: LiquidGLRendererLike) {
+  const target = document.querySelector(explorerLiquidGlassSnapshotSelector());
+  if (!(target instanceof Element) || renderer.snapshotTarget === target) return;
+  renderer.snapshotTarget = target;
+  glassRendererSnapshotSignatures.delete(renderer);
+}
+
+function markExplorerLiquidGlassTargetReady(
+  target: HTMLElement,
+  lens: LiquidGLLensLike,
+  effect: WorkspaceGlassEffectSettings,
+  lensOptions?: Record<string, unknown>,
+  applyOptions = true
+) {
+  target.classList.add('credit-card-glass');
+  target.classList.remove('explorer-glass-pending');
+  target.dataset.explorerGlassLens = 'liquidgl';
+  delete target.dataset.explorerGlassFallbackReason;
+  explorerLiquidGlassLensByTarget.set(target, lens);
+  if (applyOptions) {
+    applyExplorerGlassLensOptions(lens, effect, lensOptions);
+  } else {
+    disableManagedGlassLensResizeObserver(lens);
     target.style.pointerEvents = 'none';
   }
+}
+
+function reconcileExplorerLiquidGlassLenses(
+  renderer: LiquidGLRendererLike,
+  targets: HTMLElement[],
+  effect: WorkspaceGlassEffectSettings
+) {
+  const targetSet = new Set(targets);
+  const retained = new Set<HTMLElement>();
+  const effectSignature = explorerLiquidGlassEffectSignature(effect);
+  const updateRetainedOptions = renderer._sviExplorerEffectSignature !== effectSignature;
+  const lensOptions = explorerLiquidGlassLensOptions(effect, explorerLiquidGlassOverlayContainer());
+  renderer.lenses = (renderer.lenses ?? []).filter((lens) => {
+    const target = explorerLiquidGlassTargetForLens(lens);
+    if (!target) return true;
+    if (!targetSet.has(target) || !target.isConnected) {
+      if (renderer._pendingReveal) {
+        renderer._pendingReveal = renderer._pendingReveal.filter((pending) => pending !== lens);
+      }
+      cleanupExplorerLiquidGlassLens(lens);
+      return false;
+    }
+    retained.add(target);
+    if (updateRetainedOptions || target.dataset.explorerGlassLens !== 'liquidgl') {
+      markExplorerLiquidGlassTargetReady(target, lens, effect, lensOptions, updateRetainedOptions);
+    } else {
+      explorerLiquidGlassLensByTarget.set(target, lens);
+    }
+    return true;
+  });
+  for (const target of targets) {
+    if (retained.has(target)) continue;
+    if (typeof renderer.addLens !== 'function') return false;
+    target.classList.add('credit-card-glass', 'explorer-glass-pending');
+    target.dataset.explorerGlassLens = 'pending';
+    delete target.dataset.explorerGlassFallbackReason;
+    const lens = renderer.addLens(target, { ...lensOptions });
+    markExplorerLiquidGlassTargetReady(target, lens, effect, lensOptions, false);
+  }
+  renderer._sviExplorerEffectSignature = effectSignature;
+  return true;
 }
 
 function explorerLiquidGlassRendererContextLost(renderer: LiquidGLRendererLike | undefined = explorerLiquidGlassRenderer) {
@@ -11638,6 +12175,11 @@ function bindExplorerLiquidGlassContextEvents(renderer: LiquidGLRendererLike | u
 function ensureExplorerLiquidGlassCanvasLayer() {
   const renderer = explorerLiquidGlassRenderer;
   if (!renderer) return;
+  const hoverOnly = explorerGlassHoverOnlyEnabled();
+  if (renderer._sviExplorerHoverOnlyMode !== hoverOnly) {
+    renderer._sviExplorerHoverOnlyMode = hoverOnly;
+    if (hoverOnly) resetInactiveExplorerHoverOnlyLensesOnce();
+  }
   disableAppGlassRendererInternalObservers(renderer);
   bindExplorerLiquidGlassContextEvents(renderer);
   resizeAppGlassRendererCanvasForViewport(renderer);
@@ -11651,7 +12193,10 @@ function ensureExplorerLiquidGlassCanvasLayer() {
     canvas.style.opacity = '0';
     positionAppGlassViewportLayer(canvas, overlayContainer, '1');
   }
-  renderer.lenses?.forEach((lens) => {
+  const managedLenses = hoverOnly
+    ? [activeExplorerHoverOnlyLens()].filter((lens): lens is LiquidGLLensLike => Boolean(lens))
+    : renderer.lenses ?? [];
+  managedLenses.forEach((lens) => {
     if (!(lens.el instanceof HTMLElement) || !lens.el.classList.contains('file-row-glass')) return;
     patchAppGlassMirrorCreation(lens, overlayContainer);
     ensureExplorerLiquidGlassLocalMirror(lens);
@@ -11689,11 +12234,12 @@ function updateExplorerLiquidGlassEffectOptions() {
   }
   if (explorerRowsUsePanelSnapshot()) syncExplorerGlassPanelSnapshotSurface();
   const effect = effectiveAppGlassEffectSettings('explorer-rows');
+  const lensOptions = explorerLiquidGlassLensOptions(effect, explorerLiquidGlassOverlayContainer());
   for (const lens of renderer.lenses) {
     if (!isExplorerLiquidGlassLens(lens)) continue;
-    applyExplorerGlassLensOptions(lens, effect);
-    lens.updateMetrics?.();
+    applyExplorerGlassLensOptions(lens, effect, lensOptions);
   }
+  renderer._sviExplorerEffectSignature = explorerLiquidGlassEffectSignature(effect);
   ensureExplorerLiquidGlassCanvasLayer();
   renderer.render?.();
   syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
@@ -11733,9 +12279,6 @@ function scheduleExplorerLiquidGlassScrollRender() {
       return;
     }
     ensureExplorerLiquidGlassCanvasLayer();
-    renderer.lenses?.forEach((lens) => {
-      if (isExplorerLiquidGlassLens(lens)) lens.updateMetrics?.();
-    });
     renderer.render?.();
     syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
   });
@@ -11753,16 +12296,24 @@ async function applyExplorerLiquidGlass(recaptureSnapshot = false) {
       removeExplorerLiquidGlass();
       return;
     }
+    if (!appGlassCanCaptureSnapshotNow()) {
+      if (recaptureSnapshot) deferAppGlassRecapture('explorer-hidden');
+      return;
+    }
     if (explorerRowsUsePanelSnapshot()) {
       await refreshExplorerPanelGlassComposite();
     }
     await loadLiquidGLScripts();
+    if (!explorerLiquidGlassEligible() || !appGlassCanCaptureSnapshotNow()) {
+      if (!explorerLiquidGlassEligible()) removeExplorerLiquidGlass();
+      else if (recaptureSnapshot) deferAppGlassRecapture('explorer-await-hidden');
+      return;
+    }
     if (!window.liquidGL) {
       for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, 'unavailable');
       return;
     }
     const targets = explorerLiquidGlassTargets();
-    const signature = explorerLiquidGlassSignature(targets);
     const effect = effectiveAppGlassEffectSettings('explorer-rows');
     if (explorerLiquidGlassRendererContextLost(explorerLiquidGlassRenderer)) {
       if (explorerLiquidGlassRenderer?.canvas instanceof HTMLElement) {
@@ -11775,57 +12326,56 @@ async function applyExplorerLiquidGlass(recaptureSnapshot = false) {
       scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 1800 });
       return;
     }
-    if (explorerLiquidGlassRenderer && explorerLiquidGlassTargetSignature === signature && !recaptureSnapshot) {
-      updateExplorerLiquidGlassEffectOptions();
-      scheduleExplorerScrollDiagnostic(`glass-update targets=${targets.length}`);
-      return;
+    let renderer = explorerLiquidGlassRenderer;
+    if (renderer) {
+      syncExplorerLiquidGlassRendererSnapshotTarget(renderer);
+      if (!reconcileExplorerLiquidGlassLenses(renderer, targets, effect)) {
+        disposeExplorerLiquidGlassRenderer();
+        renderer = undefined;
+      }
     }
-    disposeExplorerLiquidGlassRenderer();
-    for (const target of targets) {
-      target.classList.add('credit-card-glass', 'explorer-glass-pending');
-      target.dataset.explorerGlassLens = 'pending';
-      delete target.dataset.explorerGlassFallbackReason;
-      clearExplorerLiquidGlassInlineStyles(target);
+    if (!renderer) {
+      for (const target of targets) {
+        target.classList.add('credit-card-glass', 'explorer-glass-pending');
+        target.dataset.explorerGlassLens = 'pending';
+        delete target.dataset.explorerGlassFallbackReason;
+        clearExplorerLiquidGlassInlineStyles(target);
+      }
+      const snapshotStage = explorerRowsUsePanelSnapshot()
+        ? el.ideGlassExplorerSnapshotStage
+        : el.ideGlassSnapshotStage;
+      const lensOptions = explorerLiquidGlassLensOptions(effect, explorerLiquidGlassOverlayContainer());
+      const isolated = createIsolatedWorkspaceLiquidGL({
+        snapshot: explorerLiquidGlassSnapshotSelector(),
+        ...glassInitialSnapshotOptions(snapshotStage),
+        target: '.file-row-glass.explorer-glass-pending',
+        resolution: 1,
+        ...lensOptions
+      });
+      renderer = isolated.renderer;
+      const lenses = liquidLensArray(isolated.result);
+      if (!renderer || !lenses.length) {
+        for (const target of targets) markExplorerGlassTargetCssFallback(target, 'init-failed');
+        return;
+      }
+      explorerLiquidGlassRenderer = renderer;
+      for (const lens of lenses) {
+        const target = explorerLiquidGlassTargetForLens(lens);
+        if (target) markExplorerLiquidGlassTargetReady(target, lens, effect, lensOptions, false);
+      }
+      renderer._sviExplorerEffectSignature = explorerLiquidGlassEffectSignature(effect);
     }
-    const isolated = createIsolatedWorkspaceLiquidGL({
-      snapshot: explorerLiquidGlassSnapshotSelector(),
-      target: '.file-row-glass.explorer-glass-pending',
-      resolution: 1,
-      refraction: effect.refraction,
-      bevelDepth: effect.bevelDepth,
-      bevelWidth: effect.bevelWidth,
-      frost: effect.frost,
-      magnify: effect.magnify,
-      shadow: effect.shadow,
-      specular: effect.specular,
-      reveal: effect.reveal,
-      tilt: effect.tilt,
-      tiltFactor: effect.tiltFactor,
-      overlayContainer: el.fileList,
-      preserveTargetOpacity: true,
-      preservePointerEvents: true
-    });
-    const renderer = isolated.renderer;
-    const lenses = liquidLensArray(isolated.result);
-    if (!renderer || !lenses.length) {
-      for (const target of targets) markExplorerGlassTargetCssFallback(target, 'init-failed');
-      return;
-    }
-    explorerLiquidGlassRenderer = renderer;
-    explorerLiquidGlassTargetSignature = signature;
-    for (const lens of lenses) {
-      const target = lens.el instanceof HTMLElement ? lens.el : null;
-      if (!target || !target.classList.contains('file-row-glass')) continue;
-      target.classList.remove('explorer-glass-pending');
-      target.dataset.explorerGlassLens = 'liquidgl';
-      delete target.dataset.explorerGlassFallbackReason;
-      applyExplorerGlassLensOptions(lens, effect);
-    }
+    syncExplorerLiquidGlassRendererSnapshotTarget(renderer);
     ensureExplorerLiquidGlassCanvasLayer();
-    await renderer.captureSnapshot?.().catch(() => undefined);
-    renderer.render?.();
+    const snapshotRendered = await ensureLiquidGlassRendererSnapshot(renderer);
+    if (!explorerLiquidGlassEligible() || !appGlassCanCaptureSnapshotNow()) {
+      if (!explorerLiquidGlassEligible()) removeExplorerLiquidGlass();
+      else if (recaptureSnapshot) deferAppGlassRecapture('explorer-capture-hidden');
+      return;
+    }
+    if (!snapshotRendered) renderer.render?.();
     syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
-    scheduleExplorerScrollDiagnostic(`glass-apply recapture=${recaptureSnapshot ? 1 : 0} targets=${targets.length} lenses=${lenses.length}`);
+    scheduleExplorerScrollDiagnostic(`glass-apply recapture=${recaptureSnapshot ? 1 : 0} targets=${targets.length} lenses=${renderer.lenses?.length ?? 0}`);
   } catch (error) {
     for (const target of explorerLiquidGlassTargets()) markExplorerGlassTargetCssFallback(target, 'init-failed');
     console.warn('explorer row liquid glass failed', error);
@@ -11847,10 +12397,14 @@ function refreshAppGlassGeometry(options: { recapture?: boolean } = {}) {
   if (!appGlassEnabled()) return;
   syncAppGlassTargets();
   for (const renderer of uniqueAppGlassRenderers()) {
-    renderer.lenses?.forEach((lens) => lens.updateMetrics?.());
     ensureAppGlassRendererLayer(renderer);
-    if (options.recapture) void renderer.captureSnapshot?.().catch(() => undefined);
-    renderer.render?.();
+    if (options.recapture) {
+      void ensureLiquidGlassRendererSnapshot(renderer).then((snapshotRendered) => {
+        if (!snapshotRendered) renderer.render?.();
+      });
+    } else {
+      renderer.render?.();
+    }
   }
   if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) {
     scheduleExplorerLiquidGlassRefresh({ recapture: options.recapture });
@@ -20740,6 +21294,7 @@ function bindEvents() {
   window.addEventListener('pagehide', flushTerminalCwdSnapshotSave);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
+      stopWorkspaceGlassTicker();
       flushTerminalCwdSnapshotSave();
       flushWorkspaceStorePersist();
       clearExplorerBackgroundWork();
@@ -25089,10 +25644,10 @@ function handleExplorerScroll() {
   syncExplorerSemanticVerticalOverflowGuard();
   markExplorerScrolling();
   scheduleExplorerVirtualRender();
-  scheduleExplorerLiquidGlassScrollRender();
+  if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
+  else scheduleExplorerLiquidGlassScrollRender();
   scheduleExplorerLiquidGlassRefresh();
   scheduleExplorerScrollDiagnostic('scroll');
-  if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
 }
 
 function explorerHiddenHorizontalContentWidth() {
@@ -25658,9 +26213,16 @@ function handleExplorerHoverOnlyPointerOut(event: PointerEvent) {
 
 function handleExplorerHoverOnlyPointerMove(event: PointerEvent) {
   if (!explorerGlassHoverOnlyEnabled()) return;
-  const hit = document.elementFromPoint(event.clientX, event.clientY);
-  const row = hit instanceof Element ? hit.closest<HTMLElement>('.file-row') : null;
-  if (row !== explorerLiquidGlassHoverOnlyTarget) setExplorerHoverOnlyTarget(row);
+  explorerLiquidGlassHoverMoveX = event.clientX;
+  explorerLiquidGlassHoverMoveY = event.clientY;
+  if (explorerLiquidGlassHoverMoveFrame) return;
+  explorerLiquidGlassHoverMoveFrame = window.requestAnimationFrame(() => {
+    explorerLiquidGlassHoverMoveFrame = 0;
+    if (!explorerGlassHoverOnlyEnabled() || Date.now() < explorerScrollingUntil) return;
+    const hit = document.elementFromPoint(explorerLiquidGlassHoverMoveX, explorerLiquidGlassHoverMoveY);
+    const row = hit instanceof Element ? hit.closest<HTMLElement>('.file-row') : null;
+    if (row !== explorerLiquidGlassHoverOnlyTarget) setExplorerHoverOnlyTarget(row);
+  });
 }
 
 function handleExplorerPointerDown(event: PointerEvent) {

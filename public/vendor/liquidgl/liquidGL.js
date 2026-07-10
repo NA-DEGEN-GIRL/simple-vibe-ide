@@ -14,10 +14,15 @@
    * ------------------------------------------------*/
   function debounce(fn, wait) {
     let t;
-    return (...a) => {
+    const debounced = (...a) => {
       clearTimeout(t);
       t = setTimeout(() => fn.apply(null, a), wait);
     };
+    debounced.cancel = () => {
+      clearTimeout(t);
+      t = null;
+    };
+    return debounced;
   }
 
   /* --------------------------------------------------
@@ -78,7 +83,11 @@
    *  Shared renderer (one per page)
    * ------------------------------------------------*/
   class liquidGLRenderer {
-    constructor(snapshotSelector, snapshotResolution = 1.0) {
+    constructor(
+      snapshotSelector,
+      snapshotResolution = 1.0,
+      rendererOptions = {}
+    ) {
       this.canvas = document.createElement("canvas");
       this.canvas.style.cssText = `position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;`;
       this.canvas.setAttribute("data-liquid-ignore", "");
@@ -87,7 +96,7 @@
       const ctxAttribs = {
         alpha: true,
         premultipliedAlpha: true,
-        preserveDrawingBuffer: true,
+        preserveDrawingBuffer: rendererOptions.preserveDrawingBuffer !== false,
       };
       this.gl =
         this.canvas.getContext("webgl2", ctxAttribs) ||
@@ -108,6 +117,11 @@
       this._resizeHandler = null;
       this._resizeObserver = null;
       this._styleEl = null;
+      this._capturing = false;
+      this._capturePromise = null;
+      this._captureTrailingRequested = false;
+      this._captureRunningTrailing = false;
+      this._revealRafId = null;
 
       this._initGL();
 
@@ -133,7 +147,7 @@
 
       const onResize = debounce(() => {
         if (this._disposed) return;
-        if (this._capturing || this._isScrolling) return;
+        if (this._isScrolling) return;
 
         if (window.visualViewport && window.visualViewport.scale !== 1) {
           return;
@@ -150,7 +164,7 @@
 
         this._resizeCanvas();
         this.lenses.forEach((l) => l.updateMetrics());
-        this.captureSnapshot();
+        this.captureSnapshot({ trailing: true });
       }, 250);
       this._resizeHandler = onResize;
       window.addEventListener("resize", this._resizeHandler, { passive: true });
@@ -179,8 +193,6 @@
       );
 
       this._resizeCanvas();
-      this.captureSnapshot();
-
       this._pendingReveal = [];
 
       /* --------------------------------------------------
@@ -203,49 +215,127 @@
       this._workerEnabled =
         typeof OffscreenCanvas !== "undefined" &&
         typeof Worker !== "undefined" &&
-        typeof ImageBitmap !== "undefined";
+        typeof ImageBitmap !== "undefined" &&
+        typeof createImageBitmap !== "undefined";
 
-      if (this._workerEnabled) {
-        const workerSrc = `
-          /* dynamic-element worker (runs in its own thread) */
-          self.onmessage = async (e) => {
-            const { id, width, height, snap, dyn } = e.data;
-            const off = new OffscreenCanvas(width, height);
-            const ctx = off.getContext('2d');
+      this._dynWorker = null;
+      this._dynWorkerUrl = null;
+      this._dynJobs = new Map();
 
+      const initialSnapshot = rendererOptions.initialSnapshot;
+      const initialSnapshotScale = Number(
+        rendererOptions.initialSnapshotScale
+      );
+      if (Number.isFinite(initialSnapshotScale) && initialSnapshotScale > 0) {
+        this.scaleFactor = initialSnapshotScale;
+      } else if (
+        initialSnapshot &&
+        Number(initialSnapshot.width) > 0 &&
+        Number(initialSnapshot.height) > 0
+      ) {
+        const targetWidth = this.snapshotTarget.scrollWidth;
+        const targetHeight = this.snapshotTarget.scrollHeight;
+        const inferredScale = Math.min(
+          targetWidth > 0 ? initialSnapshot.width / targetWidth : Infinity,
+          targetHeight > 0 ? initialSnapshot.height / targetHeight : Infinity
+        );
+        if (Number.isFinite(inferredScale) && inferredScale > 0) {
+          this.scaleFactor = inferredScale;
+        }
+      }
+
+      if (initialSnapshot) {
+        try {
+          this._uploadTexture(initialSnapshot);
+        } catch (error) {
+          console.warn("liquidGL: Initial snapshot upload failed", error);
+        }
+      }
+      const deferInitialSnapshot =
+        rendererOptions.deferInitialSnapshot === true;
+      if (!deferInitialSnapshot) this.captureSnapshot();
+    }
+
+    /* ----------------------------- */
+    _ensureDynamicWorker() {
+      if (!this._workerEnabled || this._disposed) return null;
+      if (this._dynWorker) return this._dynWorker;
+
+      const workerSrc = `
+        /* dynamic-element worker (runs in its own thread) */
+        self.onmessage = async (e) => {
+          const { id, width, height, snap, dyn } = e.data;
+          const off = new OffscreenCanvas(width, height);
+          const ctx = off.getContext('2d');
+
+          try {
             ctx.drawImage(snap, 0, 0, width, height);
             ctx.drawImage(dyn, 0, 0, width, height);
+          } finally {
+            snap.close?.();
+            dyn.close?.();
+          }
 
-            const bmp = await off.transferToImageBitmap();
-            self.postMessage({ id, bmp }, [bmp]);
-          };
-        `;
-        const blob = new Blob([workerSrc], { type: "application/javascript" });
-        this._dynWorker = new Worker(URL.createObjectURL(blob), {
-          type: "module",
+          const bmp = await off.transferToImageBitmap();
+          self.postMessage({ id, bmp }, [bmp]);
+        };
+      `;
+
+      let workerUrl = null;
+      try {
+        const blob = new Blob([workerSrc], {
+          type: "application/javascript",
         });
-
-        this._dynJobs = new Map();
-
-        this._dynWorker.onmessage = (e) => {
+        workerUrl = URL.createObjectURL(blob);
+        const worker = new Worker(workerUrl, { type: "module" });
+        worker.onmessage = (e) => {
           const { id, bmp } = e.data;
           const meta = this._dynJobs.get(id);
-          if (!meta) return;
           this._dynJobs.delete(id);
+          if (!meta || this._disposed || !this.texture) {
+            bmp?.close?.();
+            return;
+          }
 
-          const { x, y, w, h } = meta;
-          const gl = this.gl;
-          gl.bindTexture(gl.TEXTURE_2D, this.texture);
-          gl.texSubImage2D(
-            gl.TEXTURE_2D,
-            0,
-            x,
-            y,
-            gl.RGBA,
-            gl.UNSIGNED_BYTE,
-            bmp
-          );
+          try {
+            const { x, y } = meta;
+            const gl = this.gl;
+            gl.bindTexture(gl.TEXTURE_2D, this.texture);
+            gl.texSubImage2D(
+              gl.TEXTURE_2D,
+              0,
+              x,
+              y,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              bmp
+            );
+          } finally {
+            bmp?.close?.();
+          }
         };
+        worker.onerror = () => {
+          this._dynJobs.clear();
+          if (this._dynWorker === worker) {
+            worker.onmessage = null;
+            worker.onerror = null;
+            worker.terminate();
+            this._dynWorker = null;
+            if (this._dynWorkerUrl) {
+              URL.revokeObjectURL(this._dynWorkerUrl);
+              this._dynWorkerUrl = null;
+            }
+            this._workerEnabled = false;
+          }
+        };
+        this._dynWorkerUrl = workerUrl;
+        this._dynWorker = worker;
+        return worker;
+      } catch (error) {
+        if (workerUrl) URL.revokeObjectURL(workerUrl);
+        this._workerEnabled = false;
+        console.warn("liquidGL: Dynamic worker unavailable", error);
+        return null;
       }
     }
 
@@ -382,6 +472,7 @@
       if (!this.program) throw new Error("liquidGL: Shader failed");
 
       const posBuf = gl.createBuffer();
+      this._positionBuffer = posBuf;
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
       gl.bufferData(
         gl.ARRAY_BUFFER,
@@ -418,6 +509,7 @@
 
     /* ----------------------------- */
     _resizeCanvas() {
+      if (this._disposed) return;
       const dpr = Math.min(2, window.devicePixelRatio || 1);
       this.canvas.width = innerWidth * dpr;
       this.canvas.height = innerHeight * dpr;
@@ -428,11 +520,17 @@
 
     /* ----------------------------- */
     dispose() {
+      if (this._disposed) return;
       this._disposed = true;
+      this._captureTrailingRequested = false;
 
       if (this._rafId) {
         cancelAnimationFrame(this._rafId);
         this._rafId = null;
+      }
+      if (this._revealRafId) {
+        cancelAnimationFrame(this._revealRafId);
+        this._revealRafId = null;
       }
       if (this._scrollRafId) {
         cancelAnimationFrame(this._scrollRafId);
@@ -443,6 +541,7 @@
         this._scrollTimeout = null;
       }
       if (this._resizeHandler) {
+        this._resizeHandler.cancel?.();
         window.removeEventListener("resize", this._resizeHandler);
         this._resizeHandler = null;
       }
@@ -453,13 +552,33 @@
 
       this.lenses.forEach((lens) => {
         try {
-          lens._unbindTiltHandlers?.();
-          lens.setShadow?.(false);
-          lens._destroyMirrorCanvas?.();
-          lens._shadowEl?.remove?.();
+          lens._dispose?.();
         } catch {}
       });
       this.lenses = [];
+      this._pendingReveal.length = 0;
+
+      this._dynamicNodes.forEach((node) => {
+        const meta = this._dynMeta.get(node.el);
+        if (meta?._rafId) cancelAnimationFrame(meta._rafId);
+        try {
+          meta?._cleanup?.();
+        } catch {}
+        this._dynMeta.delete(node.el);
+      });
+      this._dynamicNodes = [];
+
+      if (this._dynWorker) {
+        this._dynWorker.onmessage = null;
+        this._dynWorker.onerror = null;
+        this._dynWorker.terminate();
+        this._dynWorker = null;
+      }
+      if (this._dynWorkerUrl) {
+        URL.revokeObjectURL(this._dynWorkerUrl);
+        this._dynWorkerUrl = null;
+      }
+      this._dynJobs.clear();
 
       if (this._styleEl) {
         this._styleEl.remove();
@@ -467,23 +586,75 @@
       }
 
       try {
+        if (this.texture) this.gl?.deleteTexture?.(this.texture);
+        if (this._positionBuffer) {
+          this.gl?.deleteBuffer?.(this._positionBuffer);
+        }
+        if (this.program) this.gl?.deleteProgram?.(this.program);
         this.gl?.getExtension?.("WEBGL_lose_context")?.loseContext?.();
       } catch {}
+      this.texture = null;
+      this.staticSnapshotCanvas = null;
+      this._tmpCanvas = null;
+      this._tmpCtx = null;
+      this._compositeCtx = null;
       this.canvas?.remove?.();
     }
 
     /* ----------------------------- */
-    async captureSnapshot() {
-      if (this._capturing || typeof html2canvas === "undefined") return;
+    captureSnapshot(captureOptions = {}) {
+      if (this._disposed || typeof html2canvas === "undefined") {
+        return Promise.resolve(undefined);
+      }
+      const requestTrailing =
+        captureOptions === true ||
+        (captureOptions &&
+          typeof captureOptions === "object" &&
+          (captureOptions.trailing === true ||
+            captureOptions.forceRecapture === true));
+      // Plain callers join the current capture. Explicit invalidations request
+      // one coalesced follow-up; invalidations during that follow-up stay queued.
+      if (this._capturePromise) {
+        if (requestTrailing) this._captureTrailingRequested = true;
+        return this._capturePromise;
+      }
+
+      this._captureTrailingRequested = false;
+      this._captureRunningTrailing = false;
       this._capturing = true;
 
-      const undos = [];
+      const captureBatch = Promise.resolve().then(async () => {
+        let succeeded = false;
+        let captureIndex = 0;
+        do {
+          this._captureTrailingRequested = false;
+          this._captureRunningTrailing = captureIndex > 0;
+          succeeded = await this._captureSnapshotOnce();
+          captureIndex += 1;
+        } while (!this._disposed && this._captureTrailingRequested);
+        return succeeded;
+      });
+
+      this._capturePromise = captureBatch.finally(() => {
+        this._capturing = false;
+        this._captureTrailingRequested = false;
+        this._captureRunningTrailing = false;
+        this._capturePromise = null;
+      });
+
+      return this._capturePromise;
+    }
+
+    /* ----------------------------- */
+    async _captureSnapshotOnce() {
+      if (this._disposed) return false;
 
       const attemptCapture = async (
         attempt = 1,
         maxAttempts = 3,
         delayMs = 500
       ) => {
+        if (this._disposed) return false;
         try {
           const fullW = this.snapshotTarget.scrollWidth;
           const fullH = this.snapshotTarget.scrollHeight;
@@ -541,9 +712,10 @@
             ignoreElements: ignoreElementsFunc,
           });
 
-          this._uploadTexture(snapCanvas);
-          return true;
+          if (this._disposed) return false;
+          return this._uploadTexture(snapCanvas);
         } catch (e) {
+          if (this._disposed) return false;
           console.error("liquidGL snapshot failed on attempt " + attempt, e);
           if (attempt < maxAttempts) {
             console.log(
@@ -555,26 +727,21 @@
             console.error("liquidGL: All snapshot attempts failed.", e);
             return false;
           }
-        } finally {
-          for (let i = undos.length - 1; i >= 0; i--) {
-            undos[i]();
-          }
-          this._capturing = false;
         }
       };
 
-      return await attemptCapture();
+      return attemptCapture();
     }
 
     /* ----------------------------- */
     _uploadTexture(srcCanvas) {
-      if (!srcCanvas) return;
+      if (!srcCanvas || this._disposed) return false;
 
       if (!(srcCanvas instanceof HTMLCanvasElement)) {
         const tmp = document.createElement("canvas");
         tmp.width = srcCanvas.width || 0;
         tmp.height = srcCanvas.height || 0;
-        if (tmp.width === 0 || tmp.height === 0) return;
+        if (tmp.width === 0 || tmp.height === 0) return false;
         try {
           const ctx = tmp.getContext("2d");
           ctx.drawImage(srcCanvas, 0, 0);
@@ -584,11 +751,11 @@
             "liquidGL: Unable to convert OffscreenCanvas for upload",
             e
           );
-          return;
+          return false;
         }
       }
 
-      if (srcCanvas.width === 0 || srcCanvas.height === 0) return;
+      if (srcCanvas.width === 0 || srcCanvas.height === 0) return false;
       this.staticSnapshotCanvas = srcCanvas;
       const gl = this.gl;
       if (!this.texture) this.texture = gl.createTexture();
@@ -631,6 +798,7 @@
         this._pendingReveal.forEach((ln) => ln._reveal());
         this._pendingReveal.length = 0;
       }
+      return true;
     }
 
     /* ----------------------------- */
@@ -653,6 +821,7 @@
 
     /* ----------------------------- */
     render() {
+      if (this._disposed) return;
       const gl = this.gl;
       if (!this.texture) return;
 
@@ -1033,7 +1202,10 @@
         }
 
         if (meta.lastCapture) {
-          if (meta.prevDrawRect && !(this._workerEnabled && meta._heavyAnim)) {
+          const dynamicWorker = meta._heavyAnim
+            ? this._ensureDynamicWorker()
+            : null;
+          if (meta.prevDrawRect && !dynamicWorker) {
             const { x, y, w, h } = meta.prevDrawRect;
             if (w > 0 && h > 0) {
               const eraseCanvas = this._compositeCtx.canvas;
@@ -1166,7 +1338,7 @@
             compositeCanvas
           );
 
-          if (this._workerEnabled && meta._heavyAnim) {
+          if (dynamicWorker) {
             const jobId = `${Date.now()}_${Math.random()}`;
             this._dynJobs.set(jobId, {
               x: dstX,
@@ -1184,18 +1356,49 @@
                 updH
               ),
               createImageBitmap(meta.lastCapture),
-            ]).then(([snapBmp, dynBmp]) => {
-              this._dynWorker.postMessage(
-                {
-                  id: jobId,
-                  width: updW,
-                  height: updH,
-                  snap: snapBmp,
-                  dyn: dynBmp,
-                },
-                [snapBmp, dynBmp]
-              );
-            });
+            ])
+              .then(([snapBmp, dynBmp]) => {
+                if (
+                  this._disposed ||
+                  this._dynWorker !== dynamicWorker
+                ) {
+                  this._dynJobs.delete(jobId);
+                  snapBmp.close?.();
+                  dynBmp.close?.();
+                  return;
+                }
+                try {
+                  dynamicWorker.postMessage(
+                    {
+                      id: jobId,
+                      width: updW,
+                      height: updH,
+                      snap: snapBmp,
+                      dyn: dynBmp,
+                    },
+                    [snapBmp, dynBmp]
+                  );
+                } catch (error) {
+                  this._dynJobs.delete(jobId);
+                  snapBmp.close?.();
+                  dynBmp.close?.();
+                  if (!this._disposed) {
+                    console.warn(
+                      "liquidGL: Dynamic worker post failed",
+                      error
+                    );
+                  }
+                }
+              })
+              .catch((error) => {
+                this._dynJobs.delete(jobId);
+                if (!this._disposed) {
+                  console.warn(
+                    "liquidGL: Dynamic worker bitmap creation failed",
+                    error
+                  );
+                }
+              });
             meta.prevDrawRect = { x: dstX, y: dstY, w: updW, h: updH };
             return;
           }
@@ -1247,7 +1450,15 @@
       if (el.closest && el.closest("[data-liquid-ignore]")) return;
       if (this._dynamicNodes.some((n) => n.el === el)) return;
 
-      this._dynamicNodes = this._dynamicNodes.filter((n) => !el.contains(n.el));
+      this._dynamicNodes = this._dynamicNodes.filter((node) => {
+        if (!el.contains(node.el)) return true;
+        const childMeta = this._dynMeta.get(node.el);
+        try {
+          childMeta?._cleanup?.();
+        } catch {}
+        this._dynMeta.delete(node.el);
+        return false;
+      });
 
       const meta = {
         _capturing: false,
@@ -1259,6 +1470,7 @@
         _rafId: null,
         _lastCaptureTs: 0,
         _heavyAnim: false,
+        _cleanup: null,
       };
       this._dynMeta.set(el, meta);
 
@@ -1288,7 +1500,7 @@
         return cssText;
       };
 
-      const handleLeave = () => {
+      const handleLeave = (markDirty = true) => {
         const m = this._dynMeta.get(el);
         if (!m || !m.hoverClassName) return;
 
@@ -1301,35 +1513,33 @@
           }
         }
         m.hoverClassName = null;
+        if (markDirty) setDirty();
+      };
+
+      const handleMouseEnter = () => {
+        const m = this._dynMeta.get(el);
+        if (!m) return;
+        const hoverCss = findAppliedHoverStyles(el);
+        if (hoverCss) {
+          const className = `lqgl-h-${Math.random()
+            .toString(36)
+            .substr(2, 9)}`;
+          const rule = `.${className} { ${hoverCss} }`;
+          try {
+            this._dynamicStyleSheet.insertRule(
+              rule,
+              this._dynamicStyleSheet.cssRules.length
+            );
+            m.hoverClassName = className;
+            el.classList.add(className);
+          } catch (e) {
+            console.error("liquidGL: Failed to insert hover style rule.", e);
+          }
+        }
         setDirty();
       };
 
-      el.addEventListener(
-        "mouseenter",
-        () => {
-          const m = this._dynMeta.get(el);
-          if (!m) return;
-          const hoverCss = findAppliedHoverStyles(el);
-          if (hoverCss) {
-            const className = `lqgl-h-${Math.random()
-              .toString(36)
-              .substr(2, 9)}`;
-            const rule = `.${className} { ${hoverCss} }`;
-            try {
-              this._dynamicStyleSheet.insertRule(
-                rule,
-                this._dynamicStyleSheet.cssRules.length
-              );
-              m.hoverClassName = className;
-              el.classList.add(className);
-            } catch (e) {
-              console.error("liquidGL: Failed to insert hover style rule.", e);
-            }
-          }
-          setDirty();
-        },
-        { passive: true }
-      );
+      el.addEventListener("mouseenter", handleMouseEnter, { passive: true });
 
       el.addEventListener("mouseleave", handleLeave, { passive: true });
       el.addEventListener("transitionend", setDirty, { passive: true });
@@ -1387,27 +1597,25 @@
       el.addEventListener("transitionstart", transitionRunHandler, {
         passive: true,
       });
-      el.addEventListener(
-        "animationstart",
-        () => {
-          const m = this._dynMeta.get(el);
-          if (m) m._heavyAnim = true;
-          startRealtime();
-        },
-        { passive: true }
-      );
+      const handleAnimationStart = () => {
+        const m = this._dynMeta.get(el);
+        if (m) m._heavyAnim = true;
+        startRealtime();
+      };
+      el.addEventListener("animationstart", handleAnimationStart, {
+        passive: true,
+      });
 
-      el.addEventListener(
-        "animationiteration",
-        () => {
-          const m = this._dynMeta.get(el);
-          if (m) {
-            m._heavyAnim = true;
-            if (!m._animating) startRealtime();
-          }
-        },
-        { passive: true }
-      );
+      const handleAnimationIteration = () => {
+        const m = this._dynMeta.get(el);
+        if (m) {
+          m._heavyAnim = true;
+          if (!m._animating) startRealtime();
+        }
+      };
+      el.addEventListener("animationiteration", handleAnimationIteration, {
+        passive: true,
+      });
 
       const stopRealtime = () => {
         const m = this._dynMeta.get(el);
@@ -1429,11 +1637,11 @@
       /* --------------------------------------------------
        *  Removal clean-up
        * --------------------------------------------------*/
+      let removalObserver = null;
       if (typeof MutationObserver !== "undefined") {
-        const removalObserver = new MutationObserver(() => {
+        removalObserver = new MutationObserver(() => {
           if (!document.contains(el)) {
-            handleLeave();
-            removalObserver.disconnect();
+            meta._cleanup?.();
             this._dynamicNodes = this._dynamicNodes.filter((n) => n.el !== el);
             this._dynMeta.delete(el);
           }
@@ -1443,6 +1651,32 @@
           subtree: true,
         });
       }
+
+      meta._cleanup = () => {
+        if (meta._cleaned) return;
+        meta._cleaned = true;
+        if (meta._rafId) {
+          cancelAnimationFrame(meta._rafId);
+          meta._rafId = null;
+        }
+        meta._animating = false;
+        handleLeave(false);
+        removalObserver?.disconnect();
+        el.removeEventListener("mouseenter", handleMouseEnter);
+        el.removeEventListener("mouseleave", handleLeave);
+        el.removeEventListener("transitionend", setDirty);
+        el.removeEventListener("transitionrun", transitionRunHandler);
+        el.removeEventListener("transitionstart", transitionRunHandler);
+        el.removeEventListener("animationstart", handleAnimationStart);
+        el.removeEventListener(
+          "animationiteration",
+          handleAnimationIteration
+        );
+        el.removeEventListener("transitionend", stopRealtime);
+        el.removeEventListener("transitioncancel", stopRealtime);
+        el.removeEventListener("animationend", stopRealtime);
+        el.removeEventListener("animationcancel", stopRealtime);
+      };
 
       this._dynamicNodes.push({ el });
     }
@@ -1707,6 +1941,11 @@
       const start = performance.now();
 
       const animate = () => {
+        if (this.renderer._disposed) {
+          this.renderer._revealAnimating = false;
+          this.renderer._revealRafId = null;
+          return;
+        }
         const progress = Math.min(1, (performance.now() - start) / dur);
 
         this.renderer.lenses.forEach((ln) => {
@@ -1726,8 +1965,9 @@
         this.renderer.render();
 
         if (progress < 1) {
-          requestAnimationFrame(animate);
+          this.renderer._revealRafId = requestAnimationFrame(animate);
         } else {
+          this.renderer._revealRafId = null;
           this.renderer._revealAnimating = false;
           this.renderer.lenses.forEach((ln) => {
             ln.el.style.transition = ln.originalTransition || "";
@@ -1736,7 +1976,7 @@
         }
       };
 
-      requestAnimationFrame(animate);
+      this.renderer._revealRafId = requestAnimationFrame(animate);
     }
 
     /* ----------------------------- */
@@ -2059,6 +2299,23 @@
       this._mirrorActive = false;
     }
 
+    _dispose() {
+      if (this._disposed) return;
+      this._disposed = true;
+      if (this._resetCleanupTimer) {
+        clearTimeout(this._resetCleanupTimer);
+        this._resetCleanupTimer = null;
+      }
+      if (this._sizeObs) {
+        this._sizeObs.disconnect();
+        this._sizeObs = null;
+      }
+      this._unbindTiltHandlers();
+      this.setShadow(false);
+      this._destroyMirrorCanvas();
+      this._shadowEl?.remove?.();
+    }
+
     _TriggerInit() {
       if (this._initCalled) return;
       this._initCalled = true;
@@ -2086,6 +2343,7 @@
       tilt: false,
       tiltFactor: 5,
       magnify: 1,
+      preserveDrawingBuffer: true,
       on: {},
     };
     const options = { ...defaults, ...userOptions };
@@ -2120,7 +2378,11 @@
 
     let renderer = window.__liquidGLRenderer__;
     if (!renderer) {
-      renderer = new liquidGLRenderer(options.snapshot, options.resolution);
+      renderer = new liquidGLRenderer(
+        options.snapshot,
+        options.resolution,
+        options
+      );
       window.__liquidGLRenderer__ = renderer;
     }
 
@@ -2155,7 +2417,7 @@
     if (!renderer || !renderer.addDynamicElement) return;
     renderer.addDynamicElement(elements);
     if (renderer.captureSnapshot) {
-      renderer.captureSnapshot();
+      renderer.captureSnapshot({ trailing: true });
     }
   };
 

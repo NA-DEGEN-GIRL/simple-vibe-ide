@@ -1124,7 +1124,7 @@
       "explorerSelectedRailColor": "#7aaeff",
       "explorerSelectedRailAlpha": 0.56,
       "explorerSelectedRailWidth": 4,
-      "diagnostics": true
+      "diagnostics": false
     }
   }
 }

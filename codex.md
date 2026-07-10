@@ -51,6 +51,47 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-10 - Reduce Glass recapture and Explorer hover churn
+
+#### Changed (`src/main.ts`, `public/vendor/liquidgl/liquidGL.js`, `theme/glass_set_01.json`)
+- Glass renderers now share revision-aware snapshots per source stage. New
+  renderers can seed from the cached canvas, concurrent requests join one
+  capture, and a source change during an in-flight capture requests one
+  trailing refresh instead of accepting the stale frame.
+- Focus, visibility, and restore wake signals are coalesced before Glass
+  geometry work. Hidden/tiny-window applies are deferred, then eligibility is
+  checked again after async script loads and captures.
+- Workspace row/container renderers no longer keep an unconditional RAF or
+  rebuild their WebGL contexts after every settled resize. A single app-owned
+  ticker runs only for currently visible specular material, including only the
+  active row while hover-only mode is enabled.
+- Explorer virtualization now reconciles lenses by live DOM identity instead
+  of disposing the renderer whenever the visible row signature changes.
+  Retained rows reuse their lenses, effect options are reapplied only when the
+  material changes, and removed rows run the vendored lens cleanup path.
+- Explorer hover-only rendering filters to the active lens, creates/copies only
+  its local mirror, coalesces pointer moves to one animation frame, and avoids
+  a second scroll render after the active hover row is cleared.
+- App Glass applies now capture/render once per unique shared renderer and skip
+  inactive cached owners. Redundant per-lens geometry passes were removed when
+  the following renderer pass already updates the same metrics.
+- Vendored LiquidGL now supports deferred/seeded snapshots, joins concurrent
+  capture promises, lazily creates and disposes its dynamic worker, cancels
+  pending observers/timers, and releases lens/WebGL resources on disposal.
+  `preserveDrawingBuffer` remains enabled because local mirrors and derived
+  Glass composites still read the rendered canvas.
+- Bundled Glass diagnostics now default to off, with a one-time migration for
+  existing settings, avoiding the Explorer diagnostic measurement/storage loop
+  during normal use.
+
+#### Verified
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `node --check public/vendor/liquidgl/liquidGL.js`
+- JSON parse and `git diff --check`
+- Real Windows/Tauri visual and performance smoke is still required.
+
 ### 2026-07-05 - Simplify LLM card background controls
 
 #### Changed (`src/main.ts`, `src/styles.css`)
