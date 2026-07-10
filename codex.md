@@ -51,6 +51,60 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-10 - Keep dimmed Glass workspace content above the renderer
+
+#### Changed (`src/styles.css`)
+- Memory Saver and drag dimming create an opacity stacking context on the whole
+  workspace row. In Glass mode that context now receives a narrow `z-index: 2`,
+  keeping the row header, controls, status, and agent cards above the dock's
+  LiquidGL canvases without changing the normal row paint order.
+- The capture-block marker itself does not hide workspace text. The reported
+  click-to-restore behavior came from activating a slept workspace, which
+  removed its dimming context and accidentally repaired the paint order.
+
+#### Verified
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Real Windows/WebView2 smoke is still required with an inactive protected
+  workspace entering Memory Saver while workspace row Glass is enabled.
+
+### 2026-07-10 - Harden Windows Korean IME and terminal input ordering
+
+#### Changed (`src/main.ts`, `package.json`, `package-lock.json`)
+- xterm now remains the single owner of committed IME text through its helper-textarea delta.
+  Removed the `compositionend.data` direct-send path, private `_core` mutation, and time-window
+  string dedup that could drop empty/stale Chromium commits or valid repeated Hangul.
+- Space/Enter around composition finalization are ordered without guessing candidate input. Early
+  delimiter `onData` is held until xterm's canonical commit, observed Enter newlines are normalized
+  to CR, and independent escape protocol reports do not consume the IME commit boundary.
+- Helper-textarea contents and selection are preserved across xterm's blur clear while composition
+  or deferred commit is active. Missing `compositionend` can fall through to xterm's supported
+  next-key finalize path, with bounded stale-state release for hidden, blurred, or long-lived IME.
+- All terminal writes now reserve a pane-local FIFO position before awaiting Tauri: batched keys,
+  Hangul/control input, paste, Type pad, image tags, launcher commands, and cursor-position replies.
+  Cursor replies use backend-bound protocol priority and cannot cancel queued user input.
+- WSL/Windows startup and explicit tmux reconnect type-ahead are bounded and flushed on backend
+  attach. Rust queue-full responses use bounded safe retries; an unconfirmed user-stream head
+  cancels its suffix so a detached Enter cannot execute a truncated command.
+- Delayed startup, app restore, and post-composition focus recovery now re-check the current shell,
+  Type pad, panel, or IDE keyboard owner. Focus changes cancel stale retries instead of letting a
+  terminal steal IME from another editable control.
+- Type pad paste is single-flight. A pending submission cannot be duplicated, and edits made while
+  it waits are preserved on both success and failure.
+- `@xterm/xterm` is pinned to `6.0.0` because the commit-order bridge relies on that reviewed
+  CompositionHelper listener/timer contract and must be revalidated before an xterm upgrade.
+
+#### Verified
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Real Windows WebView2 + Microsoft Korean IME smoke is still required, including fast Hangul with
+  Space/Enter, candidate selection, repeated syllables, Alt-Tab/minimize, workspace/pane switches,
+  WSL cold start, tmux reconnect, paste, and Codex/Claude raw-mode prompts.
+
 ### 2026-07-10 - Recover transient WSL service startup failures
 
 #### Changed (`src-tauri/src/lib.rs`, `src/main.ts`)

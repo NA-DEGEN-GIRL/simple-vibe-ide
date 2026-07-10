@@ -3772,6 +3772,12 @@ body.workspace-dock-resizing * {
 }
 .workspace-tab.keep-live { box-shadow: inset 0 -2px 0 rgba(111, 189, 255, 0.56); }
 .workspace-tab.memory-slept { opacity: 0.72; }
+/* Parent opacity creates a stacking context. Keep dimmed/dragged Glass rows above
+   the dock's z-index: 1 LiquidGL canvases so their text and controls stay visible. */
+.shell.workspace-dock-side.workspace-side-glass .workspace-tab:is(.memory-slept, .dragging),
+.shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab:is(.memory-slept, .dragging) {
+  z-index: 2;
+}
 .workspace-tab.memory-slept .workspace-tab-label::after {
   content: " sleep";
   color: #7f93ad;

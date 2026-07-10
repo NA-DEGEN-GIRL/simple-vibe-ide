@@ -95,6 +95,14 @@ declare global {
   }
 }
 
+interface TerminalInputPacket {
+  data: string;
+  expectedBackendId?: string;
+  protocol?: boolean;
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+}
+
 interface TerminalPane {
   paneId: string;
   widgetId: string;
@@ -134,6 +142,10 @@ interface TerminalPane {
   inputWriteBuffer: string;
   inputFlushTimer?: number;
   inputWritePromise?: Promise<void>;
+  inputWriteActivePacket?: TerminalInputPacket;
+  inputWriteQueue?: TerminalInputPacket[];
+  inputWriteQueuedChars?: number;
+  inputBackendPending?: boolean;
   shellReadyAt?: number;
   pendingShellReadyActions?: TerminalShellReadyAction[];
   startupNoticeTimer?: number;
@@ -141,10 +153,22 @@ interface TerminalPane {
   closed?: boolean;
   typingPadOpen?: boolean;
   typingPadDraft?: string;
+  typingPadPasteInFlight?: boolean;
   imeComposing?: boolean;
+  imeDomComposing?: boolean;
+  imeAwaitingXtermCommit?: boolean;
+  imeDeferredCommitKey?: ' ' | '\r';
+  imeHeldCommitKey?: ' ' | '\r';
+  imeCommitKeyReleasePending?: ' ' | '\r';
+  imeSuppressCommitKeypress?: boolean;
+  imeCompositionStartedAt?: number;
+  imeBlurPreservedValue?: string;
+  imeBlurPreservedSelectionStart?: number | null;
+  imeBlurPreservedSelectionEnd?: number | null;
+  imeCommitFallbackTimer?: number;
+  imeDeferredKeyClearTimer?: number;
   imeFallbackTimer?: number;
   imeReleaseTimer?: number;
-  imePendingCommits?: { data: string; sentAt: number }[];
   focusFrame?: number;
   focusRetryTimer?: number;
   lastUserInputAt?: number;
@@ -1689,6 +1713,11 @@ const TERMINAL_TMUX_STALE_RECOVERY_MIN_AGE_MS = 15_000;
 const TERMINAL_TMUX_STALE_RECOVERY_COOLDOWN_MS = 60_000;
 const TERMINAL_INPUT_BATCH_MS = 4;
 const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
+const TERMINAL_INPUT_PENDING_MAX_CHARS = 64 * 1024;
+const TERMINAL_INPUT_LIVE_PENDING_MAX_CHARS = 512 * 1024;
+const TERMINAL_INPUT_QUEUE_RETRY_MIN_MS = 8;
+const TERMINAL_INPUT_QUEUE_RETRY_MAX_MS = 240;
+const TERMINAL_INPUT_QUEUE_RETRY_ATTEMPTS = 8;
 const TERMINAL_START_TIMEOUT_WINDOWS_MS = 15000;
 const TERMINAL_START_TIMEOUT_WSL_MS = 60000;
 const TERMINAL_START_TIMEOUT_SSH_MS = 45000;
@@ -1813,11 +1842,12 @@ const DEFAULT_TERMINAL_FOCUS_TARGET: TerminalDefaultFocusTarget = 'shell';
 // Defer post-composition repaint/refocus well past xterm's own setTimeout(0) finalize (which
 // re-reads the helper-textarea), so our DOM/focus churn can't clobber the committed Hangul tail.
 const TERMINAL_IME_RELEASE_DEFER_MS = 120;
-const TERMINAL_IME_COMPOSITION_FALLBACK_MS = 1800;
-// xterm's deferred composition send normally arrives on the next task (setTimeout(0));
-// the window only needs to absorb main-thread contention. Commits are multi-byte IME
-// strings that no keypress path can coincidentally equal, so a generous window is safe.
-const TERMINAL_IME_COMMIT_DEDUP_MS = 1000;
+// Candidate selection can legitimately stay open for several seconds. The fallback is only a
+// stale-state guard; while xterm still shows its composition view it reschedules instead of
+// ending a live IME transaction.
+const TERMINAL_IME_COMPOSITION_FALLBACK_MS = 30_000;
+const TERMINAL_IME_COMPOSITION_HARD_LIMIT_MS = 120_000;
+const TERMINAL_IME_DEFERRED_KEY_CLEAR_MS = 1000;
 const TERMINAL_FOCUS_RETRY_MS = 36;
 const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
 const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
@@ -5003,18 +5033,22 @@ async function init() {
   await currentWindow.onFocusChanged((event) => {
     if (event.payload) {
       resumeTerminalsAfterWindowWake('window-focus');
+      releaseStaleTerminalImeGuardBeforeFocusRecovery();
       focusActiveTerminalPaneWhenItOwnsKeyboard();
       resumeGlassAfterWindowWake('window-focus');
     }
   });
   window.addEventListener('focus', () => {
     resumeTerminalsAfterWindowWake('window-focus');
+    releaseStaleTerminalImeGuardBeforeFocusRecovery();
     focusActiveTerminalPaneWhenItOwnsKeyboard();
     resumeGlassAfterWindowWake('window-focus');
   });
+  document.addEventListener('focusin', (event) => cancelTerminalFocusRequestsForMeaningfulTarget(event.target));
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       resumeTerminalsAfterWindowWake('visible');
+      releaseStaleTerminalImeGuardBeforeFocusRecovery();
       focusActiveTerminalPaneWhenItOwnsKeyboard();
       resumeGlassAfterWindowWake('visible');
     }
@@ -15953,8 +15987,12 @@ function maybeRecoverTerminalTmuxStaleDelivery(
   const sessionName = safeLlmTmuxSessionName(pane.llmTmuxSessionName);
   if (!sessionName) return;
   pane.tmuxStaleRecoveryLastAt = now;
+  pane.inputBackendPending = true;
   const recovery = recoverTerminalTmuxStaleDelivery(pane, sessionName, reason, dataAge)
     .catch((error) => {
+      if (!pane.backendId) {
+        failPendingTerminalInput(pane, 'tmux reconnect ended before pending input delivery was confirmed');
+      }
       appendDiagnosticLog(
         'terminal',
         `tmux stale-reconnect failed pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} error=${sanitizeDiagnosticLogPart(String(error), 160)}`,
@@ -15964,6 +16002,7 @@ function maybeRecoverTerminalTmuxStaleDelivery(
       setStatus(`tmux reconnect failed: ${String(error)}`, true);
     })
     .finally(() => {
+      pane.inputBackendPending = false;
       if (pane.tmuxStaleRecoveryPromise === recovery) pane.tmuxStaleRecoveryPromise = undefined;
     });
   pane.tmuxStaleRecoveryPromise = recovery;
@@ -24044,14 +24083,20 @@ async function respondToTerminalCursorQuery(pane: TerminalPane) {
 
 async function respondToTerminalCursorQueryNow(pane: TerminalPane) {
   if (!pane.backendId) return;
+  const backendId = pane.backendId;
   await flushTerminalOutputBeforeCursorResponse(pane);
-  if (!pane.backendId) return;
+  if (pane.backendId !== backendId) return;
   const buffer = pane.term.buffer.active;
   const row = clamp(Math.floor(buffer.cursorY) + 1, 1, Math.max(1, pane.term.rows));
   const col = clamp(Math.floor(buffer.cursorX) + 1, 1, Math.max(1, pane.term.cols));
   const response = `\x1b[${row};${col}R`;
   try {
-    await api.writeTerminal(pane.backendId, response);
+    // Keep the reply in the same byte-stream sequencer but prioritize it immediately after the
+    // in-flight head. A PTY can be waiting on DSR, so CPR must not await or cancel user packets.
+    await enqueueTerminalInputPacket(pane, response, {
+      expectedBackendId: backendId,
+      protocol: true
+    });
   } catch {
     // Cursor-position replies are best-effort; the terminal may exit between query and response.
   }
@@ -24135,15 +24180,27 @@ function scheduleGrokTerminalViewportRefresh(pane: TerminalPane, reason: string)
 
 function queueTerminalInput(pane: TerminalPane, data: string) {
   if (!data) return;
+  const capacityError = terminalInputCapacityError(pane, data.length);
+  if (capacityError) {
+    setStatus(capacityError.message, true);
+    return;
+  }
+  if (!pane.backendId && !terminalInputCanWaitForBackend(pane)) {
+    setStatus('Shell is not ready for terminal input', true);
+    return;
+  }
   pane.inputWriteBuffer += data;
+  // Keep startup type-ahead as one bounded chunk. It is flushed as soon as the WSL/Windows
+  // backend attaches, avoiding one IPC packet per keystroke while the shell is still spawning.
+  if (!pane.backendId) return;
   if (pane.inputWriteBuffer.length >= TERMINAL_INPUT_FORCE_FLUSH_CHARS) {
-    void flushTerminalInput(pane);
+    void flushTerminalInput(pane).catch((error) => reportTerminalInputWriteError(pane, error));
     return;
   }
   if (pane.inputFlushTimer) return;
   pane.inputFlushTimer = window.setTimeout(() => {
     pane.inputFlushTimer = undefined;
-    void flushTerminalInput(pane);
+    void flushTerminalInput(pane).catch((error) => reportTerminalInputWriteError(pane, error));
   }, TERMINAL_INPUT_BATCH_MS);
 }
 
@@ -24156,23 +24213,155 @@ function terminalInputShouldSendImmediately(data: string) {
 
 async function sendTerminalInputNow(pane: TerminalPane, data: string) {
   if (!data) return;
-  if (pane.inputWriteBuffer) await flushTerminalInput(pane);
-  if (!pane.backendId) return;
-  // Join the same write chain as batched input. Two awaited invokes are not ordered once
-  // both are in flight (sync Tauri commands run per-invoke on a thread pool), so an
-  // unchained immediate write could land after — or before — a neighbouring one.
-  const previousWrite = pane.inputWritePromise ?? Promise.resolve();
-  const currentWrite = previousWrite
-    .catch(() => undefined)
-    .then(() => {
-      if (!pane.backendId) return;
-      return api.writeTerminal(pane.backendId, data);
+  const capacityError = terminalInputCapacityError(pane, data.length);
+  if (capacityError) throw capacityError;
+  if (!pane.backendId && !terminalInputCanWaitForBackend(pane)) {
+    throw new Error('Shell is not ready for terminal input');
+  }
+  if (pane.inputFlushTimer) {
+    window.clearTimeout(pane.inputFlushTimer);
+    pane.inputFlushTimer = undefined;
+  }
+  // Reserve the byte-stream position synchronously, before the first await. Combining any older
+  // ASCII batch with this immediate IME/control payload prevents a following Enter or Space from
+  // overtaking the Hangul commit while a previous invoke is in flight.
+  const packetData = pane.inputWriteBuffer + data;
+  pane.inputWriteBuffer = '';
+  await enqueueTerminalInputPacket(pane, packetData);
+}
+
+function terminalInputPendingChars(pane: TerminalPane) {
+  return pane.inputWriteBuffer.length + (pane.inputWriteQueuedChars ?? 0);
+}
+
+function terminalInputCapacityError(pane: TerminalPane, additionalChars: number) {
+  const pendingChars = terminalInputPendingChars(pane);
+  // Preserve the previous large-paste behavior for one healthy live packet. Once anything is
+  // queued, bound additional memory more generously than startup type-ahead but still reject the
+  // whole new payload instead of truncating an escape sequence or UTF-16 string.
+  if (pane.backendId && !(pane.inputWriteQueuedChars ?? 0)) return null;
+  const maxChars = pane.backendId ? TERMINAL_INPUT_LIVE_PENDING_MAX_CHARS : TERMINAL_INPUT_PENDING_MAX_CHARS;
+  if (pendingChars + additionalChars <= maxChars) return null;
+  return new Error('Terminal input is waiting for the shell; wait for it to drain before typing more');
+}
+
+function terminalInputCanWaitForBackend(pane: TerminalPane) {
+  if (pane.closed) return false;
+  if (pane.inputBackendPending) return true;
+  if (pane.startupState !== 'starting') return false;
+  const kind = profileForIdWithWindowsFallback(pane.profileId)?.kind;
+  // SSH may still be waiting for host-key/auth interaction after process spawn. Do not inject
+  // type-ahead into that conversation; WSL and local Windows starts are non-interactive here.
+  return kind === 'wsl' || kind === 'windows';
+}
+
+function enqueueTerminalInputPacket(
+  pane: TerminalPane,
+  data: string,
+  options: { expectedBackendId?: string; protocol?: boolean } = {}
+) {
+  if (!data) return Promise.resolve();
+  if (pane.closed) return Promise.reject(new Error('Terminal is closed'));
+  if (!pane.backendId && !terminalInputCanWaitForBackend(pane)) {
+    return Promise.reject(new Error('Shell is not ready for terminal input'));
+  }
+  const queue = pane.inputWriteQueue ?? (pane.inputWriteQueue = []);
+  const promise = new Promise<void>((resolve, reject) => {
+    const packet: TerminalInputPacket = {
+      data,
+      expectedBackendId: options.expectedBackendId,
+      protocol: options.protocol,
+      resolve,
+      reject
+    };
+    if (options.protocol) {
+      const activeHeadStillQueued = Boolean(
+        pane.inputWriteActivePacket && queue[0] === pane.inputWriteActivePacket
+      );
+      queue.splice(activeHeadStillQueued ? 1 : 0, 0, packet);
+    } else {
+      queue.push(packet);
+    }
+    pane.inputWriteQueuedChars = (pane.inputWriteQueuedChars ?? 0) + data.length;
+  });
+  drainTerminalInputQueue(pane);
+  return promise;
+}
+
+function drainTerminalInputQueue(pane: TerminalPane) {
+  if (pane.closed || pane.inputWritePromise || !pane.backendId) return;
+  const packet = pane.inputWriteQueue?.[0];
+  if (!packet) return;
+  if (packet.expectedBackendId && packet.expectedBackendId !== pane.backendId) {
+    pane.inputWriteQueue?.shift();
+    pane.inputWriteQueuedChars = Math.max(0, (pane.inputWriteQueuedChars ?? 0) - packet.data.length);
+    packet.reject(new Error('Terminal protocol response expired during reconnect'));
+    drainTerminalInputQueue(pane);
+    return;
+  }
+  const backendId = pane.backendId;
+  pane.inputWriteActivePacket = packet;
+  const currentWrite = writeTerminalInputPacketWithBackpressure(pane, backendId, packet.data)
+    .then((sent) => {
+      if (!sent || pane.inputWriteQueue?.[0] !== packet) return;
+      pane.inputWriteQueue.shift();
+      pane.inputWriteQueuedChars = Math.max(0, (pane.inputWriteQueuedChars ?? 0) - packet.data.length);
+      packet.resolve();
+    })
+    .catch((error) => {
+      if (pane.inputWriteQueue?.[0] !== packet) return;
+      if (!pane.closed && pane.backendId !== backendId) return;
+      if (packet.protocol) {
+        pane.inputWriteQueue.shift();
+        pane.inputWriteQueuedChars = Math.max(0, (pane.inputWriteQueuedChars ?? 0) - packet.data.length);
+        packet.reject(error);
+        return;
+      }
+      // A PTY is one byte stream: if the head is unconfirmed, sending a queued Enter/Space tail
+      // could execute a truncated command. Cancel the whole pending suffix instead of skipping
+      // over the failed packet.
+      failPendingTerminalInput(
+        pane,
+        terminalInputQueueIsFull(error)
+          ? 'Terminal input queue stayed full; pending follow-up input was cancelled'
+          : 'Terminal input delivery was not confirmed; pending follow-up input was cancelled'
+      );
     });
   const trackedWrite = currentWrite.finally(() => {
+    if (pane.inputWriteActivePacket === packet) pane.inputWriteActivePacket = undefined;
     if (pane.inputWritePromise === trackedWrite) pane.inputWritePromise = undefined;
+    if (!pane.closed) drainTerminalInputQueue(pane);
   });
   pane.inputWritePromise = trackedWrite;
-  await trackedWrite;
+}
+
+async function writeTerminalInputPacketWithBackpressure(pane: TerminalPane, backendId: string, data: string) {
+  let retryDelay = TERMINAL_INPUT_QUEUE_RETRY_MIN_MS;
+  let attempts = 0;
+  while (!pane.closed && pane.backendId === backendId) {
+    try {
+      await api.writeTerminal(backendId, data);
+      return true;
+    } catch (error) {
+      if (!terminalInputQueueIsFull(error)) throw error;
+      // Full means Rust did not enqueue the packet, so retrying cannot duplicate input. Generic
+      // invoke errors are never retried because delivery may be ambiguous.
+      attempts += 1;
+      if (attempts >= TERMINAL_INPUT_QUEUE_RETRY_ATTEMPTS) throw error;
+      await delay(retryDelay);
+      retryDelay = Math.min(TERMINAL_INPUT_QUEUE_RETRY_MAX_MS, retryDelay * 2);
+    }
+  }
+  return false;
+}
+
+function terminalInputQueueIsFull(error: unknown) {
+  return String(error).toLowerCase().includes('terminal input queue is full');
+}
+
+function reportTerminalInputWriteError(pane: TerminalPane, error: unknown) {
+  if (pane.closed) return;
+  setStatus(`Failed to write terminal input: ${String(error)}`, true);
 }
 
 function profileNeedsShellReadyGate(profile: ConnectionProfile | null | undefined) {
@@ -24282,6 +24471,7 @@ function handleTerminalExitEvent(pane: TerminalPane) {
   flushTerminalWriteBuffer(pane);
   failPendingTerminalShellReadyActions(pane, 'shell exited before it became ready');
   setTerminalBackendId(pane, undefined);
+  failPendingTerminalInput(pane, 'Shell exited before pending terminal input delivery was confirmed');
   if (exitedDuringStartup) {
     pane.startupState = 'failed';
     pane.startupError = 'Shell exited before it became ready';
@@ -24368,32 +24558,28 @@ async function flushTerminalInput(pane: TerminalPane): Promise<void> {
     window.clearTimeout(pane.inputFlushTimer);
     pane.inputFlushTimer = undefined;
   }
-  if (!pane.inputWriteBuffer || !pane.backendId) {
-    if (pane.inputWritePromise) await pane.inputWritePromise.catch(() => undefined);
+  if (!pane.inputWriteBuffer) {
+    drainTerminalInputQueue(pane);
     return;
   }
+  if (!pane.backendId && !terminalInputCanWaitForBackend(pane)) {
+    pane.inputWriteBuffer = '';
+    throw new Error('Shell is not ready for terminal input');
+  }
   const data = pane.inputWriteBuffer;
-  const backendId = pane.backendId;
   pane.inputWriteBuffer = '';
-  const previousWrite = pane.inputWritePromise ?? Promise.resolve();
-  const currentWrite = previousWrite
-    .catch(() => undefined)
-    .then(() => api.writeTerminal(backendId, data))
-    .catch((error) => {
-      pane.inputWriteBuffer = data + pane.inputWriteBuffer;
-      throw error;
-    });
-  const trackedWrite = currentWrite.finally(() => {
-    if (pane.inputWritePromise === trackedWrite) pane.inputWritePromise = undefined;
-    if (pane.inputWriteBuffer && !pane.inputFlushTimer) {
-      pane.inputFlushTimer = window.setTimeout(() => {
-        pane.inputFlushTimer = undefined;
-        void flushTerminalInput(pane);
-      }, TERMINAL_INPUT_BATCH_MS);
-    }
-  });
-  pane.inputWritePromise = trackedWrite;
-  await trackedWrite;
+  await enqueueTerminalInputPacket(pane, data);
+}
+
+function failPendingTerminalInput(pane: TerminalPane, reason: string) {
+  if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
+  pane.inputFlushTimer = undefined;
+  pane.inputWriteBuffer = '';
+  const error = new Error(reason);
+  const queue = pane.inputWriteQueue ?? [];
+  pane.inputWriteQueue = [];
+  pane.inputWriteQueuedChars = 0;
+  for (const packet of queue) packet.reject(error);
 }
 
 function prunePendingTerminalBackendEvents() {
@@ -24503,6 +24689,9 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
       });
     }
     flushPendingTerminalBackendEvents(pane, backendId);
+    if (pane.backendId === backendId) {
+      void flushTerminalInput(pane).catch((error) => reportTerminalInputWriteError(pane, error));
+    }
   }
   if (hadLlm || terminalPaneLlmId(pane)) renderWorkspaceLlmActivityTab(pane.workspaceId);
 }
@@ -30706,8 +30895,13 @@ function recallTerminalTypingPadHistory(widget: TerminalWidget) {
 async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   if (!pane) return;
+  if (pane.typingPadPasteInFlight) {
+    setStatus('Typing pad paste is already in progress', true);
+    return;
+  }
   updateTerminalTypingPadDraft(widget);
-  const value = normalizeTerminalPasteText(pane.typingPadDraft ?? '');
+  const submittedDraft = pane.typingPadDraft ?? '';
+  const value = normalizeTerminalPasteText(submittedDraft);
   if (!value) {
     focusTerminalFromTypingPad(widget);
     return;
@@ -30717,6 +30911,8 @@ async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
     widget.typePadInput.focus({ preventScroll: true });
     return;
   }
+  pane.typingPadPasteInFlight = true;
+  syncTerminalTypingPadControls(widget);
   try {
     prepareTerminalForTypingPadPaste(widget, pane);
     markTerminalUserInput(pane);
@@ -30724,16 +30920,23 @@ async function pasteTerminalTypingPadDraft(widget: TerminalWidget) {
     await sendTerminalInputNow(pane, terminalPastePayload(value));
     rememberTerminalTypingPadHistory(value);
     terminalTypingPadHistoryCursorByWidgetId.delete(widget.widgetId);
-    pane.typingPadDraft = '';
-    widget.typePadInput.value = '';
+    const draftUnchanged = (pane.typingPadDraft ?? '') === submittedDraft;
+    if (draftUnchanged) pane.typingPadDraft = '';
+    if (activePaneForWidget(widget) === pane && draftUnchanged && widget.typePadInput.value === submittedDraft) {
+      widget.typePadInput.value = '';
+    }
     syncTerminalTypingPadControls(widget);
-    focusTerminalFromTypingPad(widget);
-    setStatus('Pasted typing pad draft into shell');
+    setStatus(draftUnchanged
+      ? 'Pasted typing pad draft into shell'
+      : 'Pasted typing pad draft; kept the newer draft');
   } catch (error) {
-    pane.typingPadDraft = value;
-    widget.typePadInput.value = value;
     setStatus(`Failed to paste typing pad draft: ${String(error)}`, true);
-    widget.typePadInput.focus({ preventScroll: true });
+    if (activePaneForWidget(widget) === pane && document.activeElement === terminalPaneTextarea(pane)) {
+      focusTerminalTypingPadWhenReady(widget);
+    }
+  } finally {
+    pane.typingPadPasteInFlight = false;
+    syncTerminalTypingPadControls(widget);
   }
 }
 
@@ -30780,7 +30983,7 @@ function saveTerminalTypingPadOpenSnapshot() {
 function syncTerminalTypingPadControls(widget: TerminalWidget) {
   const pane = activePaneForWidget(widget);
   const draft = pane?.typingPadDraft ?? widget.typePadInput.value;
-  widget.typePadPaste.disabled = !pane || !draft;
+  widget.typePadPaste.disabled = !pane || !draft || Boolean(pane.typingPadPasteInFlight);
 }
 
 function setTerminalTextTarget(target: TerminalTextTarget) {
@@ -30829,6 +31032,41 @@ function cancelTerminalFocusRequest(pane: TerminalPane) {
   if (pane.focusRetryTimer) {
     window.clearTimeout(pane.focusRetryTimer);
     pane.focusRetryTimer = undefined;
+  }
+}
+
+function cancelTerminalFocusRequestsForMeaningfulTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) return;
+  let targetPane: TerminalPane | null = null;
+  let textTarget: TerminalTextTarget | null = null;
+  for (const pane of state.terminals) {
+    if (target === terminalPaneTextarea(pane)) {
+      targetPane = pane;
+      textTarget = 'shell';
+      break;
+    }
+  }
+  if (!targetPane) {
+    for (const widget of state.terminalWidgets) {
+      if (target !== widget.typePadInput) continue;
+      targetPane = activePaneForWidget(widget);
+      textTarget = 'typing-pad';
+      break;
+    }
+  }
+  for (const pane of state.terminals) {
+    cancelTerminalFocusRequest(pane);
+  }
+  if (targetPane && textTarget) {
+    setKeyboardResizeTarget({ kind: 'terminal', paneId: targetPane.paneId });
+    setTerminalTextTarget(textTarget);
+    return;
+  }
+  const panel = target.closest<HTMLElement>('.floating-panel[data-panel]');
+  if (panel?.dataset.panel) {
+    setKeyboardResizeTarget({ kind: 'panel', id: panel.dataset.panel as FloatingPanelId });
+  } else {
+    setKeyboardResizeTarget({ kind: 'ide' });
   }
 }
 
@@ -31475,19 +31713,7 @@ async function createTerminalTab(
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
-    if (consumeTerminalImeDuplicate(pane, data)) return;
-    const inputData = filterTerminalInputData(pane, data);
-    if (!inputData) return;
-    markTerminalUserInput(pane);
-    markWorkspaceLlmInputActivityForPane(pane, inputData);
-    trackTerminalCwdFromInput(pane, inputData);
-    if (terminalInputShouldSendImmediately(inputData)) {
-      void sendTerminalInputNow(pane, inputData).catch((error) => {
-        setStatus(`Failed to write terminal input: ${String(error)}`, true);
-      });
-    } else {
-      queueTerminalInput(pane, inputData);
-    }
+    handleTerminalInputData(pane, orderTerminalImeOnData(pane, data));
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
   host.addEventListener('wheel', (event) => handleTerminalWheel(event, pane), { capture: true, passive: false });
@@ -31562,8 +31788,9 @@ async function createTerminalTab(
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
-      bringPanelToFront(widget.element);
-      term.focus();
+      // Startup may finish tens of seconds after creation. Honor the current keyboard owner
+      // instead of a stale options.focus snapshot that could interrupt IME in another control.
+      focusActiveTerminalPaneWhenItOwnsKeyboard();
     }
     setStatus(`Terminal started: ${title}`);
     if (!options.skipSnapshotSave) saveActiveWorkspaceSnapshot();
@@ -31572,6 +31799,7 @@ async function createTerminalTab(
     if (!isTerminalPaneAlive(pane)) return pane;
     pane.startupState = 'failed';
     pane.startupError = String(error);
+    failPendingTerminalInput(pane, 'Shell failed to start before pending terminal input delivery was confirmed');
     if (terminalPaneLlmId(pane)) {
       updateAgentSessionProgressForPane(pane, {
         status: 'error',
@@ -32668,76 +32896,311 @@ function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
     return;
   }
 
-  textarea.addEventListener('compositionstart', () => beginTerminalImeCompositionGuard(pane));
-  textarea.addEventListener('compositionupdate', () => beginTerminalImeCompositionGuard(pane));
-  textarea.addEventListener('compositionend', (event) => {
-    interceptTerminalImeCommit(pane, event);
+  textarea.addEventListener('compositionstart', () => beginTerminalImeDomComposition(pane));
+  textarea.addEventListener('compositionupdate', () => updateTerminalImeDomComposition(pane));
+  textarea.addEventListener('compositionend', () => {
+    beginTerminalImeCommitWait(pane);
     finishTerminalImeCompositionGuard(pane);
   });
+  // xterm normally clears its helper textarea on blur. Preserve and restore the value around that
+  // handler while an IME transaction is live, otherwise an Alt-Tab/pane switch with a delayed or
+  // missing compositionend destroys the only canonical Hangul source before xterm can finalize.
+  textarea.addEventListener('blur', () => preserveTerminalImeTextareaBeforeBlur(pane, textarea), true);
+  textarea.addEventListener('blur', () => restoreTerminalImeTextareaAfterBlur(pane, textarea));
   // No 'blur' -> finish handler on purpose: a transient blur mid-composition would schedule a
   // refocus right across xterm's compositionend finalization window (it re-reads the textarea on a
   // setTimeout(0)) and drop the last Hangul syllable. The fallback timer already releases a stuck
   // composition, so blur-based release is both redundant and harmful.
 }
 
-// xterm 6.0.0's CompositionHelper commits IME text by re-reading its helper textarea on a
-// setTimeout(0) after compositionend, and finalizes synchronously from a stale range when a
-// non-229 key lands first. Both lose or reorder fast Hangul (same family as waveterm#3164,
-// vscode#267568). Own the commit instead: send compositionend's data straight to the PTY,
-// then strand xterm's deferred duplicate. Re-verify on any xterm upgrade — 6.1's #5698
-// changes the finalize bookkeeping.
-function interceptTerminalImeCommit(pane: TerminalPane, event: CompositionEvent) {
-  const committed = event.data ?? '';
-  const neutralized = neutralizeXtermPendingComposition(pane);
-  if (!committed) return;
-  if (!neutralized) {
-    const pending = pane.imePendingCommits ?? (pane.imePendingCommits = []);
-    pending.push({ data: committed, sentAt: performance.now() });
-  }
+function handleTerminalInputData(pane: TerminalPane, data: string) {
+  const inputData = filterTerminalInputData(pane, data);
+  if (!inputData) return;
   markTerminalUserInput(pane);
-  markWorkspaceLlmInputActivityForPane(pane, committed);
-  trackTerminalCwdFromInput(pane, committed);
-  void sendTerminalInputNow(pane, committed).catch((error) => {
-    setStatus(`Failed to write IME input: ${String(error)}`, true);
-  });
-}
-
-// Flip the helper's in-flight flag so its deferred setTimeout(0) send (and the synchronous
-// finalize path) sees no pending composition and emits nothing. Private state, but property
-// names survive the bundle and the dependency is pinned; returns false so the caller falls
-// back to onData dedup if an upgrade renames it.
-function neutralizeXtermPendingComposition(pane: TerminalPane) {
-  const helper = (pane.term as unknown as {
-    _core?: { _compositionHelper?: { _isSendingComposition?: boolean } };
-  })._core?._compositionHelper;
-  if (!helper || typeof helper._isSendingComposition !== 'boolean') return false;
-  helper._isSendingComposition = false;
-  return true;
-}
-
-// Backstop for when the private flag was not reachable: xterm's deferred composition send
-// surfaces through term.onData with exactly the committed string; swallow that one echo.
-function consumeTerminalImeDuplicate(pane: TerminalPane, data: string) {
-  const pending = pane.imePendingCommits;
-  if (!pending?.length) return false;
-  const now = performance.now();
-  while (pending.length && now - pending[0].sentAt > TERMINAL_IME_COMMIT_DEDUP_MS) pending.shift();
-  if (pending.length && pending[0].data === data) {
-    pending.shift();
-    return true;
+  markWorkspaceLlmInputActivityForPane(pane, inputData);
+  trackTerminalCwdFromInput(pane, inputData);
+  if (terminalInputShouldSendImmediately(inputData)) {
+    void sendTerminalInputNow(pane, inputData).catch((error) => reportTerminalInputWriteError(pane, error));
+  } else {
+    queueTerminalInput(pane, inputData);
   }
-  return false;
+}
+
+function beginTerminalImeDomComposition(pane: TerminalPane) {
+  if (!pane.imeAwaitingXtermCommit) clearTerminalImeCommitKeyState(pane);
+  clearTerminalImeBlurPreservation(pane);
+  pane.imeCompositionStartedAt = performance.now();
+  pane.imeDomComposing = true;
+  beginTerminalImeCompositionGuard(pane);
+}
+
+function updateTerminalImeDomComposition(pane: TerminalPane) {
+  pane.imeDomComposing = true;
+  beginTerminalImeCompositionGuard(pane);
+}
+
+function preserveTerminalImeTextareaBeforeBlur(pane: TerminalPane, textarea: HTMLTextAreaElement) {
+  if (!pane.imeDomComposing && !pane.imeAwaitingXtermCommit) return;
+  pane.imeBlurPreservedValue = textarea.value;
+  pane.imeBlurPreservedSelectionStart = textarea.selectionStart;
+  pane.imeBlurPreservedSelectionEnd = textarea.selectionEnd;
+}
+
+function restoreTerminalImeTextareaAfterBlur(pane: TerminalPane, textarea: HTMLTextAreaElement) {
+  const value = pane.imeBlurPreservedValue;
+  if (value === undefined) return;
+  textarea.value = value;
+  const start = pane.imeBlurPreservedSelectionStart;
+  const end = pane.imeBlurPreservedSelectionEnd;
+  if (start !== null && start !== undefined && end !== null && end !== undefined) {
+    try {
+      textarea.setSelectionRange(start, end);
+    } catch {
+      // A detached helper textarea can reject selection restoration during pane disposal.
+    }
+  }
+}
+
+function clearTerminalImeBlurPreservation(pane: TerminalPane) {
+  pane.imeBlurPreservedValue = undefined;
+  pane.imeBlurPreservedSelectionStart = undefined;
+  pane.imeBlurPreservedSelectionEnd = undefined;
+}
+
+// xterm registers its compositionend listener during term.open(), before this app listener. Its
+// pinned 6.0 CompositionHelper therefore schedules the canonical textarea-delta send first; this
+// following zero-delay fallback runs after it. Do not replace that source with event.data:
+// Chromium can report stale data and Korean final consonants can migrate on the next vowel.
+function beginTerminalImeCommitWait(pane: TerminalPane) {
+  pane.imeDomComposing = false;
+  pane.imeCompositionStartedAt = undefined;
+  pane.imeAwaitingXtermCommit = true;
+  if (pane.imeCommitFallbackTimer) window.clearTimeout(pane.imeCommitFallbackTimer);
+  if (pane.imeDeferredKeyClearTimer) {
+    window.clearTimeout(pane.imeDeferredKeyClearTimer);
+    pane.imeDeferredKeyClearTimer = undefined;
+  }
+  pane.imeCommitFallbackTimer = window.setTimeout(() => {
+    pane.imeCommitFallbackTimer = undefined;
+    if (!pane.imeAwaitingXtermCommit) return;
+    pane.imeAwaitingXtermCommit = false;
+    const heldKey = pane.imeHeldCommitKey;
+    pane.imeHeldCommitKey = undefined;
+    pane.imeDeferredCommitKey = undefined;
+    clearTerminalImeBlurPreservation(pane);
+    pane.imeSuppressCommitKeypress = Boolean(heldKey && pane.imeCommitKeyReleasePending);
+    scheduleTerminalImeCommitKeyClear(pane);
+    // Only replay a terminator that xterm actually emitted onData before its canonical commit.
+    // A mere keydown hint is insufficient because candidate selection may consume Space/Enter.
+    if (heldKey) handleTerminalInputData(pane, heldKey);
+  }, 0);
+}
+
+function orderTerminalImeOnData(pane: TerminalPane, data: string) {
+  if (!pane.imeAwaitingXtermCommit) return data;
+  if (data.startsWith('\x1b')) {
+    // DEC focus/mouse/application-key reports can fire from xterm while the composition timer is
+    // pending. They are independent PTY input and must not consume the canonical IME boundary.
+    return data;
+  }
+  const deferredKey = pane.imeDeferredCommitKey;
+  if (deferredKey && terminalDataIsOnlyImeCommitKey(data, deferredKey)) {
+    pane.imeHeldCommitKey = deferredKey;
+    return '';
+  }
+  const heldKey = pane.imeHeldCommitKey;
+  pane.imeAwaitingXtermCommit = false;
+  if (pane.imeCommitFallbackTimer) window.clearTimeout(pane.imeCommitFallbackTimer);
+  pane.imeCommitFallbackTimer = undefined;
+  pane.imeDeferredCommitKey = undefined;
+  pane.imeHeldCommitKey = undefined;
+  clearTerminalImeBlurPreservation(pane);
+  const observedDeferredKey = deferredKey === ' '
+    ? data.endsWith(' ')
+    : deferredKey === '\r'
+      ? data.endsWith('\r') || data.endsWith('\n')
+      : false;
+  pane.imeSuppressCommitKeypress = Boolean(
+    pane.imeCommitKeyReleasePending && (heldKey || observedDeferredKey)
+  );
+  scheduleTerminalImeCommitKeyClear(pane);
+  if (heldKey === ' ') return data.endsWith(' ') ? data : `${data} `;
+  if (heldKey === '\r') {
+    if (data.endsWith('\r')) return data;
+    if (data.endsWith('\n')) return `${data.replace(/\r?\n$/, '')}\r`;
+    return `${data}\r`;
+  }
+  // A blocked keypress keeps its browser default, so xterm's textarea delta includes real
+  // delimiters but excludes candidate-navigation keys consumed by the IME. Normalize an observed
+  // Enter newline, but never append a key based on the keydown hint alone.
+  if (deferredKey === '\r' && data.endsWith('\n')) return `${data.replace(/\r?\n$/, '')}\r`;
+  return data;
+}
+
+function terminalDataIsOnlyImeCommitKey(data: string, key: ' ' | '\r') {
+  if (key === ' ') return data === ' ';
+  return data === '\r' || data === '\n' || data === '\r\n';
+}
+
+function terminalImeCommitKey(event: KeyboardEvent): ' ' | '\r' | null {
+  if (event.ctrlKey || event.metaKey || event.altKey) return null;
+  if (event.code === 'Space' || event.key === ' ') return ' ';
+  if (event.code === 'Enter' || event.code === 'NumpadEnter' || event.key === 'Enter') return '\r';
+  return null;
+}
+
+function handleTerminalImeKeyEvent(
+  event: KeyboardEvent,
+  pane: TerminalPane
+): 'block' | 'xterm' | null {
+  if (
+    pane.imeDomComposing
+    && event.type === 'keydown'
+    && !event.isComposing
+    && event.key !== 'Process'
+    && ![16, 17, 18, 20, 229].includes(event.keyCode)
+  ) {
+    // If Chromium omits compositionend, xterm deliberately finalizes on the next ordinary
+    // non-composing keydown. Release only our guard so that supported recovery path can run now
+    // instead of swallowing keys until the long candidate-selection fallback.
+    releaseTerminalImeAppCompositionGuard(pane);
+    return 'xterm';
+  }
+  const commitKey = terminalImeCommitKey(event);
+  const releaseKey = pane.imeCommitKeyReleasePending;
+  if (releaseKey && event.type === 'keydown') {
+    // A new physical keydown means a missing keyup left stale suppression behind. Commit
+    // metadata remains owned by xterm onData/fallback while that older commit is still pending.
+    if (pane.imeAwaitingXtermCommit) {
+      pane.imeCommitKeyReleasePending = undefined;
+      pane.imeSuppressCommitKeypress = false;
+    } else {
+      clearTerminalImeCommitKeyState(pane);
+    }
+  } else if (releaseKey && commitKey === releaseKey && event.type === 'keypress') {
+    if (pane.imeDomComposing || pane.imeAwaitingXtermCommit) return 'block';
+    if (pane.imeSuppressCommitKeypress) {
+      event.preventDefault();
+      event.stopPropagation();
+      return 'block';
+    }
+  } else if (releaseKey && commitKey === releaseKey && event.type === 'keyup') {
+    const imeStillOwnsKey = Boolean(pane.imeDomComposing || pane.imeAwaitingXtermCommit);
+    if (pane.imeAwaitingXtermCommit) {
+      pane.imeCommitKeyReleasePending = undefined;
+      pane.imeSuppressCommitKeypress = false;
+    } else {
+      clearTerminalImeCommitKeyState(pane);
+    }
+    return imeStillOwnsKey ? 'block' : null;
+  }
+
+  const imeOwnsKey = pane.imeDomComposing
+    || pane.imeAwaitingXtermCommit
+    || event.isComposing;
+  if (!imeOwnsKey) return null;
+  if (event.type === 'keydown' && commitKey && !pane.imeAwaitingXtermCommit) {
+    stageTerminalImeCommitKey(pane, commitKey);
+  }
+  return 'block';
+}
+
+function stageTerminalImeCommitKey(pane: TerminalPane, key: ' ' | '\r') {
+  pane.imeDeferredCommitKey = key;
+  pane.imeCommitKeyReleasePending = key;
+  scheduleTerminalImeCommitKeyClear(pane);
+}
+
+function scheduleTerminalImeCommitKeyClear(pane: TerminalPane) {
+  if (pane.imeDeferredKeyClearTimer) window.clearTimeout(pane.imeDeferredKeyClearTimer);
+  if (!pane.imeDeferredCommitKey && !pane.imeCommitKeyReleasePending) {
+    pane.imeDeferredKeyClearTimer = undefined;
+    return;
+  }
+  pane.imeDeferredKeyClearTimer = window.setTimeout(() => {
+    pane.imeDeferredKeyClearTimer = undefined;
+    pane.imeDeferredCommitKey = undefined;
+    pane.imeHeldCommitKey = undefined;
+    pane.imeCommitKeyReleasePending = undefined;
+    pane.imeSuppressCommitKeypress = false;
+  }, TERMINAL_IME_DEFERRED_KEY_CLEAR_MS);
+}
+
+function clearTerminalImeCommitKeyState(pane: TerminalPane) {
+  if (pane.imeDeferredKeyClearTimer) window.clearTimeout(pane.imeDeferredKeyClearTimer);
+  pane.imeDeferredKeyClearTimer = undefined;
+  pane.imeDeferredCommitKey = undefined;
+  pane.imeHeldCommitKey = undefined;
+  pane.imeCommitKeyReleasePending = undefined;
+  pane.imeSuppressCommitKeypress = false;
 }
 
 function beginTerminalImeCompositionGuard(pane: TerminalPane) {
   pane.imeComposing = true;
   markTerminalUserInput(pane);
+  cancelTerminalFocusRequest(pane);
   if (pane.imeReleaseTimer) {
     window.clearTimeout(pane.imeReleaseTimer);
     pane.imeReleaseTimer = undefined;
   }
+  scheduleTerminalImeCompositionFallback(pane);
+}
+
+function scheduleTerminalImeCompositionFallback(pane: TerminalPane) {
   if (pane.imeFallbackTimer) window.clearTimeout(pane.imeFallbackTimer);
-  pane.imeFallbackTimer = window.setTimeout(() => finishTerminalImeCompositionGuard(pane), TERMINAL_IME_COMPOSITION_FALLBACK_MS);
+  pane.imeFallbackTimer = window.setTimeout(() => {
+    pane.imeFallbackTimer = undefined;
+    const view = pane.host.querySelector('.composition-view');
+    const elapsed = pane.imeCompositionStartedAt
+      ? performance.now() - pane.imeCompositionStartedAt
+      : Number.POSITIVE_INFINITY;
+    const liveComposition = view?.classList.contains('active')
+      && terminalPaneVisibility(pane) === 'visible'
+      && terminalPaneHasFocus(pane)
+      && document.hasFocus()
+      && elapsed < TERMINAL_IME_COMPOSITION_HARD_LIMIT_MS;
+    if (liveComposition) {
+      scheduleTerminalImeCompositionFallback(pane);
+      return;
+    }
+    releaseTerminalImeAppCompositionGuard(pane, { recoverFocus: true });
+  }, TERMINAL_IME_COMPOSITION_FALLBACK_MS);
+}
+
+function releaseTerminalImeAppCompositionGuard(
+  pane: TerminalPane,
+  options: { recoverFocus?: boolean } = {}
+) {
+  if (pane.imeFallbackTimer) window.clearTimeout(pane.imeFallbackTimer);
+  if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
+  pane.imeFallbackTimer = undefined;
+  pane.imeReleaseTimer = undefined;
+  // xterm keeps its own composition state and can use the next non-229 keydown to run its
+  // supported synchronous finalize path if compositionend vanished.
+  pane.imeDomComposing = false;
+  pane.imeCompositionStartedAt = undefined;
+  pane.imeComposing = false;
+  clearTerminalImeBlurPreservation(pane);
+  clearTerminalImeCommitKeyState(pane);
+  scheduleFitTerminal(pane);
+  if (
+    options.recoverFocus
+    && document.hasFocus()
+    && !terminalPaneHasFocus(pane)
+    && pane.paneId === state.activePaneId
+  ) {
+    focusActiveTerminalPaneWhenItOwnsKeyboard();
+  }
+}
+
+function releaseStaleTerminalImeGuardBeforeFocusRecovery() {
+  const pane = activeTerminalPane();
+  if (!pane?.imeDomComposing || terminalPaneHasFocus(pane)) return;
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== document.documentElement) return;
+  // The app came back without the helper textarea retaining focus. Preserve xterm's internal
+  // composition for its next-key finalize, but stop the stale app guard from blocking recovery.
+  releaseTerminalImeAppCompositionGuard(pane);
 }
 
 function finishTerminalImeCompositionGuard(pane: TerminalPane) {
@@ -32746,6 +33209,7 @@ function finishTerminalImeCompositionGuard(pane: TerminalPane) {
     pane.imeFallbackTimer = undefined;
   }
   if (!pane.imeComposing) return;
+  pane.imeCompositionStartedAt = undefined;
   if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
   pane.imeReleaseTimer = window.setTimeout(() => {
     pane.imeReleaseTimer = undefined;
@@ -32755,9 +33219,9 @@ function finishTerminalImeCompositionGuard(pane: TerminalPane) {
     // full repaint of the viewport on release; the buffer is correct, only the render is stale.
     pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
     scheduleFitTerminal(pane);
-    // Only reclaim focus if composition actually lost it; refocusing while xterm still holds focus
-    // is needless churn that can disturb IME state mid-commit.
-    if (!terminalPaneHasFocus(pane)) focusTerminalPaneWhenReady(pane);
+    // Recover only when this terminal still owns keyboard intent and WebView focus fell back to
+    // body/html. Never steal focus from Type pad, editor fields, settings, or another pane.
+    if (!terminalPaneHasFocus(pane)) focusActiveTerminalPaneWhenItOwnsKeyboard();
   }, TERMINAL_IME_RELEASE_DEFER_MS);
 }
 
@@ -33048,17 +33512,15 @@ function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly
 }
 
 function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
-  if (event.isComposing || event.key === 'Process' || event.keyCode === 229) {
-    // Let the IME own composing keys. Suppressing the KEYDOWN (return false) keeps
-    // xterm's CompositionHelper from force-finalizing on a non-229 key — Windows
-    // Korean IME delivers Space/Enter mid-composition (isComposing=true), and that
-    // synchronous finalize reads a stale textarea slice and drops the syllable tail.
-    // The committed text is sent by the compositionend interceptor instead.
-    // Keypress/keyup still go to xterm: the commit key's own character (space, CR)
-    // arrives through the keypress path after compositionend, and keyup resets
-    // xterm's internal key tracking.
-    return event.type !== 'keydown';
-  }
+  // Let xterm's textarea-delta CompositionHelper own the committed text, but keep all xterm key
+  // paths out of its setTimeout(0) finalize window. Space/Enter are staged and ordered after the
+  // canonical composition onData without reading private xterm state or CompositionEvent.data.
+  const imeDisposition = handleTerminalImeKeyEvent(event, pane);
+  if (imeDisposition === 'block') return false;
+  if (imeDisposition === 'xterm') return true;
+  // A 229 key outside an actual DOM composition is xterm's supported path for punctuation and
+  // replacement input. Let CompositionHelper inspect the helper textarea after the event.
+  if (event.type === 'keydown' && event.keyCode === 229) return true;
   setTerminalTextTarget('shell');
 
   if (isWidgetFocusShortcut(event)) {
@@ -33426,15 +33888,18 @@ function terminalPaneHasFocus(pane: TerminalPane) {
   return Boolean(textarea && document.activeElement === textarea);
 }
 
-function focusTerminalPaneWhenReady(pane: TerminalPane) {
+function focusTerminalPaneWhenReady(pane: TerminalPane, options: { recovery?: boolean } = {}) {
   if (!terminalPaneCanReceiveFocus(pane)) return;
+  if (options.recovery && !terminalPaneCanRecoverOwnedKeyboard(pane)) return;
   if (pane.focusFrame) return;
   pane.focusFrame = requestAnimationFrame(() => {
     pane.focusFrame = undefined;
+    if (options.recovery && !terminalPaneCanRecoverOwnedKeyboard(pane)) return;
     focusTerminalPaneNow(pane);
     if (pane.focusRetryTimer) window.clearTimeout(pane.focusRetryTimer);
     pane.focusRetryTimer = window.setTimeout(() => {
       pane.focusRetryTimer = undefined;
+      if (options.recovery && !terminalPaneCanRecoverOwnedKeyboard(pane)) return;
       if (!terminalPaneHasFocus(pane)) focusTerminalPaneNow(pane);
     }, TERMINAL_FOCUS_RETRY_MS);
   });
@@ -33454,20 +33919,34 @@ function activeTerminalPane() {
   return state.activePaneId ? terminalPaneById.get(state.activePaneId) ?? null : null;
 }
 
+function terminalPaneCanRecoverOwnedKeyboard(pane: TerminalPane, target: TerminalTextTarget = 'shell') {
+  if (!terminalPaneCanReceiveFocus(pane)) return false;
+  if (target === 'shell' && (pane.imeComposing || pane.imeDomComposing)) return false;
+  if (keyboardResizeTarget.kind !== 'terminal' || keyboardResizeTarget.paneId !== pane.paneId) return false;
+  const active = document.activeElement;
+  const widget = terminalWidgetForPane(pane);
+  const expectedTarget = target === 'typing-pad' ? widget?.typePadInput : terminalPaneTextarea(pane);
+  if (active === expectedTarget) return true;
+  return !active || active === document.body || active === document.documentElement;
+}
+
 function focusActiveTerminalPaneWhenItOwnsKeyboard() {
   const pane = activeTerminalPane();
   if (!pane) return;
   if (keyboardResizeTarget.kind !== 'terminal' || keyboardResizeTarget.paneId !== pane.paneId) return;
   const widget = terminalWidgetForPane(pane);
-  if (
+  const useTypingPad = Boolean(
     widget
     && terminalTypingPadIsOpen(widget)
     && (terminalTextTarget === 'typing-pad' || widget.defaultFocusTarget === 'typing-pad')
-  ) {
+  );
+  if (useTypingPad && widget) {
+    if (!terminalPaneCanRecoverOwnedKeyboard(pane, 'typing-pad')) return;
     focusTerminalTypingPadWhenReady(widget);
     return;
   }
-  focusTerminalPaneWhenReady(pane);
+  if (!terminalPaneCanRecoverOwnedKeyboard(pane, 'shell')) return;
+  focusTerminalPaneWhenReady(pane, { recovery: true });
 }
 
 function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
@@ -34376,7 +34855,7 @@ async function pasteImageTagToActiveTerminal(tag: string) {
     return false;
   }
   setTerminalTextTarget('shell');
-  await api.writeTerminal(active.backendId, tag);
+  await sendTerminalInputNow(active, tag);
   setStatus(`Pasted ${tag}`);
   return true;
 }
@@ -34904,6 +35383,8 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.portScanTimer) window.clearTimeout(pane.portScanTimer);
   if (pane.cwdScanTimer) window.clearTimeout(pane.cwdScanTimer);
   if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
+  if (pane.imeCommitFallbackTimer) window.clearTimeout(pane.imeCommitFallbackTimer);
+  if (pane.imeDeferredKeyClearTimer) window.clearTimeout(pane.imeDeferredKeyClearTimer);
   if (pane.imeFallbackTimer) window.clearTimeout(pane.imeFallbackTimer);
   if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
   if (pane.llmTmuxTitlePollTimer) window.clearTimeout(pane.llmTmuxTitlePollTimer);
@@ -34924,6 +35405,8 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.portScanTimer = undefined;
   pane.cwdScanTimer = undefined;
   pane.inputFlushTimer = undefined;
+  pane.imeCommitFallbackTimer = undefined;
+  pane.imeDeferredKeyClearTimer = undefined;
   pane.imeFallbackTimer = undefined;
   pane.imeReleaseTimer = undefined;
   pane.llmTmuxTitlePollTimer = undefined;
@@ -34935,10 +35418,22 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.tmuxFreezeProbeLastLoggedAt = undefined;
   pane.tmuxFreezeProbeLastChangedAt = undefined;
   pane.inputBuffer = '';
+  failPendingTerminalInput(pane, 'Terminal closed before pending input delivery was confirmed');
   pane.shellReadyAt = undefined;
   pane.pendingShellReadyActions = undefined;
   pane.inputWritePromise = undefined;
+  pane.inputWriteActivePacket = undefined;
+  pane.inputBackendPending = false;
+  pane.typingPadPasteInFlight = false;
   pane.imeComposing = false;
+  pane.imeDomComposing = false;
+  pane.imeAwaitingXtermCommit = false;
+  pane.imeDeferredCommitKey = undefined;
+  pane.imeHeldCommitKey = undefined;
+  pane.imeCommitKeyReleasePending = undefined;
+  pane.imeSuppressCommitKeypress = false;
+  pane.imeCompositionStartedAt = undefined;
+  clearTerminalImeBlurPreservation(pane);
   pane.writeBuffer = '';
   pane.grokOutputPendingCarriageReturn = false;
   pane.pendingTerminalWrites = 0;
