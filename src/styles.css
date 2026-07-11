@@ -5246,10 +5246,12 @@ body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-row.drop-ta
   overflow: auto;
 }
 .terminal-host .xterm .xterm-scrollable-element > .scrollbar > .slider,
+.terminal-host .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider,
 .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb {
   background: rgba(127, 176, 255, 0.42) !important;
 }
 .terminal-host .xterm .xterm-scrollable-element > .scrollbar > .slider:hover,
+.terminal-host .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider:hover,
 .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: rgba(160, 198, 255, 0.68) !important;
 }
@@ -5257,16 +5259,19 @@ body.glass-mode-on .shell.app-glass-explorer-rows-on .explorer .file-row.drop-ta
   scrollbar-color: rgba(127, 176, 255, 0.52) rgba(8, 11, 16, 0.7);
   scrollbar-width: thin;
 }
-body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .scrollbar {
+body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .scrollbar,
+body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .xterm-scrollbar {
   width: var(--app-glass-terminal-scroll-width) !important;
   background: var(--app-glass-terminal-scroll-track) !important;
 }
 body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .scrollbar > .slider,
+body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider,
 body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb,
 body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-history-content::-webkit-scrollbar-thumb {
   background: var(--app-glass-terminal-scroll-thumb) !important;
 }
 body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .scrollbar > .slider:hover,
+body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider:hover,
 body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover,
 body.glass-mode-on .terminal-card.app-glass-active-shell .terminal-history-content::-webkit-scrollbar-thumb:hover {
   background: var(--app-glass-terminal-scroll-thumb-hover) !important;

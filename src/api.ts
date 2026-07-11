@@ -29,6 +29,8 @@ export const api = {
     invoke<LlmTmuxPaneProbeResult>('llm_tmux_pane_probe', { profileId, cwd, sessionName }),
   resolveProfilePath: (profileId: string, path: string) =>
     invoke<string>('resolve_profile_path', { profileId, path }),
+  profileDirectoryIsDir: (profileId: string, path: string) =>
+    invoke<boolean>('profile_directory_is_dir', { profileId, path }),
   listDirectory: (profileId: string, path: string, includeSizes = true) =>
     invoke<FileEntry[]>('list_directory', { profileId, path, includeSizes }),
   listDirectories: (profileId: string, paths: string[], includeSizes = true) =>
@@ -103,6 +105,7 @@ export const api = {
       title
     }),
   writeTerminal: (id: string, data: string) => invoke<void>('write_terminal', { id, data }),
+  flushTerminalInput: (id: string) => invoke<void>('flush_terminal_input', { id }),
   resizeTerminal: (id: string, rows: number, cols: number) =>
     invoke<void>('resize_terminal', { id, rows, cols }),
   killTerminal: (id: string) => invoke<void>('kill_terminal', { id }),

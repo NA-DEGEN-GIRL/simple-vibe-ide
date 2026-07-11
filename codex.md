@@ -51,6 +51,54 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-11 - Make workspace loading, Glass, and Korean terminal input feel immediate
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src/styles.css`, `src-tauri/src/lib.rs`, package lock/theme files)
+- Upgraded to the reviewed xterm beta line that contains the upstream helper-textarea composition
+  fixes. The app no longer stages, reconstructs, deduplicates, or reorders committed IME text;
+  xterm owns Hangul, Space, and Enter. Composition-aware blur and workspace/pane click guards only
+  delay destructive focus changes until xterm finishes its canonical commit.
+- Terminal input now has a Rust PTY-writer flush barrier for tmux client reconnects, so an accepted
+  key cannot remain behind the channel while the old client is killed. Direct output uses one
+  persistent 4 ms/16 KiB batch worker per terminal and preserves hard ordering around cursor
+  queries and exit events.
+- WSL warmup now executes `true` directly without a login shell/profile, shares successful warm
+  state across terminal and profile-shell commands, and keeps the existing bounded transient
+  service retry. Terminal cwd validation uses a directory probe instead of listing whole folders.
+- Workspace restore starts the active terminal group first, limits parallel widget startup to two,
+  and yields between groups. Core xterm loads before optional WebGL; WebGL promotes only a visible,
+  live pane after idle and stops retrying a failed pane until the user explicitly toggles DOM back
+  to Auto.
+- Explorer root loads start after the next paint, show a loading row immediately, reject stale
+  path/workspace completions, and use Canvas text metrics instead of per-row layout probes. Editor,
+  Notes, Image, Browser, and Calculator paint workspace-scoped loading shells so hidden panels can
+  never reveal the previous workspace while restoration is in flight.
+- Notes, image previews/history, snippets, browser WebViews, agent-hook checks, and image-store JSON
+  now hydrate lazily or single-flight. Async note/image/Explorer work carries explicit workspace,
+  profile, path, and tab scope so a late result cannot mutate the next workspace.
+- LiquidGL snapshot jobs for app, workspace, and Explorer Glass are serialized and paused during
+  primary restore, then one recapture is queued afterward. CSS Glass remains visible immediately;
+  the visual material settings are unchanged. The bundled theme no longer embeds a duplicate
+  170k-character wallpaper data URL because the same tracked JPG is already imported separately.
+- Rapid activation is last-click-wins across note saves, capture-protection waits, path switches,
+  and close/copy/new operations. Protected-workspace capture setup temporarily makes the old shell
+  inert, and unavailable profiles fail closed instead of leaving another workspace interactive
+  under the selected tab.
+- Debug performance markers and long-task entries are batched so diagnostics do not create their
+  own storage/render feedback loop.
+
+#### Verified
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `npm ls @xterm/xterm @xterm/addon-fit @xterm/addon-unicode11 @xterm/addon-webgl`
+- `cargo test --manifest-path src-tauri/Cargo.toml` (15 passed)
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `node --check public/vendor/liquidgl/liquidGL.js`, theme JSON parse, and `git diff --check`
+- Real Windows/WebView2 smoke is still required for Microsoft Korean IME (including Alt-Tab), live
+  WSL service recovery, tmux reconnect, multi-workspace loading, and Glass visual/performance checks.
+
 ### 2026-07-10 - Keep dimmed Glass workspace content above the renderer
 
 #### Changed (`src/styles.css`)

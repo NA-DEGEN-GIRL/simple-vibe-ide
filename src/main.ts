@@ -131,11 +131,15 @@ interface TerminalPane {
   webgl?: XTermWebglAddon;
   webglContextLost?: boolean;
   webglContextLossDisposable?: { dispose: () => void };
+  webglPromotionScheduled?: boolean;
+  webglPromotionUnavailable?: boolean;
   element: HTMLElement;
   host: HTMLElement;
   outputBuffer: string;
   writeBuffer: string;
   historyCache?: TerminalHistoryCache;
+  historyPendingBuffer?: string;
+  historyFlushTimer?: number;
   backendOutputChars: number;
   cwdOutputBuffer: string;
   inputBuffer: string;
@@ -146,6 +150,7 @@ interface TerminalPane {
   inputWriteQueue?: TerminalInputPacket[];
   inputWriteQueuedChars?: number;
   inputBackendPending?: boolean;
+  inputReconnectFrozen?: boolean;
   shellReadyAt?: number;
   pendingShellReadyActions?: TerminalShellReadyAction[];
   startupNoticeTimer?: number;
@@ -156,17 +161,11 @@ interface TerminalPane {
   typingPadPasteInFlight?: boolean;
   imeComposing?: boolean;
   imeDomComposing?: boolean;
-  imeAwaitingXtermCommit?: boolean;
-  imeDeferredCommitKey?: ' ' | '\r';
-  imeHeldCommitKey?: ' ' | '\r';
-  imeCommitKeyReleasePending?: ' ' | '\r';
-  imeSuppressCommitKeypress?: boolean;
   imeCompositionStartedAt?: number;
-  imeBlurPreservedValue?: string;
-  imeBlurPreservedSelectionStart?: number | null;
-  imeBlurPreservedSelectionEnd?: number | null;
-  imeCommitFallbackTimer?: number;
-  imeDeferredKeyClearTimer?: number;
+  imeDeferredXtermBlur?: boolean;
+  imeTraceSequence?: number;
+  imeTracePending?: string[];
+  imeTraceFlushTimer?: number;
   imeFallbackTimer?: number;
   imeReleaseTimer?: number;
   focusFrame?: number;
@@ -176,6 +175,8 @@ interface TerminalPane {
   llmOutputDetectionBuffer?: string;
   llmOutputDetectionTimer?: number;
   llmOutputDetectionMarkActivity?: boolean;
+  llmTitleDataBuffer?: string;
+  llmTitleDataTimer?: number;
   llmWaitingSuppressUntil?: number;
   llmTitleOscBuffer?: string;
   llmTitleSignalTimer?: number;
@@ -232,6 +233,13 @@ interface TerminalPane {
   lastRows?: number;
   lastCols?: number;
   resizeObserver?: ResizeObserver;
+}
+
+interface PendingTerminalImeUiSwitch {
+  sourcePaneId: string;
+  label: string;
+  run: () => void;
+  timer: number;
 }
 
 interface TerminalHistoryCache {
@@ -1357,7 +1365,10 @@ interface TerminalRuntime {
   Terminal: typeof import('@xterm/xterm').Terminal;
   FitAddon: typeof import('@xterm/addon-fit').FitAddon;
   Unicode11Addon: typeof import('@xterm/addon-unicode11').Unicode11Addon;
-  WebglAddon?: typeof import('@xterm/addon-webgl').WebglAddon;
+}
+
+interface TerminalWebglRuntime {
+  WebglAddon: typeof import('@xterm/addon-webgl').WebglAddon;
 }
 
 type FloatingPanelId = 'explorer' | 'editor' | 'image' | 'browser' | 'notes' | 'snippets' | 'calculator' | 'settings';
@@ -1519,6 +1530,11 @@ type AgentBridgeLaunchContext = {
   agentId: string;
   sessionId: string;
   bridge: AgentBridgeInfo;
+};
+
+type AgentHookState = {
+  hooksInstalled: boolean;
+  envCurrent: boolean;
 };
 
 const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
@@ -1711,6 +1727,7 @@ const TERMINAL_TMUX_FREEZE_STALE_DATA_MS = 5_000;
 const TERMINAL_TMUX_STALE_RECOVERY_COUNT = 2;
 const TERMINAL_TMUX_STALE_RECOVERY_MIN_AGE_MS = 15_000;
 const TERMINAL_TMUX_STALE_RECOVERY_COOLDOWN_MS = 60_000;
+const TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS = 1500;
 const TERMINAL_INPUT_BATCH_MS = 4;
 const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
 const TERMINAL_INPUT_PENDING_MAX_CHARS = 64 * 1024;
@@ -1735,6 +1752,8 @@ const TERMINAL_WRITE_BUFFER_TRIM_TARGET_CHARS = 384 * 1024;
 const TERMINAL_MAX_PENDING_TERM_WRITES = 4;
 const TERMINAL_LLM_DETECTION_THROTTLE_MS = 180;
 const TERMINAL_LLM_DETECTION_BUFFER_CHARS = 6000;
+const TERMINAL_TITLE_ANALYSIS_BATCH_MS = 32;
+const TERMINAL_HISTORY_ANALYSIS_BATCH_MS = 50;
 const TERMINAL_HISTORY_CONTROL_SYNC_MIN_MS = 400;
 const TERMINAL_BACKGROUND_SCAN_BATCH_MS = 900;
 const TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS = 1200;
@@ -1829,6 +1848,7 @@ const AGENT_SESSION_CWD_MAX_CHARS = 90;
 const AGENT_SESSION_OUTPUT_ACTIVITY_THROTTLE_MS = 350;
 const AGENT_ALERT_MIN_INTERVAL_MS = 4500;
 const AGENT_ALERT_DONE_EXPIRE_GRACE_MS = 30_000;
+const AGENT_HOOK_STATE_CACHE_MS = 60_000;
 const DIAGNOSTIC_LOG_MAX = 400;
 const DIAGNOSTIC_LOG_MESSAGE_MAX_CHARS = 260;
 const DIAGNOSTIC_LOG_PERSIST_MAX = 120;
@@ -1847,7 +1867,6 @@ const TERMINAL_IME_RELEASE_DEFER_MS = 120;
 // ending a live IME transaction.
 const TERMINAL_IME_COMPOSITION_FALLBACK_MS = 30_000;
 const TERMINAL_IME_COMPOSITION_HARD_LIMIT_MS = 120_000;
-const TERMINAL_IME_DEFERRED_KEY_CLEAR_MS = 1000;
 const TERMINAL_FOCUS_RETRY_MS = 36;
 const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
 const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
@@ -3642,6 +3661,7 @@ const editorPaneElementCache = new Map<string, EditorPaneElements>();
 const editorPaneViewState = new Map<string, EditorPaneViewState>();
 let editorRuntimePromise: Promise<EditorRuntime> | null = null;
 let terminalRuntimePromise: Promise<TerminalRuntime> | null = null;
+let terminalWebglRuntimePromise: Promise<TerminalWebglRuntime | null> | null = null;
 let panelZ = 20;
 let keyboardResizeTarget: ResizeTarget = { kind: 'ide' };
 let keyboardResizeTargetElement: HTMLElement | null = null;
@@ -3649,6 +3669,7 @@ let keyboardResizeTargetWidgetElement: HTMLElement | null = null;
 let widgetOpacityPopoverTarget: WidgetOpacityTarget | null = null;
 let widgetOpacityPopoverDirty = false;
 let terminalTextTarget: TerminalTextTarget = 'shell';
+let pendingTerminalImeUiSwitch: PendingTerminalImeUiSwitch | null = null;
 let llmTmuxSessionMenuToken = 0;
 const llmTmuxSessionMenuCache = new Map<string, LlmTmuxSessionMenuCacheEntry>();
 const DEFAULT_EDITOR_FONT_SIZE = 13;
@@ -3662,6 +3683,9 @@ let noteFontSize = DEFAULT_NOTE_FONT_SIZE;
 let noteOpacity = 100;
 let calculatorFontSize = DEFAULT_CALCULATOR_FONT_SIZE;
 let restoringWorkspace = false;
+let workspaceRestoreGeneration = 0;
+let workspaceActivationGeneration = 0;
+let workspacePathSwitchGeneration = 0;
 let storedActiveWorkspaceId = '';
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
 const autoForwardingPorts = new Set<string>();
@@ -3742,9 +3766,11 @@ let nativeBrowserWebviewUrl = '';
 let nativeBrowserWebviewVisible = false;
 let nativeBrowserWebviewSyncFrame = 0;
 let nativeBrowserWebviewRequestSeq = 0;
+let browserRestoreResumeToken = 0;
 const noteSaveTimers = new Map<string, number>();
 let noteMemoryRecords: NoteMemoryRecord[] = [];
 let noteMemoryPersistTimer = 0;
+let noteMemoryStoreDirty = false;
 const previewProxyProbeAt = new Map<string, number>();
 const previewProxyStarts = new Map<string, Promise<PortForwardResult>>();
 const previewProxyByTargetOrigin = new Map<string, PortForwardResult>();
@@ -3806,11 +3832,6 @@ let explorerTitleOverflowGap = 0;
 let explorerSemanticContentWidth = 0;
 let explorerMeasureCanvas: HTMLCanvasElement | null = null;
 let explorerMeasureContext: CanvasRenderingContext2D | null = null;
-let explorerMeasureHost: HTMLDivElement | null = null;
-let explorerMeasureRow: HTMLDivElement | null = null;
-let explorerMeasureDisclosure: HTMLSpanElement | null = null;
-let explorerMeasureName: HTMLSpanElement | null = null;
-let explorerMeasureSize: HTMLElement | null = null;
 const explorerRowWidthMeasureCache = new Map<string, number>();
 let explorerPathRowRenderSignature = '\0';
 let explorerFileSizeModeRenderSignature = '\0';
@@ -3880,6 +3901,7 @@ let workspaceStorePersistWorkspacesSignature = '';
 let workspaceStorePersistWorkspacesJson = '[]';
 let workspaceImageStore: Record<string, string> = {};
 let workspaceImageStoreDirty = false;
+let workspaceImageStoreLoaded = false;
 const workspaceImageRefCache = new Map<string, { dataUrl: string; key: string }>();
 const workspaceSnapshotSignatures = new Map<string, string>();
 const captureProtectionSessionWorkspaceIds = new Set<string>();
@@ -3895,6 +3917,10 @@ const workspaceLlmTitleActivityTimers = new Map<string, number>();
 const workspaceDoneUnreadIds = new Set<string>();
 const agentSessionProgressByPaneId = new Map<string, AgentSessionProgress>();
 const agentSessionProgressTimers = new Map<string, number>();
+const agentHookStateCache = new Map<string, { value: AgentHookState; cachedAt: number }>();
+const agentHookStateReads = new Map<string, Promise<AgentHookState>>();
+const agentHookInstallations = new Map<string, Promise<AgentHookState>>();
+let agentBridgeInfoPromise: Promise<AgentBridgeInfo> | null = null;
 const agentAlertLastByPaneId = new Map<string, { kind: AgentAlertKind; at: number }>();
 const agentWaitingAlertSignatureByPaneId = new Map<string, string>();
 const AGENT_ALERT_DEBUG_LOG_MAX = 12;
@@ -3904,6 +3930,11 @@ const diagnosticLogEntries: DiagnosticLogEntry[] = [];
 const diagnosticSessionId = crypto.randomUUID();
 let diagnosticLogRenderSignature = '\0';
 let diagnosticSessionHeartbeatTimer = 0;
+let performanceLongTaskObserver: PerformanceObserver | null = null;
+const pendingPerformanceLongTasks: Array<{ at: number; duration: number }> = [];
+let performanceLongTaskFlushScheduled = false;
+let performanceLongTaskCommitStartedAt = -1;
+let performanceLongTaskCommitEndedAt = -1;
 let diagnosticSessionStartedAt = Date.now();
 let diagnosticLastEventAt = 0;
 let diagnosticLastEventCategory = '';
@@ -3927,6 +3958,8 @@ let snippetTabsRenderSignature = '\0';
 let snippetTabsOrderRenderSignature = '\0';
 let snippetsRenderSignature = '\0';
 let snippetEditingItemId = '';
+let snippetsStoreLoaded = false;
+let snippetsStoreLoadPromise: Promise<void> | null = null;
 let browserTabsRenderSignature = '\0';
 let browserTabsOrderRenderSignature = '\0';
 let browserAddressSuggestionSignature = '\0';
@@ -3943,6 +3976,11 @@ let imageHistoryOrderRenderSignature = '\0';
 let imagePreviewRenderedDataUrl = '\0';
 let imagePreviewRenderedLabel = '\0';
 let imagePreviewRenderedTransform = '\0';
+let imageOpenRequestToken = 0;
+let imageHistoryPreviewRequestToken = 0;
+let imagePasteSaveRequestToken = 0;
+let imageHydrationToken = 0;
+let imageHydratingTabId = '';
 let imagePreviewDrag: { pointerId: number; startX: number; startY: number; offsetX: number; offsetY: number } | null = null;
 let imagePreviewDragDocumentBound = false;
 let imagePreviewResizeObserver: ResizeObserver | null = null;
@@ -3960,6 +3998,7 @@ const workspaceTerminalRetryInFlightIds = new Set<string>();
 let inactiveEditorHydrationToken = 0;
 let noteHydrationToken = 0;
 let explorerVisiblePrefetchToken = 0;
+let explorerRootLoadToken = 0;
 let explorerLiquidGlassRenderer: LiquidGLRendererLike | undefined;
 let explorerLiquidGlassRefreshTimer = 0;
 let explorerLiquidGlassRefreshRecapture = false;
@@ -4021,6 +4060,7 @@ let appGlassDeferredRecaptureFlushTimer = 0;
 let appGlassDeferredRecaptureFlushReason = '';
 let appGlassWindowResumeRecaptureDeferUntil = 0;
 let appGlassApplying = false;
+let initialHydrationComplete = false;
 let appGlassAppliedTopologySignature = '\0';
 let appGlassGeometryFrame = 0;
 let appGlassInitFailedRetryTimer = 0;
@@ -4973,71 +5013,72 @@ function refreshTitle() {
 }
 
 async function init() {
-  await listen<TerminalDataEvent>('terminal-data', (event) => {
-    const pane = terminalPaneByBackendId.get(event.payload.id);
-    if (!pane) {
-      bufferPendingTerminalData(event.payload.id, event.payload.data);
-      return;
-    }
-    handleTerminalData(pane, event.payload.data);
-  });
-  await listen<TerminalCursorQueryEvent>('terminal-cursor-query', (event) => {
-    const pane = terminalPaneByBackendId.get(event.payload.id);
-    if (!pane) {
-      bufferPendingTerminalCursorQuery(event.payload.id);
-      return;
-    }
-    void respondToTerminalCursorQuery(pane);
-  });
-  await listen<BrowserWebviewPageLoadEvent>('browser-webview-page-load', (event) => {
-    handleBrowserWebviewPageLoad(event.payload);
-  });
-  await listen<TerminalExitEvent>('terminal-exit', (event) => {
-    const pane = terminalPaneByBackendId.get(event.payload.id);
-    if (!pane) {
-      bufferPendingTerminalExit(event.payload);
-      return;
-    }
-    handleTerminalExitEvent(pane);
-  });
-  await listen<SshAuthPromptEvent>('ssh-auth-request', (event) => {
-    void handleSshAuthPrompt(event.payload);
-  });
-  await listen<RendererRecoveryNotice>('renderer-recovery', (event) => {
-    handleRendererRecoveryNotice(event.payload);
-  });
-  await listen<AgentAlertDelayedResultEvent>('agent-alert-delayed-result', (event) => {
-    handleAgentAlertDelayedResult(event.payload);
-  });
-  await listen<AgentBridgeEvent>('agent-bridge-event', (event) => {
-    handleAgentBridgeEvent(event.payload);
-  });
+  const initStartedAt = performance.now();
+  const listenersStartedAt = performance.now();
+  const profilesPromise = api.listProfiles();
+  await Promise.all([
+    listen<TerminalDataEvent>('terminal-data', (event) => {
+      const pane = terminalPaneByBackendId.get(event.payload.id);
+      if (!pane) {
+        bufferPendingTerminalData(event.payload.id, event.payload.data);
+        return;
+      }
+      handleTerminalData(pane, event.payload.data);
+    }),
+    listen<TerminalCursorQueryEvent>('terminal-cursor-query', (event) => {
+      const pane = terminalPaneByBackendId.get(event.payload.id);
+      if (!pane) {
+        bufferPendingTerminalCursorQuery(event.payload.id);
+        return;
+      }
+      void respondToTerminalCursorQuery(pane);
+    }),
+    listen<BrowserWebviewPageLoadEvent>('browser-webview-page-load', (event) => {
+      handleBrowserWebviewPageLoad(event.payload);
+    }),
+    listen<TerminalExitEvent>('terminal-exit', (event) => {
+      const pane = terminalPaneByBackendId.get(event.payload.id);
+      if (!pane) {
+        bufferPendingTerminalExit(event.payload);
+        return;
+      }
+      handleTerminalExitEvent(pane);
+    }),
+    listen<SshAuthPromptEvent>('ssh-auth-request', (event) => {
+      void handleSshAuthPrompt(event.payload);
+    }),
+    listen<RendererRecoveryNotice>('renderer-recovery', (event) => {
+      handleRendererRecoveryNotice(event.payload);
+    }),
+    listen<AgentAlertDelayedResultEvent>('agent-alert-delayed-result', (event) => {
+      handleAgentAlertDelayedResult(event.payload);
+    }),
+    listen<AgentBridgeEvent>('agent-bridge-event', (event) => {
+      handleAgentBridgeEvent(event.payload);
+    }),
+    listen<TauriDragDropPayload>('tauri://drag-enter', (event) => {
+      updateExplorerDropTarget(event.payload.position);
+    }),
+    listen<TauriDragDropPayload>('tauri://drag-over', (event) => {
+      updateExplorerDropTarget(event.payload.position);
+    }),
+    listen<TauriDragDropPayload>('tauri://drag-drop', (event) => {
+      void handleExplorerFileDrop(event.payload);
+    }),
+    listen('tauri://drag-leave', clearExplorerDropTarget),
+    listen<ExportProgressEvent>('export-progress', (event) => {
+      handleExportProgress(event.payload);
+    }),
+    currentWindow.onFocusChanged((event) => {
+      if (event.payload) {
+        resumeTerminalsAfterWindowWake('window-focus');
+        releaseStaleTerminalImeGuardBeforeFocusRecovery();
+        focusActiveTerminalPaneWhenItOwnsKeyboard();
+        resumeGlassAfterWindowWake('window-focus');
+      }
+    })
+  ]);
   startRendererHeartbeat();
-
-  await listen<TauriDragDropPayload>('tauri://drag-enter', (event) => {
-    updateExplorerDropTarget(event.payload.position);
-  });
-  await listen<TauriDragDropPayload>('tauri://drag-over', (event) => {
-    updateExplorerDropTarget(event.payload.position);
-  });
-  await listen<TauriDragDropPayload>('tauri://drag-drop', (event) => {
-    void handleExplorerFileDrop(event.payload);
-  });
-  await listen('tauri://drag-leave', () => {
-    clearExplorerDropTarget();
-  });
-
-  await listen<ExportProgressEvent>('export-progress', (event) => {
-    handleExportProgress(event.payload);
-  });
-  await currentWindow.onFocusChanged((event) => {
-    if (event.payload) {
-      resumeTerminalsAfterWindowWake('window-focus');
-      releaseStaleTerminalImeGuardBeforeFocusRecovery();
-      focusActiveTerminalPaneWhenItOwnsKeyboard();
-      resumeGlassAfterWindowWake('window-focus');
-    }
-  });
   window.addEventListener('focus', () => {
     resumeTerminalsAfterWindowWake('window-focus');
     releaseStaleTerminalImeGuardBeforeFocusRecovery();
@@ -5055,13 +5096,15 @@ async function init() {
     else {
       stopWorkspaceGlassTicker();
       saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+      persistNoteMemoryStore();
     }
   });
 
-  setProfiles(await api.listProfiles());
+  setProfiles(await profilesPromise);
   loadIdeSettings();
+  startPerformanceLongTaskObserver();
+  appendPerformanceDiagnostic('init-listeners', listenersStartedAt);
   startDiagnosticSessionMonitor();
-  await loadSnippetsStore();
   loadWorkspaceStore();
   loadNoteMemoryStore();
   if (!IS_TERMINAL_APP) loadMarketTickerConfig();
@@ -5091,8 +5134,9 @@ async function init() {
   applyNoteOpacity();
   applyCalculatorFontSize();
   applyBrowserZoom();
-  if (!IS_TERMINAL_APP) scheduleEditorRuntimeWarmup();
   scheduleTerminalRuntimeWarmup();
+  if (!IS_TERMINAL_APP) scheduleEditorRuntimeWarmup();
+  scheduleSnippetsStoreLoad();
   bindEvents();
   startSavedWorkspaceAutoUpdateTimer();
   startAppClock();
@@ -5101,6 +5145,11 @@ async function init() {
   setStatus(rendererRecoveryNotice?.message ?? `Ready · build ${APP_BUILD_ID}`, rendererRecoveryNotice?.kind === 'repeated-reload');
   if (!IS_TERMINAL_APP) scheduleMarketTickerStart(MARKET_TICKER_BOOT_DELAY_MS);
   scheduleWslProfilesBackgroundLoad();
+  window.requestAnimationFrame(() => {
+    initialHydrationComplete = true;
+    appendPerformanceDiagnostic('init-first-hydration', initStartedAt);
+    if (appGlassEnabled()) scheduleAppGlassRefresh({ delay: 0, reason: 'initial-hydration-complete' });
+  });
 }
 
 function renderProfiles() {
@@ -5200,7 +5249,6 @@ async function loadWslProfilesInBackground() {
 }
 
 function loadWorkspaceStore() {
-  loadWorkspaceImageStore();
   loadSavedWorkspaceStore();
   try {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACE_STORE_KEY) ?? '') as Partial<WorkspaceStore>;
@@ -5226,7 +5274,7 @@ function workspaceSnapshotsFromStore(workspaces: unknown) {
   const snapshots: WorkspaceSnapshot[] = [];
   if (!Array.isArray(workspaces)) return snapshots;
   for (const item of workspaces) {
-    if (isWorkspaceSnapshot(item)) snapshots.push(hydrateWorkspaceImageRefs(item));
+    if (isWorkspaceSnapshot(item)) snapshots.push(item);
   }
   return snapshots;
 }
@@ -5254,7 +5302,7 @@ function savedWorkspaceEntriesFromStore(saved: unknown) {
       savedAt: entry.savedAt,
       profileKind: typeof entry.profileKind === 'string' ? entry.profileKind : undefined,
       profileLabel: typeof entry.profileLabel === 'string' ? entry.profileLabel : undefined,
-      snapshot: hydrateWorkspaceImageRefs(entry.snapshot)
+      snapshot: entry.snapshot
     });
     if (entries.length >= SAVED_WORKSPACE_LIMIT) break;
   }
@@ -5273,6 +5321,7 @@ function normalizeSavedWorkspaceName(value: string, snapshot?: WorkspaceSnapshot
 }
 
 function loadWorkspaceImageStore() {
+  if (workspaceImageStoreLoaded) return;
   try {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACE_IMAGE_STORE_KEY) ?? '{}') as unknown;
     const loaded = workspaceImageStoreFromParsed(parsed);
@@ -5282,6 +5331,11 @@ function loadWorkspaceImageStore() {
     workspaceImageStore = {};
     workspaceImageStoreDirty = false;
   }
+  workspaceImageStoreLoaded = true;
+}
+
+function ensureWorkspaceImageStoreLoaded() {
+  if (!workspaceImageStoreLoaded) loadWorkspaceImageStore();
 }
 
 function workspaceImageStoreFromParsed(parsed: unknown) {
@@ -5402,6 +5456,7 @@ function imageDataRefForStore(workspaceId: string, scope: string, dataUrl: strin
   }
   if (!dataUrl.startsWith('data:image/')) return dataUrl;
   if (dataUrl.length > WORKSPACE_IMAGE_DATA_URL_PERSIST_MAX_CHARS) return '';
+  ensureWorkspaceImageStoreLoaded();
   const key = imageRefKeyForDataUrl(workspaceId, scope, dataUrl);
   usedImageRefs.add(key);
   if (workspaceImageStore[key] !== dataUrl) {
@@ -5426,38 +5481,9 @@ function imageRefKeyForDataUrl(workspaceId: string, scope: string, dataUrl: stri
   return key;
 }
 
-function hydrateWorkspaceImageRefs(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
-  return {
-    ...snapshot,
-    imageTabs: hydrateWorkspaceImageTabs(snapshot)
-  };
-}
-
-function hydrateWorkspaceImageTabs(snapshot: WorkspaceSnapshot) {
-  const tabs: ImageTabSnapshot[] = [];
-  for (const tab of snapshot.imageTabs ?? []) {
-    tabs.push({
-      ...tab,
-      dataUrl: hydrateWorkspaceImageDataUrl(snapshot.id, `tab:${tab.id}`, tab.dataUrl),
-      history: hydrateWorkspaceImageHistory(snapshot.id, tab)
-    });
-  }
-  return tabs;
-}
-
-function hydrateWorkspaceImageHistory(workspaceId: string, tab: ImageTabSnapshot) {
-  const history: PastedImageItem[] = [];
-  for (const item of tab.history ?? []) {
-    history.push({
-      ...item,
-      dataUrl: hydrateWorkspaceImageDataUrl(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl)
-    });
-  }
-  return history;
-}
-
 function hydrateWorkspaceImageDataUrl(workspaceId: string, scope: string, dataUrl: string) {
   if (!dataUrl?.startsWith(WORKSPACE_IMAGE_REF_PREFIX)) return dataUrl || '';
+  ensureWorkspaceImageStoreLoaded();
   const key = dataUrl.slice(WORKSPACE_IMAGE_REF_PREFIX.length);
   const stored = workspaceImageStore[key] ?? '';
   if (stored) {
@@ -5470,6 +5496,7 @@ function hydrateWorkspaceImageDataUrl(workspaceId: string, scope: string, dataUr
 }
 
 function pruneWorkspaceImageStore(usedImageRefs: Set<string>) {
+  if (!workspaceImageStoreLoaded) return;
   for (const key of Object.keys(workspaceImageStore)) {
     if (usedImageRefs.has(key)) continue;
     delete workspaceImageStore[key];
@@ -5490,6 +5517,7 @@ function pruneWorkspaceImageRefCache() {
 }
 
 function persistWorkspaceImageStoreIfNeeded() {
+  if (!workspaceImageStoreLoaded) return true;
   if (!workspaceImageStoreDirty) return true;
   trimWorkspaceImageStoreToBudget();
   try {
@@ -6731,6 +6759,7 @@ function choiceOptionsSignature(choices: Array<{ id: string; label: string }>) {
 }
 
 function saveSettingsFromForm() {
+  const previousTerminalRenderer = state.ideSettings.terminalRenderer;
   state.ideSettings = {
     uiFont: el.settingsUiFont.value,
     monoFont: el.settingsMonoFont.value,
@@ -6766,6 +6795,12 @@ function saveSettingsFromForm() {
   };
   persistIdeSettings();
   applyIdeSettings();
+  if (previousTerminalRenderer === 'dom' && state.ideSettings.terminalRenderer === 'auto') {
+    for (const pane of state.terminals) {
+      if (pane.webglPromotionUnavailable && !pane.webglContextLost) pane.webglPromotionUnavailable = false;
+      scheduleTerminalWebglPromotion(pane);
+    }
+  }
   scheduleWorkspaceDockLayoutRefresh();
   renderSettings();
   if (state.ideSettings.agentNotificationBanners && AGENT_ALERT_USE_FRONTEND_CLICKABLE_NOTIFICATIONS) {
@@ -9189,8 +9224,16 @@ function bindWorkspaceLiquidGlassContextEvents(renderer: LiquidGLRendererLike | 
   }, { passive: false });
 }
 
+function liquidGlassCaptureJobBusy() {
+  return appGlassApplying || workspaceLiquidGlassApplying || explorerLiquidGlassApplying;
+}
+
 async function applyWorkspaceLiquidGlass(recaptureSnapshot = false) {
-  if (workspaceLiquidGlassApplying) {
+  if (restoringWorkspace) {
+    scheduleWorkspaceLiquidGlassRefresh({ recapture: recaptureSnapshot, delay: 180 });
+    return;
+  }
+  if (liquidGlassCaptureJobBusy()) {
     scheduleWorkspaceLiquidGlassRefresh({ recapture: recaptureSnapshot });
     return;
   }
@@ -10610,6 +10653,7 @@ function scheduleLiquidGlassGeometryForOwner(owner: HTMLElement) {
 }
 
 function appGlassCanCaptureSnapshotNow() {
+  if (restoringWorkspace) return false;
   if (document.hidden || document.visibilityState === 'hidden') return false;
   if (window.innerWidth < 64 || window.innerHeight < 64) return false;
   const rect = el.shell.getBoundingClientRect();
@@ -10708,6 +10752,10 @@ function scheduleAppGlassRefresh(options: { recapture?: boolean; delay?: number;
     const recapture = appGlassRefreshRecapture;
     appGlassRefreshTimer = 0;
     appGlassRefreshRecapture = false;
+    if (!initialHydrationComplete) {
+      scheduleAppGlassRefresh({ recapture, delay: 160, reason: `${options.reason ?? 'scheduled'}-hydrate` });
+      return;
+    }
     if (recapture && !appGlassCanCaptureSnapshotNow()) {
       deferAppGlassRecapture(options.reason ?? 'scheduled');
       return;
@@ -10728,18 +10776,41 @@ function scheduleAppGlassOwnerRefresh(
     appGlassOwnerRefreshTimers.delete(owner);
     const recapture = appGlassOwnerRefreshRecapture.get(owner) ?? false;
     appGlassOwnerRefreshRecapture.delete(owner);
+    if (!initialHydrationComplete) {
+      scheduleAppGlassOwnerRefresh(owner, { recapture, delay: 160, reason: `${options.reason ?? 'owner'}-hydrate` });
+      return;
+    }
     void applyAppLiquidGlassForOwner(owner, recapture, options.reason ?? 'owner');
   }, options.delay ?? (options.recapture ? 140 : 70));
   appGlassOwnerRefreshTimers.set(owner, timer);
 }
 
 async function applyAppLiquidGlassForOwner(owner: HTMLElement, recaptureSnapshot = false, reason = 'owner') {
-  const targets = syncAppGlassOwnerTargets(owner);
-  if (!targets.length) return;
-  if (appGlassApplying) {
+  if (restoringWorkspace) {
+    scheduleAppGlassOwnerRefresh(owner, { recapture: recaptureSnapshot, delay: 180, reason: `${reason}-restore` });
+    return;
+  }
+  if (liquidGlassCaptureJobBusy()) {
     scheduleAppGlassOwnerRefresh(owner, { recapture: recaptureSnapshot, delay: 90, reason: `${reason}-pending` });
     return;
   }
+  const applyStartedAt = performance.now();
+  appGlassApplying = true;
+  try {
+    await applyAppLiquidGlassForOwnerUnlocked(owner, recaptureSnapshot, reason);
+  } finally {
+    appGlassApplying = false;
+    appendPerformanceDiagnostic(
+      'glass-owner-apply',
+      applyStartedAt,
+      `owner=${appGlassOwnerDebugName(owner)} recapture=${recaptureSnapshot ? 1 : 0}`
+    );
+  }
+}
+
+async function applyAppLiquidGlassForOwnerUnlocked(owner: HTMLElement, recaptureSnapshot = false, reason = 'owner') {
+  const targets = syncAppGlassOwnerTargets(owner);
+  if (!targets.length) return;
   if (!appGlassEnabled()) {
     cleanupAppGlassOwner(owner);
     return;
@@ -10804,7 +10875,11 @@ async function applyAppLiquidGlassForOwner(owner: HTMLElement, recaptureSnapshot
 }
 
 async function applyAppLiquidGlass(recaptureSnapshot = false) {
-  if (appGlassApplying) {
+  if (restoringWorkspace) {
+    scheduleAppGlassRefresh({ recapture: recaptureSnapshot, delay: 180, reason: 'apply-restore' });
+    return;
+  }
+  if (liquidGlassCaptureJobBusy()) {
     scheduleAppGlassRefresh({ recapture: recaptureSnapshot, reason: 'apply-pending' });
     return;
   }
@@ -12324,7 +12399,11 @@ function scheduleExplorerLiquidGlassScrollRender() {
 }
 
 async function applyExplorerLiquidGlass(recaptureSnapshot = false) {
-  if (explorerLiquidGlassApplying) {
+  if (restoringWorkspace) {
+    scheduleExplorerLiquidGlassRefresh({ recapture: recaptureSnapshot, delay: 180 });
+    return;
+  }
+  if (liquidGlassCaptureJobBusy()) {
     scheduleExplorerLiquidGlassRefresh({ recapture: recaptureSnapshot });
     return;
   }
@@ -12435,13 +12514,13 @@ function scheduleAppGlassGeometryRefresh(options: { recapture?: boolean } = {}) 
 function refreshAppGlassGeometry(options: { recapture?: boolean } = {}) {
   if (!appGlassEnabled()) return;
   syncAppGlassTargets();
-  for (const renderer of uniqueAppGlassRenderers()) {
-    ensureAppGlassRendererLayer(renderer);
-    if (options.recapture) {
-      void ensureLiquidGlassRendererSnapshot(renderer).then((snapshotRendered) => {
-        if (!snapshotRendered) renderer.render?.();
-      });
-    } else {
+  if (options.recapture) {
+    // Snapshot capture is the expensive part. Route it through the same serialized apply queue as
+    // owner/workspace/Explorer capture instead of launching one async capture per renderer.
+    scheduleAppGlassRefresh({ recapture: true, delay: 0, reason: 'geometry' });
+  } else {
+    for (const renderer of uniqueAppGlassRenderers()) {
+      ensureAppGlassRendererLayer(renderer);
       renderer.render?.();
     }
   }
@@ -14749,6 +14828,7 @@ function restorePreviousUncleanDiagnosticSession(previous: DiagnosticSessionSnap
 }
 
 function markDiagnosticSessionClean() {
+  flushPendingPerformanceLongTasks();
   if (diagnosticSessionHeartbeatTimer) {
     window.clearInterval(diagnosticSessionHeartbeatTimer);
     diagnosticSessionHeartbeatTimer = 0;
@@ -15509,12 +15589,30 @@ function clearWorkspaceLlmTitleSignalTimer(pane: TerminalPane) {
 
 function cleanupWorkspaceLlmTitleDetectionForPane(pane: TerminalPane) {
   clearWorkspaceLlmTitleSignalTimer(pane);
+  if (pane.llmTitleDataTimer) window.clearTimeout(pane.llmTitleDataTimer);
+  pane.llmTitleDataTimer = undefined;
+  pane.llmTitleDataBuffer = '';
   pane.llmTitleDisposable?.dispose();
   pane.llmTitleDisposable = undefined;
   pane.llmTitleOscBuffer = undefined;
   pane.llmTitleStatusBuffer = undefined;
   resetWorkspaceLlmTitleStatusTracker(pane);
   clearWorkspaceLlmTitleActivityForPane(pane);
+}
+
+function scheduleWorkspaceLlmTitleFromTerminalData(pane: TerminalPane, data: string) {
+  if (!data || pane.closed) return;
+  pane.llmTitleDataBuffer = trimLimitedTextBuffer(
+    `${pane.llmTitleDataBuffer ?? ''}${data}`,
+    Math.max(WORKSPACE_LLM_TITLE_STATUS_BUFFER_CHARS, WORKSPACE_LLM_TITLE_OSC_BUFFER_CHARS * 2)
+  );
+  if (pane.llmTitleDataTimer) return;
+  pane.llmTitleDataTimer = window.setTimeout(() => {
+    pane.llmTitleDataTimer = undefined;
+    const pending = pane.llmTitleDataBuffer ?? '';
+    pane.llmTitleDataBuffer = '';
+    if (pending && !pane.closed) updateWorkspaceLlmTitleFromTerminalData(pane, pending);
+  }, TERMINAL_TITLE_ANALYSIS_BATCH_MS);
 }
 
 function updateWorkspaceLlmTitleFromTerminalData(pane: TerminalPane, data: string) {
@@ -16035,59 +16133,98 @@ async function recoverTerminalTmuxStaleDelivery(
   const profile = profileForIdWithWindowsFallback(pane.profileId);
   const command = llmTmuxAttachCommand(sessionName);
   if (!profile || profile.kind === 'windows' || !command) return;
+  const inputDrained = await drainTerminalInputBeforeReconnect(pane);
+  if (!inputDrained || !isTerminalPaneAlive(pane) || !pane.backendId) {
+    appendDiagnosticLog(
+      'terminal',
+      `tmux stale-reconnect deferred pane=${diagnosticPaneLabel(pane)} reason=input-not-drained`,
+      'warn'
+    );
+    return;
+  }
+  // Stop new type-ahead at the JS boundary, then place a barrier behind every packet already
+  // accepted by the Rust channel. The barrier is acknowledged only after the PTY writer has
+  // completed write_all + flush, so killing the old tmux client cannot drop queued Hangul/input.
+  pane.inputReconnectFrozen = true;
   const oldBackendId = pane.backendId;
+  try {
+    await withTimeout(
+      api.flushTerminalInput(oldBackendId),
+      TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS,
+      'Confirming terminal input before tmux reconnect'
+    );
+  } catch (error) {
+    pane.inputReconnectFrozen = false;
+    if (pane.backendId) drainTerminalInputQueue(pane);
+    appendDiagnosticLog(
+      'terminal',
+      `tmux stale-reconnect deferred pane=${diagnosticPaneLabel(pane)} reason=pty-input-barrier error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
+      'warn'
+    );
+    return;
+  }
+  if (!isTerminalPaneAlive(pane) || pane.backendId !== oldBackendId) {
+    pane.inputReconnectFrozen = false;
+    if (pane.backendId) drainTerminalInputQueue(pane);
+    return;
+  }
   appendDiagnosticLog(
     'terminal',
     `tmux stale-reconnect start pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} oldBackend=${oldBackendId.slice(0, 8)} reason=${sanitizeDiagnosticLogPart(reason, 24)} dataAge=${Math.round(dataAge)}ms`,
     'warn',
     { force: true }
   );
-  pane.term.write('\r\n\x1b[33m[simple-vibe-ide] tmux output delivery looks stale; reconnecting this terminal client to the same tmux session...\x1b[0m\r\n');
-  setTerminalBackendId(pane, undefined);
-  dropPendingTerminalBackendEvents(oldBackendId);
-  void api.killTerminal(oldBackendId).catch((error) => {
+  try {
+    pane.term.write('\r\n\x1b[33m[simple-vibe-ide] tmux output delivery looks stale; reconnecting this terminal client to the same tmux session...\x1b[0m\r\n');
+    setTerminalBackendId(pane, undefined);
+    dropPendingTerminalBackendEvents(oldBackendId);
+    void api.killTerminal(oldBackendId).catch((error) => {
+      appendDiagnosticLog(
+        'terminal',
+        `tmux stale-reconnect old-backend kill failed pane=${diagnosticPaneLabel(pane)} oldBackend=${oldBackendId.slice(0, 8)} error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
+        'warn'
+      );
+    });
+    const spawnPromise = api.spawnTerminal(
+      profile.id,
+      pane.cwd,
+      command,
+      pane.term.rows,
+      pane.term.cols,
+      pane.workspaceId,
+      `${pane.title} reconnect`
+    );
+    const backendId = await withTimeout(
+      spawnPromise,
+      terminalStartTimeoutMs(profile),
+      `${profile.kind.toUpperCase()} tmux reconnect`
+    );
+    if (!isTerminalPaneAlive(pane)) {
+      void api.killTerminal(backendId).catch(() => undefined);
+      return;
+    }
+    setTerminalBackendId(pane, backendId);
+    pane.tmuxStaleDeliveryCount = 0;
+    const now = performance.now();
+    pane.lastTerminalDataAt = now;
+    pane.lastTerminalRefreshAt = now;
+    scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
+    const widget = terminalWidgetForPane(pane);
+    if (widget) {
+      renderTerminalWidgetTabs(widget);
+      renderTerminalWidgetSplitLayout(widget);
+    }
+    setStatus(`Reconnected tmux session: ${sessionName}`);
     appendDiagnosticLog(
       'terminal',
-      `tmux stale-reconnect old-backend kill failed pane=${diagnosticPaneLabel(pane)} oldBackend=${oldBackendId.slice(0, 8)} error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
-      'warn'
+      `tmux stale-reconnect ok pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} newBackend=${backendId.slice(0, 8)}`,
+      'info',
+      { force: true }
     );
-  });
-  const spawnPromise = api.spawnTerminal(
-    profile.id,
-    pane.cwd,
-    command,
-    pane.term.rows,
-    pane.term.cols,
-    pane.workspaceId,
-    `${pane.title} reconnect`
-  );
-  const backendId = await withTimeout(
-    spawnPromise,
-    terminalStartTimeoutMs(profile),
-    `${profile.kind.toUpperCase()} tmux reconnect`
-  );
-  if (!isTerminalPaneAlive(pane)) {
-    void api.killTerminal(backendId).catch(() => undefined);
-    return;
+  } finally {
+    pane.inputReconnectFrozen = false;
+    if (pane.backendId) drainTerminalInputQueue(pane);
   }
-  setTerminalBackendId(pane, backendId);
-  pane.tmuxStaleDeliveryCount = 0;
-  const now = performance.now();
-  pane.lastTerminalDataAt = now;
-  pane.lastTerminalRefreshAt = now;
-  scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
-  const widget = terminalWidgetForPane(pane);
-  if (widget) {
-    renderTerminalWidgetTabs(widget);
-    renderTerminalWidgetSplitLayout(widget);
-  }
-  setStatus(`Reconnected tmux session: ${sessionName}`);
-  appendDiagnosticLog(
-    'terminal',
-    `tmux stale-reconnect ok pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} newBackend=${backendId.slice(0, 8)}`,
-    'info',
-    { force: true }
-  );
 }
 
 function classifyWorkspaceLlmTerminalTitle(llmId: string, title: string): WorkspaceLlmTitleSignal {
@@ -17033,6 +17170,20 @@ function disableCaptureProtectionForShutdown() {
 const CAPTURE_FREEZE_PRIME_MS = 520;
 const CAPTURE_FREEZE_MAX_MS = 1000;
 let captureFreezeFailsafe = 0;
+let workspaceCaptureInterlockDepth = 0;
+
+function acquireWorkspaceCaptureInterlock() {
+  workspaceCaptureInterlockDepth += 1;
+  el.shell.inert = true;
+  el.shell.setAttribute('aria-busy', 'true');
+}
+
+function releaseWorkspaceCaptureInterlock() {
+  workspaceCaptureInterlockDepth = Math.max(0, workspaceCaptureInterlockDepth - 1);
+  if (workspaceCaptureInterlockDepth > 0) return;
+  el.shell.inert = false;
+  el.shell.removeAttribute('aria-busy');
+}
 
 async function primeCaptureFreezeFrame() {
   document.body.classList.add('capture-freeze-visible');
@@ -17098,7 +17249,11 @@ function delay(ms: number) {
 }
 
 async function createBlankWorkspaceTab() {
+  const operationGeneration = ++workspaceActivationGeneration;
   await saveAllDirtyNotes();
+  if (operationGeneration !== workspaceActivationGeneration) return;
+  workspacePathSwitchGeneration += 1;
+  cancelWorkspaceRestore();
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
   const previousId = state.activeWorkspaceId;
@@ -17115,7 +17270,11 @@ async function createBlankWorkspaceTab() {
   // blank snapshot or clear the previous workspace's capture setting.
   renderWorkspaceTabs();
   const preserveProtectionUntilBlank = state.captureProtectionApplied || captureProtectionDesired;
-  await closeWorkspace({ preserveCaptureProtection: preserveProtectionUntilBlank });
+  const closed = await closeWorkspace({
+    preserveCaptureProtection: preserveProtectionUntilBlank,
+    activationGeneration: operationGeneration
+  });
+  if (!closed || operationGeneration !== workspaceActivationGeneration) return;
   state.activeWorkspaceId = id;
   state.workspaceCaptureProtected = false;
   markWorkspaceActive(id);
@@ -17126,13 +17285,17 @@ async function createBlankWorkspaceTab() {
 }
 
 async function copyWorkspaceTab(id: string) {
+  const sourceIndex = workspaceSnapshotIndexById(id);
+  if (sourceIndex < 0) return;
+  const operationGeneration = ++workspaceActivationGeneration;
   await saveAllDirtyNotes();
+  if (operationGeneration !== workspaceActivationGeneration) return;
+  workspacePathSwitchGeneration += 1;
+  cancelWorkspaceRestore();
   if (id === state.activeWorkspaceId) {
     saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
     saveActiveWorkspaceRuntimeCache();
   }
-  const sourceIndex = workspaceSnapshotIndexById(id);
-  if (sourceIndex < 0) return;
   const clone = cloneWorkspaceSnapshotForCopy(state.workspaceSnapshots[sourceIndex]);
   workspaceSnapshotSignatures.set(clone.id, workspaceSnapshotSignature(clone));
   insertWorkspaceSnapshot(sourceIndex + 1, clone);
@@ -17142,13 +17305,18 @@ async function copyWorkspaceTab(id: string) {
   if (!clone.profileId) {
     if (clone.captureProtected) captureProtectionSessionWorkspaceIds.add(clone.id);
     const preserveProtectionUntilBlank = state.captureProtectionApplied || captureProtectionDesired;
-    await closeWorkspace({ preserveCaptureProtection: preserveProtectionUntilBlank });
+    const closed = await closeWorkspace({
+      preserveCaptureProtection: preserveProtectionUntilBlank,
+      activationGeneration: operationGeneration
+    });
+    if (!closed || operationGeneration !== workspaceActivationGeneration) return;
     state.workspaceCaptureProtected = Boolean(clone.captureProtected);
     applyWorkspaceCaptureProtectionSoon(activeWorkspaceCaptureProtectionShouldApply(), { quiet: true });
     renderWorkspaceTabs();
   } else {
     await restoreWorkspaceSnapshot(clone);
   }
+  if (operationGeneration !== workspaceActivationGeneration) return;
   setStatus(`Workspace copied: ${workspaceDisplayLabel(clone)}`);
 }
 
@@ -17291,7 +17459,16 @@ function cloneJson<T>(value: T): T {
 }
 
 async function closeWorkspaceTab(id: string) {
+  const operationGeneration = ++workspaceActivationGeneration;
   const wasActive = state.activeWorkspaceId === id;
+  let cancellationGeneration = 0;
+  if (wasActive) {
+    await saveAllDirtyNotes();
+    if (operationGeneration !== workspaceActivationGeneration) return;
+    workspacePathSwitchGeneration += 1;
+    cancelWorkspaceRestore();
+    cancellationGeneration = workspaceRestoreGeneration;
+  }
   const snapshot = workspaceSnapshotForId(id);
   const runtime = restoreWorkspaceRuntimeCache(id);
   closeNativeBrowserWebviewsForWorkspace(id, [
@@ -17307,6 +17484,18 @@ async function closeWorkspaceTab(id: string) {
     saveSnapshot: false,
     renderShellTabs: false
   });
+  if (operationGeneration !== workspaceActivationGeneration && state.activeWorkspaceId === id) {
+    if (cancellationGeneration && workspaceRestoreGeneration === cancellationGeneration) {
+      restoringWorkspace = false;
+      const currentSnapshot = workspaceSnapshotForId(id) ?? snapshot;
+      const profile = currentSnapshot ? profileForId(currentSnapshot.profileId) : null;
+      if (currentSnapshot && profile && (currentSnapshot.terminals ?? []).length) {
+        await restoreWorkspaceTerminals(currentSnapshot, profile);
+        if (state.activeWorkspaceId === id) setStatus(`Workspace close cancelled; shells restored: ${currentSnapshot.label}`);
+      }
+    }
+    return;
+  }
   removeWorkspaceRuntimeCache(id);
   workspaceSnapshotSignatures.delete(id);
   captureProtectionSessionWorkspaceIds.delete(id);
@@ -17315,7 +17504,7 @@ async function closeWorkspaceTab(id: string) {
   workspaceMemorySleepingIds.delete(id);
   workspaceDoneUnreadIds.delete(id);
   removeWorkspaceSnapshotById(id);
-  if (wasActive) {
+  if (state.activeWorkspaceId === id) {
     const next = state.workspaceSnapshots[0];
     if (next) {
       state.activeWorkspaceId = next.id;
@@ -17325,7 +17514,11 @@ async function closeWorkspaceTab(id: string) {
         const nextCaptureProtected = Boolean(next.captureProtected);
         if (nextCaptureProtected) captureProtectionSessionWorkspaceIds.add(next.id);
         const nextCaptureShouldApply = workspaceCaptureProtectionShouldApply(next.id, nextCaptureProtected);
-        await closeWorkspace({ preserveCaptureProtection: state.captureProtectionApplied || captureProtectionDesired || nextCaptureShouldApply });
+        const closed = await closeWorkspace({
+          preserveCaptureProtection: state.captureProtectionApplied || captureProtectionDesired || nextCaptureShouldApply,
+          activationGeneration: operationGeneration
+        });
+        if (!closed || operationGeneration !== workspaceActivationGeneration) return;
         state.workspaceCaptureProtected = nextCaptureProtected;
         applyWorkspaceCaptureProtectionSoon(nextCaptureShouldApply, { quiet: true });
         renderWorkspaceTabs();
@@ -17336,12 +17529,13 @@ async function closeWorkspaceTab(id: string) {
       return;
     }
     state.activeWorkspaceId = '';
-    await closeWorkspace({ killTerminals: true });
+    await closeWorkspace({ killTerminals: true, activationGeneration: operationGeneration });
   }
   persistWorkspaceStore();
 }
 
-async function activateWorkspaceTab(id: string) {
+async function activateWorkspaceTab(id: string, options: { imeSettled?: boolean } = {}) {
+  const activationGeneration = ++workspaceActivationGeneration;
   if (id === state.activeWorkspaceId && state.workspaceOpen) {
     acknowledgeWorkspaceDoneUnread(id);
     const snapshot = workspaceSnapshotForId(id);
@@ -17369,10 +17563,25 @@ async function activateWorkspaceTab(id: string) {
   }
   const snapshot = workspaceSnapshotForId(id);
   if (!snapshot) return;
+  if (snapshot.profileId && !profileForId(snapshot.profileId)) {
+    setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} profile is unavailable: ${snapshot.label}`, true);
+    return;
+  }
+  const activeImePane = activeTerminalPane();
+  if (
+    !options.imeSettled
+    && activeImePane
+    && deferTerminalImeUiSwitch(activeImePane, 'switching workspace', () => (
+      void activateWorkspaceTab(id, { imeSettled: true })
+    ))
+  ) return;
+  await saveAllDirtyNotes();
+  if (activationGeneration !== workspaceActivationGeneration) return;
+  workspacePathSwitchGeneration += 1;
+  cancelWorkspaceRestore();
   const nextCaptureProtected = Boolean(snapshot.captureProtected);
   if (nextCaptureProtected) captureProtectionSessionWorkspaceIds.add(id);
   const previousActiveId = state.activeWorkspaceId;
-  await saveAllDirtyNotes();
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
   state.activeWorkspaceId = id;
@@ -17382,7 +17591,11 @@ async function activateWorkspaceTab(id: string) {
   const nextCaptureShouldApply = workspaceCaptureProtectionShouldApply(id, nextCaptureProtected);
   renderWorkspaceTabActivation(previousActiveId, snapshot);
   if (!snapshot.profileId) {
-    await closeWorkspace({ preserveCaptureProtection: state.captureProtectionApplied || captureProtectionDesired || nextCaptureShouldApply });
+    const closed = await closeWorkspace({
+      preserveCaptureProtection: state.captureProtectionApplied || captureProtectionDesired || nextCaptureShouldApply,
+      activationGeneration
+    });
+    if (!closed || activationGeneration !== workspaceActivationGeneration) return;
     state.workspaceCaptureProtected = nextCaptureProtected;
     applyWorkspaceCaptureProtectionSoon(nextCaptureShouldApply, { quiet: true });
     renderWorkspaceTabs();
@@ -18035,7 +18248,7 @@ function activeWorkspaceSnapshot() {
 }
 
 function saveActiveWorkspaceRuntimeCache() {
-  if (!state.activeWorkspaceId || !state.workspaceOpen) return;
+  if (restoringWorkspace || !state.activeWorkspaceId || !state.workspaceOpen) return;
   const workspaceId = state.activeWorkspaceId;
   syncActiveEditorTabFromView();
   workspaceRuntimeCache.set(workspaceId, {
@@ -18338,29 +18551,41 @@ function deferExplorerDirectoryRestore(path: string, profileId: string, workspac
   state.explorerExpanded = new Set();
   state.explorerChildren = new Map();
   markExplorerEntryLookupDirty();
-  state.explorerLoading = new Set();
+  state.explorerLoading = new Set([path]);
   state.explorerSignatures = new Map();
   resetExplorerSelection();
   state.explorerTypeahead = '';
   state.explorerTypeaheadAt = 0;
   explorerRenderDirty = true;
   refreshTitle();
+  if (isPanelVisible('explorer')) renderExplorer();
 }
 
 async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
-  const profile = profileForId(snapshot.profileId);
-  if (!profile) {
-    setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} profile is unavailable: ${snapshot.label}`, true);
-    return;
-  }
-
-  if (!await ensureWorkspaceCaptureProtectionBeforeReveal(snapshot)) return;
-  if (state.activeWorkspaceId !== snapshot.id) return;
-  markWorkspaceActive(snapshot.id);
-
-  const terminalRestoreToken = ++workspaceTerminalRestoreToken;
+  const restoreStartedAt = performance.now();
+  const restoreGeneration = ++workspaceRestoreGeneration;
+  let primaryRestoreStarted = false;
   restoringWorkspace = true;
   try {
+    const profile = profileForId(snapshot.profileId);
+    if (!profile) {
+      showUnavailableWorkspaceShell(snapshot);
+      setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} profile is unavailable: ${snapshot.label}`, true);
+      return;
+    }
+    let captureReady = false;
+    acquireWorkspaceCaptureInterlock();
+    try {
+      captureReady = await ensureWorkspaceCaptureProtectionBeforeReveal(snapshot);
+    } finally {
+      releaseWorkspaceCaptureInterlock();
+    }
+    if (!captureReady) return;
+    if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
+    primaryRestoreStarted = true;
+    markWorkspaceActive(snapshot.id);
+
+    const terminalRestoreToken = ++workspaceTerminalRestoreToken;
     hideNativeBrowserWebview({ all: true });
     hideAllTerminalWidgets();
     clearWorkspacePanels({ skipIntermediateRenders: true });
@@ -18409,12 +18634,13 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     const loadExplorerInBackground = profileLoadsWorkspaceDirectoryInBackground(profile) && !IS_TERMINAL_APP;
     setWorkspaceOpen(true, { preserveVisibility: true, deferExplorerWatch: deferExplorerUntilShellReady });
     restorePanelSnapshots(snapshot.panels);
+    renderWorkspacePrimaryLoadingShells();
     if (isPanelVisible('calculator')) renderCalculator();
     if (isPanelVisible('settings')) renderSettings();
     refreshTitle();
     setStatus(`${IS_TERMINAL_APP ? 'Loading layout' : 'Switching workspace'}: ${snapshot.label}`);
     await yieldToUi();
-    if (state.activeWorkspaceId !== snapshot.id) return;
+    if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
 
     const hasLiveTerminals = state.terminals.some((pane) => (
       pane.workspaceId === snapshot.id && pane.startupState !== 'failed'
@@ -18422,10 +18648,18 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     if (hasLiveTerminals) {
       await restoreWorkspaceTerminals(snapshot, profile);
       await nextAnimationFrame();
+      if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
     }
 
+    const hasTerminalSnapshots = (snapshot.terminals ?? []).length > 0;
     const explorerRuntimeRestored = restoreExplorerRuntimeCache(snapshot.id, state.currentDir);
     const waitForExplorerShellReady = deferExplorerUntilShellReady && !activeWorkspaceHasReadyShell(profile);
+    if (!hasLiveTerminals && hasTerminalSnapshots) {
+      scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken, {
+        loadExplorerAfterFirstReady: waitForExplorerShellReady && !explorerRuntimeRestored && isPanelVisible('explorer'),
+        loadExplorerPath: state.currentDir
+      });
+    }
     if (!explorerRuntimeRestored && isPanelVisible('explorer')) {
       if (waitForExplorerShellReady) {
         deferExplorerDirectoryRestore(state.currentDir, profile.id, snapshot.id);
@@ -18447,30 +18681,72 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
       deferExplorerDirectoryRestore(state.currentDir, profile.id, snapshot.id);
     }
     await yieldToUi();
-    if (state.activeWorkspaceId !== snapshot.id) return;
+    if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
     await restoreEditorTabs(snapshot);
+    if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
     restoreImageTabs(snapshot);
     await restoreNoteTabs(snapshot);
+    if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
     restoreBrowserState(snapshot);
-
-    const hasTerminalSnapshots = (snapshot.terminals ?? []).length > 0;
-    if (!hasLiveTerminals && hasTerminalSnapshots) {
-      scheduleWorkspaceTerminalRestore(snapshot, profile, terminalRestoreToken, {
-        loadExplorerAfterFirstReady: waitForExplorerShellReady && !explorerRuntimeRestored && isPanelVisible('explorer'),
-        loadExplorerPath: state.currentDir
-      });
+    if (isPanelVisible('calculator')) renderCalculator();
+    if (isPanelVisible('explorer')) {
+      if (explorerRenderDirty || el.fileList.querySelector(':scope > .file-row.loading')) renderExplorer();
+      if (shouldLoadExplorerDirectoryOnShow()) {
+        loadWorkspaceDirectoryInBackground(state.currentDir, profile.id, snapshot.id);
+      }
+      scheduleExplorerWatch(1200);
     }
     refreshTitle();
     finishWorkspaceCaptureProtectionAfterReveal(snapshot);
+    appendPerformanceDiagnostic(
+      'workspace-primary-hydration',
+      restoreStartedAt,
+      `workspace=${snapshot.id.slice(0, 8)} terminals=${(snapshot.terminals ?? []).length}`
+    );
     if (hasLiveTerminals || workspaceHasRunningTerminalBackend(snapshot.id) || !hasTerminalSnapshots) {
       setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} loaded: ${snapshot.label}`);
     } else {
       setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} restoring: ${snapshot.label} (starting shells)`);
     }
   } finally {
-    restoringWorkspace = false;
-    scheduleActiveWorkspaceSnapshotSave(WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS);
+    if (restoreGeneration === workspaceRestoreGeneration) {
+      restoringWorkspace = false;
+      if (primaryRestoreStarted) {
+        scheduleActiveWorkspaceSnapshotSave(WORKSPACE_RESTORE_SNAPSHOT_DEBOUNCE_MS);
+        if (appGlassEnabled()) scheduleAppGlassRefresh({ recapture: true, delay: 140, reason: 'workspace-restored' });
+        if (workspaceLiquidGlassEligible()) scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: 160 });
+        if (normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows) {
+          scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 180 });
+        }
+      }
+    }
   }
+}
+
+function isWorkspacePrimaryRestoreCurrent(workspaceId: string, generation: number) {
+  return generation === workspaceRestoreGeneration && state.activeWorkspaceId === workspaceId;
+}
+
+function showUnavailableWorkspaceShell(snapshot: WorkspaceSnapshot) {
+  hideNativeBrowserWebview({ all: true });
+  hideAllTerminalWidgets();
+  state.activeProfile = null;
+  state.workspaceOpen = false;
+  state.workspaceRoot = snapshot.root || '';
+  state.currentDir = '';
+  clearWorkspacePanels();
+  setInputValueIfChanged(el.profileSelect, '');
+  setInputValueIfChanged(el.rootInput, snapshot.root || '');
+  if (el.rootInput.placeholder !== 'profile unavailable') el.rootInput.placeholder = 'profile unavailable';
+  setWorkspaceOpen(false, { preserveVisibility: true });
+  refreshTitle();
+}
+
+function cancelWorkspaceRestore() {
+  const wasRestoring = restoringWorkspace;
+  workspaceRestoreGeneration += 1;
+  workspaceTerminalRestoreToken += 1;
+  return wasRestoring;
 }
 
 function scheduleWorkspaceTerminalRestore(
@@ -18479,7 +18755,7 @@ function scheduleWorkspaceTerminalRestore(
   token: number,
   options: { loadExplorerAfterFirstReady?: boolean; loadExplorerPath?: string } = {}
 ) {
-  runWhenUiIdle(() => {
+  window.requestAnimationFrame(() => window.setTimeout(() => {
     if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
     void restoreWorkspaceTerminals(snapshot, profile, { token, ...options })
       .then(() => {
@@ -18498,7 +18774,7 @@ function scheduleWorkspaceTerminalRestore(
           setStatus(`Terminal restore failed: ${String(error)}`, true);
         }
       });
-  }, 650);
+  }, 0));
 }
 
 function isWorkspaceTerminalRestoreCurrent(workspaceId: string, token?: number) {
@@ -18530,12 +18806,152 @@ function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
   }
 }
 
+function renderWorkspacePrimaryLoadingShells() {
+  if (isPanelVisible('explorer') && state.currentDir) {
+    state.explorerLoading = new Set([state.currentDir]);
+    explorerRenderDirty = true;
+    renderExplorer();
+  }
+
+  if (isPanelVisible('editor')) {
+    destroyCodeEditorView();
+    editorTabsRenderSignature = '\0';
+    editorTabsOrderRenderSignature = '\0';
+    for (const tabs of el.editorSurface.querySelectorAll<HTMLElement>('.editor-pane-tabs')) tabs.replaceChildren();
+    for (const body of el.editorSurface.querySelectorAll<HTMLElement>('.editor-body')) {
+      body.replaceChildren();
+      body.classList.add('empty');
+      body.textContent = 'Loading workspace editor...';
+    }
+    setTextContentIfChanged(el.editorLabel, 'Loading workspace editor...');
+    el.toggleRaw.classList.add('hidden');
+    setDisabledIfChanged(el.refreshFile, true);
+    setDisabledIfChanged(el.saveFile, true);
+  }
+
+  if (isPanelVisible('image')) {
+    cancelImageTabHydration();
+    imageTabsRenderSignature = '\0';
+    imageTabsOrderRenderSignature = '\0';
+    imageHistoryRenderSignature = '\0';
+    imageHistoryOrderRenderSignature = '\0';
+    imagePreviewRenderedDataUrl = '\0';
+    imagePreviewRenderedLabel = '\0';
+    imagePreviewRenderedTransform = '\0';
+    el.imageTabs.replaceChildren();
+    state.imagePreviewDataUrl = '';
+    state.imagePreviewLabel = 'Loading workspace image preview...';
+    state.imageHistory = [];
+    renderImagePreview();
+    renderImageHistory();
+  }
+
+  if (isPanelVisible('notes')) {
+    noteTabsRenderSignature = '\0';
+    noteTabsOrderRenderSignature = '\0';
+    renderNoteTabs();
+    renderNotes();
+    setTextContentIfChanged(el.notesPath, 'Loading workspace notes...');
+  }
+
+  if (!isBrowserPanelHidden()) {
+    browserTabsRenderSignature = '\0';
+    browserTabsOrderRenderSignature = '\0';
+    renderBrowserTabs();
+    renderForwards();
+    renderBrowserConsole();
+    setInputValueIfChanged(el.previewUrl, '');
+    toggleClassIfChanged(el.browserShell, 'has-preview', false);
+  }
+}
+
+function renderWorkspacePanelLoadingShell(id: FloatingPanelId) {
+  if (id === 'explorer') {
+    explorerRenderDirty = true;
+    explorerRenderedStart = -1;
+    explorerRenderedEnd = -1;
+    explorerRenderedTotal = -1;
+    el.pathRow.replaceChildren();
+    el.exportList.replaceChildren();
+    const loading = document.createElement('div');
+    loading.className = 'file-row loading';
+    loading.textContent = 'Loading workspace files...';
+    el.fileList.replaceChildren(loading);
+    return;
+  }
+  if (id === 'editor') {
+    destroyCodeEditorView();
+    editorTabsRenderSignature = '\0';
+    editorTabsOrderRenderSignature = '\0';
+    for (const tabs of el.editorSurface.querySelectorAll<HTMLElement>('.editor-pane-tabs')) tabs.replaceChildren();
+    for (const body of el.editorSurface.querySelectorAll<HTMLElement>('.editor-body')) {
+      body.replaceChildren();
+      body.classList.add('empty');
+      body.textContent = 'Loading workspace editor...';
+    }
+    setTextContentIfChanged(el.editorLabel, 'Loading workspace editor...');
+    el.toggleRaw.classList.add('hidden');
+    setDisabledIfChanged(el.refreshFile, true);
+    setDisabledIfChanged(el.saveFile, true);
+    return;
+  }
+  if (id === 'image') {
+    imageTabsRenderSignature = '\0';
+    imageTabsOrderRenderSignature = '\0';
+    imageHistoryRenderSignature = '\0';
+    imageHistoryOrderRenderSignature = '\0';
+    imagePreviewRenderedDataUrl = '\0';
+    imagePreviewRenderedLabel = '\0';
+    imagePreviewRenderedTransform = '\0';
+    el.imageTabs.replaceChildren();
+    el.imageHistory.replaceChildren();
+    el.imageHistory.classList.add('hidden');
+    if (el.imagePreview.hasAttribute('src')) el.imagePreview.removeAttribute('src');
+    el.imagePreview.classList.remove('visible');
+    setTextContentIfChanged(el.imageLabel, 'Loading workspace image preview...');
+    return;
+  }
+  if (id === 'notes') {
+    noteTabsRenderSignature = '\0';
+    noteTabsOrderRenderSignature = '\0';
+    el.notesTabs.replaceChildren();
+    setInputValueIfChanged(el.notesBody, '');
+    setDisabledIfChanged(el.notesBody, true);
+    setDisabledIfChanged(el.notesChecklist, true);
+    setTextContentIfChanged(el.notesPath, 'Loading workspace notes...');
+    setTextContentIfChanged(el.notesStatus, 'Loading...');
+    return;
+  }
+  if (id === 'browser') {
+    browserTabsRenderSignature = '\0';
+    browserTabsOrderRenderSignature = '\0';
+    browserConsoleRenderSignature = '\0';
+    forwardsRenderSignature = '\0';
+    forwardsOrderRenderSignature = '\0';
+    hideAllBrowserFrames();
+    hideNativeBrowserWebview({ all: true });
+    setEdgePreviewVisible(false);
+    el.browserTabs.replaceChildren();
+    el.browserConsoleLog.replaceChildren();
+    el.forwardList.replaceChildren();
+    setInputValueIfChanged(el.previewUrl, '');
+    toggleClassIfChanged(el.browserShell, 'has-preview', false);
+    return;
+  }
+  if (id === 'calculator') {
+    setInputValueIfChanged(el.calculatorExpression, '');
+    setTextContentIfChanged(el.calculatorResult, 'Loading workspace calculator...');
+    el.calculatorHistory.replaceChildren();
+  }
+}
+
 async function restoreWorkspaceTerminals(
   snapshot: WorkspaceSnapshot,
   profile: ConnectionProfile,
   options: { token?: number; loadExplorerAfterFirstReady?: boolean; loadExplorerPath?: string } = {}
 ) {
   if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+  let restoredActivePaneId = '';
   showTerminalWidgetsForWorkspace(snapshot.id);
   if (!hasActiveWorkspaceTerminalPane()) {
     const failedPaneIds = state.terminals
@@ -18558,11 +18974,26 @@ async function restoreWorkspaceTerminals(
     }
     const widgetsBySnapshotId = new Map<string, TerminalWidget>();
     const paneIdBySnapshotPaneId = new Map<string, string>();
+    const restoredPaneOrder = new Map<string, number>();
     let queuedExplorerLoadAfterReady = false;
-    for (const terminal of terminalSnapshots) {
+    const activeSnapshotIndex = clamp(snapshot.activeTerminalIndex || 0, 0, terminalSnapshots.length - 1);
+    const orderedTerminalSnapshots = terminalSnapshots
+      .map((terminal, snapshotIndex) => ({
+        terminal,
+        snapshotIndex,
+        widgetKey: terminal.widgetId || `legacy-widget:${snapshotIndex}`
+      }))
+      .sort((left, right) => (
+        Number(right.snapshotIndex === activeSnapshotIndex) - Number(left.snapshotIndex === activeSnapshotIndex)
+        || left.snapshotIndex - right.snapshotIndex
+      ));
+    const restoreTerminalSnapshot = async ({
+      terminal,
+      snapshotIndex,
+      widgetKey
+    }: { terminal: WorkspaceTerminalSnapshot; snapshotIndex: number; widgetKey: string }) => {
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
       const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
-      const widgetKey = terminal.widgetId || crypto.randomUUID();
       const existingWidget = widgetsBySnapshotId.get(widgetKey);
       const defaultFocusTarget = terminalDefaultFocusTargetFromSnapshot(terminal, snapshot.terminalGroups);
       const terminalOptions: CreateTerminalOptions = {
@@ -18617,8 +19048,10 @@ async function restoreWorkspaceTerminals(
         return;
       }
       if (restoredPane) {
-        const snapshotPaneId = terminal.snapshotPaneId || `${widgetKey}:${terminal.groupId ?? restoredPane.groupId}:${terminalSnapshots.indexOf(terminal)}`;
+        const snapshotPaneId = terminal.snapshotPaneId || `${widgetKey}:${terminal.groupId ?? restoredPane.groupId}:${snapshotIndex}`;
         paneIdBySnapshotPaneId.set(snapshotPaneId, restoredPane.paneId);
+        restoredPaneOrder.set(restoredPane.paneId, snapshotIndex);
+        if (snapshotIndex === activeSnapshotIndex) restoredActivePaneId = restoredPane.paneId;
         restoredPane.customTitle = typeof terminal.customTitle === 'string' ? terminal.customTitle : undefined;
         restoredPane.activePythonEnv = cloneTerminalPythonEnvSnapshot(terminal.activePythonEnv);
         const typingPadOpen = Boolean(terminal.typingPadOpen);
@@ -18658,11 +19091,58 @@ async function restoreWorkspaceTerminals(
         return;
       }
       await yieldToUi();
+    };
+    const restoreGroups = new Map<string, typeof orderedTerminalSnapshots>();
+    for (const item of orderedTerminalSnapshots) {
+      const group = restoreGroups.get(item.widgetKey) ?? [];
+      group.push(item);
+      restoreGroups.set(item.widgetKey, group);
     }
+    const groups = Array.from(restoreGroups.values());
+    let nextGroupIndex = 0;
+    const restoreWorker = async () => {
+      while (nextGroupIndex < groups.length) {
+        const group = groups[nextGroupIndex++];
+        for (const item of group) {
+          await restoreTerminalSnapshot(item);
+          if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, groups.length) }, () => restoreWorker()));
+    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+    const orderedWorkspacePanes = state.terminals
+      .filter((pane) => pane.workspaceId === snapshot.id)
+      .sort((left, right) => (
+        (restoredPaneOrder.get(left.paneId) ?? Number.MAX_SAFE_INTEGER)
+        - (restoredPaneOrder.get(right.paneId) ?? Number.MAX_SAFE_INTEGER)
+      ));
+    let paneOrderIndex = 0;
+    state.terminals = state.terminals.map((pane) => (
+      pane.workspaceId === snapshot.id ? orderedWorkspacePanes[paneOrderIndex++] : pane
+    ));
+    const widgetOrder = new Map<string, number>();
+    for (const pane of orderedWorkspacePanes) {
+      widgetOrder.set(pane.widgetId, Math.min(
+        widgetOrder.get(pane.widgetId) ?? Number.MAX_SAFE_INTEGER,
+        restoredPaneOrder.get(pane.paneId) ?? Number.MAX_SAFE_INTEGER
+      ));
+    }
+    const orderedWorkspaceWidgets = state.terminalWidgets
+      .filter((widget) => widget.workspaceId === snapshot.id)
+      .sort((left, right) => (
+        (widgetOrder.get(left.widgetId) ?? Number.MAX_SAFE_INTEGER)
+        - (widgetOrder.get(right.widgetId) ?? Number.MAX_SAFE_INTEGER)
+      ));
+    let widgetOrderIndex = 0;
+    state.terminalWidgets = state.terminalWidgets.map((widget) => (
+      widget.workspaceId === snapshot.id ? orderedWorkspaceWidgets[widgetOrderIndex++] : widget
+    ));
     restoreTerminalGroupLayouts(snapshot, widgetsBySnapshotId, paneIdBySnapshotPaneId);
   }
 
-  const active = activeWorkspaceTerminalPaneAtClamped(snapshot.activeTerminalIndex || 0);
+  const active = (restoredActivePaneId ? terminalPaneById.get(restoredActivePaneId) : null)
+    ?? activeWorkspaceTerminalPaneAtClamped(snapshot.activeTerminalIndex || 0);
   if (active) {
     const widget = terminalWidgetForPane(active);
     if (widget) {
@@ -18693,9 +19173,13 @@ function restoreTerminalGroupLayouts(
   const typingPadOpenByWidgetId = new Map<string, boolean>();
   const typingPadStateKnownWidgetIds = new Set<string>();
   const defaultFocusTargetByWidgetId = new Map<string, TerminalDefaultFocusTarget>();
+  const groupOrderByWidgetId = new Map<string, Map<string, number>>();
   for (const groupSnapshot of snapshot.terminalGroups) {
     const widget = widgetsBySnapshotId.get(groupSnapshot.widgetId);
     if (!widget) continue;
+    const groupOrder = groupOrderByWidgetId.get(widget.widgetId) ?? new Map<string, number>();
+    if (!groupOrder.has(groupSnapshot.groupId)) groupOrder.set(groupSnapshot.groupId, groupOrder.size);
+    groupOrderByWidgetId.set(widget.widgetId, groupOrder);
     if (typeof groupSnapshot.typingPadOpen === 'boolean') {
       typingPadStateKnownWidgetIds.add(widget.widgetId);
       typingPadOpenByWidgetId.set(
@@ -18727,6 +19211,13 @@ function restoreTerminalGroupLayouts(
     }
   }
   for (const widget of widgetsBySnapshotId.values()) {
+    const groupOrder = groupOrderByWidgetId.get(widget.widgetId);
+    if (groupOrder) {
+      widget.tabGroups.sort((left, right) => (
+        (groupOrder.get(left.groupId) ?? Number.MAX_SAFE_INTEGER)
+        - (groupOrder.get(right.groupId) ?? Number.MAX_SAFE_INTEGER)
+      ));
+    }
     if (typingPadStateKnownWidgetIds.has(widget.widgetId)) {
       widget.typingPadOpen = Boolean(typingPadOpenByWidgetId.get(widget.widgetId));
       syncTerminalTypingPadOpenToPanes(widget, widget.typingPadOpen);
@@ -18978,11 +19469,86 @@ function restoreImageTabs(snapshot: WorkspaceSnapshot) {
   state.activeImageTabId = imageTabForId(snapshot.activeImageTabId)
     ? snapshot.activeImageTabId
     : state.imageTabs[0].id;
-  syncImageStateFromActiveTab();
-  if (getPanel('image').classList.contains('hidden')) return;
+  if (getPanel('image').classList.contains('hidden')) {
+    syncImageStateFromActiveTab();
+    return;
+  }
   renderImageTabs();
+  showImageTabForDisplay(activeImageTab(), snapshot.id, 'idle');
+}
+
+function hydrateImageTabRefs(tab: ImageTabState, workspaceId = state.activeWorkspaceId) {
+  tab.dataUrl = hydrateWorkspaceImageDataUrl(workspaceId, `tab:${tab.id}`, tab.dataUrl);
+  tab.history = tab.history.map((item) => ({
+    ...item,
+    dataUrl: hydrateWorkspaceImageDataUrl(workspaceId, `history:${tab.id}:${item.id}`, item.dataUrl)
+  }));
+}
+
+function imageTabHasPersistedRefs(tab: ImageTabState) {
+  if (tab.dataUrl.startsWith(WORKSPACE_IMAGE_REF_PREFIX)) return true;
+  return tab.history.some((item) => item.dataUrl.startsWith(WORKSPACE_IMAGE_REF_PREFIX));
+}
+
+function cancelImageTabHydration() {
+  imageHydrationToken += 1;
+  imageHydratingTabId = '';
+}
+
+function showImageTabForDisplay(
+  tab: ImageTabState,
+  workspaceId = state.activeWorkspaceId,
+  timing: 'frame' | 'idle' = 'frame'
+) {
+  const token = ++imageHydrationToken;
+  if (!imageTabHasPersistedRefs(tab)) {
+    imageHydratingTabId = '';
+    syncImageStateFromActiveTab();
+    renderImagePreview();
+    invalidateImagePreviewLayout();
+    renderImageHistory();
+    return;
+  }
+
+  // Keep large data URLs out of the workspace-switch critical path. The persisted refs stay on
+  // the tab while a cheap loading shell paints, so snapshot writes cannot replace them with an
+  // empty preview before the local image cache is hydrated.
+  imageHydratingTabId = tab.id;
+  state.imagePreviewDataUrl = '';
+  state.imagePreviewLabel = 'Loading image preview...';
+  state.imageHistory = [];
+  state.imageHistoryVisible = tab.historyVisible;
+  state.imagePreviewZoom = normalizedImageZoom(tab.zoom);
+  state.imagePreviewOffsetX = tab.offsetX;
+  state.imagePreviewOffsetY = tab.offsetY;
   renderImagePreview();
+  invalidateImagePreviewLayout();
   renderImageHistory();
+
+  const hydrate = () => {
+    if (token !== imageHydrationToken) return;
+    if (state.activeWorkspaceId !== workspaceId || state.activeImageTabId !== tab.id) {
+      imageHydratingTabId = '';
+      return;
+    }
+    // Keep the guard while hidden. Clearing it here would let a later snapshot save copy the
+    // loading shell back over the tab's persisted refs before the panel is shown again.
+    if (getPanel('image').classList.contains('hidden')) return;
+    hydrateImageTabRefs(tab, workspaceId);
+    if (token !== imageHydrationToken || state.activeWorkspaceId !== workspaceId || state.activeImageTabId !== tab.id) return;
+    imageHydratingTabId = '';
+    syncImageStateFromActiveTab();
+    renderImageTabs();
+    renderImagePreview();
+    invalidateImagePreviewLayout();
+    renderImageHistory();
+  };
+
+  window.requestAnimationFrame(() => {
+    if (token !== imageHydrationToken) return;
+    if (timing === 'idle') runWhenUiIdle(hydrate, 900);
+    else window.setTimeout(hydrate, 0);
+  });
 }
 
 function restoredImageTabsFromSnapshot(snapshot: WorkspaceSnapshot) {
@@ -19047,6 +19613,7 @@ function loadNoteMemoryStore() {
     noteMemoryRecords = [];
   }
   compactNoteMemoryRecords();
+  noteMemoryStoreDirty = false;
 }
 
 function noteMemoryRecordsFromStore(value: unknown) {
@@ -19121,14 +19688,17 @@ function persistNoteMemoryStore() {
     window.clearTimeout(noteMemoryPersistTimer);
     noteMemoryPersistTimer = 0;
   }
+  if (!noteMemoryStoreDirty) return;
   compactNoteMemoryRecords();
   try {
     localStorage.setItem(NOTES_MEMORY_STORE_KEY, JSON.stringify({ version: 1, notes: noteMemoryRecords } satisfies NoteMemoryStore));
+    noteMemoryStoreDirty = false;
   } catch {
     while (noteMemoryRecords.length > 1) {
       noteMemoryRecords.pop();
       try {
         localStorage.setItem(NOTES_MEMORY_STORE_KEY, JSON.stringify({ version: 1, notes: noteMemoryRecords } satisfies NoteMemoryStore));
+        noteMemoryStoreDirty = false;
         return;
       } catch {
         // Keep pruning below.
@@ -19140,22 +19710,40 @@ function persistNoteMemoryStore() {
 
 function schedulePersistNoteMemoryStore(delayMs = 420) {
   if (noteMemoryPersistTimer) window.clearTimeout(noteMemoryPersistTimer);
-  noteMemoryPersistTimer = window.setTimeout(persistNoteMemoryStore, delayMs);
+  noteMemoryPersistTimer = window.setTimeout(() => {
+    noteMemoryPersistTimer = 0;
+    runWhenUiIdle(persistNoteMemoryStore, 900);
+  }, delayMs);
 }
 
-function queueNoteMemoryUpsert(tab: NoteTabState, options: { delayMs?: number } = {}) {
-  upsertNoteMemoryRecord(tab);
+interface NotePersistenceScope {
+  workspaceId: string;
+  profileId: string;
+  workspaceKey: string;
+}
+
+function currentNotePersistenceScope(): NotePersistenceScope | null {
+  const profile = state.activeProfile;
+  const workspaceKey = noteWorkspaceKey();
+  if (!profile || !state.activeWorkspaceId) return null;
+  return { workspaceId: state.activeWorkspaceId, profileId: profile.id, workspaceKey };
+}
+
+function queueNoteMemoryUpsert(
+  tab: NoteTabState,
+  options: { delayMs?: number; scope?: NotePersistenceScope | null } = {}
+) {
+  upsertNoteMemoryRecord(tab, options.scope ?? undefined);
   schedulePersistNoteMemoryStore(options.delayMs ?? 420);
 }
 
-function upsertNoteMemoryRecord(tab: NoteTabState) {
-  const profile = state.activeProfile;
-  const workspaceKey = noteWorkspaceKey();
-  if (!profile || !workspaceKey || !tab.path || tab.loading) return;
+function upsertNoteMemoryRecord(tab: NoteTabState, requestedScope?: NotePersistenceScope) {
+  const scope = requestedScope ?? currentNotePersistenceScope();
+  if (!scope?.workspaceKey || !tab.path || tab.loading) return;
   const record: NoteMemoryRecord = {
     id: tab.id,
-    profileId: profile.id,
-    workspaceKey,
+    profileId: scope.profileId,
+    workspaceKey: scope.workspaceKey,
     path: tab.path,
     title: tab.title || noteTitleFromPath(tab.path),
     customTitle: tab.customTitle,
@@ -19171,7 +19759,7 @@ function upsertNoteMemoryRecord(tab: NoteTabState) {
   ));
   if (index >= 0) noteMemoryRecords[index] = record;
   else noteMemoryRecords.unshift(record);
-  compactNoteMemoryRecords();
+  noteMemoryStoreDirty = true;
 }
 
 function removeNoteMemoryRecordForPath(profileId: string, path: string) {
@@ -19180,7 +19768,10 @@ function removeNoteMemoryRecordForPath(profileId: string, path: string) {
   noteMemoryRecords = noteMemoryRecords.filter((record) => (
     record.profileId !== profileId || noteMemoryPathKey(record.path) !== pathKey
   ));
-  if (noteMemoryRecords.length !== before) persistNoteMemoryStore();
+  if (noteMemoryRecords.length !== before) {
+    noteMemoryStoreDirty = true;
+    persistNoteMemoryStore();
+  }
 }
 
 function recoverableNoteMemoryRecords() {
@@ -19251,14 +19842,14 @@ function scheduleDeferredNoteHydration(workspaceId: string, profileId: string, t
 }
 
 async function hydrateDeferredNoteTabs(workspaceId: string, profileId: string, token = ++noteHydrationToken) {
-  if (state.activeWorkspaceId !== workspaceId) return;
+  if (state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId) return;
   const pending = noteTabsInHydrationOrder();
   if (!pending.length) return;
 
   for (const tab of pending) {
-    if (token !== noteHydrationToken || state.activeWorkspaceId !== workspaceId) return;
+    if (token !== noteHydrationToken || state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId) return;
     await hydrateNoteTabContent(tab, workspaceId, profileId);
-    if (state.activeWorkspaceId !== workspaceId) return;
+    if (state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId) return;
     if (!getPanel('notes').classList.contains('hidden') && tab.id === state.activeNoteTabId) {
       renderNoteTabs();
       renderNotes();
@@ -19266,7 +19857,7 @@ async function hydrateDeferredNoteTabs(workspaceId: string, profileId: string, t
     await yieldToUi();
   }
 
-  if (state.activeWorkspaceId !== workspaceId) return;
+  if (state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId) return;
   if (!getPanel('notes').classList.contains('hidden')) {
     renderNoteTabs();
     renderNotes();
@@ -19294,19 +19885,33 @@ async function hydrateNoteTabContent(tab: NoteTabState, workspaceId: string, pro
   } catch {
     content = '';
   }
-  if (state.activeWorkspaceId !== workspaceId) return;
+  if (state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId) return;
   const live = noteTabForId(tab.id);
   if (!live || live.dirty) return;
   live.content = content;
   live.loading = false;
   live.lastSavedAt = Date.now();
-  queueNoteMemoryUpsert(live);
+  queueNoteMemoryUpsert(live, { scope: currentNotePersistenceScope() });
 }
 
 async function ensureNotesReady() {
   if (!state.workspaceOpen || !state.activeProfile) return;
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile.id;
+  const workspaceKey = noteWorkspaceKey();
+  const active = noteTabForId(state.activeNoteTabId);
+  if (active?.loading) {
+    await hydrateNoteTabContent(active, workspaceId, profileId);
+  }
+  if (
+    state.activeWorkspaceId !== workspaceId
+    || state.activeProfile?.id !== profileId
+    || noteWorkspaceKey() !== workspaceKey
+    || !state.workspaceOpen
+    || getPanel('notes').classList.contains('hidden')
+  ) return;
   if (state.noteTabs.some((tab) => tab.loading)) {
-    await hydrateDeferredNoteTabs(state.activeWorkspaceId, state.activeProfile.id);
+    scheduleDeferredNoteHydration(workspaceId, profileId, 500);
   }
   if (!state.noteTabs.length) await createNoteTab({ focus: true });
   else {
@@ -19733,9 +20338,42 @@ async function loadSnippetsStore() {
     state.snippets = defaultSnippetsStore();
     setTextContentIfChanged(el.snippetsStatus, 'Load failed');
     el.snippetsStatus.classList.add('danger');
+  } finally {
+    snippetsStoreLoaded = true;
+    getPanel('snippets').removeAttribute('aria-busy');
+    setSnippetsStoreLoadingState(false);
   }
   renderSnippetTabs();
   renderSnippets();
+}
+
+function ensureSnippetsStoreLoaded() {
+  if (snippetsStoreLoaded) return Promise.resolve();
+  if (!snippetsStoreLoadPromise) {
+    getPanel('snippets').setAttribute('aria-busy', 'true');
+    setSnippetsStoreLoadingState(true);
+    snippetsStoreLoadPromise = loadSnippetsStore().finally(() => {
+      snippetsStoreLoadPromise = null;
+    });
+  }
+  return snippetsStoreLoadPromise;
+}
+
+function setSnippetsStoreLoadingState(loading: boolean) {
+  setDisabledIfChanged(el.snippetsNewTab, loading);
+  setDisabledIfChanged(el.snippetsSearch, loading);
+  setDisabledIfChanged(el.snippetsContent, loading);
+  setDisabledIfChanged(el.snippetsDescription, loading);
+  setDisabledIfChanged(el.snippetsSave, loading);
+  setDisabledIfChanged(el.snippetsCancel, loading);
+  if (loading) {
+    setTextContentIfChanged(el.snippetsStatus, 'Loading...');
+    el.snippetsStatus.classList.remove('danger');
+  }
+}
+
+function scheduleSnippetsStoreLoad() {
+  runWhenUiIdle(() => void ensureSnippetsStoreLoaded(), 1400);
 }
 
 async function persistSnippetsStore() {
@@ -19815,13 +20453,11 @@ function validIsoDate(value: unknown) {
 }
 
 function activeSnippetTab() {
-  state.snippets = normalizeSnippetsStore(state.snippets);
   return state.snippets.tabs.find((tab) => tab.id === state.snippets.activeTabId) ?? state.snippets.tabs[0];
 }
 
 function renderSnippetTabs() {
   if (getPanel('snippets').classList.contains('hidden')) return;
-  state.snippets = normalizeSnippetsStore(state.snippets);
   const signature = snippetTabsSignature();
   if (snippetTabsRenderSignature === signature) return;
   const orderSignature = snippetTabsOrderSignature();
@@ -20303,49 +20939,60 @@ function applyNotesBodyEdit(value: string, selectionStart: number, selectionEnd:
 function scheduleNoteSave(tab: NoteTabState, delayMs: number) {
   const existing = noteSaveTimers.get(tab.id);
   if (existing) window.clearTimeout(existing);
+  const scope = currentNotePersistenceScope();
   noteSaveTimers.set(tab.id, window.setTimeout(() => {
     noteSaveTimers.delete(tab.id);
-    void saveNoteTabNow(tab);
+    void saveNoteTabNow(tab, scope);
   }, delayMs));
 }
 
 async function saveActiveNoteNow() {
   const tab = activeNoteTab();
-  if (tab && shouldSaveNoteTabNow(tab)) await saveNoteTabNow(tab);
+  const scope = currentNotePersistenceScope();
+  if (tab && shouldSaveNoteTabNow(tab)) await saveNoteTabNow(tab, scope);
 }
 
 async function saveAllDirtyNotes() {
+  const scope = currentNotePersistenceScope();
   const pending: Promise<void>[] = [];
   for (const tab of state.noteTabs) {
-    if (shouldSaveNoteTabNow(tab)) pending.push(saveNoteTabNow(tab));
+    if (shouldSaveNoteTabNow(tab)) pending.push(saveNoteTabNow(tab, scope));
   }
   if (!pending.length) return;
   await Promise.all(pending);
 }
 
-async function saveNoteTabNow(tab: NoteTabState) {
+async function saveNoteTabNow(tab: NoteTabState, requestedScope: NotePersistenceScope | null = currentNotePersistenceScope()) {
   const timer = noteSaveTimers.get(tab.id);
   if (timer) window.clearTimeout(timer);
   noteSaveTimers.delete(tab.id);
   if (tab.loading && !tab.dirty) return;
-  if (!state.activeProfile || !tab.dirty) return;
-  const profileId = state.activeProfile.id;
+  if (!requestedScope || !tab.dirty) return;
+  const scope = requestedScope;
+  const profileId = scope.profileId;
   const content = tab.content;
   tab.saving = true;
-  renderNoteStatus();
+  const scopeIsCurrent = () => (
+    state.activeWorkspaceId === scope.workspaceId
+    && state.activeProfile?.id === scope.profileId
+    && noteTabForId(tab.id) === tab
+  );
+  if (scopeIsCurrent()) renderNoteStatus();
   try {
     await api.writeTextFile(profileId, tab.path, content);
-    invalidateExplorerParentDirectoryCache(profileId, tab.path);
+    invalidateExplorerParentDirectoryCache(profileId, tab.path, scope.workspaceId);
     tab.saving = false;
     tab.lastSavedAt = Date.now();
     if (tab.content === content) tab.dirty = false;
-    queueNoteMemoryUpsert(tab);
-    renderNoteTabs();
-    renderNoteStatus();
+    queueNoteMemoryUpsert(tab, { scope });
+    if (scopeIsCurrent()) {
+      renderNoteTabs();
+      renderNoteStatus();
+    }
   } catch (error) {
     tab.saving = false;
     tab.dirty = true;
-    renderNoteStatus(`Save failed: ${String(error)}`, true);
+    if (scopeIsCurrent()) renderNoteStatus(`Save failed: ${String(error)}`, true);
   }
 }
 
@@ -20855,6 +21502,76 @@ function runWhenUiIdle(callback: () => void, timeout = 700) {
   window.setTimeout(() => window.requestAnimationFrame(run), Math.min(timeout, 160));
 }
 
+function appendPerformanceDiagnostic(label: string, startedAt: number, details = '') {
+  if (state.ideSettings.debugLogEnabled !== true) return;
+  const duration = Math.max(0, performance.now() - startedAt);
+  appendDiagnosticLog('performance', `${label} duration=${duration.toFixed(1)}ms${details ? ` ${details}` : ''}`);
+}
+
+function startPerformanceLongTaskObserver() {
+  if (performanceLongTaskObserver || typeof PerformanceObserver === 'undefined') return;
+  try {
+    performanceLongTaskObserver = new PerformanceObserver((list) => {
+      if (state.ideSettings.debugLogEnabled !== true) return;
+      for (const entry of list.getEntries()) {
+        if (entry.duration < 50) continue;
+        const entryEndedAt = entry.startTime + entry.duration;
+        if (
+          performanceLongTaskCommitStartedAt >= 0
+          && entry.startTime <= performanceLongTaskCommitEndedAt
+          && entryEndedAt >= performanceLongTaskCommitStartedAt
+        ) continue;
+        pendingPerformanceLongTasks.push({
+          at: Math.round(performance.timeOrigin + entry.startTime),
+          duration: entry.duration
+        });
+        if (pendingPerformanceLongTasks.length > DIAGNOSTIC_LOG_MAX) pendingPerformanceLongTasks.shift();
+      }
+      schedulePerformanceLongTaskFlush();
+    });
+    performanceLongTaskObserver.observe({ entryTypes: ['longtask'] });
+  } catch {
+    performanceLongTaskObserver = null;
+  }
+}
+
+function schedulePerformanceLongTaskFlush() {
+  if (performanceLongTaskFlushScheduled || !pendingPerformanceLongTasks.length) return;
+  performanceLongTaskFlushScheduled = true;
+  runWhenUiIdle(flushPendingPerformanceLongTasks, 1200);
+}
+
+function flushPendingPerformanceLongTasks() {
+  performanceLongTaskFlushScheduled = false;
+  if (!pendingPerformanceLongTasks.length) return;
+  const pending = pendingPerformanceLongTasks.splice(0);
+  if (state.ideSettings.debugLogEnabled !== true) return;
+  for (const task of pending) {
+    diagnosticLogEntries.push({
+      at: task.at,
+      category: 'performance',
+      message: `long-task duration=${task.duration.toFixed(1)}ms`,
+      severity: 'info'
+    });
+  }
+  diagnosticLogEntries.sort((left, right) => right.at - left.at);
+  if (diagnosticLogEntries.length > DIAGNOSTIC_LOG_MAX) diagnosticLogEntries.length = DIAGNOSTIC_LOG_MAX;
+  const latest = diagnosticLogEntries[0];
+  if (latest) {
+    diagnosticLastEventAt = latest.at;
+    diagnosticLastEventCategory = latest.category;
+    diagnosticLastEventMessage = latest.message;
+  }
+  // Persist and repaint once per observer batch. Doing both for each entry can itself create a
+  // second long task and contaminate the diagnostic signal it is trying to measure.
+  performanceLongTaskCommitStartedAt = performance.now();
+  persistDiagnosticSessionSnapshot();
+  renderDiagnosticLogStatus();
+  renderDiagnosticLogPanel();
+  console.info(`[diag:performance] recorded ${pending.length} long task${pending.length === 1 ? '' : 's'}`);
+  performanceLongTaskCommitEndedAt = performance.now();
+}
+
 function uiBusyDelayMs() {
   const scrollPause = explorerScrollingUntil - Date.now();
   if (scrollPause > 0) return scrollPause + EXPLORER_SCROLL_IDLE_MS;
@@ -21019,7 +21736,10 @@ function showRestoredBrowserIdle(tab: BrowserTab) {
   disconnectActiveEdgeCdp();
   if (USE_NATIVE_BROWSER_WEBVIEW) {
     setEdgePreviewVisible(false);
-    if (!isBrowserPanelHidden()) void showNativeBrowserWebview(tab, { navigate: false });
+    hideNativeBrowserWebview();
+    toggleClassIfChanged(el.browserShell, 'has-preview', false);
+    logBrowserConsole('info', `Browser preview queued for ${tab.label}; shell UI restored first.`);
+    scheduleRestoredNativeBrowserResume(tab);
     return;
   }
   if (!USE_EDGE_CDP_BROWSER) {
@@ -21035,6 +21755,23 @@ function showRestoredBrowserIdle(tab: BrowserTab) {
   hideAllBrowserFrames();
   setEdgePreviewVisible(true);
   showEdgePreviewStatus(`Browser paused. Click "${tab.label}" or Reload to reconnect.`);
+}
+
+function scheduleRestoredNativeBrowserResume(tab: BrowserTab) {
+  const token = ++browserRestoreResumeToken;
+  const workspaceId = state.activeWorkspaceId;
+  runWhenUiIdle(() => {
+    if (token !== browserRestoreResumeToken) return;
+    if (state.activeWorkspaceId !== workspaceId || state.activeBrowserTabId !== tab.id) return;
+    if (document.hidden) {
+      window.setTimeout(() => {
+        if (token === browserRestoreResumeToken) scheduleRestoredNativeBrowserResume(tab);
+      }, 600);
+      return;
+    }
+    if (isBrowserPanelHidden() || nativeBrowserWebviewVisible) return;
+    void showNativeBrowserWebview(tab, { navigate: false });
+  }, 1600);
 }
 
 function workspaceLabel(profile: ConnectionProfile, root: string) {
@@ -21065,6 +21802,7 @@ function selectProfile(profileId: string): boolean {
 }
 
 function bindEvents() {
+  document.addEventListener('pointerdown', handleTerminalImeProtectedPointerDown, true);
   el.newWorkspaceTab.addEventListener('click', () => void createBlankWorkspaceTab());
   document.addEventListener('pointerover', handleWorkspaceHoverOnlyPointerOver, { passive: true });
   document.addEventListener('pointerout', handleWorkspaceHoverOnlyPointerOut, { passive: true });
@@ -21072,7 +21810,7 @@ function bindEvents() {
   el.profileSelect.addEventListener('change', async () => {
     saveActiveWorkspaceSnapshot();
     const canFillActiveEmptyWorkspace = workspaceSnapshotCanAcceptOpen(activeWorkspaceSnapshot());
-    if (state.workspaceOpen) await closeWorkspace();
+    if (state.workspaceOpen && !await closeWorkspace()) return;
     if (!canFillActiveEmptyWorkspace) state.activeWorkspaceId = '';
     renderWorkspaceTabs();
     selectProfile(el.profileSelect.value);
@@ -21407,6 +22145,7 @@ function bindEvents() {
   });
   window.addEventListener('beforeunload', () => {
     markDiagnosticSessionClean();
+    persistNoteMemoryStore();
     flushActiveWorkspaceSnapshotSave('flush');
     flushTerminalCwdSnapshotSave();
     flushWorkspaceStorePersist();
@@ -21484,7 +22223,8 @@ function handleContextMenuKeydown(event: KeyboardEvent) {
 
 function contextMenuItemsForEvent(event: MouseEvent): ContextMenuItem[] {
   const target = event.target as Element;
-  const workspaceTab = target.closest<HTMLElement>('.workspace-tab');
+  const workspaceTab = target.closest<HTMLElement>('.workspace-tab-label')
+    ?.closest<HTMLElement>('.workspace-tab') ?? null;
   if (workspaceTab?.dataset.workspaceId) return workspaceTabContextMenu(workspaceTab.dataset.workspaceId);
 
   const noteTab = target.closest<HTMLElement>('.note-tab');
@@ -21866,6 +22606,7 @@ function beginAppShutdownForClose() {
   suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
   stopAllEdgeDevtoolsSessions();
   disableCaptureProtectionForShutdown();
+  persistNoteMemoryStore();
   void api.shutdownRuntimeSessions().catch(() => undefined);
   setStatus('Closing Simple Vibe IDE...');
   return true;
@@ -21932,9 +22673,12 @@ async function prepareAgentBridgeForLlmLaunch(
     console.info(`${agentSessionLabel(normalized)} hook bridge is currently enabled only for WSL workspaces.`);
     return null;
   }
-  const hookState = normalized === 'claude'
-    ? await claudeLocalHookState(profile, cwd).catch(() => ({ hooksInstalled: false, envCurrent: false }))
-    : await grokGlobalHookState(profile).catch(() => ({ hooksInstalled: false, envCurrent: true }));
+  const hookStateKey = agentHookStateCacheKey(normalized, profile, cwd);
+  let hookState = await cachedAgentHookState(hookStateKey, () => (
+    normalized === 'claude'
+      ? claudeLocalHookState(profile, cwd)
+      : grokGlobalHookState(profile)
+  )).catch(() => ({ hooksInstalled: false, envCurrent: normalized === 'grok' }));
   if (hookMode === 'ask' && !hookState.hooksInstalled) {
     if (options.allowPrompt === false) return null;
     const approved = window.confirm(
@@ -21945,11 +22689,17 @@ async function prepareAgentBridgeForLlmLaunch(
     if (!approved) return null;
   }
   try {
-    if (hookMode === 'auto' || !hookState.hooksInstalled || !hookState.envCurrent) {
-      if (normalized === 'claude') await installClaudeLocalHooks(profile, cwd);
-      else await installGrokGlobalHooks(profile);
+    if (!hookState.hooksInstalled || !hookState.envCurrent) {
+      hookState = await installAgentHooksOnce(hookStateKey, async () => {
+        if (normalized === 'claude') await installClaudeLocalHooks(profile, cwd);
+        else await installGrokGlobalHooks(profile);
+      });
     }
-    const bridge = await api.agentBridgeInfo();
+    agentBridgeInfoPromise ??= api.agentBridgeInfo().catch((error) => {
+      agentBridgeInfoPromise = null;
+      throw error;
+    });
+    const bridge = await agentBridgeInfoPromise;
     return {
       agentId: normalized,
       sessionId: crypto.randomUUID().replace(/[^A-Za-z0-9_-]+/g, '_'),
@@ -21960,6 +22710,48 @@ async function prepareAgentBridgeForLlmLaunch(
     setStatus(`${agentSessionLabel(normalized)} hook bridge setup failed; falling back to terminal detection: ${String(error)}`, true);
     return null;
   }
+}
+
+function installAgentHooksOnce(key: string, installer: () => Promise<void>) {
+  const pending = agentHookInstallations.get(key);
+  if (pending) return pending;
+  const installation = installer()
+    .then((): AgentHookState => ({ hooksInstalled: true, envCurrent: true }))
+    .then((value) => {
+      agentHookStateCache.set(key, { value, cachedAt: Date.now() });
+      return value;
+    })
+    .finally(() => {
+      if (agentHookInstallations.get(key) === installation) agentHookInstallations.delete(key);
+    });
+  agentHookInstallations.set(key, installation);
+  return installation;
+}
+
+function agentHookStateCacheKey(agentId: string, profile: ConnectionProfile, cwd: string) {
+  return agentId === 'claude'
+    ? `${agentId}\0${profile.id}\0${cwd}`
+    : `${agentId}\0${profile.id}`;
+}
+
+async function cachedAgentHookState(
+  key: string,
+  loader: () => Promise<AgentHookState>
+): Promise<AgentHookState> {
+  const cached = agentHookStateCache.get(key);
+  if (cached && Date.now() - cached.cachedAt <= AGENT_HOOK_STATE_CACHE_MS) return cached.value;
+  const pending = agentHookStateReads.get(key);
+  if (pending) return pending;
+  const read = loader()
+    .then((value) => {
+      agentHookStateCache.set(key, { value, cachedAt: Date.now() });
+      return value;
+    })
+    .finally(() => {
+      if (agentHookStateReads.get(key) === read) agentHookStateReads.delete(key);
+    });
+  agentHookStateReads.set(key, read);
+  return read;
 }
 
 async function claudeLocalHookState(profile: ConnectionProfile, cwd: string) {
@@ -23384,28 +24176,40 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
   if (visible) {
     if (wasHidden) syncAppGlassOwnerTargets(panel);
     if (wasHidden) applyStoredLayoutRatio(panel);
-    if (!options.skipFocus) {
+    if (wasHidden && restoringWorkspace) renderWorkspacePanelLoadingShell(id);
+    if (!options.skipFocus && !restoringWorkspace) {
       bringPanelToFront(panel);
       if (!wasHidden) pinPanelToWorkspace(panel);
       setKeyboardResizeTarget({ kind: 'panel', id });
     }
     if (id === 'editor' && wasHidden && !restoringWorkspace) void ensureEditorReady();
-    if (id === 'notes' && wasHidden && !restoringWorkspace) void ensureNotesReady();
-    if (id === 'snippets' && wasHidden && !restoringWorkspace) {
-      renderSnippetTabs();
-      renderSnippets();
-      el.snippetsSearch.focus();
+    if (id === 'notes' && wasHidden && !restoringWorkspace) {
+      // Paint the current workspace's loading/empty note state before any file RPC so a hidden
+      // panel can never reveal the previous workspace's textarea for a frame.
+      renderNoteTabs();
+      renderNotes();
+      void ensureNotesReady();
+    }
+    if (id === 'snippets' && wasHidden) {
+      const focusWhenLoaded = !restoringWorkspace && !options.skipFocus;
+      void ensureSnippetsStoreLoaded().then(() => {
+        if (getPanel('snippets').classList.contains('hidden')) return;
+        renderSnippetTabs();
+        renderSnippets();
+        if (focusWhenLoaded) el.snippetsSearch.focus();
+      });
     }
     if (id === 'image' && wasHidden && !restoringWorkspace) {
       renderImageTabs();
-      renderImagePreview();
-      invalidateImagePreviewLayout();
-      renderImageHistory();
+      showImageTabForDisplay(activeImageTab(), state.activeWorkspaceId, 'frame');
     }
     if (id === 'calculator' && wasHidden && !restoringWorkspace) renderCalculator();
     if (id === 'settings' && wasHidden) renderSettings();
     if (id === 'explorer' && wasHidden && state.workspaceOpen && !restoringWorkspace) {
       if (shouldLoadExplorerDirectoryOnShow()) {
+        if (state.currentDir) state.explorerLoading.add(state.currentDir);
+        explorerRenderDirty = true;
+        renderExplorer();
         void loadDirectory(state.currentDir);
       } else {
         if (explorerRenderDirty || !el.fileList.childElementCount) renderExplorer();
@@ -23862,35 +24666,67 @@ async function openWorkspace(path: string) {
 
 function loadWorkspaceDirectoryInBackground(path: string, profileId: string, workspaceId: string) {
   if (!path || IS_TERMINAL_APP) return;
-  runWhenUiIdle(() => {
-    if (state.activeWorkspaceId !== workspaceId || state.activeProfile?.id !== profileId || !state.workspaceOpen) return;
+  // Directory RPC runs on Tauri's blocking worker. Start it after the next paint instead of
+  // waiting for the WebView to become idle, which could add almost a second under Glass load.
+  window.requestAnimationFrame(() => {
+    if (
+      state.activeWorkspaceId !== workspaceId
+      || state.activeProfile?.id !== profileId
+      || !state.workspaceOpen
+      || !sameExplorerPath(state.currentDir, path)
+    ) return;
     void openWorkspace(path).catch((error) => {
-      if (state.activeWorkspaceId === workspaceId && state.activeProfile?.id === profileId && state.workspaceOpen) {
+      if (
+        state.activeWorkspaceId === workspaceId
+        && state.activeProfile?.id === profileId
+        && state.workspaceOpen
+        && sameExplorerPath(state.currentDir, path)
+      ) {
+        state.explorerLoading.delete(path);
+        explorerRenderDirty = true;
+        if (isPanelVisible('explorer')) renderExplorer();
         setStatus(explorerAuthErrorMessage(error, 'load directory'), true);
       }
     });
-  }, 900);
+  });
 }
 
 async function switchWorkspace(path: string) {
+  const operationGeneration = ++workspaceActivationGeneration;
+  const pathOperationGeneration = ++workspacePathSwitchGeneration;
   if (!state.activeProfile) {
     setStatus('Select a profile first', true);
     return;
   }
   const profile = state.activeProfile;
   await saveAllDirtyNotes();
-  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
-  state.workspaceRoot = path;
-  state.currentDir = path;
-  el.rootInput.value = path;
+  if (
+    operationGeneration !== workspaceActivationGeneration
+    || pathOperationGeneration !== workspacePathSwitchGeneration
+    || state.activeProfile?.id !== profile.id
+  ) return;
+  const cancelledRestore = cancelWorkspaceRestore();
+  const pathRestoreGeneration = workspaceRestoreGeneration;
+  restoringWorkspace = false;
+  if (!cancelledRestore) saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   ensureWorkspaceTabForOpen();
+  const workspaceId = state.activeWorkspaceId;
   markWorkspaceActive(state.activeWorkspaceId);
-  await closeTerminalsForWorkspace(state.activeWorkspaceId, {
+  await closeTerminalsForWorkspace(workspaceId, {
     backgroundKill: true,
     saveSnapshot: false,
     renderShellTabs: false
   });
-  discardWorkspacePreviewRuntime(state.activeWorkspaceId);
+  if (
+    pathOperationGeneration !== workspacePathSwitchGeneration
+    || workspaceRestoreGeneration !== pathRestoreGeneration
+    || state.activeWorkspaceId !== workspaceId
+    || state.activeProfile?.id !== profile.id
+  ) return;
+  state.workspaceRoot = path;
+  state.currentDir = path;
+  el.rootInput.value = path;
+  discardWorkspacePreviewRuntime(workspaceId);
   clearWorkspacePanels();
   if (profileLoadsWorkspaceDirectoryInBackground(profile) && !IS_TERMINAL_APP) {
     refreshTitle();
@@ -23910,10 +24746,23 @@ async function switchWorkspace(path: string) {
     return;
   }
   await openWorkspace(path);
+  if (
+    pathOperationGeneration !== workspacePathSwitchGeneration
+    || workspaceRestoreGeneration !== pathRestoreGeneration
+    || state.activeWorkspaceId !== workspaceId
+    || state.activeProfile?.id !== profile.id
+    || !sameExplorerPath(state.currentDir, path)
+  ) return;
   setWorkspaceOpen(true);
   revealWorkspaceOpenSurface();
   if (IS_TERMINAL_APP) {
     const widget = await createTerminal(null, 'shell', { cwd: path });
+    if (
+      pathOperationGeneration !== workspacePathSwitchGeneration
+      || workspaceRestoreGeneration !== pathRestoreGeneration
+      || state.activeWorkspaceId !== workspaceId
+      || state.activeProfile?.id !== profile.id
+    ) return;
     if (widget) revealWorkspaceOpenSurface({ terminalWidget: widget, showExplorer: false });
   }
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
@@ -23932,11 +24781,31 @@ function discardWorkspacePreviewRuntime(workspaceId: string) {
   removeWorkspaceRuntimeCache(workspaceId);
 }
 
-async function closeWorkspace(options: { killTerminals?: boolean; preserveCaptureProtection?: boolean } = {}) {
+async function closeWorkspace(options: {
+  killTerminals?: boolean;
+  preserveCaptureProtection?: boolean;
+  activationGeneration?: number;
+} = {}) {
+  const operationGeneration = options.activationGeneration ?? ++workspaceActivationGeneration;
   await saveAllDirtyNotes();
+  if (operationGeneration !== workspaceActivationGeneration) return false;
+  workspacePathSwitchGeneration += 1;
+  const cancelledRestore = cancelWorkspaceRestore();
+  const cancellationGeneration = workspaceRestoreGeneration;
   const workspaceId = state.activeWorkspaceId;
-  if (workspaceId && state.activeProfile && state.workspaceOpen) {
+  if (!cancelledRestore && workspaceId && state.activeProfile && state.workspaceOpen) {
     flushActiveWorkspaceSnapshotSave('defer');
+  }
+  if (options.killTerminals && workspaceId) {
+    await closeTerminalsForWorkspace(workspaceId, {
+      backgroundKill: true,
+      saveSnapshot: false,
+      renderShellTabs: false
+    });
+    if (operationGeneration !== workspaceActivationGeneration) {
+      if (workspaceRestoreGeneration === cancellationGeneration) restoringWorkspace = false;
+      return false;
+    }
   }
   closeNativeBrowserWebviewsForWorkspace(workspaceId);
   if (!options.preserveCaptureProtection) {
@@ -23951,18 +24820,13 @@ async function closeWorkspace(options: { killTerminals?: boolean; preserveCaptur
   setInputValueIfChanged(el.profileSelect, '');
   setInputValueIfChanged(el.rootInput, '');
   if (el.rootInput.placeholder !== 'select a profile first') el.rootInput.placeholder = 'select a profile first';
-  if (options.killTerminals && workspaceId) {
-    await closeTerminalsForWorkspace(workspaceId, {
-      backgroundKill: true,
-      saveSnapshot: false,
-      renderShellTabs: false
-    });
-  }
   hideAllTerminalWidgets();
   clearWorkspacePanels();
   renderExplorer();
   refreshTitle();
   setWorkspaceOpen(false);
+  restoringWorkspace = false;
+  return true;
 }
 
 async function closeAllTerminals() {
@@ -24289,7 +25153,7 @@ function enqueueTerminalInputPacket(
 }
 
 function drainTerminalInputQueue(pane: TerminalPane) {
-  if (pane.closed || pane.inputWritePromise || !pane.backendId) return;
+  if (pane.closed || pane.inputReconnectFrozen || pane.inputWritePromise || !pane.backendId) return;
   const packet = pane.inputWriteQueue?.[0];
   if (!packet) return;
   if (packet.expectedBackendId && packet.expectedBackendId !== pane.backendId) {
@@ -24377,7 +25241,7 @@ function profileNeedsExplorerShellReadyGate(profile: ConnectionProfile | null | 
 }
 
 function profileLoadsWorkspaceDirectoryInBackground(profile: ConnectionProfile | null | undefined) {
-  return profile?.kind === 'ssh' || profile?.kind === 'wsl';
+  return Boolean(profile);
 }
 
 function terminalShellReadyProfile(pane: TerminalPane) {
@@ -24538,6 +25402,7 @@ function queueWorkspaceDirectoryLoadAfterShellReady(
     async () => {
       if (state.activeWorkspaceId !== workspaceId) return;
       if (state.activeProfile?.id !== profile.id || !state.workspaceOpen) return;
+      if (!sameExplorerPath(state.currentDir, path)) return;
       if (state.explorerSignatures.has(path)) {
         scheduleExplorerWatch(1200);
         return;
@@ -24569,6 +25434,32 @@ async function flushTerminalInput(pane: TerminalPane): Promise<void> {
   const data = pane.inputWriteBuffer;
   pane.inputWriteBuffer = '';
   await enqueueTerminalInputPacket(pane, data);
+}
+
+async function drainTerminalInputBeforeReconnect(pane: TerminalPane) {
+  const deadline = performance.now() + TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS;
+  try {
+    await withTimeout(
+      flushTerminalInput(pane),
+      TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS,
+      'Draining terminal input before tmux reconnect'
+    );
+  } catch {
+    return false;
+  }
+  while (
+    !pane.closed
+    && (pane.inputWritePromise || pane.inputWriteQueue?.length || pane.inputWriteBuffer)
+    && performance.now() < deadline
+  ) {
+    const pending = pane.inputWritePromise;
+    if (pending) await Promise.race([pending.catch(() => undefined), delay(16)]);
+    else {
+      drainTerminalInputQueue(pane);
+      await delay(16);
+    }
+  }
+  return !pane.inputWritePromise && !pane.inputWriteQueue?.length && !pane.inputWriteBuffer;
 }
 
 function failPendingTerminalInput(pane: TerminalPane, reason: string) {
@@ -24744,6 +25635,7 @@ function flushVisibleTerminalWidgetPanes(widget: TerminalWidget, options: { reas
     if (!pane || terminalPaneVisibility(pane) !== 'visible') continue;
     flushTerminalWriteBuffer(pane);
     refreshTerminalViewportIfRecentOutput(pane);
+    scheduleTerminalWebglPromotion(pane);
     scheduleTerminalRenderWatchdog(pane);
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     flushed += 1;
@@ -24786,15 +25678,18 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   state.imagePreviewZoom = 1;
   state.imagePreviewOffsetX = 0;
   state.imagePreviewOffsetY = 0;
+  imageOpenRequestToken += 1;
+  imageHistoryPreviewRequestToken += 1;
+  imagePasteSaveRequestToken += 1;
   state.imageHistory = [];
   state.imageHistoryVisible = false;
+  cancelImageTabHydration();
   state.imageTabs = [];
   clearImageTabLookup();
   state.activeImageTabId = '';
   if (renderIntermediate) ensureImageTab();
   for (const timer of noteSaveTimers.values()) window.clearTimeout(timer);
   noteSaveTimers.clear();
-  persistNoteMemoryStore();
   noteHydrationToken += 1;
   state.noteTabs = [];
   clearNoteTabLookup();
@@ -24829,8 +25724,9 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
   markBrowserConsoleLogsChanged();
   setInputValueIfChanged(el.previewUrl, '');
   hideBrowserAddressSuggestions();
-  if (state.activeWorkspaceId) hideBrowserFramesForWorkspace(state.activeWorkspaceId);
-  else hideAllBrowserFrames();
+  // activeWorkspaceId already points at the destination during a tab switch, so hiding only that
+  // workspace can leave the previous workspace's iframe visible until primary hydration finishes.
+  hideAllBrowserFrames();
   disconnectActiveEdgeCdp();
   hideNativeBrowserWebview({ all: true });
   setEdgePreviewVisible(false);
@@ -24852,6 +25748,7 @@ function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {
 }
 
 function clearExplorerBackgroundWork() {
+  explorerRootLoadToken += 1;
   endExplorerDragSession();
   cancelExplorerWatchSchedule();
   cancelExplorerHoverPrefetch();
@@ -25225,11 +26122,14 @@ function applyLoadedDirectory(path: string, entries: FileEntry[]) {
 
 async function loadDirectory(path: string) {
   if (!state.activeProfile) return;
+  const loadToken = ++explorerRootLoadToken;
+  const loadStartedAt = performance.now();
   const profileId = state.activeProfile.id;
   const workspaceId = state.activeWorkspaceId;
   const cached = cachedExplorerDirectory(profileId, path, workspaceId);
   if (cached) {
     applyLoadedDirectory(path, cached);
+    appendPerformanceDiagnostic('explorer-first-rows', loadStartedAt, `source=cache entries=${cached.length}`);
     setStatus('Directory loaded from cache');
     saveActiveWorkspaceSnapshot();
     scheduleCachedExplorerDirectoryRefresh(path, profileId, workspaceId, {
@@ -25239,15 +26139,30 @@ async function loadDirectory(path: string) {
     });
     return;
   }
+  deferExplorerDirectoryRestore(path, profileId, workspaceId);
   setStatus(`Loading ${path}...`);
   try {
     const entries = await fetchExplorerDirectory(profileId, path, workspaceId);
-    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    if (
+      loadToken !== explorerRootLoadToken
+      || state.activeProfile?.id !== profileId
+      || state.activeWorkspaceId !== workspaceId
+      || !sameExplorerPath(state.currentDir, path)
+    ) return;
     applyLoadedDirectory(path, entries);
+    appendPerformanceDiagnostic('explorer-first-rows', loadStartedAt, `source=rpc entries=${entries.length}`);
     setStatus('Directory loaded');
     saveActiveWorkspaceSnapshot();
   } catch (error) {
-    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    if (
+      loadToken !== explorerRootLoadToken
+      || state.activeProfile?.id !== profileId
+      || state.activeWorkspaceId !== workspaceId
+      || !sameExplorerPath(state.currentDir, path)
+    ) return;
+    state.explorerLoading.delete(path);
+    explorerRenderDirty = true;
+    renderExplorer();
     setStatus(explorerAuthErrorMessage(error, 'load directory'), true);
   }
 }
@@ -25377,6 +26292,19 @@ function rebuildExplorerVisibleRows() {
   explorerRenderedEnd = -1;
   explorerRenderedTotal = -1;
   appendExplorerVisibleRows(state.entries, 0);
+  if (!explorerVisibleRows.length && state.currentDir && state.explorerLoading.has(state.currentDir)) {
+    const loadingPath = `${state.currentDir}::loading`;
+    explorerVisibleRows.push({
+      entry: null,
+      path: loadingPath,
+      pathKey: explorerPathKey(loadingPath),
+      depth: 0,
+      loading: true,
+      disclosureText: '',
+      sizeText: '',
+      staticSignature: 'loading\t0'
+    });
+  }
 }
 
 function appendExplorerVisibleRows(entries: FileEntry[], depth: number) {
@@ -25944,49 +26872,6 @@ function explorerMeasurementFont() {
   ].join(' ');
 }
 
-function ensureExplorerMeasureRow() {
-  if (!explorerMeasureHost) {
-    explorerMeasureHost = document.createElement('div');
-    explorerMeasureHost.setAttribute('aria-hidden', 'true');
-    explorerMeasureHost.setAttribute('data-liquid-ignore', '');
-    explorerMeasureHost.style.position = 'fixed';
-    explorerMeasureHost.style.left = '-10000px';
-    explorerMeasureHost.style.top = '-10000px';
-    explorerMeasureHost.style.visibility = 'hidden';
-    explorerMeasureHost.style.pointerEvents = 'none';
-    explorerMeasureHost.style.zIndex = '-1';
-    explorerMeasureHost.style.contain = 'layout style';
-    document.body.append(explorerMeasureHost);
-  }
-  if (!explorerMeasureRow) {
-    explorerMeasureRow = document.createElement('div');
-    explorerMeasureRow.className = 'file-row';
-    explorerMeasureRow.style.position = 'relative';
-    explorerMeasureRow.style.width = 'max-content';
-    explorerMeasureRow.style.minWidth = 'max-content';
-    explorerMeasureRow.style.contain = 'none';
-    explorerMeasureRow.style.pointerEvents = 'none';
-    explorerMeasureDisclosure = document.createElement('span');
-    explorerMeasureDisclosure.className = 'file-disclosure';
-    explorerMeasureName = document.createElement('span');
-    explorerMeasureName.className = 'file-name';
-    explorerMeasureName.style.overflow = 'visible';
-    explorerMeasureName.style.textOverflow = 'clip';
-    explorerMeasureName.style.whiteSpace = 'nowrap';
-    explorerMeasureName.style.minWidth = 'max-content';
-    explorerMeasureSize = document.createElement('small');
-    explorerMeasureRow.append(explorerMeasureDisclosure, explorerMeasureName, explorerMeasureSize);
-    explorerMeasureHost.append(explorerMeasureRow);
-  }
-  if (explorerMeasureRow.parentElement !== explorerMeasureHost) explorerMeasureHost.append(explorerMeasureRow);
-  return {
-    row: explorerMeasureRow,
-    disclosure: explorerMeasureDisclosure!,
-    name: explorerMeasureName!,
-    size: explorerMeasureSize!
-  };
-}
-
 function pruneExplorerRowWidthMeasureCache() {
   if (explorerRowWidthMeasureCache.size <= 2000) return;
   const excess = explorerRowWidthMeasureCache.size - 1600;
@@ -26003,19 +26888,10 @@ function measureExplorerRowContentWidth(rowInfo: ExplorerVisibleRow, hideSizes: 
   const cached = explorerRowWidthMeasureCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const parts = ensureExplorerMeasureRow();
-  const entry = rowInfo.entry;
-  parts.row.className = `file-row ${entry?.kind ?? 'loading'}`;
-  parts.row.style.setProperty('--depth', String(rowInfo.depth));
-  parts.row.style.gridTemplateColumns = hideSizes ? '20px max-content' : '22px max-content max-content';
-  parts.row.style.gap = hideSizes ? '5px' : '6px';
-  parts.disclosure.textContent = rowInfo.disclosureText;
-  parts.name.textContent = entry?.name ?? 'Loading...';
-  parts.size.textContent = hideSizes ? '' : rowInfo.sizeText;
-  parts.size.style.display = hideSizes ? 'none' : '';
-  const measured = Math.ceil(parts.row.getBoundingClientRect().width);
-  const fallback = calculateExplorerSemanticRowWidthFallback(rowInfo, hideSizes, font);
-  const width = Math.max(measured, fallback);
+  // Virtualization must not force layout once per row before its first paint. Canvas text metrics
+  // plus the known grid/padding geometry are deterministic and intentionally include a small
+  // safety margin for font hinting, including long Korean names.
+  const width = calculateExplorerSemanticRowWidthFallback(rowInfo, hideSizes, font);
   explorerRowWidthMeasureCache.set(cacheKey, width);
   pruneExplorerRowWidthMeasureCache();
   return width;
@@ -29511,6 +30387,7 @@ function createImageTab(seed?: Partial<ImageTabState>, activate = true, id: stri
   rememberImageTab(tab, index);
   if (!state.activeImageTabId) state.activeImageTabId = tab.id;
   if (activate) {
+    cancelImageTabHydration();
     state.activeImageTabId = tab.id;
     syncImageStateFromActiveTab();
     renderImageTabs();
@@ -29527,11 +30404,9 @@ function activateImageTab(id: string) {
   const tab = imageTabForId(id);
   if (!tab) return;
   state.activeImageTabId = tab.id;
-  syncImageStateFromActiveTab();
   renderImageTabActivation(previousActiveId, tab);
+  showImageTabForDisplay(tab, state.activeWorkspaceId, 'frame');
   if (previousActiveId !== tab.id) {
-    renderImagePreview();
-    renderImageHistory();
     saveActiveWorkspaceSnapshot();
   }
 }
@@ -29545,6 +30420,7 @@ function closeImageTab(id: string) {
   const index = imageTabIndexById(id);
   if (index < 0) return;
   const closingTab = state.imageTabs[index];
+  if (imageHydratingTabId === closingTab.id) cancelImageTabHydration();
   forgetImageTab(closingTab);
   state.imageTabs.splice(index, 1);
   refreshImageTabIndexLookup(index);
@@ -29553,10 +30429,8 @@ function closeImageTab(id: string) {
     const next = state.imageTabs[index] ?? state.imageTabs[index - 1] ?? state.imageTabs[0];
     state.activeImageTabId = next.id;
   }
-  syncImageStateFromActiveTab();
   renderImageTabs();
-  renderImagePreview();
-  renderImageHistory();
+  showImageTabForDisplay(activeImageTab(), state.activeWorkspaceId, 'frame');
   saveActiveWorkspaceSnapshot();
 }
 
@@ -29714,7 +30588,7 @@ function syncImageStateFromActiveTab() {
 
 function syncActiveImageTabFromState() {
   const tab = imageTabForId(state.activeImageTabId);
-  if (!tab) return;
+  if (!tab || imageHydratingTabId === tab.id) return;
   tab.dataUrl = state.imagePreviewDataUrl;
   tab.label = state.imagePreviewLabel;
   tab.history = state.imageHistory;
@@ -29726,6 +30600,20 @@ function syncActiveImageTabFromState() {
 
 async function openImageFile(path: string): Promise<boolean> {
   if (!state.activeProfile) return false;
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  const requestedTab = activeImageTab();
+  const requestToken = ++imageOpenRequestToken;
+  const previousLabel = state.imagePreviewLabel;
+  setPanelVisible('image', true);
+  setTextContentIfChanged(el.imageLabel, 'Opening image...');
+  await nextAnimationFrame();
+  if (
+    state.activeWorkspaceId !== workspaceId
+    || state.activeProfile?.id !== profileId
+    || state.activeImageTabId !== requestedTab.id
+    || imageTabForId(requestedTab.id) !== requestedTab
+  ) return false;
   setStatus(`Opening image ${path}...`);
   try {
     const existing = imageTabForSourcePath(path);
@@ -29736,10 +30624,18 @@ async function openImageFile(path: string): Promise<boolean> {
       return true;
     }
 
-    const dataUrl = await api.readFileDataUrl(state.activeProfile.id, path);
+    const dataUrl = await api.readFileDataUrl(profileId, path);
+    if (
+      requestToken !== imageOpenRequestToken
+      || state.activeWorkspaceId !== workspaceId
+      || state.activeProfile?.id !== profileId
+      || state.activeImageTabId !== requestedTab.id
+      || imageTabForId(requestedTab.id) !== requestedTab
+    ) return false;
     const tab = state.imageOpenInNewTab && activeImageTab().dataUrl
       ? createImageTab(undefined, true)
       : activeImageTab();
+    cancelImageTabHydration();
     setImageTabSourcePath(tab, path);
     tab.dataUrl = dataUrl;
     tab.label = `Image selected: ${path}`;
@@ -29753,6 +30649,14 @@ async function openImageFile(path: string): Promise<boolean> {
     saveActiveWorkspaceSnapshot();
     return true;
   } catch (error) {
+    if (
+      requestToken === imageOpenRequestToken
+      && state.activeWorkspaceId === workspaceId
+      && state.activeImageTabId === requestedTab.id
+      && imageTabForId(requestedTab.id) === requestedTab
+    ) {
+      setTextContentIfChanged(el.imageLabel, previousLabel);
+    }
     setStatus(String(error), true);
     return false;
   }
@@ -30158,33 +31062,99 @@ function ensureTerminalRuntime() {
   terminalRuntimePromise ??= Promise.all([
     import('@xterm/xterm'),
     import('@xterm/addon-fit'),
-    import('@xterm/addon-unicode11'),
-    import('@xterm/addon-webgl').catch(() => null)
-  ]).then(([terminalModule, fitModule, unicodeModule, webglModule]) => ({
+    import('@xterm/addon-unicode11')
+  ]).then(([terminalModule, fitModule, unicodeModule]) => ({
     Terminal: terminalModule.Terminal,
     FitAddon: fitModule.FitAddon,
-    Unicode11Addon: unicodeModule.Unicode11Addon,
-    WebglAddon: webglModule?.WebglAddon
+    Unicode11Addon: unicodeModule.Unicode11Addon
   }));
   return terminalRuntimePromise;
 }
 
-function scheduleTerminalRuntimeWarmup() {
-  runWhenUiIdle(() => {
-    void ensureTerminalRuntime().catch(() => undefined);
-  }, 1400);
+function ensureTerminalWebglRuntime() {
+  terminalWebglRuntimePromise ??= import('@xterm/addon-webgl')
+    .then((module): TerminalWebglRuntime => ({ WebglAddon: module.WebglAddon }))
+    .catch((error) => {
+      console.warn('Terminal WebGL runtime unavailable; keeping DOM renderer.', error);
+      return null;
+    });
+  return terminalWebglRuntimePromise;
 }
 
-function maybeLoadTerminalWebglAddon(term: XTermTerminal, runtime: TerminalRuntime) {
-  if (state.ideSettings.terminalRenderer !== 'auto' || !runtime.WebglAddon) return null;
-  try {
-    const addon = new runtime.WebglAddon();
-    term.loadAddon(addon);
-    return addon;
-  } catch (error) {
-    console.warn('Terminal WebGL renderer unavailable; falling back to DOM renderer.', error);
-    return null;
+function scheduleTerminalRuntimeWarmup() {
+  // Core terminal code is on the shell-start critical path. Warm it immediately after the first
+  // chrome paint; optional WebGL remains split out and is loaded only for a visible live pane.
+  window.requestAnimationFrame(() => {
+    window.setTimeout(() => void ensureTerminalRuntime().catch(() => undefined), 0);
+  });
+}
+
+async function promoteTerminalPaneToWebgl(pane: TerminalPane) {
+  if (!isTerminalPaneAlive(pane) || pane.webgl || pane.webglContextLost || pane.webglPromotionUnavailable) return;
+  if (state.ideSettings.terminalRenderer !== 'auto') return;
+  if (!terminalLlmShouldUseWebglRenderer(terminalPaneLlmId(pane))) return;
+  if (terminalPaneVisibility(pane) !== 'visible' || !pane.backendId) return;
+  const runtime = await ensureTerminalWebglRuntime();
+  if (!runtime) {
+    pane.webglPromotionUnavailable = true;
+    const widget = terminalWidgetForPane(pane);
+    if (widget) updateTerminalWidgetRendererBadge(widget, pane);
+    return;
   }
+  if (
+    !isTerminalPaneAlive(pane)
+    || pane.webgl
+    || pane.webglContextLost
+    || pane.webglPromotionUnavailable
+    || !pane.backendId
+  ) return;
+  if (
+    state.ideSettings.terminalRenderer !== 'auto'
+    || !terminalLlmShouldUseWebglRenderer(terminalPaneLlmId(pane))
+    || terminalPaneVisibility(pane) !== 'visible'
+  ) return;
+  let addon: XTermWebglAddon | undefined;
+  try {
+    addon = new runtime.WebglAddon();
+    pane.term.loadAddon(addon);
+    pane.webgl = addon;
+    registerTerminalWebglContextLoss(pane);
+    const widget = terminalWidgetForPane(pane);
+    if (widget) updateTerminalWidgetRendererBadge(widget, pane);
+  } catch (error) {
+    pane.webglPromotionUnavailable = true;
+    if (pane.webgl === addon) pane.webgl = undefined;
+    pane.webglContextLossDisposable?.dispose();
+    pane.webglContextLossDisposable = undefined;
+    try {
+      addon?.dispose();
+    } catch {
+      // xterm remains on its DOM renderer if a partially initialized addon cannot be disposed.
+    }
+    const widget = terminalWidgetForPane(pane);
+    if (widget) updateTerminalWidgetRendererBadge(widget, pane);
+    console.warn('Terminal WebGL renderer unavailable; falling back to DOM renderer.', error);
+  }
+}
+
+function scheduleTerminalWebglPromotion(pane: TerminalPane) {
+  if (
+    !isTerminalPaneAlive(pane)
+    || pane.webglPromotionScheduled
+    || pane.webgl
+    || pane.webglContextLost
+    || pane.webglPromotionUnavailable
+    || !pane.backendId
+    || terminalPaneVisibility(pane) !== 'visible'
+  ) return;
+  if (state.ideSettings.terminalRenderer !== 'auto') return;
+  if (!terminalLlmShouldUseWebglRenderer(terminalPaneLlmId(pane))) return;
+  pane.webglPromotionScheduled = true;
+  runWhenUiIdle(() => {
+    void promoteTerminalPaneToWebgl(pane).finally(() => {
+      pane.webglPromotionScheduled = false;
+    });
+  }, 900);
 }
 
 function terminalLlmShouldUseWebglRenderer(llmId: string | null | undefined) {
@@ -30573,7 +31543,6 @@ function createTerminalWidget(title: string, cwd: string, options: CreateTermina
   const grips = ensureResizeGrips(card, 'terminal');
   if (options.rect) applyLayoutRatio(card, options.rect);
   else placeTerminalCard(card, options);
-  scheduleAppGlassOwnerRefresh(card, { delay: 120, reason: 'terminal-create' });
 
   const widget: TerminalWidget = {
     widgetId,
@@ -31102,6 +32071,9 @@ function terminalHistoryCacheForPane(pane: TerminalPane) {
 }
 
 function clearTerminalHistoryCache(pane: TerminalPane) {
+  if (pane.historyFlushTimer) window.clearTimeout(pane.historyFlushTimer);
+  pane.historyFlushTimer = undefined;
+  pane.historyPendingBuffer = '';
   pane.historyCache = undefined;
   const widget = terminalWidgetForPane(pane);
   if (widget) {
@@ -31118,6 +32090,22 @@ function appendTerminalHistoryCache(pane: TerminalPane, data: string) {
   appendTerminalHistoryPlainText(cache, complete);
   trimTerminalHistoryCache(pane);
   syncTerminalHistoryControlsForPane(pane);
+}
+
+function scheduleTerminalHistoryCacheAppend(pane: TerminalPane, data: string) {
+  if (!data || !terminalHistoryCacheLimits().enabled) return;
+  pane.historyPendingBuffer = `${pane.historyPendingBuffer ?? ''}${data}`;
+  if (pane.historyFlushTimer) return;
+  pane.historyFlushTimer = window.setTimeout(() => {
+    pane.historyFlushTimer = undefined;
+    flushTerminalHistoryCacheAppend(pane);
+  }, TERMINAL_HISTORY_ANALYSIS_BATCH_MS);
+}
+
+function flushTerminalHistoryCacheAppend(pane: TerminalPane) {
+  const pending = pane.historyPendingBuffer ?? '';
+  pane.historyPendingBuffer = '';
+  if (pending) appendTerminalHistoryCache(pane, pending);
 }
 
 function terminalHistoryCompletePlainChunk(cache: TerminalHistoryCache, data: string) {
@@ -31295,6 +32283,11 @@ function openTerminalHistoryOverlay(
   pane: TerminalPane,
   options: { source?: 'button' | 'top-scroll' } = {}
 ) {
+  if (pane.historyFlushTimer) {
+    window.clearTimeout(pane.historyFlushTimer);
+    pane.historyFlushTimer = undefined;
+  }
+  flushTerminalHistoryCacheAppend(pane);
   if (!terminalHasCachedHistory(pane)) {
     setStatus(state.ideSettings.terminalHistoryCache === 'off'
       ? 'Terminal history cache is disabled in Settings'
@@ -31615,6 +32608,7 @@ async function createTerminalTab(
   title: string,
   options: CreateTerminalOptions = {}
 ) {
+  const terminalCreateStartedAt = performance.now();
   const terminalProfile = options.profile ?? profileForTerminalWidget(widget) ?? state.activeProfile;
   if (!terminalProfile) return null;
   const terminalCwd = options.cwd ?? activePaneForWidget(widget)?.cwd ?? workspaceShellCwd();
@@ -31626,6 +32620,7 @@ async function createTerminalTab(
   host.dataset.paneId = paneId;
   widget.hostStack.append(host);
   const runtime = await ensureTerminalRuntime();
+  appendPerformanceDiagnostic('terminal-core-ready', terminalCreateStartedAt);
   const terminalLlmId = normalizeTerminalLlmId(options.llmId) ?? undefined;
 
   const term = new runtime.Terminal({
@@ -31644,9 +32639,7 @@ async function createTerminalTab(
   applyTerminalCompatibilityForLlm(term, terminalLlmId);
   term.loadAddon(fit);
   term.open(host);
-  const webgl = terminalLlmShouldUseWebglRenderer(terminalLlmId)
-    ? maybeLoadTerminalWebglAddon(term, runtime) ?? undefined
-    : undefined;
+  appendPerformanceDiagnostic('terminal-dom-open', terminalCreateStartedAt);
 
   const pane: TerminalPane = {
     paneId,
@@ -31662,8 +32655,8 @@ async function createTerminalTab(
     cwd: terminalCwd,
     term,
     fit,
-    webgl,
     webglContextLost: false,
+    webglPromotionUnavailable: false,
     element: widget.element,
     host,
     outputBuffer: '',
@@ -31684,7 +32677,6 @@ async function createTerminalTab(
     lastRows: term.rows,
     lastCols: term.cols
   };
-  registerTerminalWebglContextLoss(pane);
   scheduleTerminalStartupWatch(pane, terminalProfile, title);
   state.terminals.push(pane);
   terminalPaneById.set(pane.paneId, pane);
@@ -31713,7 +32705,8 @@ async function createTerminalTab(
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
-    handleTerminalInputData(pane, orderTerminalImeOnData(pane, data));
+    appendTerminalImeOnDataDiagnostic(pane, data);
+    handleTerminalInputData(pane, data);
   });
   host.addEventListener('paste', (event) => handleTerminalPaste(event, pane), true);
   host.addEventListener('wheel', (event) => handleTerminalWheel(event, pane), { capture: true, passive: false });
@@ -31778,6 +32771,11 @@ async function createTerminalTab(
       return pane;
     }
     setTerminalBackendId(pane, backendId);
+    appendPerformanceDiagnostic(
+      'terminal-backend-attached',
+      terminalCreateStartedAt,
+      `kind=${terminalProfile.kind}`
+    );
     if (pane.backendId !== backendId) {
       throw new Error(`${terminalProfile.kind.toUpperCase()} shell exited during startup`);
     }
@@ -31786,6 +32784,8 @@ async function createTerminalTab(
       pane.startupError = undefined;
     }
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
+    scheduleTerminalWebglPromotion(pane);
+    scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-ready' });
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
       // Startup may finish tens of seconds after creation. Honor the current keyboard owner
@@ -31811,6 +32811,7 @@ async function createTerminalTab(
       term.write('\r\nShell startup timed out. Close this shell and try again, or reopen the workspace.\r\n');
     }
     term.write(`\r\nFailed to start terminal: ${String(error)}\r\n`);
+    scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-failed' });
     setStatus(String(error), true);
   }
   return pane;
@@ -32853,17 +33854,16 @@ function updateTerminalWidgetRendererBadge(widget: TerminalWidget, pane = active
 }
 
 async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: string) {
-  const candidates = [
+  const candidates = new Set([
     requestedCwd,
     state.currentDir,
     state.workspaceRoot,
     profile.root,
     profile.kind === 'windows' ? '' : '~'
-  ].filter(Boolean);
+  ].filter((candidate): candidate is string => candidate !== undefined && candidate !== null));
   for (const candidate of candidates) {
     try {
-      await api.listDirectory(profile.id, candidate, false);
-      return candidate;
+      if (await api.profileDirectoryIsDir(profile.id, candidate)) return candidate;
     } catch {
       // Try the next likely folder without surfacing private paths.
     }
@@ -32896,21 +33896,42 @@ function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
     return;
   }
 
-  textarea.addEventListener('compositionstart', () => beginTerminalImeDomComposition(pane));
-  textarea.addEventListener('compositionupdate', () => updateTerminalImeDomComposition(pane));
-  textarea.addEventListener('compositionend', () => {
-    beginTerminalImeCommitWait(pane);
-    finishTerminalImeCompositionGuard(pane);
+  textarea.addEventListener('compositionstart', (event) => {
+    appendTerminalImeCompositionDiagnostic(pane, 'compositionstart', event, textarea);
+    beginTerminalImeDomComposition(pane);
   });
-  // xterm normally clears its helper textarea on blur. Preserve and restore the value around that
-  // handler while an IME transaction is live, otherwise an Alt-Tab/pane switch with a delayed or
-  // missing compositionend destroys the only canonical Hangul source before xterm can finalize.
-  textarea.addEventListener('blur', () => preserveTerminalImeTextareaBeforeBlur(pane, textarea), true);
-  textarea.addEventListener('blur', () => restoreTerminalImeTextareaAfterBlur(pane, textarea));
-  // No 'blur' -> finish handler on purpose: a transient blur mid-composition would schedule a
-  // refocus right across xterm's compositionend finalization window (it re-reads the textarea on a
-  // setTimeout(0)) and drop the last Hangul syllable. The fallback timer already releases a stuck
-  // composition, so blur-based release is both redundant and harmful.
+  textarea.addEventListener('compositionupdate', (event) => {
+    appendTerminalImeCompositionDiagnostic(pane, 'compositionupdate', event, textarea);
+    updateTerminalImeDomComposition(pane);
+  });
+  textarea.addEventListener('compositionend', (event) => {
+    appendTerminalImeCompositionDiagnostic(pane, 'compositionend', event, textarea);
+    pane.imeDomComposing = false;
+    pane.imeCompositionStartedAt = undefined;
+    finishTerminalImeCompositionGuard(pane);
+    releasePendingTerminalImeUiSwitch(pane);
+    releaseDeferredTerminalImeBlur(pane, textarea);
+  });
+  textarea.addEventListener('beforeinput', (event) => {
+    appendTerminalImeInputDiagnostic(pane, 'beforeinput', event as InputEvent, textarea);
+  }, true);
+  textarea.addEventListener('input', (event) => {
+    appendTerminalImeInputDiagnostic(pane, 'input', event as InputEvent, textarea);
+  }, true);
+  textarea.addEventListener('blur', (event) => {
+    appendTerminalImeDiagnostic(pane, 'blur', terminalImeTextareaDiagnostic(textarea));
+    // Never write a saved preedit string back into xterm's helper textarea. JavaScript can restore
+    // its value and selection, but not the native Windows IME marked range; reconstructing it here
+    // can therefore duplicate the commit or lose the final syllable on the next composition event.
+    // Instead, keep xterm's own textarea untouched until its canonical composition finalizer has
+    // read it. This capture listener blocks only xterm's unconditional blur-clear while a native
+    // composition is live; no value or selection is reconstructed by the app.
+    if (pane.imeDomComposing) {
+      event.stopImmediatePropagation();
+      pane.imeDeferredXtermBlur = true;
+      pane.host.querySelector('.xterm')?.classList.remove('focus');
+    }
+  }, true);
 }
 
 function handleTerminalInputData(pane: TerminalPane, data: string) {
@@ -32927,8 +33948,6 @@ function handleTerminalInputData(pane: TerminalPane, data: string) {
 }
 
 function beginTerminalImeDomComposition(pane: TerminalPane) {
-  if (!pane.imeAwaitingXtermCommit) clearTerminalImeCommitKeyState(pane);
-  clearTerminalImeBlurPreservation(pane);
   pane.imeCompositionStartedAt = performance.now();
   pane.imeDomComposing = true;
   beginTerminalImeCompositionGuard(pane);
@@ -32939,200 +33958,191 @@ function updateTerminalImeDomComposition(pane: TerminalPane) {
   beginTerminalImeCompositionGuard(pane);
 }
 
-function preserveTerminalImeTextareaBeforeBlur(pane: TerminalPane, textarea: HTMLTextAreaElement) {
-  if (!pane.imeDomComposing && !pane.imeAwaitingXtermCommit) return;
-  pane.imeBlurPreservedValue = textarea.value;
-  pane.imeBlurPreservedSelectionStart = textarea.selectionStart;
-  pane.imeBlurPreservedSelectionEnd = textarea.selectionEnd;
-}
-
-function restoreTerminalImeTextareaAfterBlur(pane: TerminalPane, textarea: HTMLTextAreaElement) {
-  const value = pane.imeBlurPreservedValue;
-  if (value === undefined) return;
-  textarea.value = value;
-  const start = pane.imeBlurPreservedSelectionStart;
-  const end = pane.imeBlurPreservedSelectionEnd;
-  if (start !== null && start !== undefined && end !== null && end !== undefined) {
-    try {
-      textarea.setSelectionRange(start, end);
-    } catch {
-      // A detached helper textarea can reject selection restoration during pane disposal.
-    }
-  }
-}
-
-function clearTerminalImeBlurPreservation(pane: TerminalPane) {
-  pane.imeBlurPreservedValue = undefined;
-  pane.imeBlurPreservedSelectionStart = undefined;
-  pane.imeBlurPreservedSelectionEnd = undefined;
-}
-
-// xterm registers its compositionend listener during term.open(), before this app listener. Its
-// pinned 6.0 CompositionHelper therefore schedules the canonical textarea-delta send first; this
-// following zero-delay fallback runs after it. Do not replace that source with event.data:
-// Chromium can report stale data and Korean final consonants can migrate on the next vowel.
-function beginTerminalImeCommitWait(pane: TerminalPane) {
-  pane.imeDomComposing = false;
-  pane.imeCompositionStartedAt = undefined;
-  pane.imeAwaitingXtermCommit = true;
-  if (pane.imeCommitFallbackTimer) window.clearTimeout(pane.imeCommitFallbackTimer);
-  if (pane.imeDeferredKeyClearTimer) {
-    window.clearTimeout(pane.imeDeferredKeyClearTimer);
-    pane.imeDeferredKeyClearTimer = undefined;
-  }
-  pane.imeCommitFallbackTimer = window.setTimeout(() => {
-    pane.imeCommitFallbackTimer = undefined;
-    if (!pane.imeAwaitingXtermCommit) return;
-    pane.imeAwaitingXtermCommit = false;
-    const heldKey = pane.imeHeldCommitKey;
-    pane.imeHeldCommitKey = undefined;
-    pane.imeDeferredCommitKey = undefined;
-    clearTerminalImeBlurPreservation(pane);
-    pane.imeSuppressCommitKeypress = Boolean(heldKey && pane.imeCommitKeyReleasePending);
-    scheduleTerminalImeCommitKeyClear(pane);
-    // Only replay a terminator that xterm actually emitted onData before its canonical commit.
-    // A mere keydown hint is insufficient because candidate selection may consume Space/Enter.
-    if (heldKey) handleTerminalInputData(pane, heldKey);
+function releaseDeferredTerminalImeBlur(pane: TerminalPane, textarea = terminalPaneTextarea(pane)) {
+  if (!pane.imeDeferredXtermBlur) return;
+  pane.imeDeferredXtermBlur = false;
+  window.setTimeout(() => {
+    if (!textarea?.isConnected || document.activeElement === textarea || pane.imeDomComposing) return;
+    // Re-deliver the blur only after xterm's earlier compositionend timer has consumed the
+    // textarea. This lets xterm run its normal cleanup/focus notification without clearing preedit.
+    textarea.dispatchEvent(new FocusEvent('blur'));
   }, 0);
 }
 
-function orderTerminalImeOnData(pane: TerminalPane, data: string) {
-  if (!pane.imeAwaitingXtermCommit) return data;
-  if (data.startsWith('\x1b')) {
-    // DEC focus/mouse/application-key reports can fire from xterm while the composition timer is
-    // pending. They are independent PTY input and must not consume the canonical IME boundary.
-    return data;
-  }
-  const deferredKey = pane.imeDeferredCommitKey;
-  if (deferredKey && terminalDataIsOnlyImeCommitKey(data, deferredKey)) {
-    pane.imeHeldCommitKey = deferredKey;
-    return '';
-  }
-  const heldKey = pane.imeHeldCommitKey;
-  pane.imeAwaitingXtermCommit = false;
-  if (pane.imeCommitFallbackTimer) window.clearTimeout(pane.imeCommitFallbackTimer);
-  pane.imeCommitFallbackTimer = undefined;
-  pane.imeDeferredCommitKey = undefined;
-  pane.imeHeldCommitKey = undefined;
-  clearTerminalImeBlurPreservation(pane);
-  const observedDeferredKey = deferredKey === ' '
-    ? data.endsWith(' ')
-    : deferredKey === '\r'
-      ? data.endsWith('\r') || data.endsWith('\n')
-      : false;
-  pane.imeSuppressCommitKeypress = Boolean(
-    pane.imeCommitKeyReleasePending && (heldKey || observedDeferredKey)
-  );
-  scheduleTerminalImeCommitKeyClear(pane);
-  if (heldKey === ' ') return data.endsWith(' ') ? data : `${data} `;
-  if (heldKey === '\r') {
-    if (data.endsWith('\r')) return data;
-    if (data.endsWith('\n')) return `${data.replace(/\r?\n$/, '')}\r`;
-    return `${data}\r`;
-  }
-  // A blocked keypress keeps its browser default, so xterm's textarea delta includes real
-  // delimiters but excludes candidate-navigation keys consumed by the IME. Normalize an observed
-  // Enter newline, but never append a key based on the keydown hint alone.
-  if (deferredKey === '\r' && data.endsWith('\n')) return `${data.replace(/\r?\n$/, '')}\r`;
-  return data;
+function deferTerminalImeUiSwitch(pane: TerminalPane, label: string, run: () => void) {
+  if (!pane.imeDomComposing) return false;
+  if (pendingTerminalImeUiSwitch) window.clearTimeout(pendingTerminalImeUiSwitch.timer);
+  const timer = window.setTimeout(() => {
+    if (pendingTerminalImeUiSwitch?.sourcePaneId !== pane.paneId) return;
+    pendingTerminalImeUiSwitch = null;
+    setStatus(`Cancelled ${label}: finish or cancel the active IME composition, then try again`, true);
+  }, 15_000);
+  pendingTerminalImeUiSwitch = { sourcePaneId: pane.paneId, label, run, timer };
+  setStatus(`Finish the active IME composition before ${label}`);
+  return true;
 }
 
-function terminalDataIsOnlyImeCommitKey(data: string, key: ' ' | '\r') {
-  if (key === ' ') return data === ' ';
-  return data === '\r' || data === '\n' || data === '\r\n';
+function releasePendingTerminalImeUiSwitch(pane: TerminalPane) {
+  const pending = pendingTerminalImeUiSwitch;
+  if (!pending || pending.sourcePaneId !== pane.paneId) return;
+  window.clearTimeout(pending.timer);
+  pendingTerminalImeUiSwitch = null;
+  // xterm registered compositionend before this listener and queued its canonical textarea read
+  // first. This zero-delay task therefore runs after that commit without reconstructing preedit.
+  window.setTimeout(pending.run, 0);
 }
 
-function terminalImeCommitKey(event: KeyboardEvent): ' ' | '\r' | null {
-  if (event.ctrlKey || event.metaKey || event.altKey) return null;
-  if (event.code === 'Space' || event.key === ' ') return ' ';
-  if (event.code === 'Enter' || event.code === 'NumpadEnter' || event.key === 'Enter') return '\r';
-  return null;
+function cancelPendingTerminalImeUiSwitch(pane: TerminalPane) {
+  if (pendingTerminalImeUiSwitch?.sourcePaneId !== pane.paneId) return;
+  window.clearTimeout(pendingTerminalImeUiSwitch.timer);
+  pendingTerminalImeUiSwitch = null;
 }
 
-function handleTerminalImeKeyEvent(
-  event: KeyboardEvent,
-  pane: TerminalPane
-): 'block' | 'xterm' | null {
-  if (
-    pane.imeDomComposing
-    && event.type === 'keydown'
-    && !event.isComposing
-    && event.key !== 'Process'
-    && ![16, 17, 18, 20, 229].includes(event.keyCode)
-  ) {
-    // If Chromium omits compositionend, xterm deliberately finalizes on the next ordinary
-    // non-composing keydown. Release only our guard so that supported recovery path can run now
-    // instead of swallowing keys until the long candidate-selection fallback.
-    releaseTerminalImeAppCompositionGuard(pane);
-    return 'xterm';
-  }
-  const commitKey = terminalImeCommitKey(event);
-  const releaseKey = pane.imeCommitKeyReleasePending;
-  if (releaseKey && event.type === 'keydown') {
-    // A new physical keydown means a missing keyup left stale suppression behind. Commit
-    // metadata remains owned by xterm onData/fallback while that older commit is still pending.
-    if (pane.imeAwaitingXtermCommit) {
-      pane.imeCommitKeyReleasePending = undefined;
-      pane.imeSuppressCommitKeypress = false;
-    } else {
-      clearTerminalImeCommitKeyState(pane);
-    }
-  } else if (releaseKey && commitKey === releaseKey && event.type === 'keypress') {
-    if (pane.imeDomComposing || pane.imeAwaitingXtermCommit) return 'block';
-    if (pane.imeSuppressCommitKeypress) {
-      event.preventDefault();
-      event.stopPropagation();
-      return 'block';
-    }
-  } else if (releaseKey && commitKey === releaseKey && event.type === 'keyup') {
-    const imeStillOwnsKey = Boolean(pane.imeDomComposing || pane.imeAwaitingXtermCommit);
-    if (pane.imeAwaitingXtermCommit) {
-      pane.imeCommitKeyReleasePending = undefined;
-      pane.imeSuppressCommitKeypress = false;
-    } else {
-      clearTerminalImeCommitKeyState(pane);
-    }
-    return imeStillOwnsKey ? 'block' : null;
-  }
+function handleTerminalImeProtectedPointerDown(event: PointerEvent) {
+  const pane = activeTerminalPane();
+  if (!pane?.imeDomComposing || !(event.target instanceof Element)) return;
+  const target = event.target;
 
-  const imeOwnsKey = pane.imeDomComposing
-    || pane.imeAwaitingXtermCommit
-    || event.isComposing;
-  if (!imeOwnsKey) return null;
-  if (event.type === 'keydown' && commitKey && !pane.imeAwaitingXtermCommit) {
-    stageTerminalImeCommitKey(pane, commitKey);
-  }
-  return 'block';
-}
-
-function stageTerminalImeCommitKey(pane: TerminalPane, key: ' ' | '\r') {
-  pane.imeDeferredCommitKey = key;
-  pane.imeCommitKeyReleasePending = key;
-  scheduleTerminalImeCommitKeyClear(pane);
-}
-
-function scheduleTerminalImeCommitKeyClear(pane: TerminalPane) {
-  if (pane.imeDeferredKeyClearTimer) window.clearTimeout(pane.imeDeferredKeyClearTimer);
-  if (!pane.imeDeferredCommitKey && !pane.imeCommitKeyReleasePending) {
-    pane.imeDeferredKeyClearTimer = undefined;
+  const workspaceTab = target.closest<HTMLElement>('.workspace-tab-label')
+    ?.closest<HTMLElement>('.workspace-tab') ?? null;
+  const workspaceId = workspaceTab ? workspaceIdForTabElement(workspaceTab) : '';
+  if (workspaceId && workspaceId === state.activeWorkspaceId) {
+    cancelPendingTerminalImeUiSwitch(pane);
     return;
   }
-  pane.imeDeferredKeyClearTimer = window.setTimeout(() => {
-    pane.imeDeferredKeyClearTimer = undefined;
-    pane.imeDeferredCommitKey = undefined;
-    pane.imeHeldCommitKey = undefined;
-    pane.imeCommitKeyReleasePending = undefined;
-    pane.imeSuppressCommitKeypress = false;
-  }, TERMINAL_IME_DEFERRED_KEY_CLEAR_MS);
+  if (workspaceId && workspaceId !== state.activeWorkspaceId) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    deferTerminalImeUiSwitch(pane, 'switching workspace', () => void activateWorkspaceTab(workspaceId, { imeSettled: true }));
+    return;
+  }
+
+  const terminalCard = target.closest<HTMLElement>('.terminal-card');
+  if (!terminalCard) return;
+  const widget = terminalWidgetForElement(terminalCard);
+  if (!widget) return;
+  const paneElement = target.closest<HTMLElement>('.terminal-host[data-pane-id], .terminal-split-leaf[data-pane-id]');
+  let targetPane = paneElement?.dataset.paneId ? terminalPaneById.get(paneElement.dataset.paneId) ?? null : null;
+  const groupTab = target.closest<HTMLElement>('.terminal-tab-list .widget-tab-label')
+    ?.closest<HTMLElement>('.widget-tab[data-group-id]') ?? null;
+  if (!targetPane && groupTab) {
+    targetPane = activePaneForTerminalGroup(terminalGroupById(widget, groupTab.dataset.groupId ?? ''));
+  }
+  if (!targetPane) return;
+  if (targetPane.paneId === pane.paneId) {
+    cancelPendingTerminalImeUiSwitch(pane);
+    return;
+  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  deferTerminalImeUiSwitch(pane, 'switching shell pane', () => setActivePane(targetPane!.paneId, {
+    imeSettled: true
+  }));
 }
 
-function clearTerminalImeCommitKeyState(pane: TerminalPane) {
-  if (pane.imeDeferredKeyClearTimer) window.clearTimeout(pane.imeDeferredKeyClearTimer);
-  pane.imeDeferredKeyClearTimer = undefined;
-  pane.imeDeferredCommitKey = undefined;
-  pane.imeHeldCommitKey = undefined;
-  pane.imeCommitKeyReleasePending = undefined;
-  pane.imeSuppressCommitKeypress = false;
+function appendTerminalImeCompositionDiagnostic(
+  pane: TerminalPane,
+  type: string,
+  event: CompositionEvent,
+  textarea: HTMLTextAreaElement
+) {
+  appendTerminalImeDiagnostic(
+    pane,
+    type,
+    `dataLen=${event.data?.length ?? 0} ${terminalImeTextareaDiagnostic(textarea)}`
+  );
+}
+
+function appendTerminalImeInputDiagnostic(
+  pane: TerminalPane,
+  type: string,
+  event: InputEvent,
+  textarea: HTMLTextAreaElement
+) {
+  appendTerminalImeDiagnostic(
+    pane,
+    type,
+    [
+      `inputType=${sanitizeDiagnosticLogPart(event.inputType || 'unknown', 32)}`,
+      `eventComposing=${event.isComposing ? 1 : 0}`,
+      `composed=${event.composed ? 1 : 0}`,
+      terminalImeDataDiagnostic(event.data ?? ''),
+      terminalImeTextareaDiagnostic(textarea)
+    ].join(' ')
+  );
+}
+
+function appendTerminalImeKeyDiagnostic(pane: TerminalPane, event: KeyboardEvent) {
+  if (state.ideSettings.debugLogEnabled !== true) return;
+  const key = event.code === 'Space' || event.key === ' '
+    ? 'space'
+    : event.code === 'Enter' || event.code === 'NumpadEnter' || event.key === 'Enter'
+      ? 'enter'
+      : event.key === 'Process' || event.keyCode === 229
+        ? 'process'
+        : 'other';
+  if (key === 'other' && !pane.imeDomComposing && !event.isComposing) return;
+  appendTerminalImeDiagnostic(
+    pane,
+    event.type,
+    `key=${key} keyCode=${event.keyCode} eventComposing=${event.isComposing ? 1 : 0} domComposing=${pane.imeDomComposing ? 1 : 0}`
+  );
+}
+
+function appendTerminalImeOnDataDiagnostic(pane: TerminalPane, data: string) {
+  if (state.ideSettings.debugLogEnabled !== true) return;
+  if (
+    !pane.imeComposing
+    && !pane.imeDomComposing
+    && !/[^\x00-\x7f]/.test(data)
+    && data !== ' '
+    && data !== '\r'
+    && data !== '\n'
+  ) return;
+  appendTerminalImeDiagnostic(pane, 'onData', terminalImeDataDiagnostic(data));
+}
+
+function appendTerminalImeDiagnostic(pane: TerminalPane, type: string, details: string) {
+  if (state.ideSettings.debugLogEnabled !== true) return;
+  pane.imeTraceSequence = (pane.imeTraceSequence ?? 0) + 1;
+  const pending = pane.imeTracePending ?? (pane.imeTracePending = []);
+  pending.push(`seq=${pane.imeTraceSequence} type=${type} ${details}`);
+  if (pending.length > 24) pending.splice(0, pending.length - 24);
+  if (pane.imeTraceFlushTimer) return;
+  pane.imeTraceFlushTimer = window.setTimeout(() => flushTerminalImeDiagnostics(pane), 50);
+}
+
+function flushTerminalImeDiagnostics(pane: TerminalPane) {
+  pane.imeTraceFlushTimer = undefined;
+  const pending = pane.imeTracePending ?? [];
+  pane.imeTracePending = [];
+  while (pending.length) {
+    let message = `pane=${pane.paneId.slice(0, 6)}`;
+    while (pending.length && message.length + pending[0].length < DIAGNOSTIC_LOG_MESSAGE_MAX_CHARS - 8) {
+      message += ` | ${pending.shift()}`;
+    }
+    if (message === `pane=${pane.paneId.slice(0, 6)}`) message += ` | ${pending.shift()!.slice(0, 180)}`;
+    appendDiagnosticLog('terminal-ime', message);
+  }
+}
+
+function terminalImeTextareaDiagnostic(textarea: HTMLTextAreaElement) {
+  return `valueLen=${textarea.value.length} selection=${textarea.selectionStart ?? -1}-${textarea.selectionEnd ?? -1}`;
+}
+
+function terminalImeDataDiagnostic(data: string) {
+  let nonAscii = 0;
+  let controls = 0;
+  let spaces = 0;
+  let newlines = 0;
+  for (const char of data) {
+    const code = char.charCodeAt(0);
+    if (code > 0x7f) nonAscii += 1;
+    if (char === ' ') spaces += 1;
+    if (char === '\r' || char === '\n') newlines += 1;
+    if (code < 0x20 || code === 0x7f) controls += 1;
+  }
+  return `dataLen=${data.length} nonAscii=${nonAscii} controls=${controls} spaces=${spaces} newlines=${newlines}`;
 }
 
 function beginTerminalImeCompositionGuard(pane: TerminalPane) {
@@ -33180,8 +34190,6 @@ function releaseTerminalImeAppCompositionGuard(
   pane.imeDomComposing = false;
   pane.imeCompositionStartedAt = undefined;
   pane.imeComposing = false;
-  clearTerminalImeBlurPreservation(pane);
-  clearTerminalImeCommitKeyState(pane);
   scheduleFitTerminal(pane);
   if (
     options.recoverFocus
@@ -33512,15 +34520,32 @@ function scheduleFitTerminalWidget(widget: TerminalWidget, options: { activeOnly
 }
 
 function handleTerminalKey(event: KeyboardEvent, pane: TerminalPane) {
-  // Let xterm's textarea-delta CompositionHelper own the committed text, but keep all xterm key
-  // paths out of its setTimeout(0) finalize window. Space/Enter are staged and ordered after the
-  // canonical composition onData without reading private xterm state or CompositionEvent.data.
-  const imeDisposition = handleTerminalImeKeyEvent(event, pane);
-  if (imeDisposition === 'block') return false;
-  if (imeDisposition === 'xterm') return true;
-  // A 229 key outside an actual DOM composition is xterm's supported path for punctuation and
-  // replacement input. Let CompositionHelper inspect the helper textarea after the event.
-  if (event.type === 'keydown' && event.keyCode === 229) return true;
+  appendTerminalImeKeyDiagnostic(pane, event);
+  if (
+    pane.imeDomComposing
+    && event.type === 'keydown'
+    && !event.isComposing
+    && event.key !== 'Process'
+    && ![16, 17, 18, 20, 229].includes(event.keyCode)
+  ) {
+    // Chromium can omit compositionend. Release only the app's layout/focus guard and let
+    // xterm synchronously finalize its own composition before processing this ordinary key.
+    releaseTerminalImeAppCompositionGuard(pane);
+    releasePendingTerminalImeUiSwitch(pane);
+    releaseDeferredTerminalImeBlur(pane);
+    return true;
+  }
+  if (
+    pane.imeComposing
+    || pane.imeDomComposing
+    || event.isComposing
+    || event.key === 'Process'
+    || event.keyCode === 229
+  ) {
+    // xterm's CompositionHelper is the sole owner of committed text and Space/Enter ordering.
+    // Blocking these events in the custom handler bypasses its finalize path and can drop keys.
+    return true;
+  }
   setTerminalTextTarget('shell');
 
   if (isWidgetFocusShortcut(event)) {
@@ -33670,7 +34695,9 @@ function handleTerminalPaste(event: ClipboardEvent, pane: TerminalPane) {
 }
 
 async function pasteTerminalClipboard(pane: TerminalPane) {
+  const imageScope = currentImagePasteEntryScope();
   if (await pasteNativeClipboardImageToTarget('shell')) return;
+  if (imageScope && !imagePasteEntryScopeIsCurrent(imageScope)) return;
   await pasteTerminalText(pane);
 }
 
@@ -33738,7 +34765,6 @@ function nextFrame() {
 }
 
 async function settleTerminalInitialFit(pane: TerminalPane) {
-  await nextFrame();
   await nextFrame();
   fitTerminal(pane);
 }
@@ -33949,11 +34975,24 @@ function focusActiveTerminalPaneWhenItOwnsKeyboard() {
   focusTerminalPaneWhenReady(pane, { recovery: true });
 }
 
-function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
+function setActivePane(
+  paneId: string,
+  options: { focus?: boolean; imeSettled?: boolean } = {}
+) {
   const pane = terminalPaneById.get(paneId);
   if (!pane) return;
   if (pane.workspaceId !== state.activeWorkspaceId) return;
   const previousPaneId = state.activePaneId;
+  const previousPane = previousPaneId ? terminalPaneById.get(previousPaneId) ?? null : null;
+  if (
+    !options.imeSettled
+    && previousPane
+    && previousPane.paneId !== paneId
+    && deferTerminalImeUiSwitch(previousPane, 'switching shell pane', () => setActivePane(paneId, {
+      focus: options.focus,
+      imeSettled: true
+    }))
+  ) return;
   const widget = terminalWidgetForPane(pane);
   if (options.focus !== false) setTerminalTextTarget('shell');
   if (previousPaneId === paneId) {
@@ -33961,12 +35000,12 @@ function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
     flushTerminalWriteBuffer(pane);
     refreshTerminalViewportIfRecentOutput(pane);
     scheduleFitTerminal(pane);
+    scheduleTerminalWebglPromotion(pane);
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     if (options.focus === false) cancelTerminalFocusRequest(pane);
     else focusTerminalPaneWhenReady(pane);
     return;
   }
-  const previousPane = previousPaneId ? terminalPaneById.get(previousPaneId) ?? null : null;
   const previousWidget = previousPane ? terminalWidgetForPane(previousPane) : null;
   if (widget) {
     const group = terminalGroupForPane(pane);
@@ -33991,6 +35030,7 @@ function setActivePane(paneId: string, options: { focus?: boolean } = {}) {
   flushTerminalWriteBuffer(pane);
   refreshTerminalViewportIfRecentOutput(pane);
   scheduleFitTerminal(pane);
+  scheduleTerminalWebglPromotion(pane);
   scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
   if (options.focus === false) cancelTerminalFocusRequest(pane);
   else focusTerminalPaneWhenReady(pane);
@@ -34026,6 +35066,29 @@ function syncTerminalWidgetActiveState(widget: TerminalWidget) {
   updateTerminalWidgetTitle(widget);
 }
 
+interface ImagePasteEntryScope {
+  workspaceId: string;
+  profileId: string;
+  tab: ImageTabState;
+}
+
+function currentImagePasteEntryScope(): ImagePasteEntryScope | null {
+  if (!state.activeProfile || !state.workspaceOpen) return null;
+  return {
+    workspaceId: state.activeWorkspaceId,
+    profileId: state.activeProfile.id,
+    tab: activeImageTab()
+  };
+}
+
+function imagePasteEntryScopeIsCurrent(scope: ImagePasteEntryScope) {
+  return state.workspaceOpen
+    && state.activeWorkspaceId === scope.workspaceId
+    && state.activeProfile?.id === scope.profileId
+    && state.activeImageTabId === scope.tab.id
+    && imageTabForId(scope.tab.id) === scope.tab;
+}
+
 async function handlePaste(event: ClipboardEvent) {
   if (!state.activeProfile || !state.workspaceOpen) return;
   if (isExplorerClipboardTarget(event.target)) {
@@ -34039,25 +35102,40 @@ async function handlePaste(event: ClipboardEvent) {
 
   event.preventDefault();
   event.stopPropagation();
+  const scope = currentImagePasteEntryScope();
+  if (!scope) return;
   try {
     const eventDataUrl = await imageDataUrlFromClipboardEvent(event);
     const dataUrl = eventDataUrl ?? await nativeClipboardImageToDataUrl();
+    if (!imagePasteEntryScopeIsCurrent(scope)) return;
     await savePastedImage(dataUrl, imageTagPasteTargetForEvent(event.target));
   } catch (error) {
-    setStatus(`Failed to paste image: ${String(error)}`, true);
+    if (imagePasteEntryScopeIsCurrent(scope)) setStatus(`Failed to paste image: ${String(error)}`, true);
   }
 }
 
 async function pasteClipboardIntoExplorer(event: ClipboardEvent) {
   if (!state.activeProfile || !state.currentDir) return;
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile.id;
+  const currentDir = state.currentDir;
+  const requestIsCurrent = () => (
+    state.workspaceOpen
+    && state.activeWorkspaceId === workspaceId
+    && state.activeProfile?.id === profileId
+    && sameExplorerPath(state.currentDir, currentDir)
+  );
 
   try {
     const sourcePaths = await api.readClipboardFilePaths();
+    if (!requestIsCurrent()) return;
     if (sourcePaths.length > 0) {
       setStatus(`Pasting ${sourcePaths.length} file${sourcePaths.length === 1 ? '' : 's'} into Explorer...`);
-      const copied = await api.copyDroppedFiles(state.activeProfile.id, state.currentDir, sourcePaths);
-      invalidateExplorerDirectoryCache(state.activeProfile.id, state.currentDir);
-      await reloadExplorerDirectory(state.currentDir);
+      const copied = await api.copyDroppedFiles(profileId, currentDir, sourcePaths);
+      invalidateExplorerDirectoryCache(profileId, currentDir, workspaceId);
+      if (!requestIsCurrent()) return;
+      await reloadExplorerDirectory(currentDir);
+      if (!requestIsCurrent()) return;
       setStatus(`Pasted ${copied} file${copied === 1 ? '' : 's'} into Explorer`);
       return;
     }
@@ -34070,18 +35148,21 @@ async function pasteClipboardIntoExplorer(event: ClipboardEvent) {
     }
 
     const dataUrl = eventDataUrl ?? await nativeClipboardImageToDataUrl();
+    if (!requestIsCurrent()) return;
     const savedPath = await api.saveClipboardImageFile(
-      state.activeProfile.id,
-      state.currentDir,
+      profileId,
+      currentDir,
       nextImageName(),
       dataUrl
     );
-    invalidateExplorerDirectoryCache(state.activeProfile.id, state.currentDir);
-    await reloadExplorerDirectory(state.currentDir);
+    invalidateExplorerDirectoryCache(profileId, currentDir, workspaceId);
+    if (!requestIsCurrent()) return;
+    await reloadExplorerDirectory(currentDir);
+    if (!requestIsCurrent()) return;
     selectExplorerEntry(savedPath);
     setStatus(`Pasted image file into Explorer`);
   } catch (error) {
-    setStatus(`Failed to paste into Explorer: ${String(error)}`, true);
+    if (requestIsCurrent()) setStatus(`Failed to paste into Explorer: ${String(error)}`, true);
   }
 }
 
@@ -34167,14 +35248,20 @@ function loadImageElement(dataUrl: string): Promise<HTMLImageElement> {
 
 async function pasteImageFromNativeClipboard() {
   if (!state.activeProfile || !state.workspaceOpen) return;
+  const scope = currentImagePasteEntryScope();
+  if (!scope) return;
   const pasted = await pasteNativeClipboardImageToTarget(currentImageTagPasteTarget());
+  if (!imagePasteEntryScopeIsCurrent(scope)) return;
   if (!pasted) setStatus('Failed to paste image: clipboard has no image', true);
 }
 
 async function pasteNativeClipboardImageToTarget(target: ImageTagPasteTarget) {
-  if (!state.activeProfile || !state.workspaceOpen) return false;
+  const scope = currentImagePasteEntryScope();
+  if (!scope) return false;
   try {
-    await savePastedImage(await nativeClipboardImageToDataUrl(), target);
+    const dataUrl = await nativeClipboardImageToDataUrl();
+    if (!imagePasteEntryScopeIsCurrent(scope)) return false;
+    await savePastedImage(dataUrl, target);
     return true;
   } catch {
     return false;
@@ -34254,9 +35341,22 @@ async function savePastedImage(
   dataUrl: string,
   pasteTarget: ImageTagPasteTarget = state.autoPasteImageTagToShell ? currentImageTagPasteTarget() : 'none'
 ) {
-  if (!state.activeProfile) return;
+  const profile = state.activeProfile;
+  if (!profile) return;
+  const requestToken = ++imagePasteSaveRequestToken;
+  const workspaceId = state.activeWorkspaceId;
+  const initialTab = activeImageTab();
+  const requestIsCurrent = (tab = initialTab) => (
+    requestToken === imagePasteSaveRequestToken
+    && state.activeWorkspaceId === workspaceId
+    && state.activeProfile?.id === profile.id
+    && state.activeImageTabId === tab.id
+    && imageTabForId(tab.id) === tab
+  );
   const fingerprint = await fingerprintImageDataUrl(dataUrl);
+  if (!requestIsCurrent()) return;
   const existing = await findExistingPastedImage(dataUrl, fingerprint);
+  if (!requestIsCurrent()) return;
   if (existing) {
     await reusePastedImage(existing, dataUrl, pasteTarget);
     return;
@@ -34265,14 +35365,17 @@ async function savePastedImage(
     ? createImageTab(undefined, true)
     : activeImageTab();
   state.activeImageTabId = targetTab.id;
+  const currentDir = state.currentDir;
+  const attachmentSession = state.attachmentSession;
   const result = await api.saveAttachment(
-    state.activeProfile.id,
-    state.currentDir,
-    state.attachmentSession,
+    profile.id,
+    currentDir,
+    attachmentSession,
     nextImageName(),
     dataUrl
   );
-  invalidateExplorerDirectoryCache(state.activeProfile.id, state.currentDir);
+  invalidateExplorerDirectoryCache(profile.id, currentDir, workspaceId);
+  if (!requestIsCurrent(targetTab)) return;
   const item: PastedImageItem = {
     id: crypto.randomUUID(),
     path: result.path,
@@ -34284,10 +35387,7 @@ async function savePastedImage(
   state.imageHistory = [item, ...state.imageHistory].slice(0, IMAGE_HISTORY_LIMIT);
   state.imagePreviewDataUrl = dataUrl;
   setImageTabSourcePath(targetTab, result.path);
-  const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(result.tag, pasteTarget) : false;
-  state.imagePreviewLabel = pasted
-    ? `${result.tag} copied into ${imageTagPasteTargetLabel(pasteTarget)}`
-    : `${result.tag} saved`;
+  state.imagePreviewLabel = `${result.tag} saved`;
   state.imagePreviewZoom = 1;
   state.imagePreviewOffsetX = 0;
   state.imagePreviewOffsetY = 0;
@@ -34295,6 +35395,14 @@ async function savePastedImage(
   renderImageTabs();
   renderImagePreview();
   renderImageHistory();
+  saveActiveWorkspaceSnapshot();
+  const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(result.tag, pasteTarget) : false;
+  if (!requestIsCurrent(targetTab)) return;
+  state.imagePreviewLabel = pasted
+    ? `${result.tag} copied into ${imageTagPasteTargetLabel(pasteTarget)}`
+    : `${result.tag} saved`;
+  syncActiveImageTabFromState();
+  renderImagePreview();
   setStatus(pasted ? `Saved and pasted ${result.path} to ${imageTagPasteTargetLabel(pasteTarget)}` : `Saved ${result.path}`);
   saveActiveWorkspaceSnapshot();
 }
@@ -34306,10 +35414,16 @@ interface ExistingPastedImageMatch {
 
 async function findExistingPastedImage(dataUrl: string, fingerprint: string): Promise<ExistingPastedImageMatch | null> {
   const activeTab = activeImageTab();
-  const activeItem = await findMatchingPastedImageItem(state.imageHistory, dataUrl, fingerprint);
+  if (imageTabHasPersistedRefs(activeTab)) {
+    cancelImageTabHydration();
+    hydrateImageTabRefs(activeTab);
+    syncImageStateFromActiveTab();
+  }
+  const activeItem = await findMatchingPastedImageItem(activeTab.history, dataUrl, fingerprint);
   if (activeItem) return { item: activeItem, tab: activeTab };
   for (const tab of state.imageTabs) {
     if (tab.id === activeTab.id) continue;
+    hydrateImageTabRefs(tab);
     const item = await findMatchingPastedImageItem(tab.history, dataUrl, fingerprint);
     if (item) return { item, tab };
   }
@@ -34375,6 +35489,10 @@ async function reusePastedImage(
   dataUrl: string,
   pasteTarget: ImageTagPasteTarget
 ) {
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile?.id ?? '';
+  cancelImageTabHydration();
+  hydrateImageTabRefs(existing.tab);
   state.activeImageTabId = existing.tab.id;
   syncImageStateFromActiveTab();
   state.imageHistory = [
@@ -34386,14 +35504,24 @@ async function reusePastedImage(
   state.imagePreviewOffsetX = 0;
   state.imagePreviewOffsetY = 0;
   setImageTabSourcePath(existing.tab, existing.item.path);
-  const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(existing.item.tag, pasteTarget) : false;
-  state.imagePreviewLabel = pasted
-    ? `${existing.item.tag} reused into ${imageTagPasteTargetLabel(pasteTarget)}`
-    : `${existing.item.tag} reused`;
+  state.imagePreviewLabel = `${existing.item.tag} reused`;
   syncActiveImageTabFromState();
   renderImageTabs();
   renderImagePreview();
   renderImageHistory();
+  saveActiveWorkspaceSnapshot();
+  const pasted = pasteTarget !== 'none' ? await pasteImageTagToTarget(existing.item.tag, pasteTarget) : false;
+  if (
+    state.activeWorkspaceId !== workspaceId
+    || state.activeProfile?.id !== profileId
+    || state.activeImageTabId !== existing.tab.id
+    || imageTabForId(existing.tab.id) !== existing.tab
+  ) return;
+  state.imagePreviewLabel = pasted
+    ? `${existing.item.tag} reused into ${imageTagPasteTargetLabel(pasteTarget)}`
+    : `${existing.item.tag} reused`;
+  syncActiveImageTabFromState();
+  renderImagePreview();
   setStatus(
     pasted
       ? `Reused and pasted ${existing.item.path} to ${imageTagPasteTargetLabel(pasteTarget)}`
@@ -34404,6 +35532,7 @@ async function reusePastedImage(
 
 function renderImagePreview() {
   renderImageTagTargetIndicator();
+  el.imagePreview.decoding = 'async';
   const label = state.imagePreviewLabel;
   const dataUrl = state.imagePreviewDataUrl;
   const visible = Boolean(dataUrl);
@@ -34733,6 +35862,8 @@ function imageHistoryElement(id: string) {
   preview.title = 'Preview image';
   const image = document.createElement('img');
   image.alt = '';
+  image.loading = 'lazy';
+  image.decoding = 'async';
   preview.append(image);
   preview.addEventListener('click', () => {
     const item = imageHistoryItemForRow(row);
@@ -34826,17 +35957,31 @@ function previewImageHistoryItem(item: PastedImageItem) {
 }
 
 async function previewImageHistoryItemNow(item: PastedImageItem) {
+  const requestToken = ++imageHistoryPreviewRequestToken;
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile?.id ?? '';
+  const tab = activeImageTab();
+  const requestIsCurrent = () => (
+    requestToken === imageHistoryPreviewRequestToken
+    && state.activeWorkspaceId === workspaceId
+    && state.activeProfile?.id === profileId
+    && state.activeImageTabId === tab.id
+    && imageTabForId(tab.id) === tab
+    && tab.history.some((candidate) => candidate === item || candidate.id === item.id)
+  );
   let dataUrl = item.dataUrl;
-  if (!dataUrl && item.path && state.activeProfile) {
+  if (!dataUrl && item.path && profileId) {
     try {
       setStatus(`Loading image ${item.path}...`);
-      dataUrl = await api.readFileDataUrl(state.activeProfile.id, item.path);
+      dataUrl = await api.readFileDataUrl(profileId, item.path);
+      if (!requestIsCurrent()) return;
       item.dataUrl = dataUrl;
     } catch (error) {
-      setStatus(`Image preview could not be restored: ${String(error)}`, true);
+      if (requestIsCurrent()) setStatus(`Image preview could not be restored: ${String(error)}`, true);
       return;
     }
   }
+  if (!requestIsCurrent()) return;
   state.imagePreviewDataUrl = dataUrl;
   state.imagePreviewLabel = item.tag;
   state.imagePreviewZoom = 1;
@@ -35073,13 +36218,13 @@ function handleTerminalData(
   pane.tmuxStaleDeliveryCount = 0;
   pane.backendOutputChars += data.length;
   const writeData = normalizeTerminalOutputForPaneWrite(pane, data);
-  if (writeData) appendTerminalHistoryCache(pane, writeData);
+  if (writeData) scheduleTerminalHistoryCacheAppend(pane, writeData);
   markWorkspaceTerminalOutput(pane.workspaceId);
   if (options.detectLlmState !== false && !llmDetectionSuppressedAfterTerminalScroll(pane)) {
     const hookStatusActive = terminalPaneUsesHookLlmStatus(pane);
     const grokHookSupplement = hookStatusActive && terminalPaneLlmId(pane) === 'grok';
     if (!hookStatusActive || grokHookSupplement) {
-      updateWorkspaceLlmTitleFromTerminalData(pane, llmDetectionData);
+      scheduleWorkspaceLlmTitleFromTerminalData(pane, llmDetectionData);
     }
     if (!hookStatusActive || grokHookSupplement) {
       scheduleTerminalLlmOutputDetection(pane, llmDetectionData, {
@@ -35371,20 +36516,24 @@ function refreshTerminalViewportIfRecentOutput(
 }
 
 function cleanupTerminalWriteBuffer(pane: TerminalPane) {
+  cancelPendingTerminalImeUiSwitch(pane);
+  if (pane.imeTraceFlushTimer) window.clearTimeout(pane.imeTraceFlushTimer);
+  pane.imeTraceFlushTimer = undefined;
+  pane.imeTracePending = [];
   if (pane.writeFrame) window.cancelAnimationFrame(pane.writeFrame);
   if (pane.focusFrame) window.cancelAnimationFrame(pane.focusFrame);
   if (pane.grokPostWriteRefreshFrame) window.cancelAnimationFrame(pane.grokPostWriteRefreshFrame);
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
   if (pane.renderWatchdogTimer) window.clearTimeout(pane.renderWatchdogTimer);
   if (pane.llmOutputDetectionTimer) window.clearTimeout(pane.llmOutputDetectionTimer);
+  if (pane.llmTitleDataTimer) window.clearTimeout(pane.llmTitleDataTimer);
+  if (pane.historyFlushTimer) window.clearTimeout(pane.historyFlushTimer);
   if (pane.historyControlsSyncTimer) window.clearTimeout(pane.historyControlsSyncTimer);
   if (pane.focusRetryTimer) window.clearTimeout(pane.focusRetryTimer);
   if (pane.shellReadyFallbackTimer) window.clearTimeout(pane.shellReadyFallbackTimer);
   if (pane.portScanTimer) window.clearTimeout(pane.portScanTimer);
   if (pane.cwdScanTimer) window.clearTimeout(pane.cwdScanTimer);
   if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
-  if (pane.imeCommitFallbackTimer) window.clearTimeout(pane.imeCommitFallbackTimer);
-  if (pane.imeDeferredKeyClearTimer) window.clearTimeout(pane.imeDeferredKeyClearTimer);
   if (pane.imeFallbackTimer) window.clearTimeout(pane.imeFallbackTimer);
   if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
   if (pane.llmTmuxTitlePollTimer) window.clearTimeout(pane.llmTmuxTitlePollTimer);
@@ -35399,14 +36548,16 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.llmOutputDetectionTimer = undefined;
   pane.llmOutputDetectionBuffer = '';
   pane.llmOutputDetectionMarkActivity = false;
+  pane.llmTitleDataTimer = undefined;
+  pane.llmTitleDataBuffer = '';
+  pane.historyFlushTimer = undefined;
+  pane.historyPendingBuffer = '';
   pane.historyControlsSyncTimer = undefined;
   pane.focusRetryTimer = undefined;
   pane.shellReadyFallbackTimer = undefined;
   pane.portScanTimer = undefined;
   pane.cwdScanTimer = undefined;
   pane.inputFlushTimer = undefined;
-  pane.imeCommitFallbackTimer = undefined;
-  pane.imeDeferredKeyClearTimer = undefined;
   pane.imeFallbackTimer = undefined;
   pane.imeReleaseTimer = undefined;
   pane.llmTmuxTitlePollTimer = undefined;
@@ -35424,16 +36575,12 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.inputWritePromise = undefined;
   pane.inputWriteActivePacket = undefined;
   pane.inputBackendPending = false;
+  pane.inputReconnectFrozen = false;
   pane.typingPadPasteInFlight = false;
   pane.imeComposing = false;
   pane.imeDomComposing = false;
-  pane.imeAwaitingXtermCommit = false;
-  pane.imeDeferredCommitKey = undefined;
-  pane.imeHeldCommitKey = undefined;
-  pane.imeCommitKeyReleasePending = undefined;
-  pane.imeSuppressCommitKeypress = false;
+  pane.imeDeferredXtermBlur = false;
   pane.imeCompositionStartedAt = undefined;
-  clearTerminalImeBlurPreservation(pane);
   pane.writeBuffer = '';
   pane.grokOutputPendingCarriageReturn = false;
   pane.pendingTerminalWrites = 0;

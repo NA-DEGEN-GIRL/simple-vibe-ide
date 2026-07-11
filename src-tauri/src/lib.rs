@@ -11,10 +11,8 @@ use std::process::{Child as ProcessChild, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicIsize, AtomicU32};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-#[cfg(windows)]
-use std::sync::Condvar;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
@@ -135,6 +133,7 @@ const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
 const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
 const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 256;
+const TERMINAL_INPUT_BARRIER_TIMEOUT: Duration = Duration::from_millis(1_200);
 const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
 const BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX: &str = "browser-preview-webview";
 const WSL_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -196,11 +195,16 @@ impl Default for IdeState {
 }
 
 struct TerminalSession {
-    input_tx: SyncSender<Vec<u8>>,
+    input_tx: SyncSender<TerminalInputMessage>,
     child: Box<dyn portable_pty::Child + Send>,
     master: Box<dyn MasterPty + Send>,
     rows: u16,
     cols: u16,
+}
+
+enum TerminalInputMessage {
+    Data(Vec<u8>),
+    Flush(SyncSender<Result<(), String>>),
 }
 
 struct ForwardSession {
@@ -373,66 +377,191 @@ impl RuntimeShutdownBatch {
     }
 }
 
-struct AppOutputBatcher {
+struct AppOutputBatchState {
+    buffer: String,
+    first_buffered_at: Option<Instant>,
+    next_sequence: u64,
+    emitted_sequence: u64,
+    force_flush: bool,
+    stopping: bool,
+    worker_stopped: bool,
+}
+
+struct AppOutputBatchShared {
     id: String,
     app: tauri::AppHandle,
-    buffer: Mutex<String>,
-    scheduled: AtomicBool,
+    state: Mutex<AppOutputBatchState>,
+    ready: Condvar,
+}
+
+/// One sleeping worker per live terminal replaces the old thread-per-timer
+/// path. Sequence barriers keep data before a DSR query or exit event emitted
+/// before the following event without making ordinary 4 ms batches block.
+struct AppOutputBatcher {
+    shared: Arc<AppOutputBatchShared>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl AppOutputBatcher {
-    fn new(id: String, app: tauri::AppHandle) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(id: String, app: tauri::AppHandle) -> Result<Arc<Self>, String> {
+        let shared = Arc::new(AppOutputBatchShared {
             id,
             app,
-            buffer: Mutex::new(String::new()),
-            scheduled: AtomicBool::new(false),
-        })
+            state: Mutex::new(AppOutputBatchState {
+                buffer: String::new(),
+                first_buffered_at: None,
+                next_sequence: 0,
+                emitted_sequence: 0,
+                force_flush: false,
+                stopping: false,
+                worker_stopped: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let worker_shared = shared.clone();
+        let worker = thread::Builder::new()
+            .name("simple-vibe-terminal-output".to_string())
+            .spawn(move || run_app_output_batcher(worker_shared))
+            .map_err(|error| format!("failed to start terminal output batcher: {error}"))?;
+        Ok(Arc::new(Self {
+            shared,
+            worker: Mutex::new(Some(worker)),
+        }))
     }
 
-    fn push(self: &Arc<Self>, data: &str) {
-        let should_flush_now = {
-            let Ok(mut buffer) = self.buffer.lock() else {
-                return;
-            };
-            buffer.push_str(data);
-            buffer.len() >= TERMINAL_OUTPUT_EVENT_FORCE_CHARS
-        };
-        if should_flush_now {
-            self.flush();
+    fn push(&self, data: &str) {
+        if data.is_empty() {
             return;
         }
-        if self
-            .scheduled
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            let batcher = self.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS));
-                batcher.flush();
-            });
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.stopping {
+            return;
+        }
+        if state.buffer.is_empty() {
+            state.first_buffered_at = Some(Instant::now());
+        }
+        state.buffer.push_str(data);
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let should_flush = state.buffer.len() >= TERMINAL_OUTPUT_EVENT_FORCE_CHARS;
+        if should_flush {
+            state.force_flush = true;
+        }
+        self.shared.ready.notify_one();
+        drop(state);
+        if should_flush {
+            self.flush();
         }
     }
 
     fn flush(&self) {
-        self.scheduled.store(false, Ordering::Relaxed);
-        let data = {
-            let Ok(mut buffer) = self.buffer.lock() else {
-                return;
-            };
-            if buffer.is_empty() {
-                return;
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target_sequence = state.next_sequence;
+        if state.emitted_sequence >= target_sequence {
+            return;
+        }
+        state.force_flush = true;
+        self.shared.ready.notify_one();
+        while state.emitted_sequence < target_sequence && !state.worker_stopped {
+            state = self
+                .shared
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl Drop for AppOutputBatcher {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.stopping = true;
+            state.force_flush = true;
+            self.shared.ready.notify_one();
+        }
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_app_output_batcher(shared: Arc<AppOutputBatchShared>) {
+    loop {
+        let (data, sequence) = {
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if state.buffer.is_empty() {
+                    state.first_buffered_at = None;
+                    state.force_flush = false;
+                    if state.stopping {
+                        state.worker_stopped = true;
+                        shared.ready.notify_all();
+                        return;
+                    }
+                    state = shared
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                }
+
+                let now = Instant::now();
+                let deadline = state.first_buffered_at.unwrap_or(now)
+                    + Duration::from_millis(TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS);
+                if state.stopping
+                    || state.force_flush
+                    || state.buffer.len() >= TERMINAL_OUTPUT_EVENT_FORCE_CHARS
+                    || now >= deadline
+                {
+                    let data = std::mem::take(&mut state.buffer);
+                    let sequence = state.next_sequence;
+                    state.first_buffered_at = None;
+                    state.force_flush = false;
+                    break (data, sequence);
+                }
+
+                let wait_for = deadline.saturating_duration_since(now);
+                let (next_state, _) = shared
+                    .ready
+                    .wait_timeout(state, wait_for)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next_state;
             }
-            std::mem::take(&mut *buffer)
         };
-        let _ = self.app.emit(
+
+        let _ = shared.app.emit(
             "terminal-data",
             TerminalDataEvent {
-                id: self.id.clone(),
+                id: shared.id.clone(),
                 data,
             },
         );
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.emitted_sequence = state.emitted_sequence.max(sequence);
+        shared.ready.notify_all();
     }
 }
 
@@ -3146,6 +3275,49 @@ fn resolve_profile_path_blocking(profile_id: String, path: String) -> Result<Str
 }
 
 #[tauri::command]
+async fn profile_directory_is_dir(profile_id: String, path: String) -> Result<bool, String> {
+    run_blocking_command("profile directory is dir", move || {
+        profile_directory_is_dir_blocking(profile_id, path)
+    })
+    .await
+}
+
+fn profile_directory_is_dir_blocking(profile_id: String, path: String) -> Result<bool, String> {
+    let path = resolve_profile_path_blocking(profile_id.clone(), path)?;
+    let profile = profile_from_id(&profile_id);
+    match profile.kind.as_str() {
+        "windows" => local_path_is_directory(Path::new(&path)),
+        "wsl" => {
+            if let Some(windows_path) = wsl_posix_path_to_windows_path(&profile, &path) {
+                local_path_is_directory(&windows_path)
+            } else {
+                remote_path_is_directory_or_missing(&profile, &path)
+            }
+        }
+        "ssh" => remote_path_is_directory_or_missing(&profile, &path),
+        _ => Err(format!("unsupported profile kind: {}", profile.kind)),
+    }
+}
+
+fn local_path_is_directory(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn remote_path_is_directory_or_missing(
+    profile: &ConnectionProfile,
+    path: &str,
+) -> Result<bool, String> {
+    let script = format!("if [ -d {} ]; then printf y; fi", shell_quote(path));
+    let output =
+        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
+    Ok(output == b"y")
+}
+
+#[tauri::command]
 async fn list_directory(
     profile_id: String,
     path: String,
@@ -4060,6 +4232,9 @@ fn spawn_terminal_direct(
     let profile = profile_from_id(&profile_id);
     let cwd = normalize_profile_path(&profile, &cwd);
     warm_wsl_profile(&profile)?;
+    let terminal_id = Uuid::new_v4().to_string();
+    let read_id = terminal_id.clone();
+    let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone())?;
     let (program, args) = terminal_command(&profile, &cwd, command.clone());
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -4096,22 +4271,13 @@ fn spawn_terminal_direct(
         .try_clone_reader()
         .map_err(|err| err.to_string())?;
     let mut writer = pair.master.take_writer().map_err(|err| err.to_string())?;
-    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(TERMINAL_INPUT_QUEUE_CAPACITY);
+    let (input_tx, input_rx) = sync_channel::<TerminalInputMessage>(TERMINAL_INPUT_QUEUE_CAPACITY);
     thread::Builder::new()
         .name("simple-vibe-terminal-input".to_string())
         .spawn(move || {
-            for data in input_rx {
-                if writer.write_all(&data).is_err() {
-                    break;
-                }
-                let _ = writer.flush();
-            }
+            run_terminal_input_writer(&mut writer, input_rx);
         })
         .map_err(|err| format!("failed to start terminal input writer: {err}"))?;
-    let terminal_id = Uuid::new_v4().to_string();
-
-    let read_id = terminal_id.clone();
-    let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone());
     thread::spawn(move || {
         let mut buf = [0_u8; 8192];
         let mut leftover: Vec<u8> = Vec::with_capacity(8);
@@ -4182,7 +4348,10 @@ fn write_terminal_host(state: &IdeState, id: String, data: String) -> Result<(),
     write_terminal_bytes(&input_tx, data.as_bytes())
 }
 
-fn terminal_input_sender(state: &IdeState, id: &str) -> Result<SyncSender<Vec<u8>>, String> {
+fn terminal_input_sender(
+    state: &IdeState,
+    id: &str,
+) -> Result<SyncSender<TerminalInputMessage>, String> {
     let terminals = state
         .terminals
         .lock()
@@ -4193,14 +4362,84 @@ fn terminal_input_sender(state: &IdeState, id: &str) -> Result<SyncSender<Vec<u8
         .ok_or_else(|| format!("terminal not found: {id}"))
 }
 
-fn write_terminal_bytes(input_tx: &SyncSender<Vec<u8>>, data: &[u8]) -> Result<(), String> {
+fn write_terminal_bytes(
+    input_tx: &SyncSender<TerminalInputMessage>,
+    data: &[u8],
+) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
     }
-    match input_tx.try_send(data.to_vec()) {
+    match input_tx.try_send(TerminalInputMessage::Data(data.to_vec())) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => Err("terminal input queue is full; try again".to_string()),
         Err(TrySendError::Disconnected(_)) => Err("terminal input writer is closed".to_string()),
+    }
+}
+
+fn run_terminal_input_writer(
+    writer: &mut dyn Write,
+    input_rx: std::sync::mpsc::Receiver<TerminalInputMessage>,
+) {
+    for message in input_rx {
+        match message {
+            TerminalInputMessage::Data(data) => {
+                if writer
+                    .write_all(&data)
+                    .and_then(|_| writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            TerminalInputMessage::Flush(ack) => {
+                let result = writer
+                    .flush()
+                    .map_err(|error| format!("failed to flush terminal input: {error}"));
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn flush_terminal_input_sender(
+    input_tx: &SyncSender<TerminalInputMessage>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let (ack_tx, ack_rx) = sync_channel(1);
+    let mut message = TerminalInputMessage::Flush(ack_tx);
+    loop {
+        match input_tx.try_send(message) {
+            Ok(()) => break,
+            Err(TrySendError::Full(returned)) => {
+                message = returned;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(
+                        "terminal input flush timed out while waiting for queue space".to_string(),
+                    );
+                }
+                thread::sleep(remaining.min(Duration::from_millis(2)));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err("terminal input writer is closed".to_string());
+            }
+        }
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match ack_rx.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            Err("terminal input flush timed out before PTY confirmation".to_string())
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("terminal input writer closed before PTY confirmation".to_string())
+        }
     }
 }
 
@@ -4215,8 +4454,10 @@ fn push_terminal_output_without_dsr_queries(
         let before = &rest[..index];
         if !before.is_empty() {
             batcher.push(before);
-            batcher.flush();
         }
+        // A query can begin a new PTY read while prior output is still inside the 4 ms batch.
+        // Flush unconditionally so the cursor query is observed after every preceding byte.
+        batcher.flush();
         let _ = app.emit(
             "terminal-cursor-query",
             TerminalCursorQueryEvent {
@@ -4726,6 +4967,17 @@ async fn spawn_terminal(
 #[tauri::command]
 fn write_terminal(state: State<'_, IdeState>, id: String, data: String) -> Result<(), String> {
     write_terminal_host(&state, id, data)
+}
+
+#[tauri::command]
+async fn flush_terminal_input(state: State<'_, IdeState>, id: String) -> Result<(), String> {
+    // Clone the sender while holding the terminal map briefly, then wait for
+    // the writer barrier on a blocking worker without retaining that mutex.
+    let input_tx = terminal_input_sender(state.inner(), &id)?;
+    run_blocking_command("flush terminal input", move || {
+        flush_terminal_input_sender(&input_tx, TERMINAL_INPUT_BARRIER_TIMEOUT)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -7664,7 +7916,10 @@ fn run_profile_shell_with_timeout(
     let mut last_error = None;
     for attempt in 0..attempts {
         match run_profile_shell_once(profile, script, stdin_data.clone(), timeout) {
-            Ok(stdout) => return Ok(stdout),
+            Ok(stdout) => {
+                record_wsl_profile_warmup_success(profile);
+                return Ok(stdout);
+            }
             Err(error)
                 if profile.kind == "wsl"
                     && is_wsl_transient_error(&error)
@@ -7799,12 +8054,7 @@ fn warm_wsl_distro(distro: &str) -> Result<(), String> {
         let mut command = Command::new("wsl.exe");
         command
             .current_dir(windows_spawn_cwd())
-            .arg("-d")
-            .arg(distro)
-            .arg("--exec")
-            .arg("sh")
-            .arg("-lc")
-            .arg("true");
+            .args(wsl_warmup_command_args(distro));
         match command_output_with_timeout(&mut command, WSL_WARMUP_TIMEOUT) {
             Ok(output) if output.status.success() => return Ok(()),
             Ok(output) => {
@@ -7856,6 +8106,22 @@ fn record_wsl_warmup_success(distro: &str) {
     if let Ok(mut guard) = cache.lock() {
         guard.insert(distro.to_string(), Instant::now());
     }
+}
+
+fn record_wsl_profile_warmup_success(profile: &ConnectionProfile) {
+    if profile.kind != "wsl" {
+        return;
+    }
+    let distro = profile
+        .distro
+        .as_deref()
+        .filter(|distro| !distro.trim().is_empty())
+        .unwrap_or("Ubuntu");
+    record_wsl_warmup_success(distro);
+}
+
+fn wsl_warmup_command_args(distro: &str) -> [&str; 4] {
+    ["-d", distro, "--exec", "true"]
 }
 
 fn warm_wsl_distro_coordinated(distro: &str) -> Result<(), String> {
@@ -8607,6 +8873,58 @@ fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &st
 }
 
 #[cfg(test)]
+mod terminal_input_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("shared writer lock").extend(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn input_flush_barrier_confirms_prior_data_reached_the_writer() {
+        let output = SharedWriter::default();
+        let observed = output.0.clone();
+        let (input_tx, input_rx) = sync_channel(4);
+        let writer = thread::spawn(move || {
+            let mut output = output;
+            run_terminal_input_writer(&mut output, input_rx);
+        });
+
+        write_terminal_bytes(&input_tx, b"before-barrier").expect("queue terminal data");
+        flush_terminal_input_sender(&input_tx, Duration::from_millis(250))
+            .expect("confirm terminal input flush");
+
+        assert_eq!(
+            observed.lock().expect("observed writer lock").as_slice(),
+            b"before-barrier"
+        );
+        drop(input_tx);
+        writer.join().expect("join terminal input writer");
+    }
+
+    #[test]
+    fn input_flush_barrier_times_out_when_the_queue_cannot_accept_it() {
+        let (input_tx, _input_rx) = sync_channel(1);
+        write_terminal_bytes(&input_tx, b"queued").expect("fill terminal input queue");
+
+        let error = flush_terminal_input_sender(&input_tx, Duration::from_millis(10))
+            .expect_err("full queue should time out");
+
+        assert!(error.contains("timed out"));
+    }
+}
+
+#[cfg(test)]
 mod wsl_recovery_tests {
     use super::*;
 
@@ -8649,6 +8967,50 @@ mod wsl_recovery_tests {
         assert_eq!(wsl_transient_retry_delay(1), Duration::from_secs(1));
         assert_eq!(wsl_transient_retry_delay(2), Duration::from_secs(2));
         assert_eq!(wsl_transient_retry_delay(99), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn warmup_probe_executes_true_without_a_login_shell() {
+        assert_eq!(
+            wsl_warmup_command_args("Example"),
+            ["-d", "Example", "--exec", "true"]
+        );
+    }
+
+    #[test]
+    fn successful_wsl_profile_commands_mark_the_distro_warm() {
+        let distro = format!("test-{}", Uuid::new_v4());
+        let profile = profile_from_id(&format!("wsl:{distro}"));
+
+        record_wsl_profile_warmup_success(&profile);
+
+        assert!(wsl_warmup_recent(&distro));
+    }
+
+    #[test]
+    fn profile_directory_probe_distinguishes_directories_files_and_missing_paths() {
+        let root = std::env::temp_dir().join(format!("simple-vibe-dir-test-{}", Uuid::new_v4()));
+        let file = root.join("file.txt");
+        fs::create_dir_all(&root).expect("create directory probe fixture");
+        fs::write(&file, b"test").expect("create file probe fixture");
+
+        assert!(profile_directory_is_dir_blocking(
+            "windows-local".to_string(),
+            root.to_string_lossy().to_string()
+        )
+        .expect("probe directory"));
+        assert!(!profile_directory_is_dir_blocking(
+            "windows-local".to_string(),
+            file.to_string_lossy().to_string()
+        )
+        .expect("probe file"));
+        assert!(!profile_directory_is_dir_blocking(
+            "windows-local".to_string(),
+            root.join("missing").to_string_lossy().to_string()
+        )
+        .expect("probe missing path"));
+
+        fs::remove_dir_all(root).expect("remove directory probe fixture");
     }
 }
 
@@ -9577,6 +9939,7 @@ pub fn run() {
             set_capture_protection,
             force_quit_app,
             resolve_profile_path,
+            profile_directory_is_dir,
             list_directory,
             list_directories,
             directory_signatures,
@@ -9602,6 +9965,7 @@ pub fn run() {
             save_attachment,
             spawn_terminal,
             write_terminal,
+            flush_terminal_input,
             resize_terminal,
             kill_terminal,
             start_port_forward,
