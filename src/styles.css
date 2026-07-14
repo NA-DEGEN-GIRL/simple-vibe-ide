@@ -1544,6 +1544,7 @@ body.glass-mode-on .window-control-icon {
 }
 
 .context-menu,
+.terminal-ports-popover,
 .widget-opacity-popover,
 .glass-settings-popover,
 .diagnostic-log-popover {
@@ -1560,6 +1561,50 @@ body.glass-mode-on .window-control-icon {
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.45);
 }
 .context-menu.hidden { display: none; }
+.terminal-ports-popover {
+  box-sizing: border-box;
+  width: min(420px, calc(100vw - 16px));
+  max-height: min(380px, calc(100vh - 24px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid #2a3b52;
+  border-radius: 9px;
+  background: #0b111b;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.48);
+  color: #dce8f7;
+}
+.terminal-ports-popover.hidden { display: none; }
+.terminal-ports-popover-header {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  border-bottom: 1px solid #1d2a3d;
+  background: #111a28;
+}
+.terminal-ports-summary { color: #8fa4bc; font-size: 11px; white-space: nowrap; }
+.terminal-ports-popover .terminal-forward-list {
+  max-height: none;
+  min-height: 42px;
+  overflow: auto;
+  padding: 8px;
+}
+.terminal-ports-note {
+  padding: 7px 10px;
+  border-top: 1px solid #1d2a3d;
+  color: #8496ac;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.terminal-ports-popover .terminal-port-row {
+  grid-template-columns: minmax(68px, auto) minmax(0, 1fr) auto auto;
+}
+.terminal-port-row .copy { min-width: 46px; }
+.terminal-port-row.has-error .forward-detail { color: #ff9c9c; }
+.terminal-port-row.starting .forward-detail,
+.terminal-port-row.stopping .forward-detail { color: #9ec5ff; }
 .widget-opacity-popover {
   width: 238px;
   padding: 8px;
@@ -4051,6 +4096,35 @@ body.glass-mode-on.capture-protected .shell.app-glass-titlebar-on .titlebar {
 }
 .panel-toggle { min-width: 44px; padding-inline: 6px; color: #9fb0c3; }
 .panel-toggle.active { border-color: #4d8dff; background: #16243a; color: #e6edf6; }
+.terminal-ports-toggle {
+  min-width: 72px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: #aab9cb;
+}
+.terminal-ports-count {
+  min-width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #202b3b;
+  color: #b8c8da;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.terminal-ports-toggle.has-ports {
+  border-color: #3e76bd;
+  background: #14233a;
+  color: #edf6ff;
+}
+.terminal-ports-toggle.has-ports .terminal-ports-count { background: #2f6fbe; color: #ffffff; }
+.terminal-ports-toggle.has-error { border-color: #b65b64; }
+.terminal-ports-toggle.has-error .terminal-ports-count { background: #a94451; }
 .muted { color: #93a4b8; font-size: 12px; }
 .workspace-status-slot {
   flex: 1 1 220px;
@@ -6901,6 +6975,7 @@ body.glass-mode-on .browser-panel.app-glass-active-shell .browser-address-sugges
   .workspace-bar .profile-control-stack { grid-column: 1 / 3; }
   .workspace-bar label:has(#root-input) { grid-column: 3 / 5; }
   .workspace-bar button { width: 100%; padding-inline: 7px; }
+  body.terminal-app .workspace-bar .terminal-ports-toggle { width: auto; justify-self: start; }
   #profile-select, #root-input { width: 100%; }
   body.glass-mode-on .shell.app-glass-profile-actions-split-on .workspace-bar {
     display: flex;

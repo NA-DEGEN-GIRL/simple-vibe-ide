@@ -57,9 +57,12 @@ The script runs:
 - `Get-Command link.exe` (reported as advisory; build result is authoritative)
 - `npm.cmd run check`
 - `npm.cmd run build`
+- `npm.cmd run build:terminal`
 - `cargo check --manifest-path src-tauri/Cargo.toml`
 - `npm.cmd run tauri -- build --no-bundle`
-- launch of the built `simple-vibe-ide.exe` unless `-NoLaunch` is passed
+- `npm.cmd run tauri:terminal:build`
+- launch of the built `simple-vibe-ide.exe` and `simple-vibe-terminal.exe` unless
+  `-NoLaunch` is passed
 
 ## Manual Runtime Smoke Checklist
 
@@ -85,6 +88,13 @@ The script runs:
 ### 3. Terminal widgets and tabs
 
 - Create several terminal widgets and multiple tabs per widget.
+- In a Windows-local workspace, launch Codex and Claude from their buttons.
+- Confirm the Codex launch line includes `approval_policy="never"` and
+  `sandbox_mode="danger-full-access"`, and the Claude launch line includes
+  `--permission-mode bypassPermissions`.
+- Confirm both CLIs enter their bypass/no-approval mode and do not ask for an
+  approval on a harmless read-only action. Do not use a destructive action for
+  this smoke.
 - Switch active shell tabs rapidly.
 - Close active and inactive tabs.
 - Close a whole terminal widget.
@@ -117,7 +127,24 @@ The script runs:
 - Emit local URLs such as `http://127.0.0.1:3000`; confirm detected-port rows,
   manual forwards, auto-forwards, stop, ignore, and proxy-local-port filtering.
 
-### 6. Editor, Image, Notes, Calculator, Export
+### 6. Simple Vibe Terminal automatic ports
+
+- Launch the built `simple-vibe-terminal.exe` and open a WSL workspace.
+- Start a normal local development server whose output includes a positive URL,
+  for example `Local: http://localhost:8123`. Confirm the `Ports` badge appears
+  and the row becomes active without opening a hidden IDE Browser panel.
+- Confirm `Open` launches `http://127.0.0.1:[PORT]` in the default Windows
+  browser, `Copy` copies the same local URL, and `Stop` removes the row.
+- Print an error-like line such as `ECONNREFUSED http://localhost:8124` without
+  starting a server. Confirm it stays pending rather than auto-forwarding, then
+  confirm `Ignore` removes it.
+- Start a forward and immediately load another saved terminal layout or switch
+  profile/root. Confirm no stale row appears in the new layout and a late start
+  is stopped.
+- If an SSH profile is available, repeat once and confirm the automatically
+  allocated local port shown in `Ports` opens the remote server.
+
+### 7. Editor, Image, Notes, Calculator, Export
 
 - Open many editor tabs; activate existing tabs and close active/inactive tabs.
 - Open image files and paste clipboard images; confirm history rows update and
@@ -156,6 +183,7 @@ Manual smoke:
 - terminal widgets/tabs:
 - browser hidden/visible/tabs:
 - browser console/forwards:
+- Simple Vibe Terminal automatic ports:
 - editor/image/notes/calculator/export:
 
 Regressions found:

@@ -31,7 +31,7 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 오가며 Codex / Cl
 - Explorer / Editor / Browser / Image / Notes / Snippets / Calculator를 필요한 만큼 배치하고
 - 현재 작업 맥락을 workspace snapshot으로 다시 불러옵니다.
 
-같은 코드베이스에서 `Simple Vibe Terminal` 별도 앱도 빌드할 수 있습니다. IDE 패널 없이 terminal tab, split, Type pad, saved terminal layout만 쓰고 싶은 사람을 위한 terminal flavor입니다.
+같은 코드베이스에서 `Simple Vibe Terminal` 별도 앱도 빌드할 수 있습니다. IDE 패널 없이 terminal tab, split, Type pad, saved terminal layout만 쓰고 싶은 사람을 위한 terminal flavor입니다. 신뢰도 높은 로컬 서버 출력은 WSL/SSH 포트로 자동 연결되며, 상단 `Ports`에서 Windows 브라우저 열기, URL 복사, 중지/무시를 할 수 있습니다.
 
 현재 상태: **Windows-only**, **Tauri v2**, **pre-1.0**, **experimental**.
 
@@ -69,7 +69,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - Global Snippets / cheat sheet
 - Workspace별 Calculator와 history
 - Capture protection toggle
-- Simple Vibe Terminal 별도 exe
+- 자동 포트 연결과 compact `Ports` 팝오버를 포함한 Simple Vibe Terminal 별도 exe
 
 ## 설치 요구사항
 
@@ -200,7 +200,7 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - Grok: `--always-approve --permission-mode bypassPermissions`
 - Antigravity/Agy: `agy --dangerously-skip-permissions`
 
-실행 전에 alias/function/wrapper script를 확인해서 이미 들어간 flag는 다시 붙이지 않습니다. 이 flag들은 의도적으로 approval/permission prompt를 줄이기 위한 것입니다. 더 보수적으로 쓰고 싶다면 일반 terminal에서 직접 CLI를 실행하세요.
+실행 전에 실제로 선택된 alias/function/wrapper script를 확인해서 이미 들어간 canonical flag는 다시 붙이지 않습니다. Windows profile은 source-text 중복 판정이 빗나가도 bypass가 풀리지 않도록 Codex에 repeatable config override(`approval_policy="never"`, `sandbox_mode="danger-full-access"`)를, Claude에 명시적 `--permission-mode bypassPermissions`를 함께 전달합니다. 터미널의 `[simple-vibe-ide] launching ...` 줄에서 실제 app-added argv를 확인할 수 있습니다. 이 flag들은 의도적으로 approval/permission prompt를 줄이기 위한 것입니다. 더 보수적으로 쓰고 싶다면 일반 terminal에서 직접 CLI를 실행하세요.
 
 ### tmux 재접속
 
@@ -350,7 +350,7 @@ Simple Vibe IDE is a Windows-first lightweight desktop IDE for LLM-heavy coding 
 
 It is not trying to replace a full general-purpose IDE. It optimizes the local vibe-coding loop: open a workspace, launch shells and LLM CLIs, arrange Explorer / Editor / Browser / Image / Notes / Snippets / Calculator, and restore that working context quickly.
 
-The same codebase can also build `Simple Vibe Terminal`, a standalone terminal flavor for users who only want terminal tabs, splits, the Type pad, and saved terminal layouts without the IDE panels.
+The same codebase can also build `Simple Vibe Terminal`, a standalone terminal flavor for users who only want terminal tabs, splits, the Type pad, and saved terminal layouts without the IDE panels. High-confidence local-server output can auto-connect WSL/SSH ports, while the compact `Ports` popover opens the Windows browser, copies URLs, and stops or ignores entries.
 
 Status: **Windows-only**, **Tauri v2**, **pre-1.0**, **experimental**.
 
@@ -388,7 +388,7 @@ When asking an LLM or coding agent to install, build, or verify the app, provide
 - Global Snippets / cheat sheets
 - Workspace Calculator with history
 - Workspace capture protection toggle
-- Separate Simple Vibe Terminal executable
+- Separate Simple Vibe Terminal executable with automatic port connections and a compact `Ports` popover
 
 ## Requirements
 
@@ -519,7 +519,7 @@ Default launcher flags:
 - Grok: `--always-approve --permission-mode bypassPermissions`
 - Antigravity/Agy: `agy --dangerously-skip-permissions`
 
-Before launching, the app checks aliases, functions, and wrapper scripts, then skips flags already present. These flags intentionally reduce approval/permission prompts. If you want normal prompts, launch the CLI manually in a terminal instead.
+Before launching, the app checks the effective alias, function, or wrapper script and skips canonical flags already present. On Windows profiles it also passes repeatable Codex config overrides (`approval_policy="never"`, `sandbox_mode="danger-full-access"`) and Claude's explicit `--permission-mode bypassPermissions`, so an imperfect source-text dedup result cannot silently disable bypass. The terminal's `[simple-vibe-ide] launching ...` line shows the argv added by the app. These flags intentionally reduce approval/permission prompts. If you want normal prompts, launch the CLI manually in a terminal instead.
 
 ### tmux Attach/Reconnect
 

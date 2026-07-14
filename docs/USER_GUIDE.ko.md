@@ -91,6 +91,16 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 한 화면에 띄워
 - History overlay의 내용은 ANSI 색/커서 제어를 제거한 읽기용 로그입니다. TUI 화면을 그대로 재현하는 기능은 아닙니다.
 - 터미널 출력에는 secret이 섞일 수 있으므로 `Copy all cached`는 필요한 경우에만 사용하세요.
 
+### Simple Vibe Terminal의 자동 포트 연결
+
+별도 `Simple Vibe Terminal` 앱은 로컬 개발 서버의 정상 시작 문구와 localhost URL을 감지합니다.
+
+- 신뢰도 높은 WSL/SSH 서버 출력은 자동으로 Windows localhost에 연결합니다. SSH는 충돌을 피하도록 사용 가능한 로컬 포트를 자동 배정할 수 있으며, Windows에서 실제 포트 도달을 확인한 뒤 active로 표시합니다.
+- Windows shell의 서버는 별도 forwarding 없이 원래 localhost 포트를 그대로 표시합니다.
+- 오류 로그나 애매한 문구에서 찾은 포트는 바로 연결하지 않고 `Ports`에 pending 항목으로만 표시합니다. 필요한 경우 `Forward`를 직접 누릅니다.
+- 상단 `Ports` 버튼에서 `Open`, `Copy`, `Stop`, `Ignore`를 사용할 수 있습니다. `Open`은 해당 주소를 기본 Windows 브라우저로 엽니다.
+- layout/root/profile을 바꾸면 해당 terminal workspace가 만든 자동 forward를 정리합니다. 시작 중 workspace를 바꾼 경우 늦게 완료된 forward도 즉시 종료합니다.
+
 ## 5. 자주 쓰는 단축키
 
 | 단축키 | 동작 |
@@ -235,6 +245,8 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 - `Tmux` 목록의 `Kill`은 확인 후 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
 - `tmux`가 없거나 Windows profile에서는 기존처럼 직접 실행합니다.
 - 기존 bypass/YOLO 인자 자동 추가와 중복 방지는 그대로 유지됩니다.
+- Windows profile의 직접 실행은 한 줄짜리 PowerShell command로 전달되며, 실제 effective alias/function/wrapper만 중복 판정에 사용합니다. Codex는 repeatable config override로 approval `never`/sandbox `danger-full-access`를, Claude는 `--permission-mode bypassPermissions`를 한 번 더 명시하므로 wrapper 판정이 빗나가도 일반 mode로 조용히 내려가지 않습니다.
+- Windows terminal에 표시되는 `[simple-vibe-ide] launching ...` 줄은 app이 실제로 더한 argv이므로 bypass 실행 여부를 확인할 때 사용합니다.
 - `Set` -> `Agent event bridge`의 `tmux env passthrough`는 tmux 안에서 새 LLM을 띄울 때 유지할 환경변수 이름을 지정합니다. 기본값은 `IS_DEMO`이며, token/secret/key/password 계열 이름은 안전상 무시됩니다.
 
 ### Claude local hook 상태 브리지

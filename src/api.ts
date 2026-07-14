@@ -59,6 +59,7 @@ export const api = {
     invoke<void>('delete_note_file_permanently', { profileId, path }),
   openPath: (profileId: string, path: string) =>
     invoke<void>('open_path', { profileId, path }),
+  openLocalhostPort: (port: number) => invoke<void>('open_localhost_port', { port }),
   runPowerShellScriptAsAdmin: (profileId: string, path: string) =>
     invoke<void>('run_powershell_script_as_admin', { profileId, path }),
   readClipboardFilePaths: () => invoke<string[]>('read_clipboard_file_paths'),

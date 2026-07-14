@@ -3828,6 +3828,31 @@ fn open_path(profile_id: String, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_localhost_port(port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Err("local port must be between 1 and 65535".to_string());
+    }
+    // The URL is constructed from a numeric port rather than accepting terminal output or an
+    // arbitrary URL, so invoking cmd's `start` cannot turn detected text into shell syntax.
+    let url = format!("http://127.0.0.1:{port}");
+    let mut command = Command::new("cmd.exe");
+    command
+        .arg("/D")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg(url)
+        .current_dir(windows_spawn_cwd())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command)
+        .spawn()
+        .map_err(|err| format!("failed to open localhost URL: {err}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 fn run_powershell_script_as_admin(profile_id: String, path: String) -> Result<(), String> {
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
@@ -4743,6 +4768,8 @@ fn start_port_forward_host(
         push_ssh_background_options(&mut command);
         command
             .arg("-N")
+            .arg("-o")
+            .arg("ExitOnForwardFailure=yes")
             .arg("-L")
             .arg(format!("127.0.0.1:{actual_local}:127.0.0.1:{remote_port}"))
             .arg(alias)
@@ -9954,6 +9981,7 @@ pub fn run() {
             restore_deleted_paths,
             delete_note_file_permanently,
             open_path,
+            open_localhost_port,
             run_powershell_script_as_admin,
             read_clipboard_file_paths,
             save_clipboard_image_file,

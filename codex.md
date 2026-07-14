@@ -51,6 +51,61 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-14 - Auto-connect local server ports in Simple Vibe Terminal
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src/api.ts`, `src-tauri/src/lib.rs`, docs)
+- Simple Vibe Terminal now keeps an independent, workspace/profile/generation-scoped port list
+  instead of sending detected ports into the IDE Browser panel that the Terminal flavor hides.
+- High-confidence positive server startup output starts WSL/SSH forwarding automatically. Broad or
+  negative/error-like matches stay pending for explicit confirmation. Confidence is evaluated on
+  the matching line only, and total automatic attempts are capped per terminal workspace.
+- Added a compact top-bar `Ports` dialog with active/pending/error counts plus Open, Copy, Forward,
+  Stop, and Ignore actions. It does not create a hidden Browser widget or preview WebView.
+- Pending starts are cancelled safely across layout/root/profile changes; a late backend result is
+  stopped immediately, and active results are stopped before their scoped UI state is discarded.
+- WSL direct exposure and SSH tunnels stay in `Starting` until their Windows localhost port passes
+  a bounded readiness probe. Unreachable/no-op results are stopped and shown as retryable failures
+  instead of being reported as active.
+- Added a numeric-port-only localhost opener for the Windows default browser. Terminal output is
+  never passed to `cmd`, and SSH automatic forwards request an available local port with
+  `ExitOnForwardFailure=yes` enabled on the tunnel command.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Targeted detection heuristic smoke covered Vite, Uvicorn, Python HTTP server, refused URLs,
+  duration-like false positives, and documentation-only localhost URLs.
+- Real packaged Windows/WebView2 runtime validation is still required.
+
+### 2026-07-13 - Keep Windows Codex and Claude launchers in bypass mode
+
+#### Changed (`src/main.ts`, launcher docs)
+- Windows LLM launch setup is now submitted as one semicolon-delimited PowerShell command instead
+  of embedded line feeds followed by a single Enter. This avoids depending on host/version-specific
+  multiline parsing during fresh ConPTY/PSReadLine startup and keeps setup plus invocation ordered.
+- PowerShell duplicate detection now inspects only the effective command, follows aliases, and
+  reads a bounded prefix only for effective text wrappers. Lower-priority commands and native CLI
+  option/help strings can no longer suppress flags for the command that is actually invoked.
+- Codex always receives repeatable Windows config overrides for approval `never` and sandbox
+  `danger-full-access`; Claude always receives explicit `--permission-mode bypassPermissions`.
+  These enforce the intended mode even if best-effort wrapper source detection skips a canonical
+  dangerous flag. The canonical flags are still deduplicated because Codex rejects duplicates.
+- Windows launchers print a compact `[simple-vibe-ide] launching ...` line containing only the
+  executable and app-added argv, never environment values, so the effective launch can be checked
+  without exposing bridge data.
+- Added exact Windows runtime smoke checks for both launchers.
+
+#### Verified
+- Local Codex CLI accepted repeated `-c approval_policy=...` / `-c sandbox_mode=...` overrides and
+  accepted them together with `--dangerously-bypass-approvals-and-sandbox`.
+- Local Claude Code accepted `--dangerously-skip-permissions --permission-mode bypassPermissions`.
+- Real packaged Windows/WebView2 runtime validation is still required.
+
 ### 2026-07-11 - Make workspace loading, Glass, and Korean terminal input feel immediate
 
 #### Changed (`src/main.ts`, `src/api.ts`, `src/styles.css`, `src-tauri/src/lib.rs`, package lock/theme files)

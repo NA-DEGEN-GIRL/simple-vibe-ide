@@ -366,6 +366,22 @@ interface DetectedPortItem {
   url: string;
 }
 
+type TerminalPortStatus = 'detected' | 'starting' | 'active' | 'failed' | 'stopping' | 'direct';
+
+interface TerminalPortEntry {
+  key: string;
+  workspaceId: string;
+  profileId: string;
+  profileKind: ConnectionProfile['kind'];
+  generation: number;
+  remotePort: number;
+  status: TerminalPortStatus;
+  directUrl: string;
+  result?: PortForwardResult;
+  error?: string;
+  cancelRequested: boolean;
+}
+
 interface BrowserTab {
   id: string;
   url: string;
@@ -1524,6 +1540,9 @@ type LlmLauncherConfig = {
   executable: string;
   flags: LlmLauncherFlag[];
   env?: Record<string, string>;
+  // Repeatable/idempotent Windows-only arguments that enforce the intended mode even if a
+  // wrapper's source text makes the best-effort duplicate detector skip a canonical flag.
+  powershellAlwaysArgs?: string[];
 };
 
 type AgentBridgeLaunchContext = {
@@ -1540,6 +1559,10 @@ type AgentHookState = {
 const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   codex: {
     executable: 'codex',
+    powershellAlwaysArgs: [
+      '-c', 'approval_policy="never"',
+      '-c', 'sandbox_mode="danger-full-access"'
+    ],
     flags: [
       {
         bashPattern: '*--dangerously-bypass-approvals-and-sandbox*',
@@ -1555,6 +1578,7 @@ const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   },
   claude: {
     executable: 'claude',
+    powershellAlwaysArgs: ['--permission-mode', 'bypassPermissions'],
     flags: [
       {
         // claude rejects --dangerously-skip-permissions as root, so skip it when uid 0.
@@ -1877,6 +1901,11 @@ const TERMINAL_OSC7_CWD_PATTERN = /\x1b]7;file:\/\/[^/\x07\x1b]*(\/[^\x07\x1b]*)
 const TERMINAL_CPR_RESPONSE_PATTERN = /\x1b\[\d+;\d+R/g;
 const LOCAL_PREVIEW_URL_PORT_PATTERN = /\b(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b/gi;
 const LOCAL_PREVIEW_LISTENING_PORT_PATTERN = /\b(?:listening|running|available|started|serving|server)\b[^\r\n]{0,80}\b(?:port\s*)?(\d{4,5})\b/gi;
+const LOCAL_SERVER_POSITIVE_CONTEXT_PATTERN = /\b(?:local|network|listen(?:ing)?|running|available|started|serving|ready|server|development|preview)\b/i;
+const LOCAL_SERVER_NEGATIVE_CONTEXT_PATTERN = /\b(?:error|failed|failure|refused|unreachable|cannot|can't|unable|stopped|closed|not\s+(?:running|available|listening|reachable))\b/i;
+const TERMINAL_AUTO_FORWARD_LIMIT = 8;
+const TERMINAL_FORWARD_READY_TIMEOUT_MS = 10_000;
+const TERMINAL_FORWARD_READY_DELAY_MS = 250;
 const TERMINAL_POWERSHELL_PROMPT_CWD_PATTERN = /(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*)>\s*$/;
 const TERMINAL_BASH_PROMPT_CWD_PATTERN = /(?:^|\s)[^@\s:]+@[^:\s]+:([^#$\r\n]+)[#$]\s*$/;
 const EXPLORER_TYPEAHEAD_TIMEOUT_MS = 900;
@@ -3689,6 +3718,11 @@ let workspacePathSwitchGeneration = 0;
 let storedActiveWorkspaceId = '';
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
 const autoForwardingPorts = new Set<string>();
+const terminalPortEntries = new Map<string, TerminalPortEntry>();
+const ignoredTerminalPortKeys = new Set<string>();
+const terminalAutoForwardAttemptKeys = new Set<string>();
+let terminalPortScopeGeneration = 0;
+let terminalPortsPositionFrame = 0;
 const textFileCache = new Map<string, TextFileCacheEntry>();
 const textFileReads = new Map<string, Promise<string>>();
 const textFilePrefetchTimers = new Map<string, number>();
@@ -3792,6 +3826,13 @@ const forwardRowElementCache = new Map<string, HTMLElement>();
 const forwardRowPartCache = new WeakMap<HTMLElement, {
   load: HTMLButtonElement;
   detail: HTMLElement;
+  stop: HTMLButtonElement;
+}>();
+const terminalPortRowElementCache = new Map<string, HTMLElement>();
+const terminalPortRowPartCache = new WeakMap<HTMLElement, {
+  open: HTMLButtonElement;
+  detail: HTMLElement;
+  copy: HTMLButtonElement;
   stop: HTMLButtonElement;
 }>();
 const marketTickerElementCache = new Map<string, HTMLElement>();
@@ -4206,6 +4247,9 @@ app.innerHTML = `
         <button class="panel-toggle" data-toggle-panel="snippets" title="Toggle Snippets" aria-pressed="false">Snip</button>
         <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
         <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
+        <button id="terminal-ports-toggle" class="terminal-ports-toggle${IS_TERMINAL_APP ? '' : ' hidden'}" type="button" aria-haspopup="dialog" aria-controls="terminal-ports-popover" aria-expanded="false" title="Detected and forwarded local server ports">
+          <span>Ports</span><span id="terminal-ports-count" class="terminal-ports-count" aria-live="polite">0</span>
+        </button>
         <div class="workspace-status-slot"><div id="status" class="status">Ready</div></div>
         <div id="market-ticker" class="market-ticker" title="Binance USD-M Futures ticker">
           <div id="market-ticker-list" class="market-ticker-list" aria-live="polite"></div>
@@ -4511,6 +4555,16 @@ app.innerHTML = `
     <button id="window-maximize" class="window-control" type="button" title="Maximize or restore" aria-label="Maximize or restore" data-window-action="toggle-maximize"><span class="window-control-icon maximize" aria-hidden="true"></span></button>
     <button id="window-close" class="window-control close" type="button" title="Close" aria-label="Close" data-window-action="close"><span class="window-control-icon close" aria-hidden="true"></span></button>
   </div>
+  <div id="terminal-ports-popover" class="terminal-ports-popover hidden" data-no-window-drag role="dialog" aria-labelledby="terminal-ports-title" aria-hidden="true">
+    <div class="terminal-ports-popover-header">
+      <strong id="terminal-ports-title">Local server ports</strong>
+      <span id="terminal-ports-summary" class="terminal-ports-summary">No ports</span>
+      <span class="spacer"></span>
+      <button id="terminal-ports-close" type="button" aria-label="Close local server ports">Close</button>
+    </div>
+    <div id="terminal-forward-list" class="forward-list terminal-forward-list"></div>
+    <div class="terminal-ports-note">High-confidence WSL/SSH server ports auto-forward. Open launches the Windows browser; Copy copies the local URL.</div>
+  </div>
   <div id="widget-opacity-popover" class="widget-opacity-popover hidden" data-no-window-drag role="dialog" aria-label="Widget opacity">
     <div class="widget-opacity-popover-header">
       <span id="widget-opacity-popover-label">Opacity 100%</span>
@@ -4604,6 +4658,12 @@ const el = {
   savedWorkspaceSelect: document.querySelector<HTMLSelectElement>('#saved-workspace-select')!,
   loadSavedWorkspace: document.querySelector<HTMLButtonElement>('#load-saved-workspace')!,
   deleteSavedWorkspace: document.querySelector<HTMLButtonElement>('#delete-saved-workspace')!,
+  terminalPortsToggle: document.querySelector<HTMLButtonElement>('#terminal-ports-toggle')!,
+  terminalPortsCount: document.querySelector<HTMLSpanElement>('#terminal-ports-count')!,
+  terminalPortsPopover: document.querySelector<HTMLDivElement>('#terminal-ports-popover')!,
+  terminalPortsSummary: document.querySelector<HTMLSpanElement>('#terminal-ports-summary')!,
+  terminalPortsClose: document.querySelector<HTMLButtonElement>('#terminal-ports-close')!,
+  terminalForwardList: document.querySelector<HTMLDivElement>('#terminal-forward-list')!,
   newShell: document.querySelector<HTMLButtonElement>('#new-shell')!,
   newWindowsShell: document.querySelector<HTMLButtonElement>('#new-windows-shell')!,
   marketTickerList: document.querySelector<HTMLDivElement>('#market-ticker-list')!,
@@ -5122,6 +5182,7 @@ async function init() {
   renderSnippetTabs();
   renderSnippets();
   renderShellTabs();
+  renderTerminalPorts();
   renderBrowserDeviceOptions();
   if (isPanelVisible('calculator')) renderCalculator();
   if (isPanelVisible('settings')) renderSettings();
@@ -21945,6 +22006,8 @@ function bindEvents() {
   el.saveFile.addEventListener('click', saveOpenFile);
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
+  el.terminalPortsToggle.addEventListener('click', toggleTerminalPortsPopover);
+  el.terminalPortsClose.addEventListener('click', () => hideTerminalPortsPopover());
   el.loadPreview.addEventListener('click', () => void openPreviewValue(el.previewUrl.value.trim()));
   el.previewUrl.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter') return;
@@ -22106,6 +22169,8 @@ function bindEvents() {
   document.addEventListener('contextmenu', handleContextMenu, true);
   document.addEventListener('pointerdown', handleWidgetOpacityPointerDown, true);
   document.addEventListener('keydown', handleWidgetOpacityKeydown, true);
+  document.addEventListener('pointerdown', handleTerminalPortsPointerDown, true);
+  document.addEventListener('keydown', handleTerminalPortsKeydown, true);
   document.addEventListener('keydown', handleGlassSettingsKeydown, true);
   document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
   document.addEventListener('keydown', handleContextMenuKeydown, true);
@@ -22113,6 +22178,7 @@ function bindEvents() {
   window.addEventListener('blur', () => {
     hideContextMenu();
     hideWidgetOpacityPopover();
+    hideTerminalPortsPopover({ restoreFocus: false });
   });
   window.addEventListener('pagehide', flushTerminalCwdSnapshotSave);
   document.addEventListener('visibilitychange', () => {
@@ -22171,6 +22237,7 @@ function scheduleWindowResizeWork() {
     const terminalTinyLayout = updateTerminalTinyWindowLayout('window-resize');
     hideContextMenu();
     hideWidgetOpacityPopover();
+    positionTerminalPortsPopover();
     applyWorkspaceDockSettings({ skipLayoutRefresh: true });
     FLOATING_PANELS.forEach((id) => {
       const panel = getPanel(id);
@@ -23193,15 +23260,36 @@ async function nextLlmTmuxSessionName(
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
+  const alwaysArgs = launcher.powershellAlwaysArgs ?? [];
+  // Keep setup and invocation in one submitted PSReadLine command. PowerShell host/PSReadLine
+  // versions can handle raw embedded LF input differently during fresh ConPTY startup; a single
+  // ordered submission avoids depending on those multiline-input details.
+  //
+  // Inspect only the command PowerShell would actually invoke. `Get-Command -All` merges lower
+  // priority commands into the same source string, so an unrelated old wrapper containing a
+  // bypass marker can suppress flags for the effective command. Follow aliases, then include the
+  // effective function definition or a bounded text-wrapper prefix; never scan a native CLI
+  // binary, whose embedded option/help strings are not evidence that a wrapper injects the flag.
   return [
-    `$sviSource = (Get-Command ${executable} -All -ErrorAction SilentlyContinue | Format-List CommandType,Name,Definition,Source | Out-String)`,
+    `$sviCommand = Get-Command ${powershellQuote(executable)} -ErrorAction SilentlyContinue`,
+    '$sviSource = ""',
+    '$sviAliasDepth = 0',
+    'while ($sviCommand -and $sviCommand.CommandType -eq "Alias" -and $sviAliasDepth -lt 8) { $sviSource += " $($sviCommand.CommandType) $($sviCommand.Name) $($sviCommand.Definition)"; $sviCommand = Get-Command $sviCommand.Definition -ErrorAction SilentlyContinue; $sviAliasDepth += 1 }',
+    'if ($sviCommand) { $sviSource += " $($sviCommand.CommandType) $($sviCommand.Name) $($sviCommand.Definition) $($sviCommand.Source)" }',
+    'if ($sviCommand -and $sviCommand.Path -match "\\.(?:ps1|psm1|cmd|bat)$") { $sviWrapperSource = (Get-Content -LiteralPath $sviCommand.Path -TotalCount 160 -ErrorAction SilentlyContinue) -join "`n"; $sviSource += " $sviWrapperSource" }',
     '$sviArgs = @()',
     ...Object.entries(launcher.env ?? {}).map(([envName, envValue]) => `$env:${envName} = ${powershellQuote(envValue)}`),
     ...launcher.flags.map((flag) =>
       `if ($sviSource -notmatch ${powershellQuote(flag.powershellPattern)}) { $sviArgs += @(${flag.args.map(powershellQuote).join(', ')}) }`
     ),
-    `& ${executable} @sviArgs`
-  ].join('\n');
+    ...(alwaysArgs.length > 0
+      ? [`$sviArgs += @(${alwaysArgs.map(powershellQuote).join(', ')})`]
+      : []),
+    "Remove-Variable -Name 'sviCommand','sviSource','sviAliasDepth','sviWrapperSource' -ErrorAction SilentlyContinue",
+    `$sviDisplayArgs = @(${powershellQuote(executable)}) + $sviArgs`,
+    'Write-Host ("[simple-vibe-ide] launching " + ($sviDisplayArgs -join " "))',
+    `& ${powershellQuote(executable)} @sviArgs`
+  ].join('; ');
 }
 
 function bashQuote(value: string) {
@@ -25648,6 +25736,7 @@ function flushVisibleTerminalWidgetPanes(widget: TerminalWidget, options: { reas
 
 function clearWorkspacePanels(options: { skipIntermediateRenders?: boolean } = {}) {
   const renderIntermediate = !options.skipIntermediateRenders;
+  disposeTerminalPortScope();
   clearExplorerBackgroundWork();
   destroyCodeEditorView();
   state.entries = [];
@@ -36636,7 +36725,9 @@ function runTerminalPortScan(pane: TerminalPane) {
   if (!terminalOutputMayContainPreviewPortHint(pane.outputBuffer)) return;
   const cleanOutput = cleanTerminalMetadataBuffer(pane.outputBuffer);
   if (!terminalOutputMayContainPreviewPortHint(cleanOutput)) return;
-  const found = detectNewLocalServerPorts(cleanOutput, pane.seenPorts, queueDetectedPort);
+  const found = detectNewLocalServerPorts(cleanOutput, pane.seenPorts, (port, autoForward) => {
+    queueDetectedPort(port, pane, autoForward);
+  }, !IS_TERMINAL_APP);
   if (found) pane.outputBuffer = '';
 }
 
@@ -37141,10 +37232,16 @@ async function openPort(port: number, source: 'manual' | 'auto') {
   }
 }
 
-function queueDetectedPort(port: number) {
+function queueDetectedPort(port: number, pane?: TerminalPane, autoForward = false) {
   if (!state.activeProfile || !isPreviewPort(port)) return;
   if (isPreviewProxyLocalPort(port)) return;
-  const profile = state.activeProfile;
+  const profile = pane ? profileForIdWithWindowsFallback(pane.profileId) : state.activeProfile;
+  if (!profile || profile.id !== state.activeProfile.id) return;
+  if (pane && pane.workspaceId !== state.activeWorkspaceId) return;
+  if (IS_TERMINAL_APP && pane) {
+    queueTerminalPort(profile, pane.workspaceId, port, autoForward);
+    return;
+  }
   const id = detectedPortId(profile.id, port);
   const url = `http://127.0.0.1:${port}`;
   if (detectedPortForId(id)) return;
@@ -37158,17 +37255,471 @@ function queueDetectedPort(port: number) {
     : `Detected local server on :${port}`);
 }
 
+function terminalPortEntryKey(workspaceId: string, profileId: string, port: number, generation = terminalPortScopeGeneration) {
+  return `${generation}:${workspaceId}:${profileId}:${port}`;
+}
+
+function queueTerminalPort(
+  profile: ConnectionProfile,
+  workspaceId: string,
+  port: number,
+  autoForward: boolean
+) {
+  if (!IS_TERMINAL_APP || !workspaceId || workspaceId !== state.activeWorkspaceId) return;
+  if (state.activeProfile?.id !== profile.id) return;
+  const key = terminalPortEntryKey(workspaceId, profile.id, port);
+  if (ignoredTerminalPortKeys.has(key)) return;
+  const existing = terminalPortEntries.get(key);
+  if (existing) {
+    if (autoForward && existing.status === 'detected') {
+      if (existing.profileKind === 'windows') {
+        existing.status = 'direct';
+        renderTerminalPorts();
+        setStatus(`Detected local server on ${existing.directUrl}; use Ports to open it`);
+      } else if (claimTerminalAutoForwardAttempt(existing.key)) {
+        void startTerminalPortForward(existing, 'auto');
+      }
+    }
+    return;
+  }
+  const entry: TerminalPortEntry = {
+    key,
+    workspaceId,
+    profileId: profile.id,
+    profileKind: profile.kind,
+    generation: terminalPortScopeGeneration,
+    remotePort: port,
+    status: profile.kind === 'windows' && autoForward ? 'direct' : 'detected',
+    directUrl: `http://127.0.0.1:${port}`,
+    cancelRequested: false
+  };
+  terminalPortEntries.set(key, entry);
+  renderTerminalPorts();
+
+  if (profile.kind === 'windows') {
+    setStatus(autoForward
+      ? `Detected local server on ${entry.directUrl}; use Ports to open it`
+      : `Detected possible local server on :${port}; use Ports to confirm it`);
+    return;
+  }
+  if (autoForward && claimTerminalAutoForwardAttempt(entry.key)) {
+    void startTerminalPortForward(entry, 'auto');
+    return;
+  }
+  setStatus(autoForward
+    ? `Detected :${port}; automatic forwarding limit reached, use Ports to forward it`
+    : `Detected possible local server on :${port}; use Ports to forward it`);
+}
+
+function claimTerminalAutoForwardAttempt(key: string) {
+  if (terminalAutoForwardAttemptKeys.has(key)) return false;
+  if (terminalAutoForwardAttemptKeys.size >= TERMINAL_AUTO_FORWARD_LIMIT) return false;
+  terminalAutoForwardAttemptKeys.add(key);
+  return true;
+}
+
+function terminalPortEntryIsCurrent(entry: TerminalPortEntry) {
+  return IS_TERMINAL_APP
+    && !entry.cancelRequested
+    && entry.generation === terminalPortScopeGeneration
+    && terminalPortEntries.get(entry.key) === entry
+    && state.activeWorkspaceId === entry.workspaceId
+    && state.activeProfile?.id === entry.profileId;
+}
+
+async function startTerminalPortForward(entry: TerminalPortEntry, source: 'manual' | 'auto') {
+  if (!terminalPortEntryIsCurrent(entry)) return;
+  if (entry.result) return;
+  if (entry.status === 'starting' || entry.status === 'active' || entry.status === 'stopping' || entry.status === 'direct') return;
+  entry.status = 'starting';
+  entry.error = undefined;
+  renderTerminalPorts();
+  try {
+    const forward = entry.profileKind === 'ssh'
+      ? await api.startPortForward(entry.profileId, entry.remotePort, 0)
+      : await startForwardForProfile(entry.profileId, entry.profileKind, entry.remotePort);
+    if (!terminalPortEntryIsCurrent(entry)) {
+      void api.stopPortForward(forward.id).catch(() => undefined);
+      return;
+    }
+    const ready = await waitForTerminalForwardReady(entry, forward);
+    if (!terminalPortEntryIsCurrent(entry)) {
+      void api.stopPortForward(forward.id).catch(() => undefined);
+      return;
+    }
+    if (!ready) {
+      try {
+        await api.stopPortForward(forward.id);
+      } catch (cleanupError) {
+        entry.result = forward;
+        throw new Error(`Windows localhost was unreachable and tunnel cleanup failed: ${compactTerminalPortError(cleanupError)}`);
+      }
+      throw new Error(`Windows localhost did not become reachable on :${forward.localPort}`);
+    }
+    entry.result = forward;
+    entry.status = 'active';
+    entry.error = undefined;
+    renderTerminalPorts();
+    const directWsl = entry.profileKind === 'wsl' && forward.localPort === entry.remotePort;
+    setStatus(directWsl
+      ? `Detected :${entry.remotePort}; available on Windows at ${forward.url}`
+      : `${source === 'auto' ? 'Auto-forwarded' : 'Forwarding'} :${entry.remotePort} to ${forward.url}`);
+  } catch (error) {
+    if (!terminalPortEntryIsCurrent(entry)) return;
+    entry.status = 'failed';
+    entry.error = compactTerminalPortError(error);
+    renderTerminalPorts();
+    setStatus(`Port :${entry.remotePort} forward failed; use Ports to retry`, true);
+  }
+}
+
+async function waitForTerminalForwardReady(entry: TerminalPortEntry, forward: PortForwardResult) {
+  const deadline = performance.now() + TERMINAL_FORWARD_READY_TIMEOUT_MS;
+  while (true) {
+    if (!terminalPortEntryIsCurrent(entry)) return false;
+    try {
+      if (await api.probeLocalHttpUrl(forward.url)) return true;
+    } catch {
+      // A tunnel can still be starting; retry within the bounded readiness window.
+    }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(TERMINAL_FORWARD_READY_DELAY_MS, remaining));
+  }
+}
+
+async function stopTerminalPortEntry(entry: TerminalPortEntry) {
+  if (!terminalPortEntryIsCurrent(entry)) return;
+  if (!entry.result) {
+    entry.cancelRequested = entry.status === 'starting';
+    ignoredTerminalPortKeys.add(entry.key);
+    terminalPortEntries.delete(entry.key);
+    renderTerminalPorts();
+    return;
+  }
+  if (entry.status === 'stopping') return;
+  entry.status = 'stopping';
+  entry.error = undefined;
+  renderTerminalPorts();
+  try {
+    await api.stopPortForward(entry.result.id);
+    if (!terminalPortEntryIsCurrent(entry)) return;
+    ignoredTerminalPortKeys.add(entry.key);
+    terminalPortEntries.delete(entry.key);
+    renderTerminalPorts();
+    setStatus(`Stopped port :${entry.result.localPort}`);
+  } catch (error) {
+    if (!terminalPortEntryIsCurrent(entry)) return;
+    entry.status = 'active';
+    entry.error = `Stop failed: ${compactTerminalPortError(error)}`;
+    renderTerminalPorts();
+    setStatus(`Port :${entry.result.localPort} could not be stopped; retry from Ports`, true);
+  }
+}
+
+function compactTerminalPortError(error: unknown) {
+  return String(error).replace(/\s+/g, ' ').trim().slice(0, 160) || 'Unknown error';
+}
+
+function currentTerminalPortEntries() {
+  const entries: TerminalPortEntry[] = [];
+  for (const entry of terminalPortEntries.values()) {
+    if (entry.generation !== terminalPortScopeGeneration) continue;
+    if (entry.workspaceId !== state.activeWorkspaceId || entry.profileId !== state.activeProfile?.id) continue;
+    entries.push(entry);
+  }
+  return entries;
+}
+
+function renderTerminalPorts() {
+  if (!IS_TERMINAL_APP) return;
+  const focusedAction = terminalPortFocusedAction();
+  const entries = currentTerminalPortEntries();
+  let activeCount = 0;
+  let pendingCount = 0;
+  let errorCount = 0;
+  for (const entry of entries) {
+    if (entry.status === 'active' || entry.status === 'direct') activeCount += 1;
+    else pendingCount += 1;
+    if (entry.status === 'failed' || entry.error) errorCount += 1;
+  }
+
+  setTextContentIfChanged(el.terminalPortsCount, String(entries.length));
+  const summary = entries.length
+    ? `${activeCount} active${pendingCount ? ` · ${pendingCount} pending` : ''}${errorCount ? ` · ${errorCount} issue` : ''}`
+    : 'No ports';
+  setTextContentIfChanged(el.terminalPortsSummary, summary);
+  toggleClassIfChanged(el.terminalPortsToggle, 'has-ports', entries.length > 0);
+  toggleClassIfChanged(el.terminalPortsToggle, 'has-error', errorCount > 0);
+  el.terminalPortsToggle.title = entries.length
+    ? `${summary}. Open detected and forwarded local server ports.`
+    : 'Detected and forwarded local server ports';
+  el.terminalPortsToggle.setAttribute('aria-label', entries.length
+    ? `Ports: ${activeCount} active, ${pendingCount} pending, ${errorCount} issues`
+    : 'Ports: none detected');
+
+  if (!entries.length) {
+    terminalPortRowElementCache.clear();
+    const empty = document.createElement('div');
+    empty.className = 'forward-row empty';
+    empty.textContent = state.workspaceOpen
+      ? 'No local server ports detected yet.'
+      : 'Open a terminal workspace to detect local server ports.';
+    el.terminalForwardList.replaceChildren(empty);
+    restoreTerminalPortFocus(focusedAction);
+    scheduleTerminalPortsPopoverPosition();
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    seen.add(entry.key);
+    const row = terminalPortRowElement(entry.key);
+    updateTerminalPortRow(row, entry);
+    fragment.append(row);
+  }
+  el.terminalForwardList.replaceChildren(fragment);
+  for (const key of terminalPortRowElementCache.keys()) {
+    if (!seen.has(key)) terminalPortRowElementCache.delete(key);
+  }
+  restoreTerminalPortFocus(focusedAction);
+  scheduleTerminalPortsPopoverPosition();
+}
+
+function terminalPortFocusedAction() {
+  if (el.terminalPortsPopover.classList.contains('hidden')) return null;
+  const focused = document.activeElement instanceof HTMLButtonElement
+    ? document.activeElement
+    : null;
+  const row = focused?.closest<HTMLElement>('[data-terminal-port-key]');
+  if (!focused || !row || !el.terminalForwardList.contains(row)) return null;
+  return {
+    key: row.dataset.terminalPortKey ?? '',
+    action: focused.dataset.terminalPortAction ?? ''
+  };
+}
+
+function restoreTerminalPortFocus(focused: { key: string; action: string } | null) {
+  if (!focused || el.terminalPortsPopover.classList.contains('hidden')) return;
+  const row = terminalPortRowElementCache.get(focused.key);
+  const sameAction = row?.querySelector<HTMLButtonElement>(`[data-terminal-port-action="${focused.action}"]:not(:disabled)`);
+  const nextAction = row?.querySelector<HTMLButtonElement>('button:not(:disabled)')
+    ?? el.terminalForwardList.querySelector<HTMLButtonElement>('button:not(:disabled)');
+  (sameAction ?? nextAction ?? el.terminalPortsClose).focus({ preventScroll: true });
+}
+
+function terminalPortRowElement(key: string) {
+  const cached = terminalPortRowElementCache.get(key);
+  if (cached) return cached;
+  const row = document.createElement('div');
+  row.className = 'forward-row terminal-port-row';
+  row.dataset.terminalPortKey = key;
+  row.setAttribute('role', 'group');
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'load';
+  open.dataset.terminalPortAction = 'open';
+  open.addEventListener('click', () => {
+    const entry = terminalPortEntries.get(row.dataset.terminalPortKey ?? '');
+    if (!entry) return;
+    if ((entry.status === 'detected' || entry.status === 'failed') && !entry.result) {
+      if (entry.profileKind === 'windows') {
+        entry.status = 'direct';
+        entry.error = undefined;
+        renderTerminalPorts();
+      } else {
+        void startTerminalPortForward(entry, 'manual');
+        return;
+      }
+    }
+    const localPort = entry.result?.localPort ?? entry.remotePort;
+    void api.openLocalhostPort(localPort)
+      .then(() => {
+        if (terminalPortEntries.get(entry.key) === entry) setStatus(`Opened http://127.0.0.1:${localPort}`);
+      })
+      .catch((error) => {
+        if (terminalPortEntries.get(entry.key) === entry) {
+          setStatus(`Could not open local port :${localPort}: ${String(error)}`, true);
+        }
+      });
+  });
+  const detail = document.createElement('span');
+  detail.className = 'forward-detail';
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'copy';
+  copy.textContent = 'Copy';
+  copy.dataset.terminalPortAction = 'copy';
+  copy.addEventListener('click', () => {
+    const entry = terminalPortEntries.get(row.dataset.terminalPortKey ?? '');
+    if (!entry) return;
+    const url = entry.result?.url ?? entry.directUrl;
+    void writeText(url)
+      .then(() => {
+        if (terminalPortEntries.get(entry.key) === entry) setStatus(`Copied ${url}`);
+      })
+      .catch((error) => {
+        if (terminalPortEntries.get(entry.key) === entry) setStatus(`Could not copy port URL: ${String(error)}`, true);
+      });
+  });
+  const stop = document.createElement('button');
+  stop.type = 'button';
+  stop.className = 'stop';
+  stop.dataset.terminalPortAction = 'stop';
+  stop.addEventListener('click', () => {
+    const entry = terminalPortEntries.get(row.dataset.terminalPortKey ?? '');
+    if (entry) void stopTerminalPortEntry(entry);
+  });
+  row.replaceChildren(open, detail, copy, stop);
+  terminalPortRowPartCache.set(row, { open, detail, copy, stop });
+  terminalPortRowElementCache.set(key, row);
+  return row;
+}
+
+function updateTerminalPortRow(row: HTMLElement, entry: TerminalPortEntry) {
+  const parts = terminalPortRowPartCache.get(row);
+  if (!parts) return;
+  row.dataset.terminalPortKey = entry.key;
+  row.className = `forward-row terminal-port-row ${entry.status}${entry.error ? ' has-error' : ''}`;
+  const localPort = entry.result?.localPort ?? entry.remotePort;
+  const directWsl = entry.profileKind === 'wsl' && entry.result?.localPort === entry.remotePort;
+  const openLabel = (entry.status === 'detected' || entry.status === 'failed') && !entry.result
+    ? (entry.profileKind === 'windows' ? 'Open' : 'Forward')
+    : entry.status === 'starting'
+      ? 'Starting...'
+      : entry.status === 'stopping'
+        ? 'Stopping...'
+        : 'Open';
+  let detail = `Detected :${entry.remotePort}`;
+  if (entry.status === 'starting') detail = `Auto-forwarding :${entry.remotePort}`;
+  else if (entry.status === 'direct') detail = `Windows local server :${entry.remotePort}`;
+  else if (entry.result && directWsl) detail = `Available on Windows :${localPort}`;
+  else if (entry.result) detail = `Local :${localPort} → remote :${entry.remotePort}`;
+  if (entry.error) detail = `${detail} · ${entry.error}`;
+  const busy = entry.status === 'starting' || entry.status === 'stopping';
+  setTextContentIfChanged(parts.open, openLabel);
+  setTextContentIfChanged(parts.detail, detail);
+  setTextContentIfChanged(parts.stop, entry.result ? (entry.status === 'stopping' ? 'Stopping...' : 'Stop') : 'Ignore');
+  setDisabledIfChanged(parts.open, busy);
+  setDisabledIfChanged(parts.copy, busy || (!entry.result && entry.status !== 'direct'));
+  setDisabledIfChanged(parts.stop, entry.status === 'stopping');
+  row.setAttribute('aria-label', entry.result
+    ? `Remote port ${entry.remotePort}, local port ${localPort}`
+    : `Detected port ${entry.remotePort}`);
+  parts.open.setAttribute('aria-label', (entry.status === 'detected' || entry.status === 'failed') && !entry.result
+    ? (entry.profileKind === 'windows'
+        ? `Open possible Windows local port ${entry.remotePort}`
+        : `Forward remote port ${entry.remotePort}`)
+    : `Open local port ${localPort} in the Windows browser`);
+  parts.copy.setAttribute('aria-label', `Copy local URL for port ${localPort}`);
+  parts.stop.setAttribute('aria-label', entry.result
+    ? `Stop forward for remote port ${entry.remotePort}`
+    : `Ignore detected port ${entry.remotePort}`);
+  parts.detail.title = entry.error ?? detail;
+}
+
+function showTerminalPortsPopover() {
+  if (!IS_TERMINAL_APP) return;
+  renderTerminalPorts();
+  el.terminalPortsPopover.classList.remove('hidden');
+  el.terminalPortsPopover.setAttribute('aria-hidden', 'false');
+  el.terminalPortsToggle.setAttribute('aria-expanded', 'true');
+  positionTerminalPortsPopover();
+  const firstAction = el.terminalForwardList.querySelector<HTMLButtonElement>('button:not(:disabled)');
+  (firstAction ?? el.terminalPortsClose).focus({ preventScroll: true });
+}
+
+function hideTerminalPortsPopover(options: { restoreFocus?: boolean } = {}) {
+  if (!IS_TERMINAL_APP) return;
+  const wasVisible = !el.terminalPortsPopover.classList.contains('hidden');
+  el.terminalPortsPopover.classList.add('hidden');
+  el.terminalPortsPopover.setAttribute('aria-hidden', 'true');
+  el.terminalPortsToggle.setAttribute('aria-expanded', 'false');
+  if (terminalPortsPositionFrame) window.cancelAnimationFrame(terminalPortsPositionFrame);
+  terminalPortsPositionFrame = 0;
+  if (wasVisible && options.restoreFocus !== false) el.terminalPortsToggle.focus({ preventScroll: true });
+}
+
+function positionTerminalPortsPopover() {
+  if (!IS_TERMINAL_APP || el.terminalPortsPopover.classList.contains('hidden')) return;
+  const anchor = el.terminalPortsToggle.getBoundingClientRect();
+  const popover = el.terminalPortsPopover;
+  const rect = popover.getBoundingClientRect();
+  const left = clamp(anchor.right - rect.width, 8, Math.max(8, window.innerWidth - rect.width - 8));
+  const below = anchor.bottom + 6;
+  const top = below + rect.height <= window.innerHeight - 8
+    ? below
+    : Math.max(8, anchor.top - rect.height - 6);
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(top)}px`;
+}
+
+function scheduleTerminalPortsPopoverPosition() {
+  if (!IS_TERMINAL_APP || el.terminalPortsPopover.classList.contains('hidden')) return;
+  if (terminalPortsPositionFrame) return;
+  terminalPortsPositionFrame = window.requestAnimationFrame(() => {
+    terminalPortsPositionFrame = 0;
+    positionTerminalPortsPopover();
+  });
+}
+
+function toggleTerminalPortsPopover() {
+  if (el.terminalPortsPopover.classList.contains('hidden')) showTerminalPortsPopover();
+  else hideTerminalPortsPopover();
+}
+
+function handleTerminalPortsPointerDown(event: PointerEvent) {
+  if (!IS_TERMINAL_APP || el.terminalPortsPopover.classList.contains('hidden')) return;
+  if (event.target instanceof Node && (
+    el.terminalPortsPopover.contains(event.target)
+    || el.terminalPortsToggle.contains(event.target)
+  )) return;
+  hideTerminalPortsPopover({ restoreFocus: false });
+}
+
+function handleTerminalPortsKeydown(event: KeyboardEvent) {
+  if (!IS_TERMINAL_APP || event.key !== 'Escape' || el.terminalPortsPopover.classList.contains('hidden')) return;
+  event.preventDefault();
+  event.stopPropagation();
+  hideTerminalPortsPopover();
+}
+
+function disposeTerminalPortScope() {
+  if (!IS_TERMINAL_APP) return;
+  terminalPortScopeGeneration += 1;
+  for (const entry of terminalPortEntries.values()) {
+    entry.cancelRequested = true;
+    if (entry.result) void api.stopPortForward(entry.result.id).catch(() => undefined);
+  }
+  terminalPortEntries.clear();
+  ignoredTerminalPortKeys.clear();
+  terminalAutoForwardAttemptKeys.clear();
+  terminalPortRowElementCache.clear();
+  el.terminalForwardList.replaceChildren();
+  hideTerminalPortsPopover({ restoreFocus: false });
+  renderTerminalPorts();
+}
+
 function detectedPortId(profileId: string, port: number) {
   return `${profileId}:${port}`;
 }
 
 async function startForwardForPort(port: number, source: 'manual' | 'auto') {
   if (!state.activeProfile) throw new Error('No active profile');
+  return startForwardForProfile(state.activeProfile.id, state.activeProfile.kind, port);
+}
+
+async function startForwardForProfile(
+  profileId: string,
+  profileKind: ConnectionProfile['kind'],
+  port: number
+) {
   try {
-    return await api.startPortForward(state.activeProfile.id, port, port);
+    return await api.startPortForward(profileId, port, port);
   } catch (error) {
-    if (state.activeProfile.kind === 'windows') throw error;
-    return api.startPortForward(state.activeProfile.id, port, 0);
+    if (profileKind === 'windows') throw error;
+    return api.startPortForward(profileId, port, 0);
   }
 }
 
@@ -40240,27 +40791,59 @@ function parsePreviewPort(value: string) {
   return isPreviewPort(port) ? port : null;
 }
 
-function detectNewLocalServerPorts(text: string, seenPorts: Set<number>, onPort: (port: number) => void) {
-  let found = 0;
+function detectNewLocalServerPorts(
+  text: string,
+  seenPorts: Set<number>,
+  onPort: (port: number, autoForward: boolean) => void,
+  rememberPending = true
+) {
+  const detections = new Map<number, boolean>();
+  const remember = (port: number, autoForward: boolean) => {
+    if (!isPreviewPort(port) || seenPorts.has(port)) return;
+    detections.set(port, Boolean(detections.get(port)) || autoForward);
+  };
+
   LOCAL_PREVIEW_URL_PORT_PATTERN.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = LOCAL_PREVIEW_URL_PORT_PATTERN.exec(text))) {
     const port = Number(match[1]);
-    if (!isPreviewPort(port) || seenPorts.has(port)) continue;
-    seenPorts.add(port);
-    found += 1;
-    onPort(port);
+    remember(port, localServerPortMatchIsHighConfidence(text, match, 'url'));
   }
 
   LOCAL_PREVIEW_LISTENING_PORT_PATTERN.lastIndex = 0;
   while ((match = LOCAL_PREVIEW_LISTENING_PORT_PATTERN.exec(text))) {
     const port = Number(match[1]);
-    if (!isPreviewPort(port) || seenPorts.has(port)) continue;
-    seenPorts.add(port);
-    found += 1;
-    onPort(port);
+    remember(port, localServerPortMatchIsHighConfidence(text, match, 'listener'));
   }
-  return found;
+
+  for (const [port, autoForward] of detections) {
+    if (autoForward || rememberPending) seenPorts.add(port);
+    onPort(port, autoForward);
+  }
+  return detections.size;
+}
+
+function localServerPortMatchIsHighConfidence(
+  text: string,
+  match: RegExpExecArray,
+  source: 'url' | 'listener'
+) {
+  const index = match.index ?? 0;
+  const lineStart = Math.max(text.lastIndexOf('\n', index - 1), text.lastIndexOf('\r', index - 1)) + 1;
+  const nextLf = text.indexOf('\n', index + match[0].length);
+  const nextCr = text.indexOf('\r', index + match[0].length);
+  const lineEnd = Math.min(
+    nextLf < 0 ? text.length : nextLf,
+    nextCr < 0 ? text.length : nextCr
+  );
+  const context = text.slice(
+    Math.max(lineStart, index - 96),
+    Math.min(lineEnd, index + match[0].length + 96)
+  );
+  if (LOCAL_SERVER_NEGATIVE_CONTEXT_PATTERN.test(context)) return false;
+  if (source === 'url') return LOCAL_SERVER_POSITIVE_CONTEXT_PATTERN.test(context);
+  if (/\bport\s*[:=]?\s*\d{4,5}\b/i.test(match[0])) return true;
+  return /\b(?:listening|running|serving|available)\b[^\r\n]{0,48}\b(?:on|at)\s*:?[ \t]*\d{4,5}\b/i.test(match[0]);
 }
 
 function isPreviewPort(port: number) {
