@@ -51,6 +51,32 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-14 - Self-heal shifted frameless WebView and stale Glass tilt
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`)
+- The frameless main window now reasserts the main WebView at physical `(0, 0)` with the native
+  window's full client size after startup, focus/visibility return, DPI changes, maximize/restore,
+  and a debounced resize settle. This repairs a transient WebView2 child-controller offset without
+  reloading the app, nudging the native window, or changing terminal sessions.
+- Bounds repair is coalesced and force-limited so raw resize events do not add synchronous work to
+  terminal typing or repeatedly trigger Glass layout work. A detected mismatch records only
+  geometry diagnostics.
+- Window wake also clears an invalid root scroll offset and resets only stale LiquidGL hover/tilt
+  transforms before restoring the configured tilt behavior. Glass material and visual settings are
+  unchanged.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Real Windows/WebView2 smoke is still required across minimize/restore, maximize/titlebar double
+  click, mixed-DPI monitor moves, non-100% IDE scale, Glass on/off, and capture protection.
+
 ### 2026-07-14 - Auto-connect local server ports in Simple Vibe Terminal
 
 #### Changed (`src/main.ts`, `src/styles.css`, `src/api.ts`, `src-tauri/src/lib.rs`, docs)

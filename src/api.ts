@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse } from './types';
 
+export interface MainWebviewBoundsRefreshResult {
+  applied: boolean;
+  mismatched: boolean;
+}
+
 export const api = {
   listProfiles: () => invoke<ConnectionProfile[]>('list_profiles'),
   listWslProfiles: () => invoke<ConnectionProfile[]>('list_wsl_profiles'),
@@ -9,6 +14,8 @@ export const api = {
     invoke<void>('answer_ssh_auth_prompt', { id, secret }),
   setCaptureProtection: (enabled: boolean) =>
     invoke<void>('set_capture_protection', { enabled }),
+  refreshMainWebviewBounds: (force = false) =>
+    invoke<MainWebviewBoundsRefreshResult>('refresh_main_webview_bounds', { force }),
   rendererHeartbeat: () => invoke<RendererHeartbeatResponse>('renderer_heartbeat'),
   readSnippetsStore: () => invoke<string>('read_snippets_store'),
   writeSnippetsStore: (payload: string) => invoke<void>('write_snippets_store', { payload }),

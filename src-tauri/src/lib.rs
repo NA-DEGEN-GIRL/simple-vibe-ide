@@ -2854,6 +2854,69 @@ fn main_webview_window<R: tauri::Runtime>(
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MainWebviewBoundsRefreshResult {
+    applied: bool,
+    mismatched: bool,
+}
+
+fn sync_main_webview_bounds<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    force: bool,
+) -> Result<MainWebviewBoundsRefreshResult, String> {
+    let inner_size = window.inner_size().map_err(|error| error.to_string())?;
+    if inner_size.width < 64 || inner_size.height < 64 {
+        return Ok(MainWebviewBoundsRefreshResult {
+            applied: false,
+            mismatched: false,
+        });
+    }
+
+    let scale_factor = window.scale_factor().map_err(|error| error.to_string())?;
+    let webview = window.as_ref();
+    let mut bounds = webview.bounds().map_err(|error| error.to_string())?;
+    let position = bounds.position.to_physical::<i32>(scale_factor);
+    let size = bounds.size.to_physical::<u32>(scale_factor);
+    let mismatched = position.x != 0
+        || position.y != 0
+        || size.width.abs_diff(inner_size.width) > 1
+        || size.height.abs_diff(inner_size.height) > 1;
+    if !force && !mismatched {
+        return Ok(MainWebviewBoundsRefreshResult {
+            applied: false,
+            mismatched: false,
+        });
+    }
+
+    // A frameless Windows window can occasionally leave WebView2's child
+    // controller at stale bounds after maximize, DPI, or focus transitions.
+    // Reassert the full client-area rectangle without nudging the native
+    // window itself, which would cause a much more expensive app-wide resize.
+    webview
+        .set_auto_resize(true)
+        .map_err(|error| error.to_string())?;
+    bounds.position = PhysicalPosition::new(0, 0).into();
+    bounds.size = inner_size.into();
+    webview
+        .set_bounds(bounds)
+        .map_err(|error| error.to_string())?;
+    Ok(MainWebviewBoundsRefreshResult {
+        applied: true,
+        mismatched,
+    })
+}
+
+#[tauri::command]
+fn refresh_main_webview_bounds(
+    app: AppHandle,
+    force: bool,
+) -> Result<MainWebviewBoundsRefreshResult, String> {
+    let window = main_webview_window(&app)
+        .ok_or_else(|| "main WebView window is not available".to_string())?;
+    sync_main_webview_bounds(&window, force)
+}
+
 fn main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<tauri::Window<R>> {
     app.get_window("main").or_else(|| {
         app.windows()
@@ -9963,6 +10026,7 @@ pub fn run() {
             llm_tmux_pane_probe,
             read_snippets_store,
             write_snippets_store,
+            refresh_main_webview_bounds,
             set_capture_protection,
             force_quit_app,
             resolve_profile_path,

@@ -3934,6 +3934,12 @@ let activeBrowserFrameId = '';
 let browserInactiveFrameSuspendTimer = 0;
 let browserLoadRequestSeq = 0;
 let windowResizeFrame = 0;
+let mainWebviewBoundsRefreshTimer = 0;
+let mainWebviewBoundsRefreshInFlight = false;
+let mainWebviewBoundsRefreshForce = false;
+const mainWebviewBoundsRefreshReasons = new Set<string>();
+let mainWebviewBoundsRefreshErrorLogged = false;
+let mainWebviewBoundsLastForcedAt = Number.NEGATIVE_INFINITY;
 let workspaceSnapshotTimer = 0;
 let workspacePersistTimer = 0;
 let savedWorkspaceAutoUpdateTimer = 0;
@@ -5131,15 +5137,20 @@ async function init() {
     }),
     currentWindow.onFocusChanged((event) => {
       if (event.payload) {
+        scheduleMainWebviewBoundsRefresh('native-focus', { force: true });
         resumeTerminalsAfterWindowWake('window-focus');
         releaseStaleTerminalImeGuardBeforeFocusRecovery();
         focusActiveTerminalPaneWhenItOwnsKeyboard();
         resumeGlassAfterWindowWake('window-focus');
       }
+    }),
+    currentWindow.onScaleChanged(() => {
+      scheduleMainWebviewBoundsRefresh('scale-change', { delay: 120, force: true });
     })
   ]);
   startRendererHeartbeat();
   window.addEventListener('focus', () => {
+    scheduleMainWebviewBoundsRefresh('window-focus', { force: true });
     resumeTerminalsAfterWindowWake('window-focus');
     releaseStaleTerminalImeGuardBeforeFocusRecovery();
     focusActiveTerminalPaneWhenItOwnsKeyboard();
@@ -5148,6 +5159,7 @@ async function init() {
   document.addEventListener('focusin', (event) => cancelTerminalFocusRequestsForMeaningfulTarget(event.target));
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
+      scheduleMainWebviewBoundsRefresh('visible', { force: true });
       resumeTerminalsAfterWindowWake('visible');
       releaseStaleTerminalImeGuardBeforeFocusRecovery();
       focusActiveTerminalPaneWhenItOwnsKeyboard();
@@ -5210,6 +5222,7 @@ async function init() {
     initialHydrationComplete = true;
     appendPerformanceDiagnostic('init-first-hydration', initStartedAt);
     if (appGlassEnabled()) scheduleAppGlassRefresh({ delay: 0, reason: 'initial-hydration-complete' });
+    scheduleMainWebviewBoundsRefresh('startup', { delay: 360, force: true });
   });
 }
 
@@ -10658,7 +10671,7 @@ function restoreLiquidGlassTiltSuspension(suspensions: AppGlassTiltSuspension[])
       suspension.lens._shadowEl.style.transition = '';
     }
     if (suspension.tiltEnabled) suspension.lens.setTilt?.(true);
-    if (suspension.lens.el instanceof HTMLElement && suspension.lens.el.classList.contains('app-glass-plane')) {
+    if (liquidGlassLensUsesTiltFollowers(suspension.lens)) {
       installAppGlassTiltFollowers(suspension.lens);
     }
     suspension.lens.updateMetrics?.();
@@ -10739,6 +10752,7 @@ function resumeGlassAfterWindowWake(reason: string) {
 }
 
 function runGlassAfterWindowWake(reason: string) {
+  resetStaleGlassTiltAfterWindowWake();
   appGlassWindowResumeRecaptureDeferUntil = Math.max(
     appGlassWindowResumeRecaptureDeferUntil,
     performance.now() + 1100
@@ -10746,6 +10760,39 @@ function runGlassAfterWindowWake(reason: string) {
   flushDeferredAppGlassRecapture(reason, { delay: 700, stagger: 64 });
   scheduleGlassResumeGeometry(reason);
   syncWorkspaceGlassTicker();
+}
+
+function resetStaleGlassTiltAfterWindowWake() {
+  const seen = new Set<LiquidGLLensLike>();
+  const suspensions: AppGlassTiltSuspension[] = [];
+  const workspaceRenderersToRefresh = new Set<LiquidGLRendererLike>();
+  const resetRendererLenses = (renderer: LiquidGLRendererLike | undefined, workspace = false) => {
+    for (const lens of renderer?.lenses ?? []) {
+      if (seen.has(lens)) continue;
+      if (!(lens.el instanceof HTMLElement) || !lens.el.isConnected) continue;
+      seen.add(lens);
+      const transform = lens.el.style.transform || '';
+      if (lens._tiltActive !== true
+        && lens._tiltInteracting !== true
+        && !appGlassTiltTransformIsActive(transform)) {
+        continue;
+      }
+      const tiltEnabled = lens.options?.tilt === true;
+      if (tiltEnabled) lens.setTilt?.(false);
+      resetLiquidGlassLensTilt(lens);
+      suspensions.push({ lens, tiltEnabled });
+      if (workspace && renderer) workspaceRenderersToRefresh.add(renderer);
+    }
+  };
+  for (const renderer of uniqueAppGlassRenderers()) resetRendererLenses(renderer);
+  resetRendererLenses(explorerLiquidGlassRenderer);
+  resetRendererLenses(window.__liquidGLRenderer__, true);
+  resetRendererLenses(workspaceContainerLiquidGlassRenderer(), true);
+  if (!suspensions.length) return false;
+  restoreLiquidGlassTiltSuspension(suspensions);
+  for (const renderer of workspaceRenderersToRefresh) renderer.render?.();
+  appendAppGlassDiagnostic(`window-wake-tilt-reset/${suspensions.length}`);
+  return true;
 }
 
 function deferAppGlassRecapture(reason = 'deferred') {
@@ -11462,6 +11509,14 @@ function appGlassTiltTransformIsActive(transform: string) {
   const normalized = transform.trim();
   if (!normalized || normalized === 'none') return false;
   return !/rotateX\(\s*0(?:\.0+)?deg\s*\)\s*rotateY\(\s*0(?:\.0+)?deg\s*\)/i.test(normalized);
+}
+
+function liquidGlassLensUsesTiltFollowers(lens: LiquidGLLensLike) {
+  return lens.el instanceof HTMLElement && (
+    lens.el.classList.contains('app-glass-plane')
+    || lens.el.classList.contains('workspace-tab-glass-plane')
+    || lens.el.classList.contains('workspace-tab-add-glass-plane')
+  );
 }
 
 function syncAppGlassTiltOwnerState(lens: LiquidGLLensLike, active: boolean) {
@@ -22174,7 +22229,7 @@ function bindEvents() {
   document.addEventListener('keydown', handleGlassSettingsKeydown, true);
   document.addEventListener('pointerdown', handleContextMenuPointerDown, true);
   document.addEventListener('keydown', handleContextMenuKeydown, true);
-  window.addEventListener('resize', scheduleWindowResizeWork);
+  window.addEventListener('resize', () => scheduleWindowResizeWork());
   window.addEventListener('blur', () => {
     hideContextMenu();
     hideWidgetOpacityPopover();
@@ -22230,7 +22285,84 @@ function handleContextMenu(event: MouseEvent) {
   showContextMenu(event.clientX, event.clientY, items);
 }
 
-function scheduleWindowResizeWork() {
+function scheduleMainWebviewBoundsRefresh(
+  reason: string,
+  options: { delay?: number; force?: boolean } = {}
+) {
+  mainWebviewBoundsRefreshReasons.add(reason);
+  mainWebviewBoundsRefreshForce ||= options.force === true;
+  if (mainWebviewBoundsRefreshTimer) window.clearTimeout(mainWebviewBoundsRefreshTimer);
+  mainWebviewBoundsRefreshTimer = window.setTimeout(() => {
+    mainWebviewBoundsRefreshTimer = 0;
+    if (mainWebviewBoundsRefreshInFlight) {
+      scheduleMainWebviewBoundsRefresh('pending', { delay: 80 });
+      return;
+    }
+    const force = mainWebviewBoundsRefreshForce;
+    const reasons = Array.from(mainWebviewBoundsRefreshReasons);
+    mainWebviewBoundsRefreshForce = false;
+    mainWebviewBoundsRefreshReasons.clear();
+    mainWebviewBoundsRefreshInFlight = true;
+    if (force) mainWebviewBoundsLastForcedAt = performance.now();
+    const rootOffsetRepaired = resetRootViewportOrigin();
+    void api.refreshMainWebviewBounds(force)
+      .then((nativeBoundsRefresh) => {
+        mainWebviewBoundsRefreshErrorLogged = false;
+        if (!nativeBoundsRefresh.mismatched && !rootOffsetRepaired) return;
+        const shellRect = el.shell.getBoundingClientRect();
+        const visualViewport = window.visualViewport;
+        appendDiagnosticLog(
+          'renderer',
+          `viewport bounds repaired reason=${reasons.join('+') || reason}`
+            + ` native=${nativeBoundsRefresh.mismatched ? 1 : 0}`
+            + ` applied=${nativeBoundsRefresh.applied ? 1 : 0} root=${rootOffsetRepaired ? 1 : 0}`
+            + ` inner=${window.innerWidth}x${window.innerHeight}`
+            + ` doc=${document.documentElement.clientWidth}x${document.documentElement.clientHeight}`
+            + ` shell=${Math.round(shellRect.left)},${Math.round(shellRect.top)},${Math.round(shellRect.width)}x${Math.round(shellRect.height)}`
+            + ` visual=${Math.round(visualViewport?.offsetLeft ?? 0)},${Math.round(visualViewport?.offsetTop ?? 0)}`,
+          'warn',
+          { force: true }
+        );
+        scheduleWindowResizeWork({ skipNativeBoundsRefresh: true });
+        resumeGlassAfterWindowWake('viewport-repair');
+      })
+      .catch((error) => {
+        if (mainWebviewBoundsRefreshErrorLogged) return;
+        mainWebviewBoundsRefreshErrorLogged = true;
+        appendDiagnosticLog('renderer', `main WebView bounds refresh failed: ${String(error)}`, 'warn');
+      })
+      .finally(() => {
+        mainWebviewBoundsRefreshInFlight = false;
+        if (mainWebviewBoundsRefreshReasons.size && !mainWebviewBoundsRefreshTimer) {
+          scheduleMainWebviewBoundsRefresh('queued', { delay: 80 });
+        }
+      });
+  }, options.delay ?? 72);
+}
+
+function resetRootViewportOrigin() {
+  const html = document.documentElement;
+  const body = document.body;
+  const displaced = Math.abs(window.scrollX) > 0.5
+    || Math.abs(window.scrollY) > 0.5
+    || Math.abs(html.scrollLeft) > 0.5
+    || Math.abs(html.scrollTop) > 0.5
+    || Math.abs(body.scrollLeft) > 0.5
+    || Math.abs(body.scrollTop) > 0.5;
+  if (!displaced) return false;
+  window.scrollTo(0, 0);
+  html.scrollLeft = 0;
+  html.scrollTop = 0;
+  body.scrollLeft = 0;
+  body.scrollTop = 0;
+  return true;
+}
+
+function scheduleWindowResizeWork(options: { skipNativeBoundsRefresh?: boolean } = {}) {
+  if (!options.skipNativeBoundsRefresh) {
+    const force = performance.now() - mainWebviewBoundsLastForcedAt >= 750;
+    scheduleMainWebviewBoundsRefresh('window-resize', { delay: 180, force });
+  }
   if (windowResizeFrame) return;
   windowResizeFrame = window.requestAnimationFrame(() => {
     windowResizeFrame = 0;
@@ -22649,7 +22781,7 @@ function handleTitlebarMouseDown(event: MouseEvent) {
   refreshLiquidGlassGeometryForOwner(el.titlebar);
   restoreLiquidGlassTiltAfterPointerRelease(suspendedTilt);
   if (event.detail >= 2) {
-    void currentWindow.toggleMaximize();
+    void toggleCurrentWindowMaximize();
     return;
   }
   void currentWindow.startDragging();
@@ -22704,12 +22836,17 @@ async function closeCurrentWindowNow() {
 
 async function runWindowAction(action: string) {
   if (action === 'minimize') await currentWindow.minimize();
-  else if (action === 'toggle-maximize') await currentWindow.toggleMaximize();
+  else if (action === 'toggle-maximize') await toggleCurrentWindowMaximize();
   else if (action === 'close') {
     beginAppShutdownForClose();
     flushActiveWorkspaceSnapshotSave('flush');
     void closeCurrentWindowNow();
   }
+}
+
+async function toggleCurrentWindowMaximize() {
+  await currentWindow.toggleMaximize();
+  scheduleMainWebviewBoundsRefresh('toggle-maximize', { delay: 120, force: true });
 }
 async function resolveSelectedRoot() {
   if (!state.activeProfile) return '.';
