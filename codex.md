@@ -51,6 +51,72 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-15 - Keep shell command history independent per terminal pane
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`)
+- Every new shell pane now receives its own persistent history scope. This applies equally to split
+  panes, tabs, separate terminal widgets, Simple Vibe Terminal, and the outer shells created by the
+  Codex/Claude/Grok launch buttons.
+- WSL and SSH Bash sessions use a private per-pane `HISTFILE`; Windows PowerShell sessions clear any
+  shared in-memory PSReadLine entries before selecting a private `HistorySavePath`. If private
+  storage cannot be prepared, history becomes session-only instead of falling back to the shared
+  shell history file. Bash profiles that explicitly disable `HISTFILE` persistence remain
+  session-only. Custom prompt hooks that explicitly hard-code another history filename remain
+  user-owned shell configuration.
+- Normal workspace/app restore retains each pane's history scope. Workspace Copy and a fresh Load
+  of a saved workspace generate new scopes, while a retry or stale tmux client reconnect retains the
+  existing pane scope.
+- Arrow keys inside a running Codex/Claude/Grok TUI remain owned by that CLI. Explicitly opening the
+  same existing tmux session also intentionally reconnects to the same live process; neither case is
+  shell-history sharing between otherwise independent panes.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- A temporary-home Bash pseudo-TTY smoke confirmed two pane IDs stay isolated, a hostile `.bashrc`
+  cannot leak the shared history into either pane, and reopening the same pane ID restores only its
+  own commands. A second smoke confirmed `unset HISTFILE` remains session-only without private-file
+  writes. A Windows PowerShell 5.1 parser/capability smoke accepted the generated bootstrap.
+- Real packaged Windows/WebView2 smoke is still required for two-pane WSL, SSH, and PowerShell
+  history isolation, app restart continuity, workspace Copy/Load re-keying, and LLM/tmux behavior.
+
+#### Known limit
+- Per-pane history files are retained so dormant workspace panes can recover their history. An
+  automated retention/garbage-collection policy for histories no longer referenced by any layout is
+  not part of this patch.
+
+### 2026-07-15 - Restore saved terminal splits before restarting shells
+
+#### Changed (`src/main.ts`)
+- Cold workspace restore now creates every terminal widget/xterm surface first, installs the saved
+  split tree once, and only then starts shell backends. A saved 2x2 layout no longer has to pass
+  through an intermediate four-column layout while each shell starts.
+- Restored shells start active-pane-first through a bounded four-wide queue, so a typical 2x2
+  WSL/Windows layout starts all four shells in one wave. For SSH, the first pane for each profile
+  authenticates alone; after its real remote prompt is confirmed, same-profile panes fan out through
+  a separate four-wide readiness queue. Password/interactive profiles remain serial because those
+  prompts are intentionally not cached. Repeated Windows cwd probes are coalesced per restore.
+- Same-workspace restores are serialized, cancelled cold restores remove every pane/widget they
+  prepared, and late backend sessions are still killed. Normal user-created terminals keep the
+  existing direct low-latency startup path.
+- Workspace saves preserve the last complete terminal tree while structure is incomplete but still
+  retain current non-terminal panel/tab state. Liquid Glass capture waits for the final layout and
+  then recaptures once. Completion also avoids stealing focus if the user moved to another control
+  while shells were starting.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Real packaged Windows/WebView2 smoke is still required for multi-pane WSL/SSH/Windows restore,
+  cancellation during slow startup, saved 2x2 geometry, LLM/tmux relaunch, and Glass on/off.
+
 ### 2026-07-14 - Self-heal shifted frameless WebView and stale Glass tilt
 
 #### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`)

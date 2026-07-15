@@ -101,7 +101,8 @@ export const api = {
     rows: number,
     cols: number,
     workspaceId = '',
-    title = 'shell'
+    title = 'shell',
+    shellHistoryId = ''
   ) =>
     invoke<string>('spawn_terminal', {
       profileId,
@@ -110,7 +111,8 @@ export const api = {
       rows,
       cols,
       workspaceId,
-      title
+      title,
+      shellHistoryId
     }),
   writeTerminal: (id: string, data: string) => invoke<void>('write_terminal', { id, data }),
   flushTerminalInput: (id: string) => invoke<void>('flush_terminal_input', { id }),

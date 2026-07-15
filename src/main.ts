@@ -126,6 +126,7 @@ interface TerminalPane {
   llmHookActive?: boolean;
   profileId: string;
   cwd: string;
+  shellHistoryId: string;
   term: XTermTerminal;
   fit: XTermFitAddon;
   webgl?: XTermWebglAddon;
@@ -152,6 +153,8 @@ interface TerminalPane {
   inputBackendPending?: boolean;
   inputReconnectFrozen?: boolean;
   shellReadyAt?: number;
+  shellReadyConfirmed?: boolean;
+  shellReadyProbeBuffer?: string;
   pendingShellReadyActions?: TerminalShellReadyAction[];
   startupNoticeTimer?: number;
   startupStallTimer?: number;
@@ -1162,6 +1165,7 @@ interface WorkspacePanelSnapshot {
 
 interface WorkspaceTerminalSnapshot {
   snapshotPaneId?: string;
+  shellHistoryId?: string;
   title: string;
   customTitle?: string;
   command: string | null;
@@ -1516,6 +1520,13 @@ type CreateTerminalOptions = {
   pythonEnv?: TerminalPythonEnvSnapshot;
   llmId?: string;
   llmTmuxSessionName?: string;
+  shellHistoryId?: string;
+  // Workspace restore prepares every xterm surface first, applies the saved split tree once,
+  // then starts PTYs through a bounded queue. These flags are internal to that cold-restore path.
+  deferBackendStart?: boolean;
+  deferLayoutRender?: boolean;
+  skipInitialFitSettle?: boolean;
+  skipCwdValidation?: boolean;
 };
 
 interface TerminalPythonEnvSnapshot {
@@ -1764,6 +1775,10 @@ const TERMINAL_START_TIMEOUT_WSL_MS = 60000;
 const TERMINAL_START_TIMEOUT_SSH_MS = 45000;
 const TERMINAL_WSL_START_ATTEMPTS = 2;
 const TERMINAL_WSL_START_RETRY_DELAY_MS = 1400;
+// A common saved layout is 2x2. Start that whole layout in one wave while keeping
+// larger restores bounded so a workspace cannot flood WSL or the WebView with PTYs.
+const TERMINAL_RESTORE_SPAWN_CONCURRENCY = 4;
+const TERMINAL_SHELL_READY_PROBE_CHARS = 2048;
 const TERMINAL_STARTUP_NOTICE_MS = 900;
 const TERMINAL_STARTUP_STALL_MS = 10000;
 const TERMINAL_CLOSE_BACKEND_TIMEOUT_MS = 2500;
@@ -4041,6 +4056,14 @@ const terminalWidgetTabsRenderSignatures = new WeakMap<TerminalWidget, string>()
 const terminalWidgetTabsOrderRenderSignatures = new WeakMap<TerminalWidget, string>();
 const terminalWidgetTabElementCaches = new WeakMap<TerminalWidget, Map<string, HTMLElement>>();
 let workspaceTerminalRestoreToken = 0;
+let workspaceTerminalRestoreOperationSequence = 0;
+const workspaceTerminalRestoreOperations = new Map<string, Set<number>>();
+const workspaceTerminalRestoreCompletedIds = new Set<string>();
+const workspaceTerminalRestoreFailedPreserveIds = new Set<string>();
+const workspaceTerminalRestoreTails = new Map<string, Promise<void>>();
+const acquireTerminalRestoreSpawnSlot = createConcurrencyGate(TERMINAL_RESTORE_SPAWN_CONCURRENCY);
+const acquireTerminalRestoreSshBootstrapSlot = createConcurrencyGate(1);
+const acquireTerminalRestoreSshFollowerSlot = createConcurrencyGate(TERMINAL_RESTORE_SPAWN_CONCURRENCY);
 const workspaceTerminalRetryInFlightIds = new Set<string>();
 let inactiveEditorHydrationToken = 0;
 let noteHydrationToken = 0;
@@ -4867,11 +4890,22 @@ function setStatus(message: string, danger = false) {
 }
 
 const sshAuthPromptQueue: SshAuthPromptEvent[] = [];
+const sshNonCacheableAuthPromptCountsByProfile = new Map<string, number>();
 let sshAuthPromptActive = false;
 
 function handleSshAuthPrompt(request: SshAuthPromptEvent) {
+  if (!request.cacheable) {
+    sshNonCacheableAuthPromptCountsByProfile.set(
+      request.profileId,
+      (sshNonCacheableAuthPromptCountsByProfile.get(request.profileId) ?? 0) + 1
+    );
+  }
   sshAuthPromptQueue.push(request);
   showNextSshAuthPrompt();
+}
+
+function sshNonCacheableAuthPromptCount(profileId: string) {
+  return sshNonCacheableAuthPromptCountsByProfile.get(profileId) ?? 0;
 }
 
 function showNextSshAuthPrompt() {
@@ -10728,6 +10762,7 @@ function scheduleLiquidGlassGeometryForOwner(owner: HTMLElement) {
 
 function appGlassCanCaptureSnapshotNow() {
   if (restoringWorkspace) return false;
+  if (workspaceTerminalRestoreInProgress()) return false;
   if (document.hidden || document.visibilityState === 'hidden') return false;
   if (window.innerWidth < 64 || window.innerHeight < 64) return false;
   const rect = el.shell.getBoundingClientRect();
@@ -14180,6 +14215,7 @@ function cloneWorkspaceSnapshotForSavedLoad(saved: SavedWorkspaceEntry): Workspa
   snapshot.updatedAt = new Date().toISOString();
   snapshot.terminals = cloneTerminalSnapshotsForSavedWorkspace(source.terminals).map((terminal) => ({
     ...terminal,
+    shellHistoryId: crypto.randomUUID(),
     widgetId: terminal.widgetId || crypto.randomUUID()
   }));
   return snapshot;
@@ -15327,6 +15363,13 @@ function normalizeTerminalLlmId(value: string | null | undefined) {
   return Object.prototype.hasOwnProperty.call(LLM_LAUNCHERS, normalized) ? normalized : null;
 }
 
+function normalizedTerminalShellHistoryId(value: string | null | undefined) {
+  const normalized = String(value ?? '').trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(normalized)
+    ? normalized.toLowerCase()
+    : crypto.randomUUID();
+}
+
 function terminalPaneLlmId(pane: TerminalPane | null | undefined) {
   return normalizeTerminalLlmId(pane?.llmId) ?? normalizeTerminalLlmId(pane?.detectedLlmId);
 }
@@ -16308,7 +16351,8 @@ async function recoverTerminalTmuxStaleDelivery(
       pane.term.rows,
       pane.term.cols,
       pane.workspaceId,
-      `${pane.title} reconnect`
+      `${pane.title} reconnect`,
+      pane.shellHistoryId
     );
     const backendId = await withTimeout(
       spawnPromise,
@@ -17364,6 +17408,25 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
+function createConcurrencyGate(limit: number) {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  return () => new Promise<() => void>((resolve) => {
+    const enter = () => {
+      active += 1;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        active = Math.max(0, active - 1);
+        waiters.shift()?.();
+      });
+    };
+    if (active < Math.max(1, limit)) enter();
+    else waiters.push(enter);
+  });
+}
+
 async function createBlankWorkspaceTab() {
   const operationGeneration = ++workspaceActivationGeneration;
   await saveAllDirtyNotes();
@@ -17447,7 +17510,7 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
     terminalWidgetOpacity: cloneTerminalWidgetOpacityMap(source.terminalWidgetOpacity),
-    terminals: cloneTerminalSnapshots(source.terminals),
+    terminals: cloneTerminalSnapshotsForWorkspaceCopy(source.terminals),
     terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
     editorPanes: cloneEditorPaneSnapshots(source.editorPanes),
@@ -17460,11 +17523,12 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
   };
 }
 
-function cloneTerminalSnapshots(terminals: WorkspaceTerminalSnapshot[]) {
+function cloneTerminalSnapshotsForWorkspaceCopy(terminals: WorkspaceTerminalSnapshot[]) {
   const cloned: WorkspaceTerminalSnapshot[] = [];
   for (const terminal of terminals) {
     cloned.push({
       ...terminal,
+      shellHistoryId: crypto.randomUUID(),
       activePythonEnv: cloneTerminalPythonEnvSnapshot(terminal.activePythonEnv),
       rect: terminal.rect ? { ...terminal.rect } : undefined
     });
@@ -17819,6 +17883,23 @@ function writeActiveWorkspaceSnapshot(persistMode: WorkspaceSnapshotPersistMode)
   syncAllEditorPanesFromViews();
   const index = workspaceSnapshotIndexById(state.activeWorkspaceId);
   const snapshot = createCurrentWorkspaceSnapshot(state.activeWorkspaceId, state.workspaceSnapshots[index]?.updatedAt);
+  const previousSnapshot = workspaceSnapshotForId(snapshot.id);
+  const previousTerminalSnapshotStillApplies = Boolean(
+    previousSnapshot
+    && previousSnapshot.profileId === snapshot.profileId
+    && previousSnapshot.root === snapshot.root
+  );
+  const preserveFailedTerminalRestore = workspaceTerminalRestoreFailedPreserveIds.has(snapshot.id);
+  if (
+    (workspaceTerminalRestoreInProgress(snapshot.id) || preserveFailedTerminalRestore)
+    && previousSnapshot
+    && previousTerminalSnapshotStillApplies
+  ) {
+    preserveWorkspaceTerminalSnapshotFields(snapshot, previousSnapshot);
+  } else if (preserveFailedTerminalRestore && !previousTerminalSnapshotStillApplies) {
+    // A profile/root change is an intentional replacement, not a continuation of the failed restore.
+    workspaceTerminalRestoreFailedPreserveIds.delete(snapshot.id);
+  }
   const savedEntryIndex = savedWorkspaceAutoUpdateEntryIndex(snapshot);
   if (savedEntryIndex >= 0) linkSnapshotToSavedWorkspace(snapshot, state.savedWorkspaces[savedEntryIndex].id);
   const signature = workspaceSnapshotSignature(snapshot);
@@ -17833,6 +17914,14 @@ function writeActiveWorkspaceSnapshot(persistMode: WorkspaceSnapshotPersistMode)
   else insertWorkspaceSnapshot(0, snapshot);
   autoUpdateSavedWorkspaceFromSnapshot(snapshot);
   commitWorkspaceStorePersist(persistMode);
+}
+
+function preserveWorkspaceTerminalSnapshotFields(target: WorkspaceSnapshot, source: WorkspaceSnapshot) {
+  target.terminalSpawnRect = source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined;
+  target.terminalWidgetOpacity = cloneTerminalWidgetOpacityMap(source.terminalWidgetOpacity);
+  target.terminals = cloneTerminalSnapshotsForSavedWorkspace(source.terminals);
+  target.terminalGroups = cloneTerminalGroupSnapshots(source.terminalGroups);
+  target.activeTerminalIndex = source.activeTerminalIndex;
 }
 
 function commitWorkspaceStorePersist(persistMode: WorkspaceSnapshotPersistMode) {
@@ -18102,7 +18191,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.llmTmuxSessionName ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.shellHistoryId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.llmTmuxSessionName ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function terminalPythonEnvSignature(env: TerminalPythonEnvSnapshot | null | undefined) {
@@ -18309,6 +18398,7 @@ function currentWorkspaceTerminalSnapshotState(workspaceId = state.activeWorkspa
         }
         terminals.push({
           snapshotPaneId: pane.paneId,
+          shellHistoryId: pane.shellHistoryId,
           title: pane.title.replace(/\s+\(exited\)$/i, ''),
           customTitle: pane.customTitle,
           command: pane.command,
@@ -18865,15 +18955,72 @@ function cancelWorkspaceRestore() {
   return wasRestoring;
 }
 
+type WorkspaceTerminalRestoreOptions = {
+  token?: number;
+  loadExplorerAfterFirstReady?: boolean;
+  loadExplorerPath?: string;
+  operationId?: number;
+};
+
+function beginWorkspaceTerminalRestoreOperation(workspaceId: string) {
+  const operationId = ++workspaceTerminalRestoreOperationSequence;
+  const operations = workspaceTerminalRestoreOperations.get(workspaceId) ?? new Set<number>();
+  operations.add(operationId);
+  workspaceTerminalRestoreOperations.set(workspaceId, operations);
+  return operationId;
+}
+
+function workspaceTerminalRestoreInProgress(workspaceId = state.activeWorkspaceId) {
+  return Boolean(workspaceId && workspaceTerminalRestoreOperations.get(workspaceId)?.size);
+}
+
+function finishWorkspaceTerminalRestoreOperation(workspaceId: string, operationId: number, completed = false) {
+  const operations = workspaceTerminalRestoreOperations.get(workspaceId);
+  if (!operations?.delete(operationId)) return;
+  if (completed) workspaceTerminalRestoreCompletedIds.add(workspaceId);
+  if (operations.size) return;
+  workspaceTerminalRestoreOperations.delete(workspaceId);
+  const restoreCompleted = workspaceTerminalRestoreCompletedIds.delete(workspaceId);
+  if (restoreCompleted) workspaceTerminalRestoreFailedPreserveIds.delete(workspaceId);
+  else workspaceTerminalRestoreFailedPreserveIds.add(workspaceId);
+  if (state.activeWorkspaceId !== workspaceId || !state.workspaceOpen) return;
+
+  // A successful restore replaces the merge-saved terminal fields with the final live layout,
+  // then refreshes each active Glass scope once rather than once per restored pane.
+  if (restoreCompleted) saveActiveWorkspaceSnapshot();
+  if (restoringWorkspace) return;
+  const explorerGlassEnabled = normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows;
+  if (!appGlassEnabled() && !workspaceLiquidGlassEligible() && !explorerGlassEnabled) return;
+  if (appGlassDeferredRecapture) {
+    flushDeferredAppGlassRecapture('terminal-restore-complete', { baseDelay: 80, stagger: 48 });
+    return;
+  }
+  const scheduledOwners = scheduleAppGlassActiveOwnerRecaptures('terminal-restore-complete', {
+    delay: 80,
+    stagger: 48
+  });
+  if (!scheduledOwners) {
+    if (appGlassEnabled()) scheduleAppGlassRefresh({ recapture: true, delay: 80, reason: 'terminal-restore-complete' });
+    if (workspaceLiquidGlassEligible()) scheduleWorkspaceLiquidGlassRefresh({ recapture: true, delay: 100 });
+    if (explorerGlassEnabled) {
+      scheduleExplorerLiquidGlassRefresh({ recapture: true, delay: 120 });
+    }
+  }
+}
+
 function scheduleWorkspaceTerminalRestore(
   snapshot: WorkspaceSnapshot,
   profile: ConnectionProfile,
   token: number,
   options: { loadExplorerAfterFirstReady?: boolean; loadExplorerPath?: string } = {}
 ) {
+  const operationId = beginWorkspaceTerminalRestoreOperation(snapshot.id);
   window.requestAnimationFrame(() => window.setTimeout(() => {
-    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
-    void restoreWorkspaceTerminals(snapshot, profile, { token, ...options })
+    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) {
+      finishWorkspaceTerminalRestoreOperation(snapshot.id, operationId);
+      return;
+    }
+    void restoreWorkspaceTerminals(snapshot, profile, { token, operationId, ...options })
       .then(() => {
         if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, token)) return;
         refreshTitle();
@@ -19061,13 +19208,98 @@ function renderWorkspacePanelLoadingShell(id: FloatingPanelId) {
   }
 }
 
+type PreparedWorkspaceTerminalRestore = {
+  terminal: WorkspaceTerminalSnapshot;
+  snapshotIndex: number;
+  widgetKey: string;
+  terminalProfile: ConnectionProfile;
+  widget: TerminalWidget;
+  pane: TerminalPane;
+  title: string;
+  options: CreateTerminalOptions;
+  llmId?: string;
+  llmTmuxSessionName?: string;
+  agentBridgePromise: Promise<AgentBridgeLaunchContext | null> | null;
+};
+
+type WorkspaceTerminalRestoreSshScope = {
+  unlocked: boolean;
+  acquireTurn: () => Promise<() => void>;
+};
+
+type WorkspaceTerminalRestoreSshLease = {
+  release: (confirmed: boolean) => void;
+};
+
+async function waitForRestoredSshShellReady(
+  pane: TerminalPane,
+  stillCurrent: () => boolean
+) {
+  const deadline = performance.now() + TERMINAL_START_TIMEOUT_SSH_MS;
+  while (
+    stillCurrent()
+    && isTerminalPaneAlive(pane)
+    && pane.backendId
+    && !pane.shellReadyConfirmed
+    && performance.now() < deadline
+  ) {
+    await delay(80);
+  }
+  const confirmed = Boolean(
+    stillCurrent()
+    && isTerminalPaneAlive(pane)
+    && pane.backendId
+    && pane.shellReadyConfirmed
+  );
+  if (!confirmed) pane.shellReadyProbeBuffer = undefined;
+  return confirmed;
+}
+
+function queueWorkspaceTerminalRestoreTurn(workspaceId: string) {
+  const previous = workspaceTerminalRestoreTails.get(workspaceId) ?? Promise.resolve();
+  let releaseTurn: () => void = () => undefined;
+  const ownTurn = new Promise<void>((resolve) => {
+    releaseTurn = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => ownTurn);
+  workspaceTerminalRestoreTails.set(workspaceId, tail);
+  return {
+    wait: previous.catch(() => undefined),
+    release: () => {
+      releaseTurn();
+      if (workspaceTerminalRestoreTails.get(workspaceId) === tail) {
+        workspaceTerminalRestoreTails.delete(workspaceId);
+      }
+    }
+  };
+}
+
 async function restoreWorkspaceTerminals(
   snapshot: WorkspaceSnapshot,
   profile: ConnectionProfile,
-  options: { token?: number; loadExplorerAfterFirstReady?: boolean; loadExplorerPath?: string } = {}
+  options: WorkspaceTerminalRestoreOptions = {}
 ) {
-  if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+  const operationId = options.operationId ?? beginWorkspaceTerminalRestoreOperation(snapshot.id);
+  const turn = queueWorkspaceTerminalRestoreTurn(snapshot.id);
+  let completed = false;
+  try {
+    await turn.wait;
+    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+    completed = await restoreWorkspaceTerminalsInner(snapshot, profile, options);
+  } finally {
+    turn.release();
+    finishWorkspaceTerminalRestoreOperation(snapshot.id, operationId, completed);
+  }
+}
+
+async function restoreWorkspaceTerminalsInner(
+  snapshot: WorkspaceSnapshot,
+  profile: ConnectionProfile,
+  options: WorkspaceTerminalRestoreOptions
+) {
+  if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
   let restoredActivePaneId = '';
+  let coldRestorePrepared = false;
   showTerminalWidgetsForWorkspace(snapshot.id);
   if (!hasActiveWorkspaceTerminalPane()) {
     const failedPaneIds = state.terminals
@@ -19080,90 +19312,92 @@ async function restoreWorkspaceTerminals(
         renderShellTabs: false
       });
     }
-    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
+    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
     const terminalSnapshots = snapshot.terminals ?? [];
     if (!terminalSnapshots.length) {
       state.activePaneId = '';
       syncActivePaneClass();
       renderShellTabs();
-      return;
+      return true;
     }
+
     const widgetsBySnapshotId = new Map<string, TerminalWidget>();
     const paneIdBySnapshotPaneId = new Map<string, string>();
     const restoredPaneOrder = new Map<string, number>();
+    const createdWidgets: TerminalWidget[] = [];
+    const createdPaneIds: string[] = [];
+    const preparedPlans: PreparedWorkspaceTerminalRestore[] = [];
+    const windowsCwdResolutions = new Map<string, Promise<string>>();
+    const sshRestoreScopes = new Map<string, WorkspaceTerminalRestoreSshScope>();
     let queuedExplorerLoadAfterReady = false;
+    let restoreCompleted = false;
     const activeSnapshotIndex = clamp(snapshot.activeTerminalIndex || 0, 0, terminalSnapshots.length - 1);
-    const orderedTerminalSnapshots = terminalSnapshots
-      .map((terminal, snapshotIndex) => ({
-        terminal,
-        snapshotIndex,
-        widgetKey: terminal.widgetId || `legacy-widget:${snapshotIndex}`
-      }))
-      .sort((left, right) => (
-        Number(right.snapshotIndex === activeSnapshotIndex) - Number(left.snapshotIndex === activeSnapshotIndex)
-        || left.snapshotIndex - right.snapshotIndex
-      ));
-    const restoreTerminalSnapshot = async ({
-      terminal,
-      snapshotIndex,
-      widgetKey
-    }: { terminal: WorkspaceTerminalSnapshot; snapshotIndex: number; widgetKey: string }) => {
-      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
-      const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
-      const existingWidget = widgetsBySnapshotId.get(widgetKey);
-      const defaultFocusTarget = terminalDefaultFocusTargetFromSnapshot(terminal, snapshot.terminalGroups);
-      const terminalOptions: CreateTerminalOptions = {
-        focus: false,
-        profile: terminalProfile,
-        cwd: terminal.cwd || workspaceShellCwd(),
-        skipSnapshotSave: true,
-        groupId: terminal.groupId,
-        defaultFocusTarget,
-        pythonEnv: terminal.activePythonEnv
-      };
-      const terminalTitle = terminal.title || 'shell';
-      // An LLM-launcher terminal (codex/claude/grok button) is restored by spawning a plain shell
-      // and re-TYPING the launcher command, exactly as the button does, so the CLI comes back in
-      // bypass/YOLO instead of a bare shell. Regular terminals keep their saved command.
-      const llmId = terminal.llmId;
-      const llmTmuxSessionName = llmId
-        ? safeLlmTmuxSessionName(terminal.llmTmuxSessionName) ?? workspaceTmuxSessionName(snapshot.id, llmId)
-        : undefined;
-      const agentBridge = llmId
-        ? await prepareAgentBridgeForLlmLaunch(llmId, terminalProfile, terminal.cwd || workspaceShellCwd(), { allowPrompt: false })
-        : null;
-      const llmParts = llmId ? llmLauncherParts(llmId, terminalProfile.kind, snapshot.id, llmTmuxSessionName, { agentBridge }) : null;
-      const terminalCommand = llmParts ? llmParts.define : terminal.command;
-      if (llmId) {
-        terminalOptions.llmId = llmId;
-        terminalOptions.llmTmuxSessionName = llmTmuxSessionName;
-      }
-      let restoredPane: TerminalPane | null | undefined;
-      if (existingWidget) {
-        restoredPane = await createTerminalTab(existingWidget, terminalCommand, terminalTitle, terminalOptions);
-      } else {
-        const widget = await createTerminal(terminalCommand, terminalTitle, {
-          ...terminalOptions,
-          rect: terminal.rect
+
+    try {
+      // Paint the saved widget frames first. PTYs are intentionally not started until every xterm
+      // host exists and the exact saved split tree has replaced the temporary append order.
+      for (let snapshotIndex = 0; snapshotIndex < terminalSnapshots.length; snapshotIndex += 1) {
+        const terminal = terminalSnapshots[snapshotIndex];
+        const widgetKey = terminal.widgetId || `legacy-widget:${snapshotIndex}`;
+        if (widgetsBySnapshotId.has(widgetKey)) continue;
+        if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
+        const terminalTitle = terminal.title || 'shell';
+        const terminalCwd = terminal.cwd || workspaceShellCwd();
+        const defaultFocusTarget = terminalDefaultFocusTargetFromSnapshot(terminal, snapshot.terminalGroups);
+        const widget = createTerminalWidget(terminalTitle, terminalCwd, {
+          rect: terminal.rect,
+          focus: false,
+          defaultFocusTarget
         });
-        if (widget) {
-          widgetsBySnapshotId.set(widgetKey, widget);
-          applyWidgetOpacity(widget.element, terminalWidgetOpacityForSnapshot(snapshot, widgetKey), { persist: false });
-          restoredPane = activePaneForWidget(widget);
-        }
+        widget.element.setAttribute('aria-busy', 'true');
+        widget.element.dataset.terminalRestore = 'preparing';
+        widgetsBySnapshotId.set(widgetKey, widget);
+        createdWidgets.push(widget);
+        applyWidgetOpacity(widget.element, terminalWidgetOpacityForSnapshot(snapshot, widgetKey), { persist: false });
       }
-      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
-        if (restoredPane) {
-          void closeTerminalPane(restoredPane.paneId, {
-            backgroundKill: true,
-            saveSnapshot: false,
-            renderShellTabs: false
-          });
-        }
-        hideTerminalWidgetsForWorkspace(snapshot.id);
-        return;
-      }
-      if (restoredPane) {
+
+      await ensureTerminalRuntime();
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
+
+      for (let snapshotIndex = 0; snapshotIndex < terminalSnapshots.length; snapshotIndex += 1) {
+        if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
+        const terminal = terminalSnapshots[snapshotIndex];
+        const widgetKey = terminal.widgetId || `legacy-widget:${snapshotIndex}`;
+        const widget = widgetsBySnapshotId.get(widgetKey);
+        if (!widget) continue;
+        const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
+        const terminalCwd = terminal.cwd || workspaceShellCwd();
+        const defaultFocusTarget = terminalDefaultFocusTargetFromSnapshot(terminal, snapshot.terminalGroups);
+        const terminalTitle = terminal.title || 'shell';
+        // LLM launchers get a fresh define command after their bridge preparation completes. The
+        // foreground call is still typed only after the recreated shell reports ready.
+        const llmId = terminal.llmId;
+        const llmTmuxSessionName = llmId
+          ? safeLlmTmuxSessionName(terminal.llmTmuxSessionName) ?? workspaceTmuxSessionName(snapshot.id, llmId)
+          : undefined;
+        const terminalOptions: CreateTerminalOptions = {
+          focus: false,
+          profile: terminalProfile,
+          cwd: terminalCwd,
+          shellHistoryId: terminal.shellHistoryId,
+          skipSnapshotSave: true,
+          groupId: terminal.groupId,
+          defaultFocusTarget,
+          pythonEnv: terminal.activePythonEnv,
+          llmId,
+          llmTmuxSessionName,
+          deferBackendStart: true,
+          deferLayoutRender: true,
+          skipInitialFitSettle: true
+        };
+        const restoredPane = await createTerminalTab(
+          widget,
+          llmId ? null : terminal.command,
+          terminalTitle,
+          terminalOptions
+        );
+        if (!restoredPane) continue;
+        createdPaneIds.push(restoredPane.paneId);
         const snapshotPaneId = terminal.snapshotPaneId || `${widgetKey}:${terminal.groupId ?? restoredPane.groupId}:${snapshotIndex}`;
         paneIdBySnapshotPaneId.set(snapshotPaneId, restoredPane.paneId);
         restoredPaneOrder.set(restoredPane.paneId, snapshotIndex);
@@ -19172,105 +19406,284 @@ async function restoreWorkspaceTerminals(
         restoredPane.activePythonEnv = cloneTerminalPythonEnvSnapshot(terminal.activePythonEnv);
         const typingPadOpen = Boolean(terminal.typingPadOpen);
         restoredPane.typingPadOpen = typingPadOpen;
-        const restoredWidget = terminalWidgetForPane(restoredPane);
-        if (restoredWidget) {
-          setTerminalWidgetDefaultFocusTarget(restoredWidget, defaultFocusTarget);
-          restoredWidget.typingPadOpen = restoredWidget.typingPadOpen || typingPadOpen;
-          syncTerminalTypingPadForWidget(restoredWidget);
-        }
+        setTerminalWidgetDefaultFocusTarget(widget, defaultFocusTarget);
+        widget.typingPadOpen = widget.typingPadOpen || typingPadOpen;
+        preparedPlans.push({
+          terminal,
+          snapshotIndex,
+          widgetKey,
+          terminalProfile,
+          widget,
+          pane: restoredPane,
+          title: terminalTitle,
+          options: terminalOptions,
+          llmId,
+          llmTmuxSessionName,
+          agentBridgePromise: llmId === 'claude' || llmId === 'grok'
+            ? prepareAgentBridgeForLlmLaunch(llmId, terminalProfile, terminalCwd, { allowPrompt: false })
+            : null
+        });
       }
-      if (llmParts && restoredPane?.backendId) {
-        restoredPane.llmId = llmId;
-        restoredPane.llmTmuxSessionName = llmTmuxSessionName;
-        await registerAgentBridgeForPane(restoredPane, agentBridge);
-        markWorkspaceLlmActivityForPane(restoredPane, WORKSPACE_LLM_START_ACTIVE_MS);
-        queueTerminalShellReadyAction(
-          restoredPane,
-          `launch ${llmId}`,
-          () => sendTerminalInputNow(restoredPane, `${llmParts.call}\r`).catch(() => undefined),
-          { waitingStatus: `Waiting for ${terminalShellReadyProfile(restoredPane)?.kind.toUpperCase() ?? 'remote'} shell login before launching ${llmId}...` }
-        );
-      } else if (restoredPane?.backendId) {
-        await restoreTerminalPythonEnvForPane(restoredPane);
-      }
-      if (options.loadExplorerAfterFirstReady && !queuedExplorerLoadAfterReady && restoredPane?.backendId) {
-        queuedExplorerLoadAfterReady = true;
-        queueWorkspaceDirectoryLoadAfterShellReady(
-          restoredPane,
-          options.loadExplorerPath || snapshot.currentDir || snapshot.root || profile.root,
-          profile,
-          'restoring workspace files'
-        );
-      }
-      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
-        hideTerminalWidgetsForWorkspace(snapshot.id);
-        return;
-      }
-      await yieldToUi();
-    };
-    const restoreGroups = new Map<string, typeof orderedTerminalSnapshots>();
-    for (const item of orderedTerminalSnapshots) {
-      const group = restoreGroups.get(item.widgetKey) ?? [];
-      group.push(item);
-      restoreGroups.set(item.widgetKey, group);
-    }
-    const groups = Array.from(restoreGroups.values());
-    let nextGroupIndex = 0;
-    const restoreWorker = async () => {
-      while (nextGroupIndex < groups.length) {
-        const group = groups[nextGroupIndex++];
-        for (const item of group) {
-          await restoreTerminalSnapshot(item);
-          if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(2, groups.length) }, () => restoreWorker()));
-    if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return;
-    const orderedWorkspacePanes = state.terminals
-      .filter((pane) => pane.workspaceId === snapshot.id)
-      .sort((left, right) => (
-        (restoredPaneOrder.get(left.paneId) ?? Number.MAX_SAFE_INTEGER)
-        - (restoredPaneOrder.get(right.paneId) ?? Number.MAX_SAFE_INTEGER)
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
+
+      for (const widget of widgetsBySnapshotId.values()) syncTerminalTypingPadForWidget(widget);
+      const orderedWorkspacePanes = preparedPlans
+        .map((plan) => plan.pane)
+        .sort((left, right) => (
+          (restoredPaneOrder.get(left.paneId) ?? Number.MAX_SAFE_INTEGER)
+          - (restoredPaneOrder.get(right.paneId) ?? Number.MAX_SAFE_INTEGER)
+        ));
+      let paneOrderIndex = 0;
+      state.terminals = state.terminals.map((pane) => (
+        pane.workspaceId === snapshot.id ? orderedWorkspacePanes[paneOrderIndex++] ?? pane : pane
       ));
-    let paneOrderIndex = 0;
-    state.terminals = state.terminals.map((pane) => (
-      pane.workspaceId === snapshot.id ? orderedWorkspacePanes[paneOrderIndex++] : pane
-    ));
-    const widgetOrder = new Map<string, number>();
-    for (const pane of orderedWorkspacePanes) {
-      widgetOrder.set(pane.widgetId, Math.min(
-        widgetOrder.get(pane.widgetId) ?? Number.MAX_SAFE_INTEGER,
-        restoredPaneOrder.get(pane.paneId) ?? Number.MAX_SAFE_INTEGER
-      ));
-    }
-    const orderedWorkspaceWidgets = state.terminalWidgets
-      .filter((widget) => widget.workspaceId === snapshot.id)
-      .sort((left, right) => (
+      const widgetOrder = new Map<string, number>();
+      for (const pane of orderedWorkspacePanes) {
+        widgetOrder.set(pane.widgetId, Math.min(
+          widgetOrder.get(pane.widgetId) ?? Number.MAX_SAFE_INTEGER,
+          restoredPaneOrder.get(pane.paneId) ?? Number.MAX_SAFE_INTEGER
+        ));
+      }
+      const orderedWorkspaceWidgets = createdWidgets.slice().sort((left, right) => (
         (widgetOrder.get(left.widgetId) ?? Number.MAX_SAFE_INTEGER)
         - (widgetOrder.get(right.widgetId) ?? Number.MAX_SAFE_INTEGER)
       ));
-    let widgetOrderIndex = 0;
-    state.terminalWidgets = state.terminalWidgets.map((widget) => (
-      widget.workspaceId === snapshot.id ? orderedWorkspaceWidgets[widgetOrderIndex++] : widget
-    ));
-    restoreTerminalGroupLayouts(snapshot, widgetsBySnapshotId, paneIdBySnapshotPaneId);
+      let widgetOrderIndex = 0;
+      state.terminalWidgets = state.terminalWidgets.map((widget) => (
+        widget.workspaceId === snapshot.id ? orderedWorkspaceWidgets[widgetOrderIndex++] ?? widget : widget
+      ));
+
+      restoreTerminalGroupLayouts(snapshot, widgetsBySnapshotId, paneIdBySnapshotPaneId);
+      coldRestorePrepared = true;
+      const preparedActive = (restoredActivePaneId ? terminalPaneById.get(restoredActivePaneId) : null)
+        ?? orderedWorkspacePanes[activeSnapshotIndex]
+        ?? orderedWorkspacePanes[0];
+      if (preparedActive) {
+        setActivePane(preparedActive.paneId, { focus: false });
+        bringPanelToFront(preparedActive.element);
+      }
+      await nextAnimationFrame();
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
+      for (const plan of preparedPlans) fitTerminal(plan.pane);
+
+      const resolveWindowsCwd = (plan: PreparedWorkspaceTerminalRestore) => {
+        const key = `${plan.terminalProfile.id}\0${plan.pane.cwd}`;
+        let pending = windowsCwdResolutions.get(key);
+        if (!pending) {
+          pending = usableTerminalCwd(plan.terminalProfile, plan.pane.cwd);
+          windowsCwdResolutions.set(key, pending);
+        }
+        return pending;
+      };
+      const acquireSshRestoreLease = async (
+        plan: PreparedWorkspaceTerminalRestore
+      ): Promise<WorkspaceTerminalRestoreSshLease | null> => {
+        if (plan.terminalProfile.kind !== 'ssh') return null;
+        const scopeKey = plan.terminalProfile.id;
+        let scope = sshRestoreScopes.get(scopeKey);
+        if (!scope) {
+          scope = {
+            unlocked: false,
+            acquireTurn: createConcurrencyGate(1)
+          };
+          sshRestoreScopes.set(scopeKey, scope);
+        }
+
+        // The first unconfirmed connection for each SSH profile owns its scope turn and the
+        // global auth lane. A confirmed remote prompt unlocks the scope, after which queued
+        // panes fan out through a separate four-wide readiness lane without blocking WSL/Windows.
+        const releaseScopeTurn = await scope.acquireTurn();
+        if (scope.unlocked) {
+          releaseScopeTurn();
+          const releaseFollowerSlot = await acquireTerminalRestoreSshFollowerSlot();
+          return { release: () => releaseFollowerSlot() };
+        }
+
+        const releaseBootstrapSlot = await acquireTerminalRestoreSshBootstrapSlot();
+        const nonCacheablePromptCount = sshNonCacheableAuthPromptCount(scopeKey);
+        let released = false;
+        return {
+          release: (confirmed) => {
+            if (released) return;
+            released = true;
+            // Key passphrases are session-cached, but password/interactive prompts are not.
+            // Keep those profiles serial so fan-out cannot enqueue several password dialogs.
+            if (
+              confirmed
+              && sshNonCacheableAuthPromptCount(scopeKey) === nonCacheablePromptCount
+            ) {
+              scope!.unlocked = true;
+            }
+            releaseBootstrapSlot();
+            releaseScopeTurn();
+          }
+        };
+      };
+      const startPreparedPlan = async (plan: PreparedWorkspaceTerminalRestore, reserveSpawnSlot = false) => {
+        let agentBridge: AgentBridgeLaunchContext | null = null;
+        let llmParts: ReturnType<typeof llmLauncherParts> | null = null;
+        let sshRestoreLease: WorkspaceTerminalRestoreSshLease | null = null;
+        let sshReadyConfirmed = false;
+        let releaseSpawnSlot: (() => void) | undefined;
+        try {
+          if (reserveSpawnSlot) {
+            sshRestoreLease = await acquireSshRestoreLease(plan);
+            releaseSpawnSlot = await acquireTerminalRestoreSpawnSlot();
+          }
+          agentBridge = plan.agentBridgePromise
+            ? await plan.agentBridgePromise.catch(() => null)
+            : null;
+          if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
+          llmParts = plan.llmId
+            ? llmLauncherParts(
+                plan.llmId,
+                plan.terminalProfile.kind,
+                snapshot.id,
+                plan.llmTmuxSessionName,
+                { agentBridge }
+              )
+            : null;
+          const terminalCommand = llmParts ? llmParts.define : plan.terminal.command;
+          if (!reserveSpawnSlot) {
+            sshRestoreLease = await acquireSshRestoreLease(plan);
+            releaseSpawnSlot = await acquireTerminalRestoreSpawnSlot();
+          }
+          if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
+          if (plan.terminalProfile.kind === 'windows') {
+            const spawnCwd = await resolveWindowsCwd(plan);
+            if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
+            if (spawnCwd !== plan.pane.cwd) {
+              plan.pane.cwd = spawnCwd;
+              updateTerminalWidgetTitle(plan.widget);
+            }
+          }
+          await startTerminalPaneBackend(
+            plan.pane,
+            plan.widget,
+            plan.terminalProfile,
+            terminalCommand,
+            plan.title,
+            {
+              ...plan.options,
+              deferBackendStart: false,
+              skipInitialFitSettle: true,
+              skipCwdValidation: plan.terminalProfile.kind === 'windows'
+            }
+          );
+          releaseSpawnSlot?.();
+          releaseSpawnSlot = undefined;
+          if (plan.terminalProfile.kind === 'ssh' && plan.pane.backendId) {
+            sshReadyConfirmed = await waitForRestoredSshShellReady(
+              plan.pane,
+              () => isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)
+            );
+          }
+        } finally {
+          releaseSpawnSlot?.();
+          sshRestoreLease?.release(sshReadyConfirmed);
+        }
+
+        if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) {
+          await closeTerminalPane(plan.pane.paneId, {
+            backgroundKill: true,
+            saveSnapshot: false,
+            renderShellTabs: false
+          });
+          return;
+        }
+        if (llmParts && plan.pane.backendId && plan.llmId) {
+          plan.pane.llmId = plan.llmId;
+          plan.pane.llmTmuxSessionName = plan.llmTmuxSessionName;
+          await registerAgentBridgeForPane(plan.pane, agentBridge).catch((error) => {
+            console.warn(`Failed to register ${plan.llmId} bridge for restored pane`, error);
+          });
+          markWorkspaceLlmActivityForPane(plan.pane, WORKSPACE_LLM_START_ACTIVE_MS);
+          queueTerminalShellReadyAction(
+            plan.pane,
+            `launch ${plan.llmId}`,
+            () => sendTerminalInputNow(plan.pane, `${llmParts.call}\r`).catch(() => undefined),
+            { waitingStatus: `Waiting for ${terminalShellReadyProfile(plan.pane)?.kind.toUpperCase() ?? 'remote'} shell login before launching ${plan.llmId}...` }
+          );
+        } else if (plan.pane.backendId) {
+          await restoreTerminalPythonEnvForPane(plan.pane);
+        }
+        if (options.loadExplorerAfterFirstReady && !queuedExplorerLoadAfterReady && plan.pane.backendId) {
+          queuedExplorerLoadAfterReady = true;
+          queueWorkspaceDirectoryLoadAfterShellReady(
+            plan.pane,
+            options.loadExplorerPath || snapshot.currentDir || snapshot.root || profile.root,
+            profile,
+            'restoring workspace files'
+          );
+        }
+      };
+      const spawnPlans = preparedPlans.slice().sort((left, right) => (
+        Number(right.snapshotIndex === activeSnapshotIndex) - Number(left.snapshotIndex === activeSnapshotIndex)
+        || left.snapshotIndex - right.snapshotIndex
+      ));
+      const [activePlan, ...remainingPlans] = spawnPlans;
+      const activeStart = activePlan ? startPreparedPlan(activePlan, true) : Promise.resolve();
+      // Let the visible pane reserve its spawn turn before later panes contend for the queue.
+      await Promise.resolve();
+      await Promise.all([
+        activeStart,
+        ...remainingPlans.map((plan) => startPreparedPlan(plan))
+      ]);
+      if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
+      restoreCompleted = true;
+    } finally {
+      for (const widget of createdWidgets) {
+        widget.element.removeAttribute('aria-busy');
+        delete widget.element.dataset.terminalRestore;
+      }
+      if (!restoreCompleted) {
+        await cleanupPreparedWorkspaceTerminalRestore(createdPaneIds, createdWidgets);
+      }
+    }
   }
 
+  if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
   const active = (restoredActivePaneId ? terminalPaneById.get(restoredActivePaneId) : null)
     ?? activeWorkspaceTerminalPaneAtClamped(snapshot.activeTerminalIndex || 0);
   if (active) {
     const widget = terminalWidgetForPane(active);
     if (widget) {
+      const terminalStillOwnsKeyboard = keyboardResizeTarget.kind === 'terminal'
+        && keyboardResizeTarget.paneId === active.paneId;
       setActivePane(active.paneId, { focus: false });
-      focusTerminalWidgetDefaultTarget(widget, active);
+      if (!coldRestorePrepared || terminalStillOwnsKeyboard) {
+        focusTerminalWidgetDefaultTarget(widget, active);
+      }
     } else {
-      setActivePane(active.paneId);
+      setActivePane(active.paneId, { focus: !coldRestorePrepared });
     }
     bringPanelToFront(active.element);
   } else {
     state.activePaneId = '';
     syncActivePaneClass();
+  }
+  return true;
+}
+
+async function cleanupPreparedWorkspaceTerminalRestore(
+  paneIds: string[],
+  widgets: TerminalWidget[]
+) {
+  for (const paneId of paneIds.slice().reverse()) {
+    await closeTerminalPane(paneId, {
+      backgroundKill: true,
+      saveSnapshot: false,
+      renderShellTabs: false
+    });
+  }
+  for (const widget of widgets) {
+    if (terminalWidgetById.get(widget.widgetId) !== widget || terminalPanesForWidget(widget).length) continue;
+    const widgetIndex = state.terminalWidgets.indexOf(widget);
+    if (widgetIndex >= 0) state.terminalWidgets.splice(widgetIndex, 1);
+    if (widgetOpacityPopoverTarget?.element === widget.element) hideWidgetOpacityPopover({ persist: false });
+    forgetTerminalWidget(widget);
+    cleanupAppGlassOwner(widget.element);
+    widget.element.remove();
   }
 }
 
@@ -25537,11 +25950,12 @@ function queueTerminalShellReadyAction(
   if (options.waitingStatus && terminalShellReadyStatusApplies(pane)) setStatus(options.waitingStatus);
 }
 
-function markTerminalShellReady(pane: TerminalPane) {
+function markTerminalShellReady(pane: TerminalPane, options: { confirmed?: boolean } = {}) {
   if (!pane.backendId || !isTerminalPaneAlive(pane)) return;
   pane.startupState = 'ready';
   pane.startupError = undefined;
   if (!pane.shellReadyAt) pane.shellReadyAt = performance.now();
+  if (options.confirmed) pane.shellReadyConfirmed = true;
   clearTerminalStartupWatch(pane);
   clearTerminalShellReadyFallback(pane);
   const actions = pane.pendingShellReadyActions;
@@ -25787,13 +26201,20 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
   pane.backendId = backendId;
   pane.backendOutputChars = 0;
   pane.shellReadyAt = undefined;
+  pane.shellReadyConfirmed = undefined;
+  pane.shellReadyProbeBuffer = undefined;
   if (backendId) {
     pane.llmWaitingDetectionBuffer = '';
     pane.llmTitleOscBuffer = undefined;
     pane.llmTitleStatusBuffer = undefined;
     resetWorkspaceLlmTitleStatusTracker(pane);
-    if (!terminalNeedsShellReadyGate(pane)) pane.shellReadyAt = performance.now();
-    else scheduleTerminalShellReadyFallback(pane);
+    if (!terminalNeedsShellReadyGate(pane)) {
+      pane.shellReadyAt = performance.now();
+      pane.shellReadyConfirmed = true;
+    } else {
+      if (terminalShellReadyProfile(pane)?.kind === 'ssh') pane.shellReadyProbeBuffer = '';
+      scheduleTerminalShellReadyFallback(pane);
+    }
   }
   if (backendId) {
     terminalPaneByBackendId.set(backendId, pane);
@@ -25825,6 +26246,7 @@ function scheduleTerminalShellReadyFallback(pane: TerminalPane) {
     if (!pane.backendId || pane.shellReadyAt || !isTerminalPaneAlive(pane)) return;
     if (!terminalNeedsShellReadyGate(pane)) return;
     markTerminalShellReady(pane);
+    if (!workspaceTerminalRestoreInProgress(pane.workspaceId)) pane.shellReadyProbeBuffer = undefined;
     if (terminalShellReadyStatusApplies(pane)) {
       setStatus(`${terminalShellReadyProfile(pane)?.kind.toUpperCase() ?? 'Remote'} shell is still warming up; continuing workspace restore`);
     }
@@ -32879,6 +33301,7 @@ async function createTerminalTab(
     llmTmuxSessionName: safeLlmTmuxSessionName(options.llmTmuxSessionName) ?? undefined,
     profileId: terminalProfile.id,
     cwd: terminalCwd,
+    shellHistoryId: normalizedTerminalShellHistoryId(options.shellHistoryId),
     term,
     fit,
     webglContextLost: false,
@@ -32903,7 +33326,6 @@ async function createTerminalTab(
     lastRows: term.rows,
     lastCols: term.cols
   };
-  scheduleTerminalStartupWatch(pane, terminalProfile, title);
   state.terminals.push(pane);
   terminalPaneById.set(pane.paneId, pane);
   rememberTerminalPane(pane);
@@ -32923,11 +33345,13 @@ async function createTerminalTab(
   } else {
     if (!widget.activeGroupId) widget.activeGroupId = group.groupId;
     if (!widget.activePaneId) widget.activePaneId = group.activePaneId || paneId;
-    syncActivePaneClass();
+    if (!options.deferLayoutRender) syncActivePaneClass();
   }
-  renderTerminalWidgetTabs(widget);
-  renderTerminalWidgetSplitLayout(widget);
-  if (pane.paneId === widget.activePaneId) scheduleFitTerminal(pane);
+  if (!options.deferLayoutRender) {
+    renderTerminalWidgetTabs(widget);
+    renderTerminalWidgetSplitLayout(widget);
+    if (pane.paneId === widget.activePaneId) scheduleFitTerminal(pane);
+  }
 
   term.attachCustomKeyEventHandler((event) => handleTerminalKey(event, pane));
   term.onData((data) => {
@@ -32943,11 +33367,38 @@ async function createTerminalTab(
   });
   pane.resizeObserver.observe(host);
 
+  if (options.deferBackendStart) return pane;
+  return startTerminalPaneBackend(
+    pane,
+    widget,
+    terminalProfile,
+    command,
+    title,
+    options,
+    terminalCreateStartedAt
+  );
+}
+
+async function startTerminalPaneBackend(
+  pane: TerminalPane,
+  widget: TerminalWidget,
+  terminalProfile: ConnectionProfile,
+  command: string | null,
+  title: string,
+  options: CreateTerminalOptions = {},
+  terminalCreateStartedAt = performance.now()
+) {
+  if (!isTerminalPaneAlive(pane)) return pane;
+  pane.command = command;
+  scheduleTerminalStartupWatch(pane, terminalProfile, title);
+  const term = pane.term;
   try {
     const initiallyVisible = isTerminalPaneVisible(pane);
-    if (initiallyVisible) await settleTerminalInitialFit(pane);
-    if (terminalProfile.kind === 'windows') {
+    if (initiallyVisible && !options.skipInitialFitSettle) await settleTerminalInitialFit(pane);
+    if (!isTerminalPaneAlive(pane)) return pane;
+    if (terminalProfile.kind === 'windows' && !options.skipCwdValidation) {
       const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd);
+      if (!isTerminalPaneAlive(pane)) return pane;
       if (spawnCwd !== pane.cwd) {
         pane.cwd = spawnCwd;
         updateTerminalWidgetTitle(widget);
@@ -32956,15 +33407,17 @@ async function createTerminalTab(
     const attempts = terminalProfile.kind === 'wsl' ? TERMINAL_WSL_START_ATTEMPTS : 1;
     let backendId = '';
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (!isTerminalPaneAlive(pane)) return pane;
       let disposeLateBackend = false;
       const spawnPromise = api.spawnTerminal(
         terminalProfile.id,
         pane.cwd,
-        command,
+        pane.command,
         term.rows,
         term.cols,
         widget.workspaceId,
-        title
+        title,
+        pane.shellHistoryId
       );
       spawnPromise.then((lateBackendId) => {
         if (disposeLateBackend || !isTerminalPaneAlive(pane)) {
@@ -33011,7 +33464,9 @@ async function createTerminalTab(
     }
     scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
     scheduleTerminalWebglPromotion(pane);
-    scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-ready' });
+    if (!workspaceTerminalRestoreInProgress(widget.workspaceId)) {
+      scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-ready' });
+    }
     if (options.focus !== false) {
       queueTerminalFitBurst(pane);
       // Startup may finish tens of seconds after creation. Honor the current keyboard owner
@@ -33019,7 +33474,11 @@ async function createTerminalTab(
       focusActiveTerminalPaneWhenItOwnsKeyboard();
     }
     setStatus(`Terminal started: ${title}`);
-    if (!options.skipSnapshotSave) saveActiveWorkspaceSnapshot();
+    if (!options.skipSnapshotSave) {
+      // A successfully started user-created shell is an intentional replacement after a failed cold restore.
+      workspaceTerminalRestoreFailedPreserveIds.delete(widget.workspaceId);
+      saveActiveWorkspaceSnapshot();
+    }
   } catch (error) {
     clearTerminalStartupWatch(pane);
     if (!isTerminalPaneAlive(pane)) return pane;
@@ -33037,7 +33496,9 @@ async function createTerminalTab(
       term.write('\r\nShell startup timed out. Close this shell and try again, or reopen the workspace.\r\n');
     }
     term.write(`\r\nFailed to start terminal: ${String(error)}\r\n`);
-    scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-failed' });
+    if (!workspaceTerminalRestoreInProgress(widget.workspaceId)) {
+      scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-failed' });
+    }
     setStatus(String(error), true);
   }
   return pane;
@@ -36463,10 +36924,21 @@ function handleTerminalData(
     scheduleTerminalRenderWatchdog(pane);
     scheduleTerminalTmuxFreezeProbe(pane);
   }
-  if (data.includes('\x1b]7;')) {
-    const oscCwd = extractOsc7Cwd(data);
+  const carriesSplitShellReadyProbe = pane.shellReadyProbeBuffer !== undefined;
+  const shellReadyProbeData = carriesSplitShellReadyProbe
+    ? `${pane.shellReadyProbeBuffer}${data}`
+    : data;
+  if (shellReadyProbeData.includes('\x1b]7;')) {
+    const oscCwd = extractOsc7Cwd(shellReadyProbeData);
     if (oscCwd) updateTerminalCwd(pane, oscCwd);
-    if (oscCwd || data.includes('\x1b]7;file://simple-vibe-ide')) markTerminalShellReady(pane);
+    if (oscCwd) {
+      markTerminalShellReady(pane, { confirmed: true });
+    }
+  }
+  if (carriesSplitShellReadyProbe) {
+    pane.shellReadyProbeBuffer = pane.shellReadyConfirmed
+      ? undefined
+      : shellReadyProbeData.slice(-TERMINAL_SHELL_READY_PROBE_CHARS);
   }
 
   const shouldTrackPromptCwd = terminalDataMayContainPromptCwdHint(pane, data, visibility);

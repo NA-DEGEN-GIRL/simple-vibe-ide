@@ -4316,14 +4316,17 @@ fn spawn_terminal_direct(
     cols: u16,
     _workspace_id: Option<String>,
     _title: Option<String>,
+    shell_history_id: Option<String>,
 ) -> Result<String, String> {
     let profile = profile_from_id(&profile_id);
     let cwd = normalize_profile_path(&profile, &cwd);
     warm_wsl_profile(&profile)?;
     let terminal_id = Uuid::new_v4().to_string();
+    let shell_history_id =
+        normalized_terminal_shell_history_id(shell_history_id.as_deref(), &terminal_id);
     let read_id = terminal_id.clone();
     let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone())?;
-    let (program, args) = terminal_command(&profile, &cwd, command.clone());
+    let (program, args) = terminal_command(&profile, &cwd, command.clone(), &shell_history_id);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -5036,6 +5039,7 @@ async fn spawn_terminal(
     cols: u16,
     workspace_id: Option<String>,
     title: Option<String>,
+    shell_history_id: Option<String>,
 ) -> Result<String, String> {
     run_blocking_command("spawn terminal", move || {
         let state = app.state::<IdeState>();
@@ -5049,6 +5053,7 @@ async fn spawn_terminal(
             cols,
             workspace_id,
             title,
+            shell_history_id,
         )
     })
     .await
@@ -5910,6 +5915,7 @@ fn terminal_command(
     profile: &ConnectionProfile,
     cwd: &str,
     command: Option<String>,
+    shell_history_id: &str,
 ) -> (String, Vec<String>) {
     match profile.kind.as_str() {
         "wsl" => {
@@ -5928,13 +5934,18 @@ fn terminal_command(
                 args.extend([
                     "bash".to_string(),
                     "-lc".to_string(),
-                    bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command)),
+                    bash_bootstrap_script(
+                        Some(cwd),
+                        Some(&profile.root),
+                        Some(&command),
+                        shell_history_id,
+                    ),
                 ]);
             } else {
                 args.extend([
                     "bash".to_string(),
                     "-lc".to_string(),
-                    bash_bootstrap_script(Some(cwd), Some(&profile.root), None),
+                    bash_bootstrap_script(Some(cwd), Some(&profile.root), None, shell_history_id),
                 ]);
             }
             ("wsl.exe".to_string(), args)
@@ -5945,9 +5956,14 @@ fn terminal_command(
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
             let remote_script = if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
-                bash_bootstrap_script(Some(cwd), Some(&profile.root), Some(&command))
+                bash_bootstrap_script(
+                    Some(cwd),
+                    Some(&profile.root),
+                    Some(&command),
+                    shell_history_id,
+                )
             } else {
-                bash_bootstrap_script(Some(cwd), Some(&profile.root), None)
+                bash_bootstrap_script(Some(cwd), Some(&profile.root), None, shell_history_id)
             };
             let remote_command = ssh_remote_bash_command(&remote_script);
             (
@@ -5966,31 +5982,73 @@ fn terminal_command(
             )
         }
         _ => {
-            if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
-                (
-                    "powershell.exe".to_string(),
-                    vec![
-                        "-NoLogo".to_string(),
-                        "-NoProfile".to_string(),
-                        "-NoExit".to_string(),
-                        "-Command".to_string(),
-                        command,
-                    ],
-                )
-            } else {
-                (
-                    "powershell.exe".to_string(),
-                    vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
-                )
-            }
+            let bootstrap = powershell_terminal_bootstrap_script(
+                shell_history_id,
+                command.as_deref().filter(|value| !value.trim().is_empty()),
+            );
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NoExit".to_string(),
+                    "-EncodedCommand".to_string(),
+                    powershell_encoded_command(&bootstrap),
+                ],
+            )
         }
     }
+}
+
+fn normalized_terminal_shell_history_id(value: Option<&str>, fallback: &str) -> String {
+    value
+        .and_then(|candidate| Uuid::parse_str(candidate.trim()).ok())
+        .map(|id| id.hyphenated().to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn powershell_terminal_bootstrap_script(shell_history_id: &str, command: Option<&str>) -> String {
+    // Changing only HistorySavePath can leave default shared entries in PSReadLine memory, and
+    // re-enabling SaveIncrementally can persist them. Disable saving and clear first; if private
+    // storage setup fails, keep PSReadLine session-only instead of falling back to its shared file.
+    let mut script = format!(
+        "$__sviHistoryRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)\n\
+$__sviPsReadLineLoaded = $false\n\
+try {{\n\
+  Import-Module PSReadLine -ErrorAction Stop\n\
+  $__sviPsReadLineLoaded = $true\n\
+  Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction Stop\n\
+  [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()\n\
+  if ([string]::IsNullOrWhiteSpace($__sviHistoryRoot)) {{ throw 'Local application data is unavailable.' }}\n\
+  $__sviHistoryDir = [IO.Path]::Combine($__sviHistoryRoot, 'Simple Vibe IDE', 'terminal-history')\n\
+  [IO.Directory]::CreateDirectory($__sviHistoryDir) | Out-Null\n\
+  $__sviHistoryPath = [IO.Path]::Combine($__sviHistoryDir, '{}.txt')\n\
+  Set-PSReadLineOption -HistorySavePath $__sviHistoryPath -HistorySaveStyle SaveIncrementally -ErrorAction Stop\n\
+}} catch {{\n\
+  if ($__sviPsReadLineLoaded) {{\n\
+    try {{\n\
+      Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue\n\
+      [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()\n\
+    }} catch {{\n\
+      Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue\n\
+    }}\n\
+  }}\n\
+}}\n\
+Remove-Variable -Name '__sviHistoryRoot','__sviHistoryDir','__sviHistoryPath','__sviPsReadLineLoaded' -ErrorAction SilentlyContinue",
+        shell_history_id
+    );
+    if let Some(command) = command {
+        script.push('\n');
+        script.push_str(command);
+    }
+    script
 }
 
 fn bash_bootstrap_script(
     cwd: Option<&str>,
     fallback_cwd: Option<&str>,
     command: Option<&str>,
+    shell_history_id: &str,
 ) -> String {
     let mut script = String::new();
     script.push_str(&format!(
@@ -6008,17 +6066,36 @@ fn bash_bootstrap_script(
 	  fi\n\
 	elif [ -n \"$__svide_fallback_cwd\" ] && [ \"$__svide_fallback_cwd\" != \"~\" ]; then\n\
 	  cd \"$__svide_fallback_cwd\" 2>/dev/null || __svide_cd_failed \"$__svide_fallback_cwd\"\n\
-	fi\n",
+	fi\n\
+	__svide_history_base=${{XDG_STATE_HOME:-\"$HOME/.local/state\"}}\n\
+	case \"$__svide_history_base\" in /*) ;; *) __svide_history_base=\"$HOME/.local/state\" ;; esac\n\
+	__svide_history_dir=\"$__svide_history_base/simple-vibe-ide/terminal-history\"\n\
+	__svide_history_file=\"$__svide_history_dir/{}.bash\"\n\
+	if (umask 077 && mkdir -p \"$__svide_history_dir\" && : >>\"$__svide_history_file\" && chmod 700 \"$__svide_history_dir\" && chmod 600 \"$__svide_history_file\") 2>/dev/null; then\n\
+	  __SVIDE_HISTORY_FILE=\"$__svide_history_file\"\n\
+	  HISTFILE=\"$__svide_history_file\"\n\
+	else\n\
+	  __SVIDE_HISTORY_FILE=''\n\
+	  HISTFILE=/dev/null\n\
+	fi\n\
+	export __SVIDE_HISTORY_FILE HISTFILE\n\
+	unset __svide_history_base __svide_history_dir __svide_history_file\n",
         shell_quote(cwd.unwrap_or("")),
-        shell_quote(fallback_cwd.unwrap_or(""))
+        shell_quote(fallback_cwd.unwrap_or("")),
+        shell_history_id
     ));
     script.push_str(
         "exec bash --rcfile <(cat <<'__SVIDE_RC__'\n\
-__simple_vibe_ide_prompt_command() { local __sv_status=$?; printf '\\033]7;file://simple-vibe-ide%s\\033\\\\' \"$PWD\"; return $__sv_status; }\n\
+__simple_vibe_ide_history_file=${__SVIDE_HISTORY_FILE-}\n\
+__simple_vibe_ide_prompt_command() { local __sv_status=$?; if [ -n \"$__simple_vibe_ide_history_file\" ]; then HISTFILE=\"$__simple_vibe_ide_history_file\"; export HISTFILE; builtin history -a \"$__simple_vibe_ide_history_file\" 2>/dev/null || true; fi; printf '\\033]7;file://simple-vibe-ide%s\\033\\\\' \"$PWD\"; return $__sv_status; }\n\
 case \";${PROMPT_COMMAND:-};\" in *__simple_vibe_ide_prompt_command*) ;; *) PROMPT_COMMAND=\"__simple_vibe_ide_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}\" ;; esac\n\
 export PROMPT_COMMAND\n\
 __simple_vibe_ide_prompt_command\n\
 [ -f ~/.bashrc ] && . ~/.bashrc\n\
+if [ -n \"$__simple_vibe_ide_history_file\" ] && [ -n \"${HISTFILE+x}\" ] && [ -n \"$HISTFILE\" ] && [ \"$HISTFILE\" != /dev/null ]; then HISTFILE=\"$__simple_vibe_ide_history_file\"; else __simple_vibe_ide_history_file=''; HISTFILE=/dev/null; fi\n\
+export HISTFILE\n\
+builtin history -c 2>/dev/null || true\n\
+unset __SVIDE_HISTORY_FILE\n\
 case \";${PROMPT_COMMAND:-};\" in *__simple_vibe_ide_prompt_command*) ;; *) PROMPT_COMMAND=\"__simple_vibe_ide_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}\" ;; esac\n\
 export PROMPT_COMMAND\n\
 __simple_vibe_ide_prompt_command\n\
@@ -8960,6 +9037,84 @@ fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &st
     };
     name.trim().eq_ignore_ascii_case(expected_name)
         && value.trim().eq_ignore_ascii_case(expected_value)
+}
+
+#[cfg(test)]
+mod terminal_history_tests {
+    use super::*;
+
+    const HISTORY_ID: &str = "7fdf62e2-a590-4efc-a68f-c8d74208d9b1";
+    const FALLBACK_ID: &str = "c5a5d188-da1f-4386-b9f2-11b38c71e6d9";
+
+    #[test]
+    fn terminal_history_id_is_canonical_and_rejects_path_input() {
+        assert_eq!(
+            normalized_terminal_shell_history_id(
+                Some(" 7FDF62E2-A590-4EFC-A68F-C8D74208D9B1 "),
+                FALLBACK_ID,
+            ),
+            HISTORY_ID
+        );
+        assert_eq!(
+            normalized_terminal_shell_history_id(Some("../../shared-history"), FALLBACK_ID),
+            FALLBACK_ID
+        );
+        assert_eq!(
+            normalized_terminal_shell_history_id(Some("bad\nname"), FALLBACK_ID),
+            FALLBACK_ID
+        );
+    }
+
+    #[test]
+    fn bash_bootstrap_uses_only_the_private_pane_history_file() {
+        let script = bash_bootstrap_script(Some("~/work"), Some("~"), None, HISTORY_ID);
+        let source_bashrc = script.find("[ -f ~/.bashrc ]").expect("source bashrc");
+        let reassert_history = script[source_bashrc..]
+            .find("HISTFILE=\"$__simple_vibe_ide_history_file\"")
+            .map(|offset| source_bashrc + offset)
+            .expect("reassert pane history after bashrc");
+        let clear_history = script[reassert_history..]
+            .find("builtin history -c")
+            .map(|offset| reassert_history + offset)
+            .expect("clear history loaded by bashrc");
+
+        assert!(script.contains(&format!("/{HISTORY_ID}.bash")));
+        assert!(script.contains("${XDG_STATE_HOME:-\"$HOME/.local/state\"}"));
+        assert!(script.contains("chmod 700 \"$__svide_history_dir\""));
+        assert!(script.contains("chmod 600 \"$__svide_history_file\""));
+        assert!(script.contains("HISTFILE=/dev/null"));
+        assert!(script.contains("[ -n \"${HISTFILE+x}\" ]"));
+        assert!(script.contains("__simple_vibe_ide_history_file=''; HISTFILE=/dev/null"));
+        assert!(
+            script.contains("builtin history -a \"$__simple_vibe_ide_history_file\" 2>/dev/null")
+        );
+        assert!(source_bashrc < reassert_history && reassert_history < clear_history);
+        assert!(!script.contains("history -r"));
+        assert!(!script.contains("~/.bash_history"));
+    }
+
+    #[test]
+    fn powershell_bootstrap_clears_shared_state_before_enabling_pane_history() {
+        let command = "Write-Output 'ready'";
+        let script = powershell_terminal_bootstrap_script(HISTORY_ID, Some(command));
+        let disable = script
+            .find("-HistorySaveStyle SaveNothing -ErrorAction Stop")
+            .expect("disable default history");
+        let clear = script[disable..]
+            .find("[Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()")
+            .map(|offset| disable + offset)
+            .expect("clear shared in-memory history");
+        let enable = script[clear..]
+            .find("-HistorySavePath $__sviHistoryPath -HistorySaveStyle SaveIncrementally")
+            .map(|offset| clear + offset)
+            .expect("enable private history");
+        let launch = script.rfind(command).expect("launch command");
+
+        assert!(script.contains(&format!("'{HISTORY_ID}.txt'")));
+        assert!(disable < clear && clear < enable && enable < launch);
+        assert!(script.contains("Remove-Module PSReadLine -Force"));
+        assert!(!script.contains("ConsoleHost_history"));
+    }
 }
 
 #[cfg(test)]
