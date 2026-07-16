@@ -1330,6 +1330,7 @@ interface WorkspaceRuntimeCache {
   browserHistory: string[];
   activeBrowserTabId: string;
   previewUrl: string;
+  forwards: PortForwardResult[];
   previewProxies: PortForwardResult[];
   browserConsoleLogs: BrowserConsoleLog[];
 }
@@ -1977,9 +1978,13 @@ const BROWSER_CONSOLE_HIDDEN_FLUSH_DEBOUNCE_MS = 220;
 const BROWSER_CONSOLE_HIDDEN_FLUSH_IDLE_MS = 900;
 const BROWSER_CONSOLE_LOCAL_URL_PORT_PATTERN = /\b(?:https?|wss?):\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d{2,5})\b/gi;
 const BROWSER_INACTIVE_FRAME_SUSPEND_DELAY_MS = 3500;
-const BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS = 350;
 const BROWSER_FRAME_SUSPEND_IDLE_MS = 250;
-const BROWSER_NATIVE_HIDDEN_CLOSE_DELAY_MS = 12_000;
+// Preserve a small, bounded set of hidden browser contexts long enough for normal
+// workspace/panel switching without allowing background WebViews to accumulate.
+const BROWSER_HIDDEN_CONTEXT_TTL_MS = 5 * 60_000;
+const BROWSER_OFFSCREEN_CONTEXT_TTL_MS = 12_000;
+const BROWSER_NATIVE_HIDDEN_RETAIN_LIMIT = 4;
+const BROWSER_FRAME_WORKSPACE_RETAIN_LIMIT = 4;
 const WORKSPACE_RESTORE_BACKGROUND_DELAY_MS = 1800;
 const WORKSPACE_MEMORY_SAVER_CHECK_DELAY_MS = 3000;
 const WORKSPACE_MEMORY_SAVER_BALANCED_LIVE_LIMIT = 3;
@@ -3813,8 +3818,11 @@ let nativeBrowserWebviewTabId = '';
 let nativeBrowserWebviewLabel = '';
 let nativeBrowserWebviewUrl = '';
 let nativeBrowserWebviewVisible = false;
+let nativeBrowserWebviewNeedsBoundsRecovery = false;
+let nativeBrowserWebviewSuspendedForAddressSuggestions = false;
 let nativeBrowserWebviewSyncFrame = 0;
 let nativeBrowserWebviewRequestSeq = 0;
+let nativeBrowserOverlayObserver: MutationObserver | null = null;
 let browserRestoreResumeToken = 0;
 const noteSaveTimers = new Map<string, number>();
 let noteMemoryRecords: NoteMemoryRecord[] = [];
@@ -3970,6 +3978,8 @@ const captureProtectionSessionWorkspaceIds = new Set<string>();
 const workspaceLastActiveAt = new Map<string, number>();
 const workspaceLastOutputAt = new Map<string, number>();
 const workspaceMemorySleepingIds = new Set<string>();
+const workspaceMemoryWakingIds = new Set<string>();
+let workspaceRuntimeOwnerId = '';
 let workspaceMemorySaverTimer = 0;
 const workspaceLlmActivityExpiresAt = new Map<string, number>();
 const workspaceLlmActivityTimers = new Map<string, number>();
@@ -4084,6 +4094,7 @@ let terminalWindowWakeRefreshReason = '';
 let terminalTinyWindowLayoutActive = false;
 let workspaceGlassSkipNextResizeRebuildAfterTinyRestore = false;
 let rendererHeartbeatTimer = 0;
+let rendererHeartbeatInFlight = false;
 let rendererRecoveryNotice: RendererRecoveryNotice | null = null;
 let marketTickerSocket: WebSocket | null = null;
 let marketTickerStarted = false;
@@ -5024,6 +5035,17 @@ function setWorkspaceTabLabelText(label: HTMLButtonElement, text: string) {
   setTextContentIfChanged(textNode, text);
 }
 
+function setWorkspaceTabMemoryState(label: HTMLButtonElement, state: 'sleep' | 'waking' | '') {
+  let badge = label.querySelector<HTMLSpanElement>(':scope > .workspace-tab-memory-state');
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.className = 'workspace-tab-memory-state';
+    label.append(badge);
+  }
+  badge.hidden = !state;
+  setTextContentIfChanged(badge, state);
+}
+
 function setDisabledIfChanged(
   element: HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement,
   disabled: boolean
@@ -5074,13 +5096,19 @@ function renderAppClock() {
 
 function startRendererHeartbeat() {
   if (rendererHeartbeatTimer) return;
-  const ping = () => {
-    void api.rendererHeartbeat()
-      .then(handleRendererHeartbeatResponse)
-      .catch(() => undefined);
-  };
-  ping();
-  rendererHeartbeatTimer = window.setInterval(ping, RENDERER_HEARTBEAT_INTERVAL_MS);
+  pingRendererHeartbeat();
+  rendererHeartbeatTimer = window.setInterval(pingRendererHeartbeat, RENDERER_HEARTBEAT_INTERVAL_MS);
+}
+
+function pingRendererHeartbeat() {
+  if (rendererHeartbeatInFlight || appShutdownStarted) return;
+  rendererHeartbeatInFlight = true;
+  void api.rendererHeartbeat()
+    .then(handleRendererHeartbeatResponse)
+    .catch(() => undefined)
+    .finally(() => {
+      rendererHeartbeatInFlight = false;
+    });
 }
 
 function handleRendererHeartbeatResponse(response: RendererHeartbeatResponse) {
@@ -5175,7 +5203,9 @@ async function init() {
     }),
     currentWindow.onFocusChanged((event) => {
       if (event.payload) {
+        pingRendererHeartbeat();
         scheduleMainWebviewBoundsRefresh('native-focus', { force: true });
+        scheduleNativeBrowserWebviewSync();
         resumeTerminalsAfterWindowWake('window-focus');
         releaseStaleTerminalImeGuardBeforeFocusRecovery();
         focusActiveTerminalPaneWhenItOwnsKeyboard();
@@ -5184,11 +5214,14 @@ async function init() {
     }),
     currentWindow.onScaleChanged(() => {
       scheduleMainWebviewBoundsRefresh('scale-change', { delay: 120, force: true });
+      scheduleNativeBrowserWebviewSync();
     })
   ]);
   startRendererHeartbeat();
   window.addEventListener('focus', () => {
+    pingRendererHeartbeat();
     scheduleMainWebviewBoundsRefresh('window-focus', { force: true });
+    scheduleNativeBrowserWebviewSync();
     resumeTerminalsAfterWindowWake('window-focus');
     releaseStaleTerminalImeGuardBeforeFocusRecovery();
     focusActiveTerminalPaneWhenItOwnsKeyboard();
@@ -5197,6 +5230,7 @@ async function init() {
   document.addEventListener('focusin', (event) => cancelTerminalFocusRequestsForMeaningfulTarget(event.target));
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
+      pingRendererHeartbeat();
       scheduleMainWebviewBoundsRefresh('visible', { force: true });
       resumeTerminalsAfterWindowWake('visible');
       releaseStaleTerminalImeGuardBeforeFocusRecovery();
@@ -12054,13 +12088,24 @@ function explorerGlassHoverOnlyEnabled() {
   return explorerLiquidGlassHoverOnlyRuntime && explorerLiquidGlassEligible();
 }
 
+function hoveredExplorerHoverOnlyRow() {
+  if (document.hidden
+    || !document.hasFocus()
+    || Date.now() < explorerScrollingUntil
+    || !el.fileList.matches(':hover')) return null;
+  return el.fileList.querySelector<HTMLElement>('.file-row:hover');
+}
+
 function activeExplorerHoverOnlyGlassElements() {
   if (!explorerGlassHoverOnlyEnabled()) return null;
-  const hovered = el.fileList.querySelector<HTMLElement>('.file-row:hover');
+  const hovered = hoveredExplorerHoverOnlyRow();
   const row = explorerLiquidGlassHoverOnlyTarget?.isConnected
+    && el.fileList.contains(explorerLiquidGlassHoverOnlyTarget)
     ? explorerLiquidGlassHoverOnlyTarget
     : hovered;
-  if (!(row instanceof HTMLElement) || !row.isConnected) return new Set<HTMLElement>();
+  if (!(row instanceof HTMLElement) || !row.isConnected || !el.fileList.contains(row)) {
+    return new Set<HTMLElement>();
+  }
   const glass = row.querySelector<HTMLElement>(':scope > .file-row-glass');
   return new Set<HTMLElement>(glass ? [glass] : []);
 }
@@ -12080,8 +12125,9 @@ function explorerLiquidGlassLensForRow(row: HTMLElement | null) {
 function activeExplorerHoverOnlyLens() {
   if (!explorerGlassHoverOnlyEnabled()) return null;
   const row = explorerLiquidGlassHoverOnlyTarget?.isConnected
+    && el.fileList.contains(explorerLiquidGlassHoverOnlyTarget)
     ? explorerLiquidGlassHoverOnlyTarget
-    : el.fileList.querySelector<HTMLElement>('.file-row:hover');
+    : hoveredExplorerHoverOnlyRow();
   return explorerLiquidGlassLensForRow(row);
 }
 
@@ -12108,6 +12154,17 @@ function syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer: LiquidGLRende
   if (!renderer?.lenses) return;
   if (explorerGlassHoverOnlyEnabled()) {
     const activeLens = activeExplorerHoverOnlyLens();
+    const activeTarget = activeLens?.el;
+    const activeRow = activeTarget instanceof HTMLElement && activeTarget.parentElement instanceof HTMLElement
+      ? activeTarget.parentElement
+      : null;
+    reconcileExplorerHoverOnlyRowClasses(activeRow);
+    // Pointer transitions can be coalesced or lost while rows are virtualized.
+    // Reassert the single-visible-mirror invariant after every filtered render
+    // instead of relying only on the previous row's pointerout cleanup.
+    for (const mirror of el.fileList.querySelectorAll<HTMLCanvasElement>('canvas[data-explorer-glass-local-mirror="1"]')) {
+      if (mirror.style.opacity !== '0') mirror.style.opacity = '0';
+    }
     if (activeLens?._appGlassLocalMirror instanceof HTMLCanvasElement && !activeLens._mirrorActive) {
       activeLens._appGlassLocalMirror.style.opacity = '1';
     }
@@ -12145,10 +12202,48 @@ function renderExplorerHoverOnlyNow() {
   syncExplorerLiquidGlassLocalMirrorsFromRenderer(renderer);
 }
 
+function reconcileExplorerHoverOnlyRowClasses(activeRow: HTMLElement | null) {
+  for (const row of el.fileList.querySelectorAll<HTMLElement>('.file-row.glass-hover-active')) {
+    if (row !== activeRow) row.classList.remove('glass-hover-active');
+  }
+  activeRow?.classList.add('glass-hover-active');
+}
+
+function cancelExplorerHoverOnlyPointerMove() {
+  if (explorerLiquidGlassHoverMoveFrame) {
+    window.cancelAnimationFrame(explorerLiquidGlassHoverMoveFrame);
+    explorerLiquidGlassHoverMoveFrame = 0;
+  }
+  explorerLiquidGlassHoverMoveX = Number.NaN;
+  explorerLiquidGlassHoverMoveY = Number.NaN;
+}
+
+function detachExplorerHoverOnlyRow(row: HTMLElement) {
+  row.classList.remove('glass-hover-active');
+  if (row !== explorerLiquidGlassHoverOnlyTarget) return;
+  const lens = explorerLiquidGlassLensForRow(row);
+  if (lens) {
+    resetHoverOnlyLiquidGlassLens(lens);
+    if (lens._appGlassLocalMirror instanceof HTMLCanvasElement) {
+      lens._appGlassLocalMirror.style.opacity = '0';
+    }
+  }
+  explorerLiquidGlassHoverOnlyTarget = null;
+}
+
+function clearExplorerHoverOnlyTargetForRowReplacement() {
+  cancelExplorerHoverOnlyPointerMove();
+  const target = explorerLiquidGlassHoverOnlyTarget;
+  if (target) detachExplorerHoverOnlyRow(target);
+  reconcileExplorerHoverOnlyRowClasses(null);
+  explorerLiquidGlassHoverOnlyTarget = null;
+}
+
 function setExplorerHoverOnlyTarget(row: HTMLElement | null) {
   const previousRow = explorerLiquidGlassHoverOnlyTarget;
   if (!explorerGlassHoverOnlyEnabled()) {
-    previousRow?.classList.remove('glass-hover-active');
+    cancelExplorerHoverOnlyPointerMove();
+    reconcileExplorerHoverOnlyRowClasses(null);
     const previousLens = explorerLiquidGlassLensForRow(previousRow);
     if (previousLens) {
       resetHoverOnlyLiquidGlassLens(previousLens);
@@ -12160,8 +12255,17 @@ function setExplorerHoverOnlyTarget(row: HTMLElement | null) {
     renderExplorerHoverOnlyNow();
     return;
   }
-  const next = row instanceof HTMLElement && row.isConnected ? row : null;
-  if (explorerLiquidGlassHoverOnlyTarget === next) return;
+  const next = row instanceof HTMLElement
+    && row.isConnected
+    && el.fileList.contains(row)
+    ? row
+    : null;
+  if (!next) cancelExplorerHoverOnlyPointerMove();
+  reconcileExplorerHoverOnlyRowClasses(next);
+  if (explorerLiquidGlassHoverOnlyTarget === next) {
+    syncExplorerLiquidGlassLocalMirrorsFromRenderer();
+    return;
+  }
   previousRow?.classList.remove('glass-hover-active');
   const previousLens = explorerLiquidGlassLensForRow(previousRow);
   if (previousLens) {
@@ -12171,7 +12275,6 @@ function setExplorerHoverOnlyTarget(row: HTMLElement | null) {
     }
   }
   explorerLiquidGlassHoverOnlyTarget = next;
-  explorerLiquidGlassHoverOnlyTarget?.classList.add('glass-hover-active');
   renderExplorerHoverOnlyNow();
 }
 
@@ -12246,7 +12349,8 @@ function disposeExplorerLiquidGlassRenderer() {
 }
 
 function removeExplorerLiquidGlass() {
-  explorerLiquidGlassHoverOnlyTarget?.classList.remove('glass-hover-active');
+  cancelExplorerHoverOnlyPointerMove();
+  reconcileExplorerHoverOnlyRowClasses(null);
   explorerLiquidGlassHoverOnlyTarget = null;
   toggleClassIfChanged(el.fileList, 'explorer-semantic-no-y-scroll', false);
   toggleClassIfChanged(el.fileList, 'explorer-semantic-x-scroll', false);
@@ -12263,10 +12367,6 @@ function removeExplorerLiquidGlass() {
   if (explorerLiquidGlassScrollFrame) {
     window.cancelAnimationFrame(explorerLiquidGlassScrollFrame);
     explorerLiquidGlassScrollFrame = 0;
-  }
-  if (explorerLiquidGlassHoverMoveFrame) {
-    window.cancelAnimationFrame(explorerLiquidGlassHoverMoveFrame);
-    explorerLiquidGlassHoverMoveFrame = 0;
   }
   disposeExplorerLiquidGlassRenderer();
   explorerLiquidGlassOverlayHost?.remove();
@@ -13851,6 +13951,7 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
   const protectedWorkspace = Boolean(workspace.captureProtected);
   const keepLive = Boolean(workspace.keepLive);
   const sleeping = workspaceMemorySleepingIds.has(workspace.id);
+  const waking = sleeping && workspaceMemoryWakingIds.has(workspace.id);
   const sessionEnabled = workspaceCaptureProtectionSessionEnabled(workspace.id);
   const appliedWorkspace = workspaceCaptureProtectionAppliedForWorkspace(workspace.id);
   const active = workspace.id === state.activeWorkspaceId;
@@ -13858,14 +13959,14 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
   const displayLabel = workspaceDisplayLabel(workspace);
   const detailOpen = workspaceDockDetailIsOpen(workspace.id);
   const detailSignature = detailOpen ? `${workspaceAgentProgressSignature(workspace.id)}\t${workspaceDetailContentSignature(workspace)}` : '';
-  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}\t${sessionEnabled ? '1' : '0'}\t${appliedWorkspace ? '1' : '0'}\t${llmState}\t${keepLive ? '1' : '0'}\t${sleeping ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
+  const signature = `${workspace.id}\t${active ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${protectedWorkspace ? '1' : '0'}\t${sessionEnabled ? '1' : '0'}\t${appliedWorkspace ? '1' : '0'}\t${llmState}\t${keepLive ? '1' : '0'}\t${sleeping ? '1' : '0'}\t${waking ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
   tab.dataset.workspaceId = workspace.id;
   if (tab.dataset.renderSignature === signature) return;
   tab.dataset.renderSignature = signature;
   const llmDisplayState = llmState === 'none' ? 'idle' : llmState;
   const wasRenaming = tab.classList.contains('renaming');
   const wasDragging = tab.classList.contains('dragging');
-  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${appliedWorkspace ? ' capture-applied' : ''}${keepLive ? ' keep-live' : ''}${sleeping ? ' memory-slept' : ''}${detailOpen ? ' detail-open' : ''}${wasRenaming ? ' renaming' : ''}${wasDragging ? ' dragging' : ''} llm-present llm-${llmDisplayState}`;
+  tab.className = `workspace-tab${active ? ' active' : ''}${protectedWorkspace ? ' protected' : ''}${appliedWorkspace ? ' capture-applied' : ''}${keepLive ? ' keep-live' : ''}${sleeping ? ' memory-slept' : ''}${waking ? ' memory-waking' : ''}${detailOpen ? ' detail-open' : ''}${wasRenaming ? ' renaming' : ''}${wasDragging ? ' dragging' : ''} llm-present llm-${llmDisplayState}`;
   if (workspaceLiquidGlassEligible() || tab.dataset.workspaceGlassLens) {
     tab.classList.add('credit-card-glass');
     if (tab.dataset.workspaceGlassLens === 'pending') tab.classList.add('workspace-glass-pending');
@@ -13891,11 +13992,16 @@ function updateWorkspaceTabElement(tab: HTMLElement, workspace: WorkspaceSnapsho
         ? ' - capture block marked; opening auto-applies'
         : '';
   const keepLiveTitle = keepLive ? ' - kept live' : '';
-  const memoryTitle = sleeping ? ' - memory saver slept shells' : '';
+  const memoryTitle = waking
+    ? ' - memory saver waking shells'
+    : sleeping
+      ? ' - memory saver slept shells'
+      : '';
   tab.title = `${displayLabel} - ${workspace.root || 'empty'}${workspace.customLabel ? ` - ${workspace.label}` : ''}${captureTitle}${keepLiveTitle}${memoryTitle}${llmTitle}`;
   const parts = workspaceTabParts(tab);
   const label = parts.label;
   setWorkspaceTabLabelText(label, displayLabel);
+  setWorkspaceTabMemoryState(label, waking ? 'waking' : sleeping ? 'sleep' : '');
   if (label.title !== tab.title) label.title = tab.title;
   setAttributeIfChanged(label, 'aria-label', `Open workspace: ${displayLabel}`);
   parts.detailToggle.textContent = detailOpen ? '▾' : '▸';
@@ -14172,6 +14278,7 @@ async function loadSelectedSavedWorkspace() {
   const activeIndex = workspaceSnapshotIndexById(state.activeWorkspaceId);
   insertWorkspaceSnapshot(activeIndex >= 0 ? activeIndex + 1 : state.workspaceSnapshots.length, snapshot);
   const previousActiveId = state.activeWorkspaceId;
+  markWorkspaceInactive(previousActiveId);
   state.activeWorkspaceId = snapshot.id;
   markWorkspaceActive(snapshot.id);
   renderWorkspaceTabActivation(previousActiveId, snapshot);
@@ -16898,7 +17005,7 @@ function workspaceTabsSignature() {
     if (index) signature += '\n';
     const detailOpen = workspaceDockDetailIsOpen(workspace.id);
     const detailSignature = detailOpen ? `${workspaceAgentProgressSignature(workspace.id)}\t${workspaceDetailContentSignature(workspace)}` : '';
-    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceCaptureProtectionSessionEnabled(workspace.id) ? '1' : '0'}\t${workspaceCaptureProtectionAppliedForWorkspace(workspace.id) ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}\t${workspace.keepLive ? '1' : '0'}\t${workspaceMemorySleepingIds.has(workspace.id) ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
+    signature += `${workspace.id}\t${workspace.id === state.activeWorkspaceId ? '1' : '0'}\t${workspace.label}\t${workspace.customLabel ?? ''}\t${workspace.root}\t${workspace.captureProtected ? '1' : '0'}\t${workspaceCaptureProtectionSessionEnabled(workspace.id) ? '1' : '0'}\t${workspaceCaptureProtectionAppliedForWorkspace(workspace.id) ? '1' : '0'}\t${workspaceLlmIndicatorState(workspace.id)}\t${workspace.keepLive ? '1' : '0'}\t${workspaceMemorySleepingIds.has(workspace.id) ? '1' : '0'}\t${workspaceMemoryWakingIds.has(workspace.id) ? '1' : '0'}\t${detailOpen ? '1' : '0'}\t${detailSignature}`;
   }
   return signature;
 }
@@ -17164,12 +17271,13 @@ function toggleWorkspaceKeepLive(id: string) {
   snapshot.keepLive = !snapshot.keepLive;
   snapshot.updatedAt = new Date().toISOString();
   workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
-  if (snapshot.keepLive) workspaceMemorySleepingIds.delete(id);
   renderWorkspaceTabs();
   persistWorkspaceStore();
   scheduleWorkspaceMemorySaver();
   setStatus(snapshot.keepLive
-    ? 'Workspace will stay live'
+    ? workspaceMemorySleepingIds.has(id)
+      ? 'Workspace will stay live after its shells wake'
+      : 'Workspace will stay live'
     : 'Workspace can be slept by Memory Saver');
 }
 
@@ -17493,6 +17601,8 @@ async function copyWorkspaceTab(id: string) {
   const clone = cloneWorkspaceSnapshotForCopy(state.workspaceSnapshots[sourceIndex]);
   workspaceSnapshotSignatures.set(clone.id, workspaceSnapshotSignature(clone));
   insertWorkspaceSnapshot(sourceIndex + 1, clone);
+  const previousActiveId = state.activeWorkspaceId;
+  markWorkspaceInactive(previousActiveId);
   state.activeWorkspaceId = clone.id;
   markWorkspaceActive(clone.id);
   persistWorkspaceStore();
@@ -17697,6 +17807,7 @@ async function closeWorkspaceTab(id: string) {
   workspaceLastActiveAt.delete(id);
   workspaceLastOutputAt.delete(id);
   workspaceMemorySleepingIds.delete(id);
+  workspaceMemoryWakingIds.delete(id);
   workspaceDoneUnreadIds.delete(id);
   removeWorkspaceSnapshotById(id);
   if (state.activeWorkspaceId === id) {
@@ -17731,6 +17842,14 @@ async function closeWorkspaceTab(id: string) {
 
 async function activateWorkspaceTab(id: string, options: { imeSettled?: boolean } = {}) {
   const activationGeneration = ++workspaceActivationGeneration;
+  if (id === state.activeWorkspaceId && state.workspaceOpen && workspaceRuntimeOwnerId !== id) {
+    const snapshot = workspaceSnapshotForId(id);
+    if (snapshot?.profileId && profileForId(snapshot.profileId)) {
+      setStatus(`Retrying workspace setup: ${snapshot.label}`);
+      await restoreWorkspaceSnapshot(snapshot);
+    }
+    return;
+  }
   if (id === state.activeWorkspaceId && state.workspaceOpen) {
     acknowledgeWorkspaceDoneUnread(id);
     const snapshot = workspaceSnapshotForId(id);
@@ -17738,17 +17857,36 @@ async function activateWorkspaceTab(id: string, options: { imeSettled?: boolean 
     const hasFailedShell = state.terminals.some((pane) => (
       pane.workspaceId === id && pane.startupState === 'failed'
     ));
+    const wakingFromMemorySaver = workspaceMemorySleepingIds.has(id);
+    const retryingFailedRestore = workspaceTerminalRestoreFailedPreserveIds.has(id);
+    const expectedTerminalCount = snapshot?.terminals?.length ?? 0;
+    const runningTerminalCount = workspaceRunningTerminalBackendCount(id);
+    const retryingSnapshotRestore = wakingFromMemorySaver || retryingFailedRestore;
+    const canRetryShells = retryingSnapshotRestore
+      ? runningTerminalCount < expectedTerminalCount
+      : hasFailedShell && runningTerminalCount === 0;
     if (
       snapshot
       && profile
-      && hasFailedShell
-      && (snapshot.terminals ?? []).length > 0
-      && !workspaceHasRunningTerminalBackend(id)
+      && canRetryShells
+      && expectedTerminalCount > 0
+      && !workspaceTerminalRestoreInProgress(id)
       && !workspaceTerminalRetryInFlightIds.has(id)
     ) {
       workspaceTerminalRetryInFlightIds.add(id);
       try {
-        setStatus(`Retrying failed shells: ${snapshot.label}`);
+        if (wakingFromMemorySaver) {
+          markWorkspaceActive(id);
+          renderWorkspaceLlmActivityTabNow(id);
+        }
+        setStatus(`${wakingFromMemorySaver ? 'Waking' : 'Retrying failed'} shells: ${snapshot.label}`);
+        if (retryingSnapshotRestore && runningTerminalCount > 0) {
+          await closeTerminalsForWorkspace(id, {
+            backgroundKill: true,
+            saveSnapshot: false,
+            renderShellTabs: false
+          });
+        }
         await restoreWorkspaceTerminals(snapshot, profile);
       } finally {
         workspaceTerminalRetryInFlightIds.delete(id);
@@ -17779,6 +17917,7 @@ async function activateWorkspaceTab(id: string, options: { imeSettled?: boolean 
   const previousActiveId = state.activeWorkspaceId;
   saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
   saveActiveWorkspaceRuntimeCache();
+  markWorkspaceInactive(previousActiveId);
   state.activeWorkspaceId = id;
   markWorkspaceActive(id);
   acknowledgeWorkspaceDoneUnread(id);
@@ -18483,15 +18622,14 @@ function saveActiveWorkspaceRuntimeCache() {
     browserHistory: currentBrowserHistorySnapshot(),
     activeBrowserTabId: state.activeBrowserTabId,
     previewUrl: state.previewUrl,
+    forwards: state.forwards.map((forward) => ({ ...forward })),
     previewProxies: snapshotPreviewProxiesForRuntime(),
     browserConsoleLogs: snapshotBrowserConsoleLogsForRuntime()
   });
   clearExplorerBackgroundWork();
   if (hasBrowserFramesForWorkspace(workspaceId)) {
     hideBrowserFramesForWorkspace(workspaceId);
-    if (document.hidden) {
-      suspendBrowserFramesForWorkspace(workspaceId, { includeActive: true });
-    }
+    scheduleBrowserWorkspaceFrameSuspend(workspaceId, { includeActive: true });
   }
   if (activeEdgeCdp && browserTabForId(activeEdgeCdp.tabId)) {
     disconnectActiveEdgeCdp();
@@ -18502,6 +18640,10 @@ function saveActiveWorkspaceRuntimeCache() {
 
 function closeNativeBrowserWebviewsForWorkspace(workspaceId: string, tabs = state.browserTabs) {
   if (!workspaceId) return;
+  if (workspaceId === state.activeWorkspaceId) {
+    nativeBrowserWebviewNeedsBoundsRecovery = false;
+    nativeBrowserWebviewSuspendedForAddressSuggestions = false;
+  }
   const labels = new Set<string>();
   for (const tab of tabs) {
     if (tab?.id) labels.add(nativeBrowserWebviewLabelForTab(tab, workspaceId));
@@ -18521,9 +18663,12 @@ function removeWorkspaceRuntimeCache(workspaceId: string) {
   const cached = workspaceRuntimeCache.get(workspaceId);
   if (cached) closeNativeBrowserWebviewsForWorkspace(workspaceId, cached.browserTabs);
   if (cached) {
-    for (const proxy of cached.previewProxies) {
-      previewProxyProbeAt.delete(proxy.id);
-      void api.stopPortForward(proxy.id).catch(() => undefined);
+    const forwardIds = new Set<string>();
+    for (const forward of [...cached.forwards, ...cached.previewProxies]) {
+      if (forwardIds.has(forward.id)) continue;
+      forwardIds.add(forward.id);
+      previewProxyProbeAt.delete(forward.id);
+      void api.stopPortForward(forward.id).catch(() => undefined);
     }
   }
   stopEdgeDevtoolsForWorkspace(workspaceId);
@@ -18534,14 +18679,33 @@ function removeWorkspaceRuntimeCache(workspaceId: string) {
 function markWorkspaceActive(workspaceId: string) {
   if (!workspaceId) return;
   workspaceLastActiveAt.set(workspaceId, Date.now());
-  workspaceMemorySleepingIds.delete(workspaceId);
+  if (workspaceMemorySleepingIds.has(workspaceId)) workspaceMemoryWakingIds.add(workspaceId);
+  else workspaceMemoryWakingIds.delete(workspaceId);
   scheduleWorkspaceMemorySaver();
+}
+
+function markWorkspaceInactive(workspaceId: string) {
+  if (!workspaceId) return;
+  // An active workspace is never eligible for Memory Saver. Start its inactive
+  // grace when the user actually leaves it, rather than from the older time it
+  // was first activated or last happened to print terminal output.
+  workspaceLastActiveAt.set(workspaceId, Date.now());
+  scheduleWorkspaceMemorySaver();
+}
+
+function markWorkspaceMemoryAwake(workspaceId: string) {
+  if (!workspaceId) return;
+  const sleepingChanged = workspaceMemorySleepingIds.delete(workspaceId);
+  const wakingChanged = workspaceMemoryWakingIds.delete(workspaceId);
+  if (sleepingChanged || wakingChanged) renderWorkspaceLlmActivityTabNow(workspaceId);
 }
 
 function markWorkspaceTerminalOutput(workspaceId: string) {
   if (!workspaceId) return;
   workspaceLastOutputAt.set(workspaceId, Date.now());
-  workspaceMemorySleepingIds.delete(workspaceId);
+  if (!workspaceMemoryWakingIds.has(workspaceId) || !workspaceTerminalRestoreInProgress(workspaceId)) {
+    markWorkspaceMemoryAwake(workspaceId);
+  }
 }
 
 function scheduleWorkspaceMemorySaver(delayMs = WORKSPACE_MEMORY_SAVER_CHECK_DELAY_MS) {
@@ -18595,10 +18759,10 @@ function workspaceMemorySaverIdleMs() {
 function liveTerminalWorkspaceIds() {
   const ids = new Set<string>();
   for (const pane of state.terminals) {
-    if (pane.workspaceId && !pane.closed) ids.add(pane.workspaceId);
-  }
-  for (const widget of state.terminalWidgets) {
-    if (widget.workspaceId) ids.add(widget.workspaceId);
+    const ownsRuntime = Boolean(pane.backendId)
+      || pane.inputBackendPending === true
+      || pane.startupState === 'starting';
+    if (pane.workspaceId && !pane.closed && ownsRuntime) ids.add(pane.workspaceId);
   }
   return ids;
 }
@@ -18642,6 +18806,7 @@ async function sleepWorkspaceTerminals(workspaceId: string) {
     saveSnapshot: false,
     renderShellTabs: false
   });
+  workspaceMemoryWakingIds.delete(workspaceId);
   workspaceMemorySleepingIds.add(workspaceId);
   renderWorkspaceTabs();
   scheduleWorkspaceStorePersist();
@@ -18814,6 +18979,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     state.workspaceRoot = snapshot.root || profile.root;
     state.currentDir = snapshot.currentDir || state.workspaceRoot;
     state.workspaceOpen = true;
+    workspaceRuntimeOwnerId = snapshot.id;
     state.workspaceCaptureProtected = Boolean(snapshot.captureProtected);
     state.explorerOpenMode = snapshot.explorerOpenMode ?? 'single';
     state.showFileSizes = snapshot.showFileSizes ?? DEFAULT_SHOW_FILE_SIZES;
@@ -18873,6 +19039,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     }
 
     const hasTerminalSnapshots = (snapshot.terminals ?? []).length > 0;
+    if (!hasTerminalSnapshots) markWorkspaceMemoryAwake(snapshot.id);
     const explorerRuntimeRestored = restoreExplorerRuntimeCache(snapshot.id, state.currentDir);
     const waitForExplorerShellReady = deferExplorerUntilShellReady && !activeWorkspaceHasReadyShell(profile);
     if (!hasLiveTerminals && hasTerminalSnapshots) {
@@ -18903,12 +19070,15 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     }
     await yieldToUi();
     if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
+    // Browser tabs and a retained child WebView are cheap to reconnect and are
+    // highly visible during a workspace switch. Restore them before remote
+    // editor/note hydration so the preview is not held behind file I/O.
+    restoreBrowserState(snapshot);
     await restoreEditorTabs(snapshot);
     if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
     restoreImageTabs(snapshot);
     await restoreNoteTabs(snapshot);
     if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
-    restoreBrowserState(snapshot);
     if (isPanelVisible('calculator')) renderCalculator();
     if (isPanelVisible('explorer')) {
       if (explorerRenderDirty || el.fileList.querySelector(':scope > .file-row.loading')) renderExplorer();
@@ -18930,6 +19100,14 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
       setStatus(`${IS_TERMINAL_APP ? 'Layout' : 'Workspace'} restoring: ${snapshot.label} (starting shells)`);
     }
   } finally {
+    // If capture/setup was cancelled before a terminal restore operation could
+    // take ownership, revert `waking` back to the still-slept state. Successful
+    // and scheduled restores settle the marker in their operation finalizer.
+    if (workspaceMemoryWakingIds.has(snapshot.id)
+      && !workspaceTerminalRestoreInProgress(snapshot.id)) {
+      workspaceMemoryWakingIds.delete(snapshot.id);
+      renderWorkspaceLlmActivityTabNow(snapshot.id);
+    }
     if (restoreGeneration === workspaceRestoreGeneration) {
       restoringWorkspace = false;
       if (primaryRestoreStarted) {
@@ -18953,6 +19131,7 @@ function showUnavailableWorkspaceShell(snapshot: WorkspaceSnapshot) {
   hideAllTerminalWidgets();
   state.activeProfile = null;
   state.workspaceOpen = false;
+  workspaceRuntimeOwnerId = '';
   state.workspaceRoot = snapshot.root || '';
   state.currentDir = '';
   clearWorkspacePanels();
@@ -18996,13 +19175,21 @@ function finishWorkspaceTerminalRestoreOperation(workspaceId: string, operationI
   if (operations.size) return;
   workspaceTerminalRestoreOperations.delete(workspaceId);
   const restoreCompleted = workspaceTerminalRestoreCompletedIds.delete(workspaceId);
-  if (restoreCompleted) workspaceTerminalRestoreFailedPreserveIds.delete(workspaceId);
-  else workspaceTerminalRestoreFailedPreserveIds.add(workspaceId);
+  const expectedTerminalCount = workspaceSnapshotForId(workspaceId)?.terminals.length ?? 0;
+  const restoreSucceeded = restoreCompleted
+    && workspaceRunningTerminalBackendCount(workspaceId) >= expectedTerminalCount;
+  if (restoreSucceeded) {
+    workspaceTerminalRestoreFailedPreserveIds.delete(workspaceId);
+    markWorkspaceMemoryAwake(workspaceId);
+  } else {
+    workspaceTerminalRestoreFailedPreserveIds.add(workspaceId);
+    if (workspaceMemoryWakingIds.delete(workspaceId)) renderWorkspaceLlmActivityTabNow(workspaceId);
+  }
   if (state.activeWorkspaceId !== workspaceId || !state.workspaceOpen) return;
 
   // A successful restore replaces the merge-saved terminal fields with the final live layout,
   // then refreshes each active Glass scope once rather than once per restored pane.
-  if (restoreCompleted) saveActiveWorkspaceSnapshot();
+  if (restoreSucceeded) saveActiveWorkspaceSnapshot();
   if (restoringWorkspace) return;
   const explorerGlassEnabled = normalizeAppGlassSettings(state.ideSettings.appGlass).explorerRows;
   if (!appGlassEnabled() && !workspaceLiquidGlassEligible() && !explorerGlassEnabled) return;
@@ -19063,7 +19250,13 @@ function isWorkspaceTerminalRestoreCurrent(workspaceId: string, token?: number) 
 }
 
 function workspaceHasRunningTerminalBackend(workspaceId: string) {
-  return state.terminals.some((pane) => pane.workspaceId === workspaceId && Boolean(pane.backendId));
+  return workspaceRunningTerminalBackendCount(workspaceId) > 0;
+}
+
+function workspaceRunningTerminalBackendCount(workspaceId: string) {
+  return state.terminals.reduce((count, pane) => (
+    pane.workspaceId === workspaceId && pane.backendId ? count + 1 : count
+  ), 0);
 }
 
 function restorePanelSnapshots(panels: WorkspaceSnapshot['panels']) {
@@ -19155,6 +19348,7 @@ function renderWorkspacePanelLoadingShell(id: FloatingPanelId) {
     const loading = document.createElement('div');
     loading.className = 'file-row loading';
     loading.textContent = 'Loading workspace files...';
+    clearExplorerHoverOnlyTargetForRowReplacement();
     el.fileList.replaceChildren(loading);
     return;
   }
@@ -19646,7 +19840,12 @@ async function restoreWorkspaceTerminalsInner(
         ...remainingPlans.map((plan) => startPreparedPlan(plan))
       ]);
       if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
-      restoreCompleted = true;
+      restoreCompleted = preparedPlans.length === terminalSnapshots.length
+        && preparedPlans.every((plan) => (
+          isTerminalPaneAlive(plan.pane)
+          && Boolean(plan.pane.backendId)
+          && plan.pane.startupState !== 'failed'
+        ));
     } finally {
       for (const widget of createdWidgets) {
         widget.element.removeAttribute('aria-busy');
@@ -19656,6 +19855,7 @@ async function restoreWorkspaceTerminalsInner(
         await cleanupPreparedWorkspaceTerminalRestore(createdPaneIds, createdWidgets);
       }
     }
+    if (!restoreCompleted) return false;
   }
 
   if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)) return false;
@@ -22165,6 +22365,9 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
   const browserVisible = !isBrowserPanelHidden();
   const browserConsoleVisible = Boolean(snapshot.browserConsoleVisible);
+  state.forwards = runtime?.forwards.map((forward) => ({ ...forward })) ?? [];
+  clearForwardLookup();
+  for (const forward of state.forwards) rememberForward(forward);
   state.browserTabs = restoredBrowserTabs(snapshot, runtime);
   state.browserHistory = restoredBrowserHistory(snapshot, runtime);
   rebuildBrowserTabLookup();
@@ -22196,6 +22399,7 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   }
   hideBrowserAddressSuggestions();
   if (browserVisible) {
+    renderForwards();
     renderBrowserTabs();
     if (state.browserConsoleVisible) renderBrowserConsole();
   }
@@ -22305,18 +22509,15 @@ function showRestoredBrowserIdle(tab: BrowserTab) {
 function scheduleRestoredNativeBrowserResume(tab: BrowserTab) {
   const token = ++browserRestoreResumeToken;
   const workspaceId = state.activeWorkspaceId;
-  runWhenUiIdle(() => {
+  // The child WebView may already contain the exact page/scroll/form state for
+  // this workspace. Wait only for two layout paints, then re-show it without a
+  // navigation instead of putting the visible preview behind idle hydration.
+  window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
     if (token !== browserRestoreResumeToken) return;
     if (state.activeWorkspaceId !== workspaceId || state.activeBrowserTabId !== tab.id) return;
-    if (document.hidden) {
-      window.setTimeout(() => {
-        if (token === browserRestoreResumeToken) scheduleRestoredNativeBrowserResume(tab);
-      }, 600);
-      return;
-    }
-    if (isBrowserPanelHidden() || nativeBrowserWebviewVisible) return;
+    if (document.hidden || isBrowserPanelHidden() || nativeBrowserWebviewVisible) return;
     void showNativeBrowserWebview(tab, { navigate: false });
-  }, 1600);
+  }));
 }
 
 function workspaceLabel(profile: ConnectionProfile, root: string) {
@@ -22347,6 +22548,7 @@ function selectProfile(profileId: string): boolean {
 }
 
 function bindEvents() {
+  bindNativeBrowserOverlayObservers();
   document.addEventListener('pointerdown', handleTerminalImeProtectedPointerDown, true);
   el.newWorkspaceTab.addEventListener('click', () => void createBlankWorkspaceTab());
   document.addEventListener('pointerover', handleWorkspaceHoverOnlyPointerOver, { passive: true });
@@ -22660,6 +22862,7 @@ function bindEvents() {
   document.addEventListener('keydown', handleContextMenuKeydown, true);
   window.addEventListener('resize', () => scheduleWindowResizeWork());
   window.addEventListener('blur', () => {
+    if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
     hideContextMenu();
     hideWidgetOpacityPopover();
     hideTerminalPortsPopover({ restoreFocus: false });
@@ -22667,13 +22870,15 @@ function bindEvents() {
   window.addEventListener('pagehide', flushTerminalCwdSnapshotSave);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
+      if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
       stopWorkspaceGlassTicker();
       flushTerminalCwdSnapshotSave();
       flushWorkspaceStorePersist();
       clearExplorerBackgroundWork();
       pauseMarketTickerForHidden();
       cancelBrowserFrameSuspend();
-      hideNativeBrowserWebview();
+      hideNativeBrowserWebview({ closeDelayMs: BROWSER_OFFSCREEN_CONTEXT_TTL_MS });
+      shortenHiddenNativeBrowserWebviewRetention(BROWSER_OFFSCREEN_CONTEXT_TTL_MS);
       suspendBrowserFramesForAllWorkspaces();
     } else if (state.workspaceOpen) {
       resumeGlassAfterWindowWake('visible');
@@ -24909,6 +25114,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
       delay: visible ? 120 : 0,
       reason: visible ? 'panel-show' : 'panel-hide'
     });
+    scheduleNativeBrowserWebviewSync();
   }
 }
 
@@ -24954,6 +25160,7 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
     };
     applyPanelRect(panel, snapPanelRect(panel, rawRect, { moveX: true, moveY: true }, snapGuides), { skipGlassRefresh: true });
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    else hideNativeBrowserWebviewIfOccludedBy(panel);
     scheduleLiquidGlassGeometryForOwner(panel);
   };
 
@@ -24963,7 +25170,7 @@ function startPanelDrag(event: PointerEvent, panel: HTMLElement) {
     panel.removeEventListener('pointermove', move);
     panel.removeEventListener('pointerup', up);
     panel.removeEventListener('pointercancel', up);
-    if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    scheduleNativeBrowserWebviewSync();
     restoreLiquidGlassTiltSuspension(suspendedTilt);
     refreshLiquidGlassGeometryForOwner(panel);
     saveActiveWorkspaceSnapshot();
@@ -25043,6 +25250,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
     if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    else hideNativeBrowserWebviewIfOccludedBy(panel);
     scheduleLiquidGlassGeometryForOwner(panel);
   };
 
@@ -25055,7 +25263,7 @@ function startPanelResize(event: PointerEvent, panel: HTMLElement, grip: HTMLEle
     requestCodeEditorMeasure();
     const widget = terminalWidgetForElement(panel);
     if (widget) scheduleFitTerminalWidget(widget);
-    if (panel.dataset.panel === 'browser') scheduleNativeBrowserWebviewSync();
+    scheduleNativeBrowserWebviewSync();
     restoreLiquidGlassTiltSuspension(suspendedTilt);
     refreshLiquidGlassGeometryForOwner(panel);
     saveActiveWorkspaceSnapshot();
@@ -25070,6 +25278,7 @@ function bringPanelToFront(panel: HTMLElement) {
   panelZ = Math.max(panelZ, maxFloatingSurfaceZ());
   panel.style.zIndex = String(++panelZ);
   scheduleLiquidGlassGeometryForOwner(panel);
+  scheduleNativeBrowserWebviewSync();
 }
 
 function maxFloatingSurfaceZ() {
@@ -25379,6 +25588,7 @@ async function switchWorkspace(path: string) {
   ) return;
   state.workspaceRoot = path;
   state.currentDir = path;
+  workspaceRuntimeOwnerId = workspaceId;
   el.rootInput.value = path;
   discardWorkspacePreviewRuntime(workspaceId);
   clearWorkspacePanels();
@@ -25425,10 +25635,15 @@ async function switchWorkspace(path: string) {
 function discardWorkspacePreviewRuntime(workspaceId: string) {
   closeNativeBrowserWebviewsForWorkspace(workspaceId);
   cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
-  for (const proxy of state.previewProxies) {
-    previewProxyProbeAt.delete(proxy.id);
-    void api.stopPortForward(proxy.id).catch(() => undefined);
+  const forwardIds = new Set<string>();
+  for (const forward of [...state.forwards, ...state.previewProxies]) {
+    if (forwardIds.has(forward.id)) continue;
+    forwardIds.add(forward.id);
+    previewProxyProbeAt.delete(forward.id);
+    void api.stopPortForward(forward.id).catch(() => undefined);
   }
+  state.forwards = [];
+  clearForwardLookup();
   state.previewProxies = [];
   clearPreviewProxyLookup();
   stopEdgeDevtoolsForWorkspace(workspaceId);
@@ -25447,6 +25662,7 @@ async function closeWorkspace(options: {
   const cancelledRestore = cancelWorkspaceRestore();
   const cancellationGeneration = workspaceRestoreGeneration;
   const workspaceId = state.activeWorkspaceId;
+  markWorkspaceInactive(workspaceId);
   if (!cancelledRestore && workspaceId && state.activeProfile && state.workspaceOpen) {
     flushActiveWorkspaceSnapshotSave('defer');
   }
@@ -25468,6 +25684,7 @@ async function closeWorkspace(options: {
   }
   state.activeProfile = null;
   state.workspaceOpen = false;
+  workspaceRuntimeOwnerId = '';
   state.workspaceRoot = '';
   state.currentDir = '';
   state.entries = [];
@@ -27120,6 +27337,7 @@ function renderVirtualExplorerRows(
   explorerRenderedEnd = nextEnd;
   explorerRenderedTotal = total;
 
+  clearExplorerHoverOnlyTargetForRowReplacement();
   explorerRenderedRowByPath.clear();
   const fragment = document.createDocumentFragment();
   appendExplorerSpacer(fragment, explorerRenderedStart * EXPLORER_ROW_HEIGHT, explorerTopSpacer);
@@ -27210,6 +27428,7 @@ function explorerRowForWindowIndex(
 
 function removeExplorerRenderedChild(child: Element | null) {
   if (!(child instanceof HTMLElement) || child === explorerTopSpacer || child === explorerBottomSpacer) return;
+  detachExplorerHoverOnlyRow(child);
   const key = child.dataset.pathKey;
   if (key && explorerRenderedRowByPath.get(key) === child) explorerRenderedRowByPath.delete(key);
   const glass = child.querySelector<HTMLElement>(':scope > .file-row-glass');
@@ -27445,7 +27664,8 @@ function explorerCachePruneBusy() {
 }
 
 function recycleExplorerRowElement(row?: HTMLElement) {
-  if (!row || row.isConnected || explorerReusableRowElements.length >= EXPLORER_ROW_RECYCLE_LIMIT) return;
+  if (!row || row.isConnected) return;
+  detachExplorerHoverOnlyRow(row);
   const glass = row.querySelector<HTMLElement>(':scope > .file-row-glass');
   if (glass) cleanupExplorerLiquidGlassTarget(glass);
   row.dataset.staticSignature = '';
@@ -27454,6 +27674,7 @@ function recycleExplorerRowElement(row?: HTMLElement) {
   delete row.dataset.path;
   delete row.dataset.pathKey;
   row.className = 'file-row';
+  if (explorerReusableRowElements.length >= EXPLORER_ROW_RECYCLE_LIMIT) return;
   explorerReusableRowElements.push(row);
 }
 
@@ -27461,6 +27682,7 @@ function bindExplorerListEvents() {
   el.fileList.addEventListener('scroll', handleExplorerScroll, { passive: true });
   el.fileList.addEventListener('pointerover', handleExplorerHoverOnlyPointerOver, { passive: true });
   el.fileList.addEventListener('pointerout', handleExplorerHoverOnlyPointerOut, { passive: true });
+  el.fileList.addEventListener('pointerleave', handleExplorerHoverOnlyPointerLeave, { passive: true });
   el.fileList.addEventListener('pointermove', handleExplorerHoverOnlyPointerMove, { passive: true });
   el.fileList.addEventListener('pointerover', handleExplorerPointerOver);
   el.fileList.addEventListener('pointerdown', handleExplorerPointerDown);
@@ -27999,6 +28221,10 @@ function handleExplorerHoverOnlyPointerOut(event: PointerEvent) {
   setExplorerHoverOnlyTarget(related);
 }
 
+function handleExplorerHoverOnlyPointerLeave() {
+  if (explorerGlassHoverOnlyEnabled()) setExplorerHoverOnlyTarget(null);
+}
+
 function handleExplorerHoverOnlyPointerMove(event: PointerEvent) {
   if (!explorerGlassHoverOnlyEnabled()) return;
   explorerLiquidGlassHoverMoveX = event.clientX;
@@ -28007,6 +28233,12 @@ function handleExplorerHoverOnlyPointerMove(event: PointerEvent) {
   explorerLiquidGlassHoverMoveFrame = window.requestAnimationFrame(() => {
     explorerLiquidGlassHoverMoveFrame = 0;
     if (!explorerGlassHoverOnlyEnabled() || Date.now() < explorerScrollingUntil) return;
+    if (!el.fileList.matches(':hover')
+      || !Number.isFinite(explorerLiquidGlassHoverMoveX)
+      || !Number.isFinite(explorerLiquidGlassHoverMoveY)) {
+      setExplorerHoverOnlyTarget(null);
+      return;
+    }
     const hit = document.elementFromPoint(explorerLiquidGlassHoverMoveX, explorerLiquidGlassHoverMoveY);
     const row = hit instanceof Element ? hit.closest<HTMLElement>('.file-row') : null;
     if (row !== explorerLiquidGlassHoverOnlyTarget) setExplorerHoverOnlyTarget(row);
@@ -36828,6 +37060,61 @@ function removeForwardById(id: string) {
   return removed;
 }
 
+type BrowserForwardScope = {
+  workspaceId: string;
+  profileId: string;
+  root: string;
+};
+
+function currentBrowserForwardScope(profile = state.activeProfile): BrowserForwardScope | null {
+  if (!profile || !state.activeWorkspaceId) return null;
+  return {
+    workspaceId: state.activeWorkspaceId,
+    profileId: profile.id,
+    root: state.workspaceRoot
+  };
+}
+
+function browserForwardScopeIsActive(scope: BrowserForwardScope) {
+  return state.activeWorkspaceId === scope.workspaceId
+    && state.activeProfile?.id === scope.profileId
+    && state.workspaceRoot === scope.root;
+}
+
+function cachedBrowserForwardScope(scope: BrowserForwardScope) {
+  const snapshot = workspaceSnapshotForId(scope.workspaceId);
+  const runtime = workspaceRuntimeCache.get(scope.workspaceId);
+  return snapshot?.profileId === scope.profileId && snapshot.root === scope.root ? runtime ?? null : null;
+}
+
+function adoptBrowserForward(scope: BrowserForwardScope, forward: PortForwardResult) {
+  if (browserForwardScopeIsActive(scope)) {
+    addForward(forward);
+    return 'active' as const;
+  }
+  const runtime = cachedBrowserForwardScope(scope);
+  if (runtime) {
+    if (!runtime.forwards.some((candidate) => candidate.id === forward.id)) {
+      runtime.forwards.push({ ...forward });
+    }
+    return 'cached' as const;
+  }
+  void api.stopPortForward(forward.id).catch(() => undefined);
+  return 'stopped' as const;
+}
+
+function forgetBrowserForwardForScope(scope: BrowserForwardScope, id: string) {
+  if (browserForwardScopeIsActive(scope)) {
+    removeForwardById(id);
+    renderForwards();
+    return;
+  }
+  const runtime = cachedBrowserForwardScope(scope);
+  if (!runtime) return;
+  const index = runtime.forwards.findIndex((forward) => forward.id === id);
+  if (index >= 0) runtime.forwards.splice(index, 1);
+}
+
 function clearDetectedPortLookup() {
   detectedPortById.clear();
 }
@@ -36868,6 +37155,9 @@ function removeDetectedPortById(id: string) {
 
 async function startForward() {
   if (!state.activeProfile) return;
+  const scope = currentBrowserForwardScope();
+  if (!scope) return;
+  const profileId = scope.profileId;
   const remotePort = Number(el.remotePort.value);
   const localPort = Number(el.localPort.value || remotePort);
   if (!Number.isInteger(remotePort) || remotePort <= 0) {
@@ -36875,14 +37165,14 @@ async function startForward() {
     return;
   }
   try {
-    const forward = await api.startPortForward(state.activeProfile.id, remotePort, localPort);
-    addForward(forward);
-    removeDetectedPortById(detectedPortId(state.activeProfile.id, remotePort));
+    const forward = await api.startPortForward(profileId, remotePort, localPort);
+    if (adoptBrowserForward(scope, forward) !== 'active') return;
+    removeDetectedPortById(detectedPortId(profileId, remotePort));
     renderForwards();
     await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
     setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
   } catch (error) {
-    setStatus(String(error), true);
+    if (browserForwardScopeIsActive(scope)) setStatus(String(error), true);
   }
 }
 
@@ -36909,16 +37199,21 @@ async function openLocalPreviewUrl(url: URL) {
   if (!isPreviewPort(port)) return;
   const suffix = `${url.pathname}${url.search}${url.hash}`;
   const directUrl = `http://127.0.0.1:${port}${suffix}`;
-  if (!state.activeProfile || state.activeProfile.kind === 'windows') {
+  const profile = state.activeProfile;
+  if (!profile || profile.kind === 'windows') {
     await openLocalBrowserTab(directUrl, browserTabLabel(url.toString()));
     return;
   }
+  const scope = currentBrowserForwardScope(profile);
+  if (!scope) return;
 
   if (await canUseDirectLocalPreview(directUrl)) {
+    if (!browserForwardScopeIsActive(scope)) return;
     await openLocalBrowserTab(directUrl, browserTabLabel(url.toString()));
     setStatus(`Previewing local :${port}`);
     return;
   }
+  if (!browserForwardScopeIsActive(scope)) return;
 
   const existing = forwardForRemotePort(port);
   if (existing) {
@@ -36926,9 +37221,15 @@ async function openLocalPreviewUrl(url: URL) {
     return;
   }
 
-  const forward = await startForwardForPort(port, 'manual');
-  addForward(forward);
-  removeDetectedPortById(detectedPortId(state.activeProfile.id, port));
+  let forward: PortForwardResult;
+  try {
+    forward = await startForwardForProfile(scope.profileId, profile.kind, port);
+  } catch (error) {
+    if (browserForwardScopeIsActive(scope)) setStatus(String(error), true);
+    return;
+  }
+  if (adoptBrowserForward(scope, forward) !== 'active') return;
+  removeDetectedPortById(detectedPortId(scope.profileId, port));
   renderForwards();
   await openLocalBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
   setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
@@ -37848,7 +38149,9 @@ function flushTerminalCwdSnapshotSave() {
 async function openPort(port: number, source: 'manual' | 'auto') {
   if (!state.activeProfile || !isPreviewPort(port)) return;
   const profile = state.activeProfile;
-  const key = `${profile.id}:${port}`;
+  const scope = currentBrowserForwardScope(profile);
+  if (!scope) return;
+  const key = `${scope.workspaceId}:${profile.id}:${port}`;
   const existing = forwardForRemotePort(port);
   if (existing) {
     removeDetectedPortById(detectedPortId(profile.id, port));
@@ -37870,8 +38173,8 @@ async function openPort(port: number, source: 'manual' | 'auto') {
   if (autoForwardingPorts.has(key)) return;
   autoForwardingPorts.add(key);
   try {
-    const forward = await startForwardForPort(port, source);
-    addForward(forward);
+    const forward = await startForwardForProfile(scope.profileId, profile.kind, port);
+    if (adoptBrowserForward(scope, forward) !== 'active') return;
     removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
     await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
@@ -37879,6 +38182,7 @@ async function openPort(port: number, source: 'manual' | 'auto') {
       ? `Detected port ${port}; forwarding ${forward.url}`
       : `Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
   } catch (error) {
+    if (!browserForwardScopeIsActive(scope)) return;
     if (source === 'manual') {
       setStatus(String(error), true);
     } else {
@@ -38362,11 +38666,6 @@ function detectedPortId(profileId: string, port: number) {
   return `${profileId}:${port}`;
 }
 
-async function startForwardForPort(port: number, source: 'manual' | 'auto') {
-  if (!state.activeProfile) throw new Error('No active profile');
-  return startForwardForProfile(state.activeProfile.id, state.activeProfile.kind, port);
-}
-
 async function startForwardForProfile(
   profileId: string,
   profileKind: ConnectionProfile['kind'],
@@ -38540,10 +38839,13 @@ function updateForwardRowElement(
         renderForwards();
         return;
       }
+      const scope = currentBrowserForwardScope();
+      if (!scope) return;
       void (async () => {
-        await api.stopPortForward(id).catch((error) => setStatus(String(error), true));
-        removeForwardById(id);
-        renderForwards();
+        await api.stopPortForward(id).catch((error) => {
+          if (browserForwardScopeIsActive(scope)) setStatus(String(error), true);
+        });
+        forgetBrowserForwardForScope(scope, id);
       })();
     });
     row.replaceChildren(load, detail, stop);
@@ -38706,7 +39008,7 @@ function scheduleBrowserWorkspaceFrameSuspend(
 ) {
   if (!workspaceId) return;
   cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
-  const delayMs = options.delayMs ?? BROWSER_WORKSPACE_SWITCH_FRAME_SUSPEND_DELAY_MS;
+  const delayMs = options.delayMs ?? BROWSER_HIDDEN_CONTEXT_TTL_MS;
   const timer = window.setTimeout(() => {
     browserWorkspaceSuspendTimers.delete(workspaceId);
     runWhenUiIdle(() => {
@@ -38716,6 +39018,16 @@ function scheduleBrowserWorkspaceFrameSuspend(
     }, BROWSER_FRAME_SUSPEND_IDLE_MS);
   }, delayMs);
   browserWorkspaceSuspendTimers.set(workspaceId, timer);
+  trimHiddenBrowserFrameWorkspaces();
+}
+
+function trimHiddenBrowserFrameWorkspaces() {
+  while (browserWorkspaceSuspendTimers.size > BROWSER_FRAME_WORKSPACE_RETAIN_LIMIT) {
+    const oldestWorkspaceId = browserWorkspaceSuspendTimers.keys().next().value;
+    if (!oldestWorkspaceId) return;
+    cancelScheduledBrowserWorkspaceFrameSuspend(oldestWorkspaceId);
+    suspendBrowserFramesForWorkspace(oldestWorkspaceId, { includeActive: true });
+  }
 }
 
 function scheduleInactiveBrowserFrameSuspend(delayMs = BROWSER_INACTIVE_FRAME_SUSPEND_DELAY_MS) {
@@ -38992,25 +39304,109 @@ function loadBrowserTabFallback(tab: BrowserTab) {
 }
 
 function nativeBrowserPreviewRect() {
+  if (!el.browserPreviewScaleBox.isConnected
+    || isBrowserPanelHidden()
+    || el.browserPanel.classList.contains('browser-suggestions-open')
+    || document.hidden) return null;
   const scaleRect = el.browserPreviewScaleBox.getBoundingClientRect();
   const shellRect = el.browserShell.getBoundingClientRect();
+  const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+  const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
+  if (![scaleRect.left, scaleRect.top, scaleRect.right, scaleRect.bottom,
+    shellRect.left, shellRect.top, shellRect.right, shellRect.bottom,
+    viewportWidth, viewportHeight].every(Number.isFinite)) return null;
   // Native child WebViews are OS-level siblings of the main WebView, so CSS
   // overflow/paint containment on `.browser-shell` cannot clip them. Clip the
-  // child WebView bounds to the visible preview grid cell so it cannot paint
-  // over the console or the rest of the IDE when device mode is scrollable.
-  const left = Math.max(scaleRect.left, shellRect.left);
-  const top = Math.max(scaleRect.top, shellRect.top);
-  const right = Math.min(scaleRect.right, shellRect.right);
-  const bottom = Math.min(scaleRect.bottom, shellRect.bottom);
+  // child WebView bounds to both the visible preview grid cell and the renderer
+  // viewport. Clamping x/y after measuring left a wider child behind after an
+  // offscreen/root-offset transition.
+  const left = Math.max(0, scaleRect.left, shellRect.left);
+  const top = Math.max(0, scaleRect.top, shellRect.top);
+  const right = Math.min(viewportWidth, scaleRect.right, shellRect.right);
+  const bottom = Math.min(viewportHeight, scaleRect.bottom, shellRect.bottom);
   const width = right - left;
   const height = bottom - top;
   if (width <= 1 || height <= 1) return null;
+  if (nativeBrowserPreviewOccluded({ left, top, right, bottom })) return null;
   return {
-    x: Math.max(0, left),
-    y: Math.max(0, top),
-    width: Math.max(1, width),
-    height: Math.max(1, height)
+    x: left,
+    y: top,
+    width,
+    height
   };
+}
+
+function nativeBrowserPreviewOccluded(rect: { left: number; top: number; right: number; bottom: number }) {
+  const browserZ = floatingSurfaceZForNativePreview(el.browserPanel);
+  const overlaps = (surface: HTMLElement) => {
+    if (surface === el.browserPanel || !surface.isConnected || surface.classList.contains('hidden')) return false;
+    if (floatingSurfaceZForNativePreview(surface) <= browserZ) return false;
+    const other = surface.getBoundingClientRect();
+    return other.right > rect.left
+      && other.left < rect.right
+      && other.bottom > rect.top
+      && other.top < rect.bottom;
+  };
+  for (const id of FLOATING_PANELS) {
+    if (overlaps(getPanel(id))) return true;
+  }
+  for (const widget of state.terminalWidgets) {
+    if (overlaps(widget.element)) return true;
+  }
+  for (const overlay of nativeBrowserDomOverlays()) {
+    if (!overlay.isConnected || overlay.classList.contains('hidden')) continue;
+    const other = overlay.getBoundingClientRect();
+    if (other.right > rect.left
+      && other.left < rect.right
+      && other.bottom > rect.top
+      && other.top < rect.bottom) return true;
+  }
+  return false;
+}
+
+function nativeBrowserDomOverlays() {
+  return [
+    el.contextMenu,
+    el.widgetOpacityPopover,
+    el.glassSettingsPopover,
+    el.diagnosticLogPopover,
+    el.terminalPortsPopover
+  ];
+}
+
+function bindNativeBrowserOverlayObservers() {
+  if (nativeBrowserOverlayObserver) return;
+  nativeBrowserOverlayObserver = new MutationObserver(() => scheduleNativeBrowserWebviewSync());
+  for (const overlay of nativeBrowserDomOverlays()) {
+    nativeBrowserOverlayObserver.observe(overlay, { attributes: true, attributeFilter: ['class', 'style'] });
+  }
+}
+
+function floatingSurfaceZForNativePreview(surface: HTMLElement) {
+  const explicit = floatingSurfaceExplicitZ(surface);
+  if (explicit !== null) return explicit;
+  const computed = Number.parseInt(window.getComputedStyle(surface).zIndex, 10);
+  return Number.isFinite(computed) ? computed : 0;
+}
+
+function hideNativeBrowserWebviewIfOccludedBy(surface: HTMLElement) {
+  if (!nativeBrowserWebviewVisible || surface === el.browserPanel || surface.classList.contains('hidden')) return;
+  const browserZ = floatingSurfaceZForNativePreview(el.browserPanel);
+  if (floatingSurfaceZForNativePreview(surface) <= browserZ) return;
+  const scale = el.browserPreviewScaleBox.getBoundingClientRect();
+  const shell = el.browserShell.getBoundingClientRect();
+  const preview = {
+    left: Math.max(scale.left, shell.left),
+    top: Math.max(scale.top, shell.top),
+    right: Math.min(scale.right, shell.right),
+    bottom: Math.min(scale.bottom, shell.bottom)
+  };
+  const other = surface.getBoundingClientRect();
+  if (other.right <= preview.left
+    || other.left >= preview.right
+    || other.bottom <= preview.top
+    || other.top >= preview.bottom) return;
+  hideNativeBrowserWebview();
 }
 
 function activeBrowserUsesNativeWebview() {
@@ -39022,6 +39418,13 @@ function activeBrowserUsesNativeWebview() {
     && nativeBrowserWebviewLabel === (active ? nativeBrowserWebviewLabelForTab(active) : '')
     && !isBrowserPanelHidden()
     && !document.hidden;
+}
+
+function nativeBrowserWebviewLabelForOperation(tab: BrowserTab | null | undefined) {
+  if (!tab || !nativeBrowserWebviewAllowedForActiveWorkspace()) return '';
+  const label = nativeBrowserWebviewLabelForTab(tab);
+  if (activeBrowserUsesNativeWebview() && nativeBrowserWebviewLabel === label) return label;
+  return nativeBrowserWebviewCloseTimers.has(label) ? label : '';
 }
 
 function safeNativeBrowserWebviewLabelPart(value: string) {
@@ -39036,7 +39439,7 @@ function nativeBrowserWebviewLabelForTab(tab: BrowserTab, workspaceId = state.ac
   ].join('-');
 }
 
-function hideNativeBrowserWebview(options: { all?: boolean } = {}) {
+function hideNativeBrowserWebview(options: { all?: boolean; closeDelayMs?: number } = {}) {
   nativeBrowserWebviewRequestSeq += 1;
   if (nativeBrowserWebviewSyncFrame) {
     window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
@@ -39046,9 +39449,10 @@ function hideNativeBrowserWebview(options: { all?: boolean } = {}) {
   nativeBrowserWebviewTabId = '';
   nativeBrowserWebviewLabel = '';
   nativeBrowserWebviewUrl = '';
+  nativeBrowserWebviewNeedsBoundsRecovery = false;
   if (!nativeBrowserWebviewVisible && !label && !options.all) return;
   nativeBrowserWebviewVisible = false;
-  if (label) scheduleNativeBrowserWebviewClose(label);
+  if (label) scheduleNativeBrowserWebviewClose(label, options.closeDelayMs);
   void api.hideBrowserWebview(options.all ? undefined : (label || undefined)).catch(() => undefined);
 }
 
@@ -39065,6 +39469,7 @@ function closeNativeBrowserWebview(label = nativeBrowserWebviewLabel) {
     nativeBrowserWebviewLabel = '';
     nativeBrowserWebviewUrl = '';
     nativeBrowserWebviewVisible = false;
+    nativeBrowserWebviewNeedsBoundsRecovery = false;
   }
   void api.closeBrowserWebview(label || undefined).catch(() => undefined);
 }
@@ -39080,18 +39485,60 @@ function closeAllNativeBrowserWebviews() {
   nativeBrowserWebviewLabel = '';
   nativeBrowserWebviewUrl = '';
   nativeBrowserWebviewVisible = false;
+  nativeBrowserWebviewNeedsBoundsRecovery = false;
+  nativeBrowserWebviewSuspendedForAddressSuggestions = false;
   void api.closeBrowserWebview().catch(() => undefined);
 }
 
-function scheduleNativeBrowserWebviewClose(label: string, delayMs = BROWSER_NATIVE_HIDDEN_CLOSE_DELAY_MS) {
+function scheduleNativeBrowserWebviewClose(label: string, delayMs = BROWSER_HIDDEN_CONTEXT_TTL_MS) {
   if (!label) return;
   cancelNativeBrowserWebviewClose(label);
   const timer = window.setTimeout(() => {
     nativeBrowserWebviewCloseTimers.delete(label);
     if (nativeBrowserWebviewVisible && nativeBrowserWebviewLabel === label) return;
-    void api.closeBrowserWebview(label).catch(() => undefined);
+    void closeHiddenNativeBrowserWebview(label);
   }, delayMs);
   nativeBrowserWebviewCloseTimers.set(label, timer);
+  trimHiddenNativeBrowserWebviews();
+}
+
+function shortenHiddenNativeBrowserWebviewRetention(delayMs: number) {
+  for (const label of Array.from(nativeBrowserWebviewCloseTimers.keys())) {
+    scheduleNativeBrowserWebviewClose(label, delayMs);
+  }
+}
+
+async function closeHiddenNativeBrowserWebview(label: string) {
+  try {
+    await api.closeBrowserWebview(label);
+  } catch {
+    return;
+  }
+  // A close IPC can already be in flight when the user switches back. If it
+  // won that race, recreate/re-show only the still-current label without a
+  // forced navigation; a retained child keeps its state, while a closed one
+  // safely falls back to the tab URL.
+  if (appShutdownStarted
+    || !nativeBrowserWebviewVisible
+    || nativeBrowserWebviewLabel !== label
+    || !nativeBrowserWebviewAllowedForActiveWorkspace()
+    || isBrowserPanelHidden()
+    || document.hidden) return;
+  const tab = browserTabForId(nativeBrowserWebviewTabId);
+  if (!tab || nativeBrowserWebviewLabelForTab(tab) !== label) return;
+  void showNativeBrowserWebview(tab, { boundsOnly: true, navigate: false });
+}
+
+function trimHiddenNativeBrowserWebviews() {
+  while (nativeBrowserWebviewCloseTimers.size > BROWSER_NATIVE_HIDDEN_RETAIN_LIMIT) {
+    const oldestLabel = nativeBrowserWebviewCloseTimers.keys().next().value;
+    if (!oldestLabel) return;
+    const timer = nativeBrowserWebviewCloseTimers.get(oldestLabel);
+    if (timer) window.clearTimeout(timer);
+    nativeBrowserWebviewCloseTimers.delete(oldestLabel);
+    if (nativeBrowserWebviewVisible && nativeBrowserWebviewLabel === oldestLabel) continue;
+    void closeHiddenNativeBrowserWebview(oldestLabel);
+  }
 }
 
 function cancelNativeBrowserWebviewClose(label: string) {
@@ -39107,19 +39554,44 @@ function cancelAllNativeBrowserWebviewCloses() {
 }
 
 function scheduleNativeBrowserWebviewSync() {
-  if (!activeBrowserUsesNativeWebview() || nativeBrowserWebviewSyncFrame) return;
+  const active = browserTabForId(state.activeBrowserTabId) ?? state.browserTabs[0];
+  const activeLabel = active ? nativeBrowserWebviewLabelForTab(active) : '';
+  if (appShutdownStarted
+    || !USE_NATIVE_BROWSER_WEBVIEW
+    || !nativeBrowserWebviewAllowedForActiveWorkspace()
+    || isBrowserPanelHidden()
+    || document.hidden
+    || !active
+    || (!nativeBrowserWebviewVisible
+      && !nativeBrowserWebviewNeedsBoundsRecovery
+      && !nativeBrowserWebviewCloseTimers.has(activeLabel))
+    || nativeBrowserWebviewSyncFrame) return;
   nativeBrowserWebviewSyncFrame = window.requestAnimationFrame(() => {
     nativeBrowserWebviewSyncFrame = 0;
-    const tab = browserTabForId(nativeBrowserWebviewTabId);
-    if (!tab || !activeBrowserUsesNativeWebview()) {
+    if (appShutdownStarted
+      || !nativeBrowserWebviewAllowedForActiveWorkspace()
+      || isBrowserPanelHidden()
+      || document.hidden) {
       hideNativeBrowserWebview();
       return;
     }
-    void showNativeBrowserWebview(tab, { boundsOnly: true });
+    const tab = browserTabForId(state.activeBrowserTabId) ?? state.browserTabs[0];
+    if (!tab) {
+      hideNativeBrowserWebview();
+      return;
+    }
+    const label = nativeBrowserWebviewLabelForTab(tab);
+    if (!nativeBrowserWebviewVisible
+      && !nativeBrowserWebviewNeedsBoundsRecovery
+      && !nativeBrowserWebviewCloseTimers.has(label)) return;
+    // This also repairs a child that was temporarily hidden by a zero/offscreen
+    // rect. Bounds recovery must not depend on the previous `visible` flag.
+    void showNativeBrowserWebview(tab, { boundsOnly: true, navigate: false });
   });
 }
 
 async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?: boolean; loadUrl?: string; navigate?: boolean } = {}) {
+  if (appShutdownStarted) return;
   if (!nativeBrowserWebviewAllowedForActiveWorkspace()) {
     hideNativeBrowserWebview();
     if (!isBrowserPanelHidden()) loadBrowserTabFallback(tab);
@@ -39131,12 +39603,29 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
   }
   const requestId = ++nativeBrowserWebviewRequestSeq;
   const label = nativeBrowserWebviewLabelForTab(tab);
-  const previousLabel = nativeBrowserWebviewVisible ? nativeBrowserWebviewLabel : '';
+  const previousLabel = nativeBrowserWebviewLabel;
+  const rect = nativeBrowserPreviewRect();
+  if (!rect) {
+    nativeBrowserWebviewTabId = '';
+    nativeBrowserWebviewLabel = '';
+    nativeBrowserWebviewUrl = '';
+    nativeBrowserWebviewVisible = false;
+    nativeBrowserWebviewNeedsBoundsRecovery = true;
+    toggleClassIfChanged(el.browserShell, 'has-preview', false);
+    if (previousLabel) scheduleNativeBrowserWebviewClose(previousLabel);
+    const labelsToHide = new Set([label]);
+    if (previousLabel) labelsToHide.add(previousLabel);
+    for (const hiddenLabel of labelsToHide) {
+      void api.hideBrowserWebview(hiddenLabel).catch(() => undefined);
+    }
+    return;
+  }
   cancelNativeBrowserWebviewClose(label);
   nativeBrowserWebviewTabId = tab.id;
   nativeBrowserWebviewLabel = label;
   nativeBrowserWebviewUrl = tab.url;
   nativeBrowserWebviewVisible = true;
+  nativeBrowserWebviewNeedsBoundsRecovery = false;
   hideAllBrowserFrames();
   if (previousLabel && previousLabel !== label) {
     scheduleNativeBrowserWebviewClose(previousLabel);
@@ -39148,29 +39637,24 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
   if (!options.boundsOnly) {
     logBrowserConsole('info', `Loading native WebView preview ${tab.url}`);
   }
-  const rect = nativeBrowserPreviewRect();
-  if (!rect) {
-    await api.hideBrowserWebview(label).catch(() => undefined);
-    if (requestId === nativeBrowserWebviewRequestSeq) {
-      nativeBrowserWebviewVisible = false;
-    }
-    return;
-  }
   const loadUrl = options.loadUrl ?? tab.url;
   const navigate = options.navigate ?? Boolean(options.loadUrl);
   try {
     await api.showBrowserWebview(label, loadUrl, rect.x, rect.y, rect.width, rect.height, navigate);
     if (requestId !== nativeBrowserWebviewRequestSeq) {
-      void api.hideBrowserWebview(label).catch(() => undefined);
+      const stillDesired = nativeBrowserWebviewVisible && nativeBrowserWebviewLabel === label;
+      if (!stillDesired) void api.hideBrowserWebview(label).catch(() => undefined);
       return;
     }
     nativeBrowserWebviewVisible = true;
+    nativeBrowserWebviewNeedsBoundsRecovery = false;
   } catch (error) {
     if (requestId !== nativeBrowserWebviewRequestSeq) return;
     nativeBrowserWebviewVisible = false;
     nativeBrowserWebviewTabId = '';
     nativeBrowserWebviewLabel = '';
     nativeBrowserWebviewUrl = '';
+    nativeBrowserWebviewNeedsBoundsRecovery = false;
     logBrowserConsole('error', `Native WebView preview failed: ${String(error)}`);
     setStatus(`Native WebView preview failed: ${String(error)}`, true);
     loadBrowserTabFallback(tab);
@@ -39181,8 +39665,23 @@ function handleBrowserWebviewPageLoad(payload: BrowserWebviewPageLoadEvent) {
   if (!activeBrowserUsesNativeWebview()) return;
   if (payload.label && payload.label !== nativeBrowserWebviewLabel) return;
   if (payload.event === 'finished') {
-    logBrowserConsole('info', `Loaded ${nativeBrowserWebviewUrl || payload.url}`);
-    setStatus(`Loaded ${nativeBrowserWebviewUrl || payload.url}`);
+    const loadedUrl = withoutPreviewCacheBuster(payload.url);
+    const tab = browserTabForId(nativeBrowserWebviewTabId);
+    if (tab && loadedUrl && loadedUrl !== 'about:blank' && tab.url !== loadedUrl) {
+      updateBrowserTabUrl(tab, loadedUrl);
+      tab.label = browserTabLabel(loadedUrl);
+      tab.frameUrl = USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(loadedUrl)
+        ? undefined
+        : loadedUrl;
+      nativeBrowserWebviewUrl = loadedUrl;
+      state.previewUrl = loadedUrl;
+      if (document.activeElement !== el.previewUrl) setInputValueIfChanged(el.previewUrl, loadedUrl);
+      rememberBrowserAddress(loadedUrl);
+      renderBrowserTabs();
+    }
+    const displayUrl = loadedUrl || nativeBrowserWebviewUrl || payload.url;
+    logBrowserConsole('info', `Loaded ${displayUrl}`);
+    setStatus(`Loaded ${displayUrl}`);
   }
 }
 
@@ -40117,6 +40616,18 @@ function hideBrowserAddressSuggestions() {
 
 function setBrowserAddressSuggestionsOpen(open: boolean) {
   toggleClassIfChanged(el.browserPanel, 'browser-suggestions-open', open);
+  // A native child WebView always paints above DOM overlays. Temporarily hide
+  // it while the address list is open, then re-show the preserved page.
+  if (open) {
+    nativeBrowserWebviewSuspendedForAddressSuggestions ||= activeBrowserUsesNativeWebview();
+    hideNativeBrowserWebview();
+  } else {
+    if (nativeBrowserWebviewSuspendedForAddressSuggestions) {
+      nativeBrowserWebviewNeedsBoundsRecovery = true;
+      nativeBrowserWebviewSuspendedForAddressSuggestions = false;
+    }
+    scheduleNativeBrowserWebviewSync();
+  }
 }
 
 function activateBrowserTab(id: string, options: { forceSave?: boolean } = {}) {
@@ -41101,6 +41612,8 @@ function formatConsoleValueCompact(value: unknown) {
 function maybeAutoForwardBrowserLocalUrl(message: string) {
   const profile = state.activeProfile;
   if (!profile || profile.kind === 'windows') return;
+  const scope = currentBrowserForwardScope(profile);
+  if (!scope) return;
   const profileId = profile.id;
   BROWSER_CONSOLE_LOCAL_URL_PORT_PATTERN.lastIndex = 0;
   let match: RegExpExecArray | null;
@@ -41109,16 +41622,20 @@ function maybeAutoForwardBrowserLocalUrl(message: string) {
     if (!isPreviewPort(port)) continue;
     if (isPreviewProxyLocalPort(port)) continue;
     if (forwardForRemotePort(port)) continue;
-    const key = `browser-dep:${profileId}:${port}`;
+    const key = `browser-dep:${scope.workspaceId}:${profileId}:${port}`;
     if (autoForwardingPorts.has(key)) continue;
     autoForwardingPorts.add(key);
-    void startForwardForPort(port, 'auto')
+    void startForwardForProfile(scope.profileId, profile.kind, port)
       .then((forward) => {
-        addForward(forward);
+        if (adoptBrowserForward(scope, forward) !== 'active') return;
         renderForwards();
         logBrowserConsole('info', `Auto forwarded browser dependency port ${port}`);
       })
-      .catch((error) => logBrowserConsole('warn', `Auto forward for browser dependency port ${port} failed: ${String(error)}`))
+      .catch((error) => {
+        if (browserForwardScopeIsActive(scope)) {
+          logBrowserConsole('warn', `Auto forward for browser dependency port ${port} failed: ${String(error)}`);
+        }
+      })
       .finally(() => autoForwardingPorts.delete(key));
   }
 }
@@ -41218,11 +41735,21 @@ function currentBrowserTab() {
 }
 
 function navigateBrowserHistory(delta: -1 | 1) {
+  const tab = currentBrowserTab();
+  hideBrowserAddressSuggestions();
   if (activeEdgeCdp) {
     void edgeCdpSend('Runtime.evaluate', {
       expression: delta < 0 ? 'history.back()' : 'history.forward()',
       userGesture: true
     }).then(() => {
+      activateBrowserPanel();
+      logBrowserConsole('info', delta < 0 ? 'Browser back' : 'Browser forward');
+    }).catch((error) => setStatus(`Browser history navigation failed: ${String(error)}`, true));
+    return;
+  }
+  const nativeLabel = nativeBrowserWebviewLabelForOperation(tab);
+  if (nativeLabel) {
+    void api.navigateBrowserWebviewHistory(nativeLabel, delta).then(() => {
       activateBrowserPanel();
       logBrowserConsole('info', delta < 0 ? 'Browser back' : 'Browser forward');
     }).catch((error) => setStatus(`Browser history navigation failed: ${String(error)}`, true));
@@ -41259,6 +41786,7 @@ function refreshPreview(hard: boolean) {
     setStatus('No preview URL to refresh', true);
     return;
   }
+  hideBrowserAddressSuggestions();
 
   if (activeEdgeCdp && tab.edge && activeEdgeCdp.tabId === tab.id) {
     void edgeCdpSend('Page.reload', { ignoreCache: hard }).then(() => {
@@ -41276,10 +41804,11 @@ function refreshPreview(hard: boolean) {
   }
 
   if (USE_NATIVE_BROWSER_WEBVIEW) {
-    if (activeBrowserUsesNativeWebview()) {
+    const nativeLabel = nativeBrowserWebviewLabelForOperation(tab);
+    if (nativeLabel) {
       const action = hard
         ? showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url), navigate: true })
-        : api.reloadBrowserWebview(nativeBrowserWebviewLabel);
+        : api.reloadBrowserWebview(nativeLabel);
       void action.then(() => {
         state.previewUrl = tab.url;
         setInputValueIfChanged(el.previewUrl, tab.url);
@@ -41309,6 +41838,7 @@ async function clearBrowserCacheAndReload() {
     setStatus('No browser tab to clear', true);
     return;
   }
+  hideBrowserAddressSuggestions();
 
   if (activeEdgeCdp && tab.edge && activeEdgeCdp.tabId === tab.id) {
     await edgeCdpSend('Network.clearBrowserCache', {}).catch(() => undefined);
@@ -41382,6 +41912,19 @@ function withPreviewCacheBuster(url: string) {
     const hash = hashIndex >= 0 ? url.slice(hashIndex) : '';
     const separator = beforeHash.includes('?') ? '&' : '?';
     return `${beforeHash}${separator}__svide_hard_reload=${stamp}${hash}`;
+  }
+}
+
+function withoutPreviewCacheBuster(url: string) {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.searchParams.has('__svide_hard_reload')) return url;
+    parsed.searchParams.delete('__svide_hard_reload');
+    return parsed.toString();
+  } catch {
+    return url.replace(/([?&])__svide_hard_reload=[^&#]*(&?)/, (_match, prefix, suffix) => (
+      prefix === '?' && suffix ? '?' : suffix ? '&' : ''
+    ));
   }
 }
 

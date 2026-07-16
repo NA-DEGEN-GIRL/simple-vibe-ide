@@ -3823,11 +3823,14 @@ body.workspace-dock-resizing * {
 .shell.workspace-side-glass:not(.workspace-dock-side) .workspace-tab:is(.memory-slept, .dragging) {
   z-index: 2;
 }
-.workspace-tab.memory-slept .workspace-tab-label::after {
-  content: " sleep";
+.workspace-tab-memory-state {
+  flex: 0 0 auto;
   color: #7f93ad;
   font-size: 10px;
   font-weight: 600;
+}
+.workspace-tab.memory-waking .workspace-tab-memory-state {
+  color: #9bbde0;
 }
 .workspace-tab button, .widget-tab button { min-width: 0; border: 0; background: transparent; padding: 4px 7px; }
 .workspace-tab-label, .widget-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
@@ -6809,6 +6812,11 @@ body.glass-mode-on .browser-panel.app-glass-active-shell .port-form {
 body.glass-mode-on .browser-panel.app-glass-active-shell .browser-shell,
 body.glass-mode-on .browser-panel.app-glass-active-shell .browser-workspace {
   background: transparent;
+}
+body.glass-mode-on .browser-panel.app-glass-active-shell .browser-console {
+  border-color: var(--app-glass-browser-item-outline);
+  background: transparent;
+  color: var(--app-glass-browser-item-text);
 }
 body.glass-mode-on .browser-panel.app-glass-active-shell .browser-shell:not(.has-preview) {
   background: transparent;

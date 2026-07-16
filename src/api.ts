@@ -165,6 +165,8 @@ export const api = {
     invoke<void>('close_browser_webview', { label, rendererRuntimeEpoch }),
   reloadBrowserWebview: (label?: string) =>
     invoke<void>('reload_browser_webview', { label, rendererRuntimeEpoch }),
+  navigateBrowserWebviewHistory: (label: string, delta: -1 | 1) =>
+    invoke<void>('navigate_browser_webview_history', { label, delta, rendererRuntimeEpoch }),
   startEdgeDevtoolsSession: (workspaceId: string) =>
     invoke<EdgeDevtoolsSession>('start_edge_devtools_session', { workspaceId, rendererRuntimeEpoch }),
   edgeDevtoolsNewPage: (sessionId: string, url: string) =>

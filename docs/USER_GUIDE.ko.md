@@ -198,9 +198,11 @@ workspace는 현재 작업 맥락을 저장합니다.
 `Set` 패널의 `Workspace memory saver` 기본값은 `Balanced`입니다.
 
 - workspace가 많아졌을 때 오래 안 쓴 inactive workspace의 shell/PTY를 정리해 RAM 사용량을 줄입니다.
+- inactive 시간은 해당 workspace를 실제로 떠난 시점부터 계산합니다.
 - 해당 workspace tab과 layout snapshot은 유지되고, 다시 열면 shell이 새로 시작됩니다.
+- sleep된 workspace를 열면 tab에 `waking`이 표시되고, 저장된 split shell 복원이 끝난 뒤 해제됩니다. 복원이 실패하면 같은 workspace tab을 다시 눌러 재시도할 수 있습니다.
 - sleep된 workspace의 실행 중이던 shell process는 종료됩니다. 출력이 계속 나는 workspace는 idle로 보지 않지만, 장시간 서버/작업은 `Keep live`를 켜두는 것이 안전합니다.
-- dev server나 장시간 실행 작업을 유지해야 하는 workspace는 workspace tab 우클릭 메뉴에서 `Keep live`를 켜세요.
+- dev server나 장시간 실행 작업을 유지해야 하는 workspace는 workspace tab 우클릭 메뉴에서 `Keep live`를 켜세요. 이미 sleep된 workspace에서 켠 경우에는 먼저 workspace를 열어 shell을 다시 시작해야 합니다.
 
 ### Workspace tab 위치
 

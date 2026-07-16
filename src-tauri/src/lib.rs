@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
-    State, WebviewBuilder, WebviewUrl, WindowEvent,
+    Rect, State, WebviewBuilder, WebviewUrl, WindowEvent,
 };
 use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
@@ -162,6 +162,9 @@ const LLM_TMUX_TITLE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDERER_HEARTBEAT_STARTUP_GRACE: Duration = Duration::from_secs(30);
 const RENDERER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const RENDERER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+const RENDERER_WATCHDOG_OVERSLEEP_TOLERANCE: Duration = Duration::from_secs(2);
+const RENDERER_WATCHDOG_CANDIDATE_MAX_AGE: Duration = Duration::from_secs(2);
+const RENDERER_FOREGROUND_RESUME_GRACE: Duration = Duration::from_secs(30);
 const RENDERER_RECOVERY_RELOAD_COOLDOWN: Duration = Duration::from_secs(120);
 const RENDERER_RECOVERY_STABLE_AFTER: Duration = Duration::from_secs(35);
 const RENDERER_RECOVERY_WARN_ATTEMPTS: u32 = 3;
@@ -418,6 +421,7 @@ struct AgentBridgeEvent {
 
 struct RendererHealthState {
     last_heartbeat: Instant,
+    foreground_since: Option<Instant>,
     last_reload: Option<Instant>,
     reload_attempts: u32,
     pending_notice: Option<RendererRecoveryNotice>,
@@ -427,6 +431,7 @@ impl RendererHealthState {
     fn new() -> Self {
         Self {
             last_heartbeat: Instant::now(),
+            foreground_since: None,
             last_reload: None,
             reload_attempts: 0,
             pending_notice: None,
@@ -5169,22 +5174,51 @@ fn start_renderer_watchdog(app: AppHandle) {
             if let Ok(mut health) = app.state::<IdeState>().renderer_health.lock() {
                 health.last_heartbeat = Instant::now();
             }
+            let mut last_check = Instant::now();
 
             loop {
                 if !sleep_renderer_watchdog(RENDERER_HEARTBEAT_CHECK_INTERVAL) {
                     return;
                 }
-
-                let Some(notice) = renderer_watchdog_recovery_notice(&app) else {
+                let now = Instant::now();
+                let check_gap = now.saturating_duration_since(last_check);
+                last_check = now;
+                if renderer_watchdog_check_gap_is_overslept(check_gap) {
+                    // Instant advances while Windows is suspended. Without
+                    // rearming here, a still-focused window can look like a
+                    // renderer hang before WebView2 has had a chance to resume
+                    // its heartbeat, which would tear down healthy SSH/PTYs.
+                    rearm_renderer_watchdog_after_long_pause(&app, now);
                     continue;
-                };
-                let _ = app.emit("renderer-recovery", notice);
+                }
+
+                if !renderer_watchdog_recovery_due(&app) {
+                    continue;
+                }
 
                 let reload_app = app.clone();
+                let candidate_at = Instant::now();
                 let _ = app.run_on_main_thread(move || {
                     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
                         return;
                     }
+                    let commit_at = Instant::now();
+                    if !renderer_watchdog_candidate_is_fresh(candidate_at, commit_at) {
+                        // The main-thread commit was delayed across suspend or
+                        // a long dispatcher stall. Treat it as a resume, not a
+                        // still-current renderer-hang verdict.
+                        rearm_renderer_watchdog_after_long_pause(&reload_app, commit_at);
+                        return;
+                    }
+                    // The candidate was observed on the watchdog thread. Recheck
+                    // focus, resume grace, the latest heartbeat, and cooldown on
+                    // the main thread before committing a destructive recovery.
+                    // A heartbeat or minimize/Alt-Tab between the two phases must
+                    // leave every PTY and child WebView intact.
+                    let Some(notice) = renderer_watchdog_recovery_notice(&reload_app) else {
+                        return;
+                    };
+                    let _ = reload_app.emit("renderer-recovery", notice);
                     // A renderer reload cannot reattach the current JS objects to
                     // in-process PTYs or child WebViews. Drain them deliberately
                     // so recovery does not leave orphaned shells/WebView2
@@ -5220,20 +5254,102 @@ fn sleep_renderer_watchdog(duration: Duration) -> bool {
     }
 }
 
+fn renderer_window_is_foreground(app: &AppHandle) -> bool {
+    let Some(window) = main_webview_window(app) else {
+        return false;
+    };
+    matches!(window.is_visible(), Ok(true))
+        && matches!(window.is_minimized(), Ok(false))
+        && matches!(window.is_focused(), Ok(true))
+}
+
+fn renderer_watchdog_check_gap_is_overslept(check_gap: Duration) -> bool {
+    check_gap > RENDERER_HEARTBEAT_CHECK_INTERVAL + RENDERER_WATCHDOG_OVERSLEEP_TOLERANCE
+}
+
+fn renderer_watchdog_candidate_is_fresh(candidate_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(candidate_at) <= RENDERER_WATCHDOG_CANDIDATE_MAX_AGE
+}
+
+fn sync_renderer_foreground_state(
+    health: &mut RendererHealthState,
+    foreground: bool,
+    now: Instant,
+) -> Option<Instant> {
+    if !foreground {
+        health.foreground_since = None;
+        return None;
+    }
+    Some(*health.foreground_since.get_or_insert(now))
+}
+
+fn rearm_renderer_foreground_state(
+    health: &mut RendererHealthState,
+    foreground: bool,
+    now: Instant,
+) {
+    health.foreground_since = foreground.then_some(now);
+}
+
+fn rearm_renderer_watchdog_after_long_pause(app: &AppHandle, now: Instant) {
+    let foreground = renderer_window_is_foreground(app);
+    let state = app.state::<IdeState>();
+    let Ok(mut health) = state.renderer_health.lock() else {
+        return;
+    };
+    rearm_renderer_foreground_state(&mut health, foreground, now);
+}
+
+fn renderer_watchdog_recovery_is_due(
+    health: &mut RendererHealthState,
+    foreground: bool,
+    now: Instant,
+) -> bool {
+    let Some(foreground_since) = sync_renderer_foreground_state(health, foreground, now) else {
+        return false;
+    };
+    if now.saturating_duration_since(foreground_since) < RENDERER_FOREGROUND_RESUME_GRACE {
+        return false;
+    }
+    if health
+        .last_reload
+        .map(|last| now.saturating_duration_since(last) < RENDERER_RECOVERY_RELOAD_COOLDOWN)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if health.last_heartbeat < foreground_since {
+        return true;
+    }
+    now.saturating_duration_since(health.last_heartbeat) >= RENDERER_HEARTBEAT_TIMEOUT
+}
+
+fn renderer_watchdog_recovery_due(app: &AppHandle) -> bool {
+    let foreground = renderer_window_is_foreground(app);
+    let now = Instant::now();
+    let state = app.state::<IdeState>();
+    let Ok(mut health) = state.renderer_health.lock() else {
+        return false;
+    };
+    renderer_watchdog_recovery_is_due(&mut health, foreground, now)
+}
+
+fn update_renderer_native_focus(app: &AppHandle, focused: bool) {
+    let state = app.state::<IdeState>();
+    let Ok(mut health) = state.renderer_health.lock() else {
+        return;
+    };
+    rearm_renderer_foreground_state(&mut health, focused, Instant::now());
+}
+
 fn renderer_watchdog_recovery_notice(app: &AppHandle) -> Option<RendererRecoveryNotice> {
+    let foreground = renderer_window_is_foreground(app);
     let now = Instant::now();
     let state = app.state::<IdeState>();
     let Ok(mut health) = state.renderer_health.lock() else {
         return None;
     };
-    if health.last_heartbeat.elapsed() < RENDERER_HEARTBEAT_TIMEOUT {
-        return None;
-    }
-    if health
-        .last_reload
-        .map(|last| last.elapsed() < RENDERER_RECOVERY_RELOAD_COOLDOWN)
-        .unwrap_or(false)
-    {
+    if !renderer_watchdog_recovery_is_due(&mut health, foreground, now) {
         return None;
     }
 
@@ -5711,10 +5827,13 @@ async fn show_browser_webview(
     let size = LogicalSize::new(width.max(1.0), height.max(1.0));
 
     if let Some(webview) = app.get_webview(&label) {
+        let bounds = Rect {
+            position: position.into(),
+            size: size.into(),
+        };
         webview
-            .set_position(position)
+            .set_bounds(bounds)
             .map_err(|error| error.to_string())?;
-        webview.set_size(size).map_err(|error| error.to_string())?;
         let should_navigate = navigate.unwrap_or(true)
             && webview
                 .url()
@@ -5755,7 +5874,10 @@ async fn show_browser_webview(
     let webview = main
         .add_child(webview_builder, position, size)
         .map_err(|error| error.to_string())?;
-    webview.show().map_err(|error| error.to_string())?;
+    if let Err(error) = webview.show() {
+        let _ = webview.close();
+        return Err(error.to_string());
+    }
     refresh_active_capture_protection(&app);
     Ok(())
 }
@@ -5786,13 +5908,18 @@ fn hide_browser_webview_host(app: AppHandle, label: Option<String>) -> Result<()
         }
         return Ok(());
     }
+    let mut first_error = None;
     for (label, webview) in app.webviews() {
         if !is_browser_webview_label(&label) {
             continue;
         }
-        webview.hide().map_err(|error| error.to_string())?;
+        if let Err(error) = webview.hide() {
+            if first_error.is_none() {
+                first_error = Some(format!("failed to hide browser preview {label}: {error}"));
+            }
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 #[tauri::command]
@@ -5822,13 +5949,18 @@ fn close_browser_webview_host(app: AppHandle, label: Option<String>) -> Result<(
         }
         return Ok(());
     }
+    let mut first_error = None;
     for (label, webview) in app.webviews() {
         if !is_browser_webview_label(&label) {
             continue;
         }
-        webview.close().map_err(|error| error.to_string())?;
+        if let Err(error) = webview.close() {
+            if first_error.is_none() {
+                first_error = Some(format!("failed to close browser preview {label}: {error}"));
+            }
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 #[tauri::command]
@@ -5851,6 +5983,32 @@ fn reload_browser_webview(
         webview.reload().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn navigate_browser_webview_history(
+    app: AppHandle,
+    label: String,
+    delta: i32,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before browser history navigation".to_string());
+    }
+    let script = match delta {
+        -1 => "history.back()",
+        1 => "history.forward()",
+        _ => return Err("browser history delta must be -1 or 1".to_string()),
+    };
+    let label = normalize_browser_webview_label(Some(label))?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "browser preview is not available".to_string())?;
+    webview.eval(script).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -9819,6 +9977,123 @@ fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &st
 }
 
 #[cfg(test)]
+mod renderer_watchdog_tests {
+    use super::*;
+
+    fn stale_health(now: Instant) -> RendererHealthState {
+        RendererHealthState {
+            last_heartbeat: now - RENDERER_HEARTBEAT_TIMEOUT - Duration::from_secs(1),
+            foreground_since: Some(now - RENDERER_FOREGROUND_RESUME_GRACE),
+            last_reload: None,
+            reload_attempts: 0,
+            pending_notice: None,
+        }
+    }
+
+    #[test]
+    fn background_renderer_never_requests_destructive_recovery() {
+        let now = Instant::now();
+        let mut health = stale_health(now);
+        assert!(!renderer_watchdog_recovery_is_due(&mut health, false, now));
+        assert!(health.foreground_since.is_none());
+    }
+
+    #[test]
+    fn foreground_resume_requires_grace_and_a_new_heartbeat() {
+        let resumed_at = Instant::now();
+        let mut health = stale_health(resumed_at);
+        assert!(!renderer_watchdog_recovery_is_due(
+            &mut health,
+            false,
+            resumed_at
+        ));
+        assert!(!renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            resumed_at
+        ));
+        assert!(!renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            resumed_at + RENDERER_FOREGROUND_RESUME_GRACE - Duration::from_millis(1)
+        ));
+        assert!(renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            resumed_at + RENDERER_FOREGROUND_RESUME_GRACE
+        ));
+    }
+
+    #[test]
+    fn post_resume_heartbeat_restores_the_normal_timeout() {
+        let resumed_at = Instant::now();
+        let mut health = stale_health(resumed_at);
+        renderer_watchdog_recovery_is_due(&mut health, false, resumed_at);
+        renderer_watchdog_recovery_is_due(&mut health, true, resumed_at);
+        let heartbeat_at = resumed_at + Duration::from_secs(1);
+        health.last_heartbeat = heartbeat_at;
+        assert!(!renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            resumed_at + RENDERER_FOREGROUND_RESUME_GRACE
+        ));
+        assert!(renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            heartbeat_at + RENDERER_HEARTBEAT_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn recovery_cooldown_still_wins_after_resume_grace() {
+        let now = Instant::now();
+        let mut health = stale_health(now);
+        health.last_reload = Some(now - Duration::from_secs(1));
+        assert!(!renderer_watchdog_recovery_is_due(&mut health, true, now));
+    }
+
+    #[test]
+    fn long_watchdog_pause_rearms_foreground_resume_grace() {
+        let resumed_at = Instant::now();
+        let mut health = stale_health(resumed_at);
+        rearm_renderer_foreground_state(&mut health, true, resumed_at);
+        assert_eq!(health.foreground_since, Some(resumed_at));
+        assert!(!renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            resumed_at + RENDERER_FOREGROUND_RESUME_GRACE - Duration::from_millis(1)
+        ));
+        assert!(renderer_watchdog_recovery_is_due(
+            &mut health,
+            true,
+            resumed_at + RENDERER_FOREGROUND_RESUME_GRACE
+        ));
+    }
+
+    #[test]
+    fn watchdog_oversleep_and_candidate_age_have_bounded_thresholds() {
+        assert!(!renderer_watchdog_check_gap_is_overslept(
+            RENDERER_HEARTBEAT_CHECK_INTERVAL + RENDERER_WATCHDOG_OVERSLEEP_TOLERANCE
+        ));
+        assert!(renderer_watchdog_check_gap_is_overslept(
+            RENDERER_HEARTBEAT_CHECK_INTERVAL
+                + RENDERER_WATCHDOG_OVERSLEEP_TOLERANCE
+                + Duration::from_millis(1)
+        ));
+
+        let candidate_at = Instant::now();
+        assert!(renderer_watchdog_candidate_is_fresh(
+            candidate_at,
+            candidate_at + RENDERER_WATCHDOG_CANDIDATE_MAX_AGE
+        ));
+        assert!(!renderer_watchdog_candidate_is_fresh(
+            candidate_at,
+            candidate_at + RENDERER_WATCHDOG_CANDIDATE_MAX_AGE + Duration::from_millis(1)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod terminal_history_tests {
     use super::*;
 
@@ -11001,6 +11276,7 @@ pub fn run() {
             hide_browser_webview,
             close_browser_webview,
             reload_browser_webview,
+            navigate_browser_webview_history,
             start_edge_devtools_session,
             edge_devtools_new_page,
             edge_devtools_activate_page,
@@ -11041,6 +11317,9 @@ pub fn run() {
                     if !APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
                         request_app_exit(app_for_events.clone());
                     }
+                }
+                WindowEvent::Focused(focused) => {
+                    update_renderer_native_focus(&app_for_events, *focused);
                 }
                 _ => {}
             });

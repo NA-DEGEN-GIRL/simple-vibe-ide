@@ -45,11 +45,83 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   primary product goal: a very responsive shell-first IDE.
 - Workspace snapshots still restore UI/work context, but shell processes are
   recreated after app close/rebuild rather than reattached.
-- Keep browser preview fixes general. The active browser path is currently the
-  iframe/proxy preview; Edge CDP preview is disabled because earlier attempts
-  caused startup freeze/endpoint readiness issues.
+- Keep browser preview fixes general. The active path is a scoped Tauri child
+  WebView when capture protection is off, with iframe fallback for capture-safe
+  workspaces. Edge CDP preview remains disabled because earlier attempts caused
+  startup freeze/endpoint readiness issues.
 
 ## Patch Notes
+
+### 2026-07-16 - Prevent false SSH workspace wakes and Explorer hover Glass trails
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
+- Memory Saver inactivity now starts when the user actually leaves a workspace, so a quiet but active
+  SSH workspace cannot be slept immediately after a switch. Backend-less failed/exited pane shells no
+  longer inflate the live-workspace count.
+- A slept workspace remains visibly `waking` until its saved terminal restore operation has completed
+  and every saved pane backend is running. Failed or cancelled split restores remain slept and can
+  be retried by clicking the active workspace again. Enabling `Keep live` prevents future sleeps but
+  does not pretend that already-stopped shells are still alive.
+- Renderer hang recovery is disabled while the native window is hidden, minimized, or unfocused. A
+  foreground-resume grace, long system-suspend rearm, immediate frontend heartbeat, and main-thread
+  recheck prevent a background WebView2 timer pause from draining healthy WSL/SSH/PTY sessions.
+- Explorer row hover-only Glass now reasserts exactly one active row and one visible local mirror on
+  every filtered render. Pointer leave, window blur/hide, full list replacement, and virtual-row
+  detach/recycle clear stale hover ownership, including coalesced pointer transitions during rapid
+  movement or scrolling.
+- Memory Saver thresholds, SSH keepalive, SSH multiplexing, and terminal restore fan-out policy are
+  unchanged; use `Keep live` for workspaces whose long-running shell processes must remain alive.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Real packaged Windows/WebView2 smoke is still required for 2x2 SSH wake/retry, minimize/Alt-Tab and
+  system sleep, intentional foreground renderer-hang recovery, and rapid Explorer hover/leave/scroll.
+
+### 2026-07-16 - Preserve and harden Browser previews across workspace switches
+
+#### Changed (`src/main.ts`, `src/styles.css`, `src/api.ts`, `src-tauri/src/lib.rs`)
+- Browser Console now exposes the Browser Glass surface instead of compositing its configurable
+  translucent toolbar/log colors over a hard-coded opaque parent.
+- Workspace and Browser-tab switches retain Browser page/scroll/form state. Hidden contexts use a
+  five-minute grace period; retained native and iframe workspace contexts are each capped to the four
+  most recent contexts. Explicit panel close destroys that panel's children, while minimize/background
+  handling suspends iframe work immediately and shortens every retained native child's close grace.
+  Browser state restores before remote editor/note file hydration, and retained native previews
+  reappear after layout paint rather than waiting for idle hydration.
+- Native preview bounds are intersected with both the Browser cell and renderer viewport. A temporary
+  zero/offscreen rect can recover on focus, resize, scale, or layout sync; overlapping same-label show
+  requests no longer let an obsolete completion hide the current child, and an in-flight retention
+  close repairs the still-active preview after it finishes.
+- Native page navigation updates the tab/address state, hard-refresh cache markers are stripped before
+  persistence, and Browser Back/Forward now works on the active child WebView. Address suggestions,
+  global popovers/context menus, and higher floating widgets hide an overlapping OS child surface and
+  re-show its preserved page when the DOM surface no longer blocks it.
+- Manual port forwards remain attached to their workspace UI across switches and are stopped when that
+  workspace runtime is actually discarded. A forward that finishes starting after a workspace switch
+  is returned to its originating runtime or stopped instead of leaking into the new workspace.
+- Backend child bounds update atomically. Hide/close-all attempts every Browser child even if one fails,
+  and a child created successfully but failing its first show is closed immediately. Existing renderer
+  generation and app-exit cleanup barriers remain authoritative.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Real packaged Windows/WebView2 smoke is still required for retained scroll/form state, capture-safe
+  iframe fallback, rapid workspace/tab switching and panel resize, DPI/minimize recovery, Browser Glass
+  settings, Back/Forward, and repeated titlebar/Alt+F4 exit with child `msedgewebview2.exe` verification.
 
 ### 2026-07-16 - Drain IDE-owned WSL/SSH clients before exit and renderer replacement
 
