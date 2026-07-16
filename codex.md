@@ -51,6 +51,60 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-16 - Drain IDE-owned WSL/SSH clients before exit and renderer replacement
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`)
+- Window close now stays backend-owned: native close is prevented, the window is hidden, new runtime
+  starts are blocked, tracked terminal/forward/export/Edge/helper roots are drained through a bounded
+  cleanup pool, and Tauri exits only after that barrier. A hard timeout and the Windows Job Object
+  remain crash/failure fallbacks instead of replacing explicit cleanup.
+- Persistent starts and generation-owned browser mutations carry a backend-issued renderer token.
+  A terminal, forward, preview proxy, export, Edge action, or native child-WebView request dispatched
+  by an obsolete renderer can no longer register or mutate the replacement generation after its
+  cleanup barrier. Failed or cancelled post-spawn setup uses owned-child guards so the partially
+  created process tree is reaped.
+- Per-pane termination now waits for its bounded backend cleanup instead of spawning another
+  fire-and-forget thread. Natural terminal exits, timed-out late starts, and stale tmux client
+  reconnects also remove their backend sessions. Listener-backed forwards retain and join their
+  listener worker during teardown.
+- Active exports and short-lived WSL/SSH helpers are tracked during their process lifetime. The
+  Windows OpenSSH service probe is cached and timeout-bounded, cleanup Job assignment failures are
+  reported without local path data, and app exit explicitly terminates the cleanup Job after tracked
+  roots have been handled.
+- Cleanup targets only IDE-owned local client trees such as `wsl.exe`, the PowerShell wrapper, and
+  `ssh.exe`. It does not call `wsl --shutdown`, terminate a distro, or stop tmux; tmux servers and the
+  shell/LLM processes they own inside WSL/SSH remain available for the next app launch.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Real packaged Windows/WebView2 smoke is still required with repeated titlebar and Alt+F4 closes,
+  mixed 2x2 WSL/SSH panes, active forwarding/export, renderer reload, and a check that local IDE
+  client PIDs disappear while `tmux ls` remains intact.
+
+### 2026-07-16 - Preserve the editor viewport across Ctrl+S
+
+#### Changed (`src/main.ts`)
+- Saving updates the file baseline, dirty state, tabs, label, and snapshot without rebuilding or
+  detaching the CodeMirror split surface, so the current scroll position and selection stay in place.
+- The saved text and path are captured before the asynchronous write. If the user keeps typing,
+  switches tabs, or renames the file while a remote save is in flight, the saved baseline advances
+  only when it still belongs to that path and newer/current-path content remains dirty.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Real WebView2 smoke is still required for a long file scrolled to the middle, split editor panes,
+  slow SSH saves with continued typing, and secure/raw editor modes.
+
 ### 2026-07-15 - Keep shell command history independent per terminal pane
 
 #### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`)

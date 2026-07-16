@@ -8,11 +8,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
-use std::sync::atomic::{AtomicIsize, AtomicU32};
+use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
@@ -60,12 +60,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Process-wide Windows Job Object that owns every child process the IDE
-/// spawns (terminals, ssh/wsl, port forwards, Edge devtools). It is configured
-/// with `KILL_ON_JOB_CLOSE`, so when the IDE process dies for ANY reason -
-/// graceful exit, a Rust panic (the release profile uses `panic = "abort"`),
-/// or an external force-kill - Windows tears down the whole tree. This is the
-/// crash-safety net behind the explicit teardown in `shutdown_runtime_sessions`.
+/// Process-wide Windows Job Object for app-owned child processes. It is an
+/// additional crash-safety net behind explicit tracked-PID teardown, not the
+/// only cleanup path: portable-pty starts a child before it exposes the handle,
+/// and Windows can reject assignment when another incompatible job owns it.
 #[cfg(windows)]
 mod cleanup_job {
     use std::sync::OnceLock;
@@ -73,7 +71,7 @@ mod cleanup_job {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
@@ -109,21 +107,35 @@ mod cleanup_job {
         JOB.get_or_init(init_job).as_ref().map(|h| h.0)
     }
 
-    /// Assign a spawned child PID to the cleanup job. Best-effort: any failure
-    /// (e.g. the child already exited, or it lives in an incompatible job) is
-    /// ignored because the explicit `taskkill /T` teardown is the primary path.
-    pub fn assign(pid: u32) {
+    pub fn initialize() -> Result<(), String> {
+        job_handle()
+            .map(|_| ())
+            .ok_or_else(|| "failed to initialize the Windows child cleanup job".to_string())
+    }
+
+    /// Assign a spawned child PID to the cleanup job. Explicit tracked-PID
+    /// teardown remains the primary normal-exit path when this best-effort
+    /// assignment is too late or Windows rejects it.
+    pub fn assign(pid: u32) -> Result<(), String> {
         if pid == 0 {
-            return;
+            return Ok(());
         }
-        let Some(job) = job_handle() else {
-            return;
-        };
+        let job = job_handle().ok_or_else(|| "cleanup job is unavailable".to_string())?;
         unsafe {
-            if let Ok(process) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) {
-                let _ = AssignProcessToJobObject(job, process);
-                let _ = CloseHandle(process);
-            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
+                .map_err(|error| format!("OpenProcess failed: {error}"))?;
+            let result = AssignProcessToJobObject(job, process)
+                .map_err(|error| format!("AssignProcessToJobObject failed: {error}"));
+            let _ = CloseHandle(process);
+            result
+        }
+    }
+
+    pub fn terminate_all() -> Result<(), String> {
+        let job = job_handle().ok_or_else(|| "cleanup job is unavailable".to_string())?;
+        unsafe {
+            TerminateJobObject(job, 1)
+                .map_err(|error| format!("TerminateJobObject failed: {error}"))
         }
     }
 }
@@ -153,6 +165,11 @@ const RENDERER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const RENDERER_RECOVERY_RELOAD_COOLDOWN: Duration = Duration::from_secs(120);
 const RENDERER_RECOVERY_STABLE_AFTER: Duration = Duration::from_secs(35);
 const RENDERER_RECOVERY_WARN_ATTEMPTS: u32 = 3;
+const PROCESS_TREE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+const APP_EXIT_HARD_TIMEOUT: Duration = Duration::from_secs(15);
+const RUNTIME_CLEANUP_PARALLELISM: usize = 8;
+#[cfg(windows)]
+const WINDOWS_SSH_AGENT_STATUS_CACHE_TTL: Duration = Duration::from_secs(10);
 const AGENT_BRIDGE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SNIPPETS_STORE_FILE: &str = "snippets.v1.json";
 const SNIPPETS_STORE_MAX_BYTES: usize = 1024 * 1024;
@@ -165,6 +182,9 @@ static WSL_HOME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new(
 static WSL_WARMUP_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 static WSL_WARMUP_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static WSL_DISTRO_LIST_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
+static TRANSIENT_PROCESS_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+#[cfg(windows)]
+static WINDOWS_SSH_AGENT_STATUS_CACHE: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
 
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
@@ -202,6 +222,36 @@ struct TerminalSession {
     cols: u16,
 }
 
+struct PendingTerminalChild {
+    child: Option<Box<dyn portable_pty::Child + Send>>,
+}
+
+impl PendingTerminalChild {
+    fn new(child: Box<dyn portable_pty::Child + Send>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child(&self) -> &(dyn portable_pty::Child + Send) {
+        self.child
+            .as_deref()
+            .expect("pending terminal child was already committed")
+    }
+
+    fn take(&mut self) -> Box<dyn portable_pty::Child + Send> {
+        self.child
+            .take()
+            .expect("pending terminal child was already committed")
+    }
+}
+
+impl Drop for PendingTerminalChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate_terminal_child(child.as_mut());
+        }
+    }
+}
+
 enum TerminalInputMessage {
     Data(Vec<u8>),
     Flush(SyncSender<Result<(), String>>),
@@ -210,10 +260,95 @@ enum TerminalInputMessage {
 struct ForwardSession {
     stop: Option<Arc<AtomicBool>>,
     child: Option<ProcessChild>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+struct PendingProcessChild {
+    child: Option<ProcessChild>,
+}
+
+impl PendingProcessChild {
+    fn new(child: ProcessChild) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child(&self) -> &ProcessChild {
+        self.child
+            .as_ref()
+            .expect("pending process child was already committed")
+    }
+
+    fn child_mut(&mut self) -> &mut ProcessChild {
+        self.child
+            .as_mut()
+            .expect("pending process child was already committed")
+    }
+
+    fn take(&mut self) -> ProcessChild {
+        self.child
+            .take()
+            .expect("pending process child was already committed")
+    }
+}
+
+impl Drop for PendingProcessChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate_process_child(&mut child);
+        }
+    }
+}
+
+struct TransientProcessRegistration {
+    pid: u32,
+}
+
+impl TransientProcessRegistration {
+    fn new(pid: u32) -> Self {
+        if pid != 0 {
+            TRANSIENT_PROCESS_PIDS
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(pid);
+        }
+        Self { pid }
+    }
+}
+
+impl Drop for TransientProcessRegistration {
+    fn drop(&mut self) {
+        if self.pid == 0 {
+            return;
+        }
+        TRANSIENT_PROCESS_PIDS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.pid);
+    }
 }
 
 struct ExportSession {
     cancel: Arc<AtomicBool>,
+    process_pid: Arc<AtomicU32>,
+}
+
+struct ExportProcessPidRegistration {
+    process_pid: Arc<AtomicU32>,
+}
+
+impl ExportProcessPidRegistration {
+    fn new(process_pid: Arc<AtomicU32>, pid: u32) -> Self {
+        process_pid.store(pid, Ordering::SeqCst);
+        Self { process_pid }
+    }
+}
+
+impl Drop for ExportProcessPidRegistration {
+    fn drop(&mut self) {
+        self.process_pid.store(0, Ordering::SeqCst);
+    }
 }
 
 struct EdgeDevtoolsSessionState {
@@ -368,12 +503,18 @@ struct SshAskpassHttpRequestOut {
 struct RuntimeShutdownBatch {
     terminals: Vec<TerminalSession>,
     forwards: Vec<ForwardSession>,
+    exports: Vec<ExportSession>,
     edge_sessions: Vec<EdgeDevtoolsSessionState>,
+    transient_pids: Vec<u32>,
 }
 
 impl RuntimeShutdownBatch {
     fn is_empty(&self) -> bool {
-        self.terminals.is_empty() && self.forwards.is_empty() && self.edge_sessions.is_empty()
+        self.terminals.is_empty()
+            && self.forwards.is_empty()
+            && self.exports.is_empty()
+            && self.edge_sessions.is_empty()
+            && self.transient_pids.is_empty()
     }
 }
 
@@ -717,13 +858,30 @@ fn hide_command_window(command: &mut Command) -> &mut Command {
     command
 }
 
-/// Register a freshly spawned child with the process-wide cleanup job so it is
-/// guaranteed to die with the IDE even on a crash. No-op off Windows.
+/// Register a freshly spawned child with the process-wide cleanup job. Normal
+/// shutdown still tears down tracked roots explicitly because assignment can
+/// fail or happen after a very fast child has already created descendants.
 fn assign_child_to_cleanup_job(pid: u32) {
     #[cfg(windows)]
-    cleanup_job::assign(pid);
+    if let Err(error) = cleanup_job::assign(pid) {
+        eprintln!("failed to register app-owned child pid {pid} for crash cleanup: {error}");
+    }
     #[cfg(not(windows))]
     let _ = pid;
+}
+
+fn initialize_child_cleanup_job() {
+    #[cfg(windows)]
+    if let Err(error) = cleanup_job::initialize() {
+        eprintln!("{error}");
+    }
+}
+
+fn terminate_child_cleanup_job() {
+    #[cfg(windows)]
+    if let Err(error) = cleanup_job::terminate_all() {
+        eprintln!("failed to terminate the Windows child cleanup job: {error}");
+    }
 }
 
 #[cfg(windows)]
@@ -1300,9 +1458,8 @@ fn query_windows_ssh_agent_service_running() -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    hide_command_window(&mut command)
-        .status()
-        .map(|status| status.success())
+    command_output_with_timeout(&mut command, Duration::from_secs(3))
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
@@ -1313,7 +1470,19 @@ fn windows_ssh_agent_service_running() -> bool {
     }
     #[cfg(windows)]
     {
-        query_windows_ssh_agent_service_running()
+        let cache = WINDOWS_SSH_AGENT_STATUS_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(cached) = cache.lock() {
+            if let Some((checked_at, running)) = *cached {
+                if checked_at.elapsed() < WINDOWS_SSH_AGENT_STATUS_CACHE_TTL {
+                    return running;
+                }
+            }
+        }
+        let running = query_windows_ssh_agent_service_running();
+        if let Ok(mut cached) = cache.lock() {
+            *cached = Some((Instant::now(), running));
+        }
+        running
     }
 }
 
@@ -1442,7 +1611,23 @@ fn kill_process_tree(pid: u32) {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let _ = hide_command_window(&mut command).status();
+        let Ok(mut taskkill) = hide_command_window(&mut command).spawn() else {
+            return;
+        };
+        let deadline = Instant::now() + PROCESS_TREE_KILL_TIMEOUT;
+        loop {
+            match taskkill.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = taskkill.kill();
+                    let _ = taskkill.wait();
+                    break;
+                }
+            }
+        }
     }
     #[cfg(not(windows))]
     {
@@ -2428,7 +2613,11 @@ fn list_llm_tmux_sessions_direct(
         if !is_llm_tmux_session_for_base(name, &base_name) || !is_safe_llm_tmux_session_name(name) {
             continue;
         }
-        let attached = parts.next().unwrap_or("0") == "1";
+        let attached = parts
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+            > 0;
         let windows = parts
             .next()
             .and_then(|value| value.parse().ok())
@@ -3018,6 +3207,57 @@ static MAIN_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 #[cfg(windows)]
 static AGENT_ALERT_TRAY_ICON_ID: AtomicU32 = AtomicU32::new(0x5349_0000);
 static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static APP_EXIT_CLEANUP_COMPLETED: AtomicBool = AtomicBool::new(false);
+static RENDERER_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(0);
+static RENDERER_RUNTIME_RESETS_PENDING: AtomicU32 = AtomicU32::new(0);
+static RUNTIME_LIFECYCLE_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+
+struct RendererRuntimeResetRequest {
+    active: bool,
+}
+
+impl RendererRuntimeResetRequest {
+    fn new() -> Self {
+        RENDERER_RUNTIME_RESETS_PENDING.fetch_add(1, Ordering::SeqCst);
+        Self { active: true }
+    }
+
+    fn finish(&mut self) {
+        if !self.active {
+            return;
+        }
+        RENDERER_RUNTIME_RESETS_PENDING.fetch_sub(1, Ordering::SeqCst);
+        self.active = false;
+    }
+}
+
+impl Drop for RendererRuntimeResetRequest {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn runtime_lifecycle_gate() -> &'static RwLock<()> {
+    RUNTIME_LIFECYCLE_GATE.get_or_init(|| RwLock::new(()))
+}
+
+fn runtime_lifecycle_read() -> RwLockReadGuard<'static, ()> {
+    runtime_lifecycle_gate()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn runtime_lifecycle_write() -> RwLockWriteGuard<'static, ()> {
+    runtime_lifecycle_gate()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn renderer_runtime_epoch_is_current(epoch: u64) -> bool {
+    epoch != 0
+        && RENDERER_RUNTIME_RESETS_PENDING.load(Ordering::SeqCst) == 0
+        && epoch == RENDERER_RUNTIME_EPOCH.load(Ordering::SeqCst)
+}
 
 #[cfg(windows)]
 fn set_window_capture_protection<R: tauri::Runtime>(
@@ -4130,12 +4370,21 @@ fn start_export_path(
     state: State<IdeState>,
     profile_id: String,
     path: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<ExportStartResult, String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before the export started".to_string());
+    }
     let profile = profile_from_id(&profile_id);
     let source_path = normalize_profile_path(&profile, &path);
     let display_name = export_display_name(&profile, &source_path);
     let id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
+    let process_pid = Arc::new(AtomicU32::new(0));
     state
         .exports
         .lock()
@@ -4144,6 +4393,7 @@ fn start_export_path(
             id.clone(),
             ExportSession {
                 cancel: cancel.clone(),
+                process_pid: process_pid.clone(),
             },
         );
 
@@ -4152,16 +4402,21 @@ fn start_export_path(
     let name_for_thread = display_name.clone();
     let name_for_result = display_name.clone();
     thread::spawn(move || {
-        let result = export_source_info(&profile, &source_path).and_then(|info| {
-            run_export_job(
-                &app_handle,
-                &id_for_thread,
-                &profile,
-                &source_path,
-                info,
-                cancel.clone(),
-            )
-        });
+        let result = check_export_cancelled(&cancel)
+            .and_then(|_| {
+                export_source_info(&profile, &source_path, &cancel, renderer_runtime_epoch)
+            })
+            .and_then(|info| {
+                run_export_job(
+                    &app_handle,
+                    &id_for_thread,
+                    &profile,
+                    &source_path,
+                    info,
+                    cancel.clone(),
+                    process_pid.clone(),
+                )
+            });
         if let Err(error) = result {
             emit_export_event(
                 &app_handle,
@@ -4317,16 +4572,36 @@ fn spawn_terminal_direct(
     _workspace_id: Option<String>,
     _title: Option<String>,
     shell_history_id: Option<String>,
+    renderer_runtime_epoch: u64,
 ) -> Result<String, String> {
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced while the terminal was launching".to_string());
+    }
     let profile = profile_from_id(&profile_id);
     let cwd = normalize_profile_path(&profile, &cwd);
     warm_wsl_profile(&profile)?;
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced while the terminal was warming up".to_string());
+    }
     let terminal_id = Uuid::new_v4().to_string();
     let shell_history_id =
         normalized_terminal_shell_history_id(shell_history_id.as_deref(), &terminal_id);
     let read_id = terminal_id.clone();
     let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone())?;
     let (program, args) = terminal_command(&profile, &cwd, command.clone(), &shell_history_id);
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced while the terminal was launching".to_string());
+    }
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -4350,12 +4625,19 @@ fn spawn_terminal_direct(
         cmd.cwd(windows_spawn_cwd());
     }
 
-    let child = pair
+    let child: Box<dyn portable_pty::Child + Send> = pair
         .slave
         .spawn_command(cmd)
         .map_err(|err| err.to_string())?;
-    if let Some(pid) = child.process_id() {
+    let mut pending_child = PendingTerminalChild::new(child);
+    if let Some(pid) = pending_child.child().process_id() {
         assign_child_to_cleanup_job(pid);
+    }
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown started while the terminal was launching".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced while the terminal was launching".to_string());
     }
     let mut reader = pair
         .master
@@ -4416,20 +4698,26 @@ fn spawn_terminal_direct(
         );
     });
 
-    state
+    let mut terminals = state
         .terminals
         .lock()
-        .map_err(|_| "terminal state poisoned".to_string())?
-        .insert(
-            terminal_id.clone(),
-            TerminalSession {
-                input_tx,
-                child,
-                master: pair.master,
-                rows,
-                cols,
-            },
-        );
+        .map_err(|_| "terminal state poisoned".to_string())?;
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown started while the terminal was launching".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced while the terminal was launching".to_string());
+    }
+    terminals.insert(
+        terminal_id.clone(),
+        TerminalSession {
+            input_tx,
+            child: pending_child.take(),
+            master: pair.master,
+            rows,
+            cols,
+        },
+    );
 
     Ok(terminal_id)
 }
@@ -4603,105 +4891,270 @@ fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
         .map_err(|_| "terminal state poisoned".to_string())?
         .remove(&id);
     if let Some(session) = session {
-        terminate_terminal_session_background(session);
+        terminate_terminal_session(session);
     }
     Ok(())
 }
 
-fn terminate_terminal_session_background(session: TerminalSession) {
-    let _ = thread::Builder::new()
-        .name("simple-vibe-terminal-kill".to_string())
-        .spawn(move || terminate_terminal_session(session));
+fn wait_for_terminal_child_exit(child: &mut (dyn portable_pty::Child + Send)) {
+    let deadline = Instant::now() + PROCESS_TREE_KILL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => return,
+        }
+    }
+}
+
+fn terminate_terminal_child(child: &mut (dyn portable_pty::Child + Send)) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if let Some(pid) = child.process_id() {
+        kill_process_tree(pid);
+    }
+    let _ = child.kill();
+    wait_for_terminal_child_exit(child);
+}
+
+fn terminate_process_child(child: &mut ProcessChild) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    kill_process_tree(child.id());
+    let _ = child.kill();
+    let deadline = Instant::now() + PROCESS_TREE_KILL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => return,
+        }
+    }
 }
 
 fn terminate_terminal_session(mut session: TerminalSession) {
-    if let Some(pid) = session.child.process_id() {
-        kill_process_tree(pid);
+    terminate_terminal_child(session.child.as_mut());
+}
+
+enum RuntimeCleanupTask {
+    Terminal(TerminalSession),
+    Forward(ForwardSession),
+    Export(ExportSession),
+    Edge(EdgeDevtoolsSessionState),
+    Transient(u32),
+}
+
+impl RuntimeCleanupTask {
+    fn run(self) {
+        match self {
+            Self::Terminal(session) => terminate_terminal_session(session),
+            Self::Forward(mut forward) => {
+                if let Some(stop) = forward.stop.take() {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                if let Some(mut child) = forward.child.take() {
+                    terminate_process_child(&mut child);
+                }
+                if let Some(worker) = forward.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+            Self::Export(export) => {
+                let pid = export.process_pid.load(Ordering::SeqCst);
+                if pid != 0 {
+                    kill_process_tree(pid);
+                }
+            }
+            Self::Edge(mut session) => {
+                if let Some(mut child) = session.child.take() {
+                    terminate_process_child(&mut child);
+                }
+            }
+            Self::Transient(pid) => kill_process_tree(pid),
+        }
     }
-    let _ = session.child.kill();
-    let _ = session.child.wait();
 }
 
 fn drain_runtime_sessions(state: &IdeState) -> RuntimeShutdownBatch {
     let terminals = state
         .terminals
         .lock()
-        .map(|mut sessions| sessions.drain().map(|(_, session)| session).collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
     let forwards = state
         .forwards
         .lock()
-        .map(|mut sessions| sessions.drain().map(|(_, session)| session).collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
+    let exports = state
+        .exports
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
     let edge_sessions = state
         .edge_sessions
         .lock()
-        .map(|mut sessions| sessions.drain().map(|(_, session)| session).collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
+    let transient_pids = TRANSIENT_PROCESS_PIDS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .copied()
+        .collect();
     RuntimeShutdownBatch {
         terminals,
         forwards,
+        exports,
         edge_sessions,
+        transient_pids,
     }
 }
 
 fn terminate_runtime_sessions(batch: RuntimeShutdownBatch) {
-    for session in batch.terminals {
-        terminate_terminal_session(session);
+    let RuntimeShutdownBatch {
+        terminals,
+        forwards,
+        exports,
+        edge_sessions,
+        transient_pids,
+    } = batch;
+    for export in &exports {
+        export.cancel.store(true, Ordering::SeqCst);
     }
-
-    for mut forward in batch.forwards {
-        if let Some(stop) = forward.stop.take() {
-            stop.store(true, Ordering::Relaxed);
+    let mut tasks = terminals
+        .into_iter()
+        .map(RuntimeCleanupTask::Terminal)
+        .chain(forwards.into_iter().map(RuntimeCleanupTask::Forward))
+        .chain(exports.into_iter().map(RuntimeCleanupTask::Export))
+        .chain(edge_sessions.into_iter().map(RuntimeCleanupTask::Edge))
+        .chain(
+            transient_pids
+                .into_iter()
+                .map(RuntimeCleanupTask::Transient),
+        )
+        .collect::<Vec<_>>();
+    // Workers pop from the end. Reverse once so terminals and forwards remain
+    // the first roots handled if a severely wedged host reaches the hard exit
+    // watchdog before every best-effort task completes.
+    tasks.reverse();
+    let worker_count = tasks.len().min(RUNTIME_CLEANUP_PARALLELISM);
+    let tasks = Mutex::new(tasks);
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tasks = &tasks;
+            scope.spawn(move || loop {
+                let task = tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pop();
+                let Some(task) = task else {
+                    return;
+                };
+                task.run();
+            });
         }
-        if let Some(mut child) = forward.child.take() {
-            kill_process_tree(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    for mut session in batch.edge_sessions {
-        if let Some(mut child) = session.child.take() {
-            kill_process_tree(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+    });
 }
 
-fn shutdown_runtime_sessions_background(state: &IdeState) {
-    let batch = drain_runtime_sessions(state);
-    if batch.is_empty() {
-        return;
-    }
-    // Drain the session maps synchronously so future frontend/backend calls see
-    // the runtime as closed, but run process-tree termination and waits off the
-    // Tauri close path. On Windows the cleanup Job Object remains the hard
-    // guarantee if the app process exits before this worker finishes.
-    let _ = thread::Builder::new()
+fn reload_renderer_after_runtime_shutdown(app: AppHandle) -> Result<(), String> {
+    let mut reset_request = RendererRuntimeResetRequest::new();
+    thread::Builder::new()
         .name("simple-vibe-runtime-shutdown".to_string())
-        .spawn(move || terminate_runtime_sessions(batch));
-}
-
-fn shutdown_app_runtime(app: &AppHandle) {
-    close_capture_cover(app);
-    let _ = close_browser_webview(app.clone(), None);
-    shutdown_runtime_sessions_background(app.state::<IdeState>().inner());
-    shutdown_session_ssh_agent();
+        .spawn(move || {
+            let recovery_epoch = {
+                let _runtime_guard = runtime_lifecycle_write();
+                let recovery_epoch = RENDERER_RUNTIME_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+                let batch = drain_runtime_sessions(app.state::<IdeState>().inner());
+                if !batch.is_empty() {
+                    terminate_runtime_sessions(batch);
+                }
+                reset_request.finish();
+                recovery_epoch
+            };
+            if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+                return;
+            }
+            let reload_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let _runtime_guard = runtime_lifecycle_read();
+                if APP_EXIT_REQUESTED.load(Ordering::SeqCst)
+                    || !renderer_runtime_epoch_is_current(recovery_epoch)
+                {
+                    return;
+                }
+                let _ = close_browser_webview_host(reload_app.clone(), None);
+                if let Some(window) = main_webview_window(&reload_app) {
+                    let _ = window.reload();
+                }
+            });
+        })
+        .map(|_| ())
+        .map_err(|error| format!("failed to start renderer runtime cleanup: {error}"))
 }
 
 fn request_app_exit(app: AppHandle) {
     if APP_EXIT_REQUESTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    shutdown_app_runtime(&app);
-    let _ = thread::Builder::new()
+    if let Some(window) = main_webview_window(&app) {
+        let _ = window.hide();
+    }
+    close_capture_cover(&app);
+    let _ = close_browser_webview_host(app.clone(), None);
+    shutdown_session_ssh_agent();
+
+    let cleanup_app = app.clone();
+    let cleanup_worker = thread::Builder::new()
         .name("simple-vibe-app-exit".to_string())
         .spawn(move || {
-            thread::sleep(Duration::from_millis(60));
-            app.exit(0);
-            thread::sleep(Duration::from_millis(900));
+            let _runtime_guard = runtime_lifecycle_write();
+            let batch = drain_runtime_sessions(cleanup_app.state::<IdeState>().inner());
+            if !batch.is_empty() {
+                terminate_runtime_sessions(batch);
+            }
+            let _ = close_browser_webview_host(cleanup_app.clone(), None);
+            // This catches successfully assigned helper descendants after the
+            // tracked root cleanup has had a chance to walk each tree.
+            terminate_child_cleanup_job();
+            APP_EXIT_CLEANUP_COMPLETED.store(true, Ordering::SeqCst);
+            cleanup_app.exit(0);
+        });
+    if let Err(error) = cleanup_worker {
+        eprintln!("failed to start the app runtime cleanup worker: {error}");
+        terminate_child_cleanup_job();
+        APP_EXIT_CLEANUP_COMPLETED.store(true, Ordering::SeqCst);
+        app.exit(0);
+        return;
+    }
+
+    let watchdog_app = app.clone();
+    let _ = thread::Builder::new()
+        .name("simple-vibe-app-exit-watchdog".to_string())
+        .spawn(move || {
+            thread::sleep(APP_EXIT_HARD_TIMEOUT);
+            if APP_EXIT_CLEANUP_COMPLETED.load(Ordering::SeqCst) {
+                return;
+            }
+            terminate_child_cleanup_job();
+            APP_EXIT_CLEANUP_COMPLETED.store(true, Ordering::SeqCst);
+            watchdog_app.exit(0);
+            thread::sleep(Duration::from_millis(750));
             std::process::exit(0);
         });
 }
@@ -4737,10 +5190,15 @@ fn start_renderer_watchdog(app: AppHandle) {
                     // so recovery does not leave orphaned shells/WebView2
                     // processes behind. Workspace snapshots recreate fresh
                     // shells after reload.
-                    let _ = close_browser_webview(reload_app.clone(), None);
-                    shutdown_runtime_sessions_background(reload_app.state::<IdeState>().inner());
-                    if let Some(window) = main_webview_window(&reload_app) {
-                        let _ = window.reload();
+                    let _ = close_browser_webview_host(reload_app.clone(), None);
+                    if let Err(error) = reload_renderer_after_runtime_shutdown(reload_app.clone()) {
+                        eprintln!("{error}");
+                        // If even the cleanup worker could not be created, let
+                        // the replacement renderer's prepare handshake perform
+                        // the same generation bump and drain before it restores.
+                        if let Some(window) = main_webview_window(&reload_app) {
+                            let _ = window.reload();
+                        }
                     }
                 });
             }
@@ -4815,6 +5273,7 @@ fn start_port_forward_host(
     profile_id: String,
     remote_port: u16,
     local_port: u16,
+    renderer_runtime_epoch: u64,
 ) -> Result<PortForwardResult, String> {
     let profile = profile_from_id(&profile_id);
     let id = Uuid::new_v4().to_string();
@@ -4844,10 +5303,20 @@ fn start_port_forward_host(
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         apply_session_ssh_auth_to_command(&mut command, &profile);
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err(
+                "renderer runtime was replaced before the port forward started".to_string(),
+            );
+        }
         let child = hide_command_window(&mut command)
             .spawn()
             .map_err(|err| format!("failed to start ssh forward: {err}"))?;
-        assign_child_to_cleanup_job(child.id());
+        let mut pending_child = PendingProcessChild::new(child);
+        assign_child_to_cleanup_job(pending_child.child().id());
         state
             .forwards
             .lock()
@@ -4856,7 +5325,8 @@ fn start_port_forward_host(
                 id.clone(),
                 ForwardSession {
                     stop: None,
-                    child: Some(child),
+                    child: Some(pending_child.take()),
+                    worker: None,
                 },
             );
         return Ok(PortForwardResult {
@@ -4868,6 +5338,13 @@ fn start_port_forward_host(
         });
     }
 
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before the port forward started".to_string());
+    }
     let target_host = "127.0.0.1".to_string();
 
     // WSL localhost forwarding already exposes many dev servers on Windows localhost.
@@ -4882,6 +5359,7 @@ fn start_port_forward_host(
                 ForwardSession {
                     stop: None,
                     child: None,
+                    worker: None,
                 },
             );
 
@@ -4904,7 +5382,7 @@ fn start_port_forward_host(
     let thread_stop = stop.clone();
     let thread_target = target_host.clone();
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         while !thread_stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((incoming, _)) => {
@@ -4921,17 +5399,22 @@ fn start_port_forward_host(
         }
     });
 
-    state
-        .forwards
-        .lock()
-        .map_err(|_| "forward state poisoned".to_string())?
-        .insert(
-            id.clone(),
-            ForwardSession {
-                stop: Some(stop),
-                child: None,
-            },
-        );
+    let mut forwards = match state.forwards.lock() {
+        Ok(forwards) => forwards,
+        Err(_) => {
+            stop.store(true, Ordering::SeqCst);
+            let _ = worker.join();
+            return Err("forward state poisoned".to_string());
+        }
+    };
+    forwards.insert(
+        id.clone(),
+        ForwardSession {
+            stop: Some(stop),
+            child: None,
+            worker: Some(worker),
+        },
+    );
 
     Ok(PortForwardResult {
         id,
@@ -4945,7 +5428,11 @@ fn start_port_forward_host(
 fn start_preview_proxy_host(
     state: &IdeState,
     target_url: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<PortForwardResult, String> {
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before the preview proxy started".to_string());
+    }
     let target = parse_http_preview_target(&target_url)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|err| format!("failed to bind preview proxy: {err}"))?;
@@ -4959,7 +5446,7 @@ fn start_preview_proxy_host(
     let thread_host = target.host.clone();
     let thread_port = target.port;
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         while !thread_stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((incoming, _)) => {
@@ -4976,17 +5463,22 @@ fn start_preview_proxy_host(
         }
     });
 
-    state
-        .forwards
-        .lock()
-        .map_err(|_| "forward state poisoned".to_string())?
-        .insert(
-            id.clone(),
-            ForwardSession {
-                stop: Some(stop),
-                child: None,
-            },
-        );
+    let mut forwards = match state.forwards.lock() {
+        Ok(forwards) => forwards,
+        Err(_) => {
+            stop.store(true, Ordering::SeqCst);
+            let _ = worker.join();
+            return Err("forward state poisoned".to_string());
+        }
+    };
+    forwards.insert(
+        id.clone(),
+        ForwardSession {
+            stop: Some(stop),
+            child: None,
+            worker: Some(worker),
+        },
+    );
 
     Ok(PortForwardResult {
         id,
@@ -5021,9 +5513,10 @@ fn stop_port_forward_host(state: &IdeState, id: String) -> Result<(), String> {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(mut child) = forward.child.take() {
-            kill_process_tree(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_child(&mut child);
+        }
+        if let Some(worker) = forward.worker.take() {
+            let _ = worker.join();
         }
     }
     Ok(())
@@ -5040,6 +5533,7 @@ async fn spawn_terminal(
     workspace_id: Option<String>,
     title: Option<String>,
     shell_history_id: Option<String>,
+    renderer_runtime_epoch: u64,
 ) -> Result<String, String> {
     run_blocking_command("spawn terminal", move || {
         let state = app.state::<IdeState>();
@@ -5054,6 +5548,7 @@ async fn spawn_terminal(
             workspace_id,
             title,
             shell_history_id,
+            renderer_runtime_epoch,
         )
     })
     .await
@@ -5100,10 +5595,17 @@ async fn start_port_forward(
     profile_id: String,
     remote_port: u16,
     local_port: u16,
+    renderer_runtime_epoch: u64,
 ) -> Result<PortForwardResult, String> {
     run_blocking_command("start port forward", move || {
         let state = app.state::<IdeState>();
-        start_port_forward_host(state.inner(), profile_id, remote_port, local_port)
+        start_port_forward_host(
+            state.inner(),
+            profile_id,
+            remote_port,
+            local_port,
+            renderer_runtime_epoch,
+        )
     })
     .await
 }
@@ -5112,10 +5614,20 @@ async fn start_port_forward(
 async fn start_preview_proxy(
     app: tauri::AppHandle,
     target_url: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<PortForwardResult, String> {
     run_blocking_command("start preview proxy", move || {
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err(
+                "renderer runtime was replaced before the preview proxy started".to_string(),
+            );
+        }
         let state = app.state::<IdeState>();
-        start_preview_proxy_host(state.inner(), target_url)
+        start_preview_proxy_host(state.inner(), target_url, renderer_runtime_epoch)
     })
     .await
 }
@@ -5130,9 +5642,23 @@ async fn stop_port_forward(app: tauri::AppHandle, id: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn shutdown_runtime_sessions_command(state: State<'_, IdeState>) -> Result<(), String> {
-    shutdown_runtime_sessions_background(&state);
-    Ok(())
+async fn prepare_renderer_runtime(app: AppHandle) -> Result<u64, String> {
+    let mut reset_request = RendererRuntimeResetRequest::new();
+    let cleanup_app = app.clone();
+    let renderer_runtime_epoch = run_blocking_command("prepare renderer runtime", move || {
+        let _runtime_guard = runtime_lifecycle_write();
+        let renderer_runtime_epoch = RENDERER_RUNTIME_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        let batch = drain_runtime_sessions(cleanup_app.state::<IdeState>().inner());
+        if !batch.is_empty() {
+            terminate_runtime_sessions(batch);
+        }
+        let close_result = close_browser_webview_host(cleanup_app, None);
+        reset_request.finish();
+        close_result?;
+        Ok(renderer_runtime_epoch)
+    })
+    .await?;
+    Ok(renderer_runtime_epoch)
 }
 
 fn normalize_browser_webview_label(label: Option<String>) -> Result<String, String> {
@@ -5168,7 +5694,15 @@ async fn show_browser_webview(
     width: f64,
     height: f64,
     navigate: Option<bool>,
+    renderer_runtime_epoch: u64,
 ) -> Result<(), String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before the browser preview opened".to_string());
+    }
     let label = normalize_browser_webview_label(label)?;
     let parsed_url: tauri::Url = url
         .parse()
@@ -5227,7 +5761,24 @@ async fn show_browser_webview(
 }
 
 #[tauri::command]
-fn hide_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), String> {
+fn hide_browser_webview(
+    app: AppHandle,
+    label: Option<String>,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err(
+            "renderer runtime was replaced before the browser preview was hidden".to_string(),
+        );
+    }
+    hide_browser_webview_host(app, label)
+}
+
+fn hide_browser_webview_host(app: AppHandle, label: Option<String>) -> Result<(), String> {
     if let Some(label) = label {
         let label = normalize_browser_webview_label(Some(label))?;
         if let Some(webview) = app.get_webview(&label) {
@@ -5245,7 +5796,22 @@ fn hide_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), Str
 }
 
 #[tauri::command]
-fn close_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), String> {
+fn close_browser_webview(
+    app: AppHandle,
+    label: Option<String>,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before the browser preview closed".to_string());
+    }
+    close_browser_webview_host(app, label)
+}
+
+fn close_browser_webview_host(app: AppHandle, label: Option<String>) -> Result<(), String> {
     // Child WebViews keep running media after `hide()`. Use close() only at true
     // destroy boundaries (panel/workspace close), while workspace switching can
     // still hide and later re-show a preserved preview without reloading.
@@ -5266,7 +5832,20 @@ fn close_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), St
 }
 
 #[tauri::command]
-fn reload_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), String> {
+fn reload_browser_webview(
+    app: AppHandle,
+    label: Option<String>,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err(
+            "renderer runtime was replaced before the browser preview reloaded".to_string(),
+        );
+    }
     let label = normalize_browser_webview_label(label)?;
     if let Some(webview) = app.get_webview(&label) {
         webview.reload().map_err(|error| error.to_string())?;
@@ -5278,10 +5857,18 @@ fn reload_browser_webview(app: AppHandle, label: Option<String>) -> Result<(), S
 async fn start_edge_devtools_session(
     state: State<'_, IdeState>,
     workspace_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<EdgeDevtoolsSession, String> {
     let edge_sessions = Arc::clone(&state.edge_sessions);
     tauri::async_runtime::spawn_blocking(move || {
-        start_edge_devtools_session_blocking(edge_sessions, workspace_id)
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err("renderer runtime was replaced before Edge started".to_string());
+        }
+        start_edge_devtools_session_blocking(edge_sessions, workspace_id, renderer_runtime_epoch)
     })
     .await
     .map_err(|err| format!("Edge startup task failed: {err}"))?
@@ -5290,6 +5877,7 @@ async fn start_edge_devtools_session(
 fn start_edge_devtools_session_blocking(
     edge_sessions: EdgeSessionStore,
     workspace_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<EdgeDevtoolsSession, String> {
     let id = normalized_edge_session_id(&workspace_id);
     {
@@ -5350,31 +5938,36 @@ fn start_edge_devtools_session_blocking(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let mut child = hide_command_window(&mut command)
+    let child = hide_command_window(&mut command)
         .spawn()
         .map_err(|err| format!("failed to start Edge: {err}"))?;
-    assign_child_to_cleanup_job(child.id());
+    let mut pending_child = PendingProcessChild::new(child);
+    assign_child_to_cleanup_job(pending_child.child().id());
 
-    let launcher_alive = match wait_for_edge_devtools(&mut child, port) {
-        Ok(alive) => alive,
-        Err(err) => {
-            kill_process_tree(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(err);
-        }
+    let launcher_alive =
+        match wait_for_edge_devtools(pending_child.child_mut(), port, renderer_runtime_epoch) {
+            Ok(alive) => alive,
+            Err(err) => return Err(err),
+        };
+
+    let mut sessions = edge_sessions
+        .lock()
+        .map_err(|_| "edge session state poisoned".to_string())?;
+    let tracked_child = if launcher_alive {
+        Some(pending_child.take())
+    } else {
+        let mut child = pending_child.take();
+        let _ = child.try_wait();
+        None
     };
 
-    edge_sessions
-        .lock()
-        .map_err(|_| "edge session state poisoned".to_string())?
-        .insert(
-            id.clone(),
-            EdgeDevtoolsSessionState {
-                child: if launcher_alive { Some(child) } else { None },
-                port,
-            },
-        );
+    sessions.insert(
+        id.clone(),
+        EdgeDevtoolsSessionState {
+            child: tracked_child,
+            port,
+        },
+    );
 
     Ok(edge_session_result(&id, port))
 }
@@ -5384,9 +5977,17 @@ async fn edge_devtools_new_page(
     state: State<'_, IdeState>,
     session_id: String,
     url: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<EdgeDevtoolsPage, String> {
     let edge_sessions = Arc::clone(&state.edge_sessions);
     tauri::async_runtime::spawn_blocking(move || {
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err("renderer runtime was replaced before the Edge page opened".to_string());
+        }
         let port = edge_session_port(&edge_sessions, &session_id)?;
         let path = format!("/json/new?{}", percent_encode_component(&url));
         let body = devtools_http_request(port, "PUT", &path)
@@ -5407,9 +6008,17 @@ async fn edge_devtools_activate_page(
     state: State<'_, IdeState>,
     session_id: String,
     target_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<(), String> {
     let edge_sessions = Arc::clone(&state.edge_sessions);
     tauri::async_runtime::spawn_blocking(move || {
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err("renderer runtime was replaced before the Edge page activated".to_string());
+        }
         let port = edge_session_port(&edge_sessions, &session_id)?;
         let path = format!("/json/activate/{}", percent_encode_component(&target_id));
         devtools_http_request(port, "GET", &path).map(|_| ())
@@ -5423,9 +6032,17 @@ async fn edge_devtools_close_page(
     state: State<'_, IdeState>,
     session_id: String,
     target_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<(), String> {
     let edge_sessions = Arc::clone(&state.edge_sessions);
     tauri::async_runtime::spawn_blocking(move || {
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err("renderer runtime was replaced before the Edge page closed".to_string());
+        }
         let port = edge_session_port(&edge_sessions, &session_id)?;
         let path = format!("/json/close/{}", percent_encode_component(&target_id));
         devtools_http_request(port, "GET", &path).map(|_| ())
@@ -5435,17 +6052,27 @@ async fn edge_devtools_close_page(
 }
 
 #[tauri::command]
-fn stop_edge_devtools_session(state: State<IdeState>, session_id: String) -> Result<(), String> {
+fn stop_edge_devtools_session(
+    state: State<IdeState>,
+    session_id: String,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    let _runtime_guard = runtime_lifecycle_read();
+    if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+        return Err("app shutdown is already in progress".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before Edge stopped".to_string());
+    }
     let id = normalized_edge_session_id(&session_id);
-    let mut sessions = state
+    let session = state
         .edge_sessions
         .lock()
-        .map_err(|_| "edge session state poisoned".to_string())?;
-    if let Some(mut session) = sessions.remove(&id) {
+        .map_err(|_| "edge session state poisoned".to_string())?
+        .remove(&id);
+    if let Some(mut session) = session {
         if let Some(mut child) = session.child.take() {
-            kill_process_tree(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_child(&mut child);
         }
     }
     Ok(())
@@ -5491,11 +6118,21 @@ fn edge_devtools_endpoint_ready(port: u16) -> bool {
         .is_ok()
 }
 
-fn wait_for_edge_devtools(child: &mut ProcessChild, port: u16) -> Result<bool, String> {
+fn wait_for_edge_devtools(
+    child: &mut ProcessChild,
+    port: u16,
+    renderer_runtime_epoch: u64,
+) -> Result<bool, String> {
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut last_error = String::new();
     let mut launcher_exited = false;
     while Instant::now() < deadline {
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown started while Edge was launching".to_string());
+        }
+        if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+            return Err("renderer runtime was replaced while Edge was launching".to_string());
+        }
         if !launcher_exited {
             if let Some(status) = child
                 .try_wait()
@@ -7217,7 +7854,12 @@ fn export_display_name(profile: &ConnectionProfile, path: &str) -> String {
     }
 }
 
-fn export_source_info(profile: &ConnectionProfile, path: &str) -> Result<ExportSourceInfo, String> {
+fn export_source_info(
+    profile: &ConnectionProfile,
+    path: &str,
+    cancel: &AtomicBool,
+    renderer_runtime_epoch: u64,
+) -> Result<ExportSourceInfo, String> {
     match profile.kind.as_str() {
         "windows" => export_local_source_info(Path::new(path)),
         "wsl" => {
@@ -7226,10 +7868,10 @@ fn export_source_info(profile: &ConnectionProfile, path: &str) -> Result<ExportS
                 info.direct_windows_path = Some(windows_path);
                 Ok(info)
             } else {
-                export_remote_source_info(profile, path)
+                export_remote_source_info(profile, path, cancel, renderer_runtime_epoch)
             }
         }
-        "ssh" => export_remote_source_info(profile, path),
+        "ssh" => export_remote_source_info(profile, path, cancel, renderer_runtime_epoch),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
 }
@@ -7261,13 +7903,21 @@ fn export_local_source_info(path: &Path) -> Result<ExportSourceInfo, String> {
 fn export_remote_source_info(
     profile: &ConnectionProfile,
     path: &str,
+    cancel: &AtomicBool,
+    renderer_runtime_epoch: u64,
 ) -> Result<ExportSourceInfo, String> {
     let script = format!(
         "if [ -d {0} ]; then printf 'dir\\t0'; elif [ -f {0} ]; then printf 'file\\t'; wc -c < {0}; else printf 'other\\t0'; fi",
         shell_quote(path)
     );
-    let output =
-        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
+    let output = run_profile_shell_with_timeout_for_renderer(
+        profile,
+        &script,
+        None,
+        REMOTE_DIRECTORY_COMMAND_TIMEOUT,
+        cancel,
+        renderer_runtime_epoch,
+    )?;
     let text = String::from_utf8_lossy(&output);
     let mut parts = text.trim().splitn(2, '\t');
     let kind = parts.next().unwrap_or("other").to_string();
@@ -7292,6 +7942,7 @@ fn run_export_job(
     source_path: &str,
     info: ExportSourceInfo,
     cancel: Arc<AtomicBool>,
+    process_pid: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let root = export_root()?;
     let job_dir = root.join(sanitize_segment(id));
@@ -7346,6 +7997,7 @@ fn run_export_job(
             source_path,
             &output_path,
             &cancel,
+            &process_pid,
             app,
             id,
             &output_name,
@@ -7356,6 +8008,7 @@ fn run_export_job(
             source_path,
             &output_path,
             &cancel,
+            &process_pid,
             info.size.unwrap_or(0),
             app,
             id,
@@ -7537,13 +8190,24 @@ fn stream_remote_file(
     source_path: &str,
     output_path: &Path,
     cancel: &Arc<AtomicBool>,
+    process_pid: &Arc<AtomicU32>,
     total: u64,
     app: &tauri::AppHandle,
     id: &str,
     name: &str,
 ) -> Result<(), String> {
     let script = format!("cat -- {}", shell_quote(source_path));
-    stream_profile_shell_to_file(profile, &script, output_path, cancel, total, app, id, name)
+    stream_profile_shell_to_file(
+        profile,
+        &script,
+        output_path,
+        cancel,
+        process_pid,
+        total,
+        app,
+        id,
+        name,
+    )
 }
 
 fn stream_remote_directory_tar(
@@ -7551,6 +8215,7 @@ fn stream_remote_directory_tar(
     source_path: &str,
     output_path: &Path,
     cancel: &Arc<AtomicBool>,
+    process_pid: &Arc<AtomicU32>,
     app: &tauri::AppHandle,
     id: &str,
     name: &str,
@@ -7562,7 +8227,17 @@ fn stream_remote_directory_tar(
         shell_quote(&parent),
         shell_quote(&name_in_parent)
     );
-    stream_profile_shell_to_file(profile, &script, output_path, cancel, 0, app, id, name)
+    stream_profile_shell_to_file(
+        profile,
+        &script,
+        output_path,
+        cancel,
+        process_pid,
+        0,
+        app,
+        id,
+        name,
+    )
 }
 
 fn stream_profile_shell_to_file(
@@ -7570,6 +8245,7 @@ fn stream_profile_shell_to_file(
     script: &str,
     output_path: &Path,
     cancel: &Arc<AtomicBool>,
+    process_pid: &Arc<AtomicU32>,
     total: u64,
     app: &tauri::AppHandle,
     id: &str,
@@ -7580,10 +8256,23 @@ fn stream_profile_shell_to_file(
     }
     let mut command = profile_shell_command(profile, script)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = hide_command_window(&mut command)
-        .spawn()
-        .map_err(|err| format!("failed to start export: {err}"))?;
-    let mut stdout = child
+    let (mut pending_child, pid_registration) = {
+        let _runtime_guard = runtime_lifecycle_read();
+        check_export_cancelled(cancel)?;
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        let child = hide_command_window(&mut command)
+            .spawn()
+            .map_err(|err| format!("failed to start export: {err}"))?;
+        let pending_child = PendingProcessChild::new(child);
+        let pid = pending_child.child().id();
+        assign_child_to_cleanup_job(pid);
+        let registration = ExportProcessPidRegistration::new(Arc::clone(process_pid), pid);
+        (pending_child, registration)
+    };
+    let mut stdout = pending_child
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| "failed to capture export stream".to_string())?;
@@ -7597,14 +8286,12 @@ fn stream_profile_shell_to_file(
             emit_export_progress(app, id, name, done, total, false);
         },
     );
-    if copy_result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return copy_result.map(|_| ());
-    }
-    let output = child
+    copy_result?;
+    let output = pending_child
+        .take()
         .wait_with_output()
         .map_err(|err| format!("failed to wait for export: {err}"))?;
+    drop(pid_registration);
     if !output.status.success() {
         if profile.kind == "ssh" {
             clear_ssh_askpass_cache_for_profile(profile);
@@ -8075,6 +8762,33 @@ fn run_profile_shell_with_timeout(
     stdin_data: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
+    run_profile_shell_with_timeout_scoped(profile, script, stdin_data, timeout, None)
+}
+
+fn run_profile_shell_with_timeout_for_renderer(
+    profile: &ConnectionProfile,
+    script: &str,
+    stdin_data: Option<Vec<u8>>,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    renderer_runtime_epoch: u64,
+) -> Result<Vec<u8>, String> {
+    run_profile_shell_with_timeout_scoped(
+        profile,
+        script,
+        stdin_data,
+        timeout,
+        Some((cancel, renderer_runtime_epoch)),
+    )
+}
+
+fn run_profile_shell_with_timeout_scoped(
+    profile: &ConnectionProfile,
+    script: &str,
+    stdin_data: Option<Vec<u8>>,
+    timeout: Duration,
+    renderer_scope: Option<(&AtomicBool, u64)>,
+) -> Result<Vec<u8>, String> {
     let attempts = if profile.kind == "wsl" {
         WSL_TRANSIENT_RETRY_ATTEMPTS
     } else {
@@ -8082,7 +8796,8 @@ fn run_profile_shell_with_timeout(
     };
     let mut last_error = None;
     for attempt in 0..attempts {
-        match run_profile_shell_once(profile, script, stdin_data.clone(), timeout) {
+        check_renderer_process_scope(renderer_scope)?;
+        match run_profile_shell_once(profile, script, stdin_data.clone(), timeout, renderer_scope) {
             Ok(stdout) => {
                 record_wsl_profile_warmup_success(profile);
                 return Ok(stdout);
@@ -8106,6 +8821,7 @@ fn run_profile_shell_once(
     script: &str,
     stdin_data: Option<Vec<u8>>,
     timeout: Duration,
+    renderer_scope: Option<(&AtomicBool, u64)>,
 ) -> Result<Vec<u8>, String> {
     let mut command = match profile.kind.as_str() {
         "wsl" => {
@@ -8142,19 +8858,31 @@ fn run_profile_shell_once(
         command.stdin(Stdio::null());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = hide_command_window(&mut command)
-        .spawn()
-        .map_err(|err| format!("failed to run remote shell: {err}"))?;
-    let pid = child.id();
-    assign_child_to_cleanup_job(pid);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let (child, _process_registration) = {
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        check_renderer_process_scope(renderer_scope)?;
+        let child = hide_command_window(&mut command)
+            .spawn()
+            .map_err(|err| format!("failed to run remote shell: {err}"))?;
+        let mut pending_child = PendingProcessChild::new(child);
+        let pid = pending_child.child().id();
+        assign_child_to_cleanup_job(pid);
+        let registration = TransientProcessRegistration::new(pid);
+        check_renderer_process_scope(renderer_scope)?;
+        (pending_child.take(), registration)
+    };
+    let mut pending_child = PendingProcessChild::new(child);
+    let stdout = pending_child.child_mut().stdout.take();
+    let stderr = pending_child.child_mut().stderr.take();
     let stdout_reader =
         stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
     let stderr_reader =
         stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
     let stdin_writer = stdin_data.and_then(|data| {
-        child.stdin.take().map(|mut stdin| {
+        pending_child.child_mut().stdin.take().map(|mut stdin| {
             thread::spawn(move || {
                 stdin
                     .write_all(&data)
@@ -8165,19 +8893,26 @@ fn run_profile_shell_once(
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait() {
+        match pending_child.child_mut().try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if let Err(error) = check_renderer_process_scope(renderer_scope) {
+                    terminate_process_child(pending_child.child_mut());
+                    let _ = join_stdin_writer(stdin_writer);
+                    let _ = join_process_output(stdout_reader);
+                    let _ = join_process_output(stderr_reader);
+                    drop(_process_registration);
+                    return Err(error);
+                }
                 if Instant::now() >= deadline {
-                    kill_process_tree(pid);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_process_child(pending_child.child_mut());
                     let _ = join_stdin_writer(stdin_writer);
                     let _ = join_process_output(stdout_reader);
                     let _ = join_process_output(stderr_reader);
                     if profile.kind == "ssh" {
                         clear_ssh_askpass_cache_for_profile(profile);
                     }
+                    drop(_process_registration);
                     return Err(format!(
                         "remote shell timed out after {}s",
                         timeout.as_secs()
@@ -8185,12 +8920,24 @@ fn run_profile_shell_once(
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(err) => return Err(format!("failed to wait for remote shell: {err}")),
+            Err(err) => {
+                terminate_process_child(pending_child.child_mut());
+                let _ = join_stdin_writer(stdin_writer);
+                let _ = join_process_output(stdout_reader);
+                let _ = join_process_output(stderr_reader);
+                drop(_process_registration);
+                return Err(format!("failed to wait for remote shell: {err}"));
+            }
         }
     };
+    let completed_child = pending_child.take();
     let stdin_result = join_stdin_writer(stdin_writer);
-    let stdout = join_process_output(stdout_reader)?;
-    let stderr = join_process_output(stderr_reader)?;
+    let stdout = join_process_output(stdout_reader);
+    let stderr = join_process_output(stderr_reader);
+    drop(_process_registration);
+    drop(completed_child);
+    let stdout = stdout?;
+    let stderr = stderr?;
     if !status.success() {
         if profile.kind == "ssh" {
             clear_ssh_askpass_cache_for_profile(profile);
@@ -8204,6 +8951,19 @@ fn run_profile_shell_once(
     }
     stdin_result?;
     Ok(stdout)
+}
+
+fn check_renderer_process_scope(renderer_scope: Option<(&AtomicBool, u64)>) -> Result<(), String> {
+    let Some((cancel, renderer_runtime_epoch)) = renderer_scope else {
+        return Ok(());
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Export cancelled".to_string());
+    }
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced while the export was preparing".to_string());
+    }
+    Ok(())
 }
 
 fn warm_wsl_profile(profile: &ConnectionProfile) -> Result<(), String> {
@@ -8393,39 +9153,58 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = hide_command_window(command)
-        .spawn()
-        .map_err(|err| format!("failed to start process: {err}"))?;
-    let pid = child.id();
-    assign_child_to_cleanup_job(pid);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let (child, _process_registration) = {
+        let _runtime_guard = runtime_lifecycle_read();
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        let child = hide_command_window(command)
+            .spawn()
+            .map_err(|err| format!("failed to start process: {err}"))?;
+        let pid = child.id();
+        assign_child_to_cleanup_job(pid);
+        let registration = TransientProcessRegistration::new(pid);
+        (child, registration)
+    };
+    let mut pending_child = PendingProcessChild::new(child);
+    let stdout = pending_child.child_mut().stdout.take();
+    let stderr = pending_child.child_mut().stderr.take();
     let stdout_reader =
         stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
     let stderr_reader =
         stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait() {
+        match pending_child.child_mut().try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    kill_process_tree(pid);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_process_child(pending_child.child_mut());
                     let _ = join_process_output(stdout_reader);
                     let _ = join_process_output(stderr_reader);
+                    drop(_process_registration);
                     return Err(format!("process timed out after {}s", timeout.as_secs()));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(err) => return Err(format!("failed to wait for process: {err}")),
+            Err(err) => {
+                terminate_process_child(pending_child.child_mut());
+                let _ = join_process_output(stdout_reader);
+                let _ = join_process_output(stderr_reader);
+                drop(_process_registration);
+                return Err(format!("failed to wait for process: {err}"));
+            }
         }
     };
+    let completed_child = pending_child.take();
+    let stdout = join_process_output(stdout_reader);
+    let stderr = join_process_output(stderr_reader);
+    drop(_process_registration);
+    drop(completed_child);
     Ok(Output {
         status,
-        stdout: join_process_output(stdout_reader)?,
-        stderr: join_process_output(stderr_reader)?,
+        stdout: stdout?,
+        stderr: stderr?,
     })
 }
 
@@ -10228,9 +11007,10 @@ pub fn run() {
             edge_devtools_close_page,
             stop_edge_devtools_session,
             stop_port_forward,
-            shutdown_runtime_sessions_command
+            prepare_renderer_runtime
         ])
         .setup(|app| {
+            initialize_child_cleanup_job();
             let Some(window) = main_webview_window(app.handle()) else {
                 eprintln!("main window was not available during setup");
                 return Ok(());
@@ -10253,11 +11033,14 @@ pub fn run() {
             close_capture_cover(&app_handle);
             let app_for_events = app_handle.clone();
             window.on_window_event(move |event| match event {
-                WindowEvent::CloseRequested { .. } => {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
                     request_app_exit(app_for_events.clone());
                 }
                 WindowEvent::Destroyed => {
-                    shutdown_app_runtime(&app_for_events);
+                    if !APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+                        request_app_exit(app_for_events.clone());
+                    }
                 }
                 _ => {}
             });
@@ -10276,14 +11059,16 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while running Simple Vibe app")
-        .run(|app_handle, event| {
-            // Guarantee child processes (terminals, ssh/wsl, port forwards,
-            // Edge devtools) are detached from app state on every exit path,
-            // but do not block the window/app close path on taskkill/wait.
-            // The Windows cleanup Job Object is the hard guarantee if the
-            // process exits before the background worker finishes.
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                shutdown_app_runtime(app_handle);
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if APP_EXIT_CLEANUP_COMPLETED.load(Ordering::SeqCst) {
+                    terminate_child_cleanup_job();
+                } else {
+                    api.prevent_exit();
+                    request_app_exit(app_handle.clone());
+                }
             }
+            tauri::RunEvent::Exit => terminate_child_cleanup_job(),
+            _ => {}
         });
 }

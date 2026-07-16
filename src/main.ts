@@ -1781,7 +1781,7 @@ const TERMINAL_RESTORE_SPAWN_CONCURRENCY = 4;
 const TERMINAL_SHELL_READY_PROBE_CHARS = 2048;
 const TERMINAL_STARTUP_NOTICE_MS = 900;
 const TERMINAL_STARTUP_STALL_MS = 10000;
-const TERMINAL_CLOSE_BACKEND_TIMEOUT_MS = 2500;
+const TERMINAL_CLOSE_BACKEND_TIMEOUT_MS = 5000;
 const TERMINAL_SHELL_READY_FALLBACK_MS = 4500;
 const TERMINAL_SHELL_READY_ACTION_FALLBACK_MS = 6500;
 const TERMINAL_PENDING_BACKEND_EVENT_LIMIT = 64;
@@ -5114,6 +5114,10 @@ function refreshTitle() {
 
 async function init() {
   const initStartedAt = performance.now();
+  // A WebView reload replaces every JS terminal object but leaves Rust-owned
+  // PTYs alive. Finish draining the previous renderer generation before any
+  // workspace restore can create replacement WSL/SSH clients.
+  await api.prepareRendererRuntime();
   const listenersStartedAt = performance.now();
   const profilesPromise = api.listProfiles();
   await Promise.all([
@@ -16337,13 +16341,13 @@ async function recoverTerminalTmuxStaleDelivery(
     pane.term.write('\r\n\x1b[33m[simple-vibe-ide] tmux output delivery looks stale; reconnecting this terminal client to the same tmux session...\x1b[0m\r\n');
     setTerminalBackendId(pane, undefined);
     dropPendingTerminalBackendEvents(oldBackendId);
-    void api.killTerminal(oldBackendId).catch((error) => {
-      appendDiagnosticLog(
-        'terminal',
-        `tmux stale-reconnect old-backend kill failed pane=${diagnosticPaneLabel(pane)} oldBackend=${oldBackendId.slice(0, 8)} error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
-        'warn'
-      );
-    });
+    await withTimeout(
+      api.killTerminal(oldBackendId),
+      TERMINAL_CLOSE_BACKEND_TIMEOUT_MS,
+      `Closing stale tmux client ${pane.title}`
+    );
+    if (!isTerminalPaneAlive(pane)) return;
+    let disposeLateBackend = false;
     const spawnPromise = api.spawnTerminal(
       profile.id,
       pane.cwd,
@@ -16354,11 +16358,22 @@ async function recoverTerminalTmuxStaleDelivery(
       `${pane.title} reconnect`,
       pane.shellHistoryId
     );
-    const backendId = await withTimeout(
-      spawnPromise,
-      terminalStartTimeoutMs(profile),
-      `${profile.kind.toUpperCase()} tmux reconnect`
-    );
+    spawnPromise.then((lateBackendId) => {
+      if (disposeLateBackend || !isTerminalPaneAlive(pane)) {
+        void api.killTerminal(lateBackendId).catch(() => undefined);
+      }
+    }).catch(() => undefined);
+    let backendId = '';
+    try {
+      backendId = await withTimeout(
+        spawnPromise,
+        terminalStartTimeoutMs(profile),
+        `${profile.kind.toUpperCase()} tmux reconnect`
+      );
+    } catch (error) {
+      disposeLateBackend = String(error).includes('timed out');
+      throw error;
+    }
     if (!isTerminalPaneAlive(pane)) {
       void api.killTerminal(backendId).catch(() => undefined);
       return;
@@ -19041,7 +19056,8 @@ function scheduleWorkspaceTerminalRestore(
 }
 
 function isWorkspaceTerminalRestoreCurrent(workspaceId: string, token?: number) {
-  return state.activeWorkspaceId === workspaceId
+  return !appShutdownStarted
+    && state.activeWorkspaceId === workspaceId
     && state.workspaceOpen
     && (token === undefined || token === workspaceTerminalRestoreToken);
 }
@@ -23216,10 +23232,8 @@ function beginAppShutdownForClose() {
   pauseMarketTickerForHidden();
   closeAllNativeBrowserWebviews();
   suspendBrowserFramesForWorkspace(state.activeWorkspaceId, { includeActive: true });
-  stopAllEdgeDevtoolsSessions();
   disableCaptureProtectionForShutdown();
   persistNoteMemoryStore();
-  void api.shutdownRuntimeSessions().catch(() => undefined);
   setStatus('Closing Simple Vibe IDE...');
   return true;
 }
@@ -23229,7 +23243,7 @@ function scheduleWindowCloseFallback() {
   appCloseFallbackTimer = window.setTimeout(() => {
     appCloseFallbackTimer = 0;
     void api.forceQuitApp().catch(() => currentWindow.destroy().catch(() => undefined));
-  }, 1200);
+  }, 8000);
 }
 
 async function closeCurrentWindowNow() {
@@ -23237,13 +23251,15 @@ async function closeCurrentWindowNow() {
   scheduleWindowCloseFallback();
   try {
     await api.forceQuitApp();
+    // The backend hides the window, drains every tracked runtime process, and
+    // exits only after the cleanup barrier. Destroying here would bypass it.
+    return;
   } catch {
-    // Fall through to the local window destroy path if IPC is already wedged.
-  }
-  try {
-    await currentWindow.destroy();
-  } catch {
-    await currentWindow.close().catch(() => undefined);
+    try {
+      await currentWindow.destroy();
+    } catch {
+      await currentWindow.close().catch(() => undefined);
+    }
   }
 }
 
@@ -25969,11 +25985,17 @@ function markTerminalShellReady(pane: TerminalPane, options: { confirmed?: boole
 
 function handleTerminalExitEvent(pane: TerminalPane) {
   const workspaceId = pane.workspaceId;
+  const exitedBackendId = pane.backendId;
   const exitedDuringStartup = pane.startupState === 'starting';
   clearTerminalStartupWatch(pane);
   flushTerminalWriteBuffer(pane);
   failPendingTerminalShellReadyActions(pane, 'shell exited before it became ready');
   setTerminalBackendId(pane, undefined);
+  // The backend reader can report EOF before a very fast process has been
+  // inserted into the Rust session map. Reap only after the event has been
+  // associated with its pane/backend ID; buffered startup exits reach this
+  // same path after insertion.
+  if (exitedBackendId) void api.killTerminal(exitedBackendId).catch(() => undefined);
   failPendingTerminalInput(pane, 'Shell exited before pending terminal input delivery was confirmed');
   if (exitedDuringStartup) {
     pane.startupState = 'failed';
@@ -32009,25 +32031,50 @@ async function saveOpenFile() {
   const file = state.openFile;
   const profile = state.activeProfile;
   if (!file || !profile) return;
-  const content = file.masked && !file.rawMode
-    ? serializeSecretLines(file.lines)
-    : codeView?.state.doc.toString() ?? file.draftContent ?? file.content;
+  const savedPath = file.path;
+  const content = currentEditorContentForFile(file);
   try {
-    await api.writeTextFile(profile.id, file.path, content);
+    await api.writeTextFile(profile.id, savedPath, content);
     // Drop any cached copy so a later reopen re-reads from disk (picks up this save and any
     // external edit that may have raced it) instead of serving a stale signature match.
-    invalidateTextFileCache(profile.id, file.path);
-    invalidateExplorerParentDirectoryCache(profile.id, file.path);
-    file.content = content;
-    file.draftContent = undefined;
-    file.lines = file.masked ? parseSecretLinesCached(content, file.path) : [];
-    file.dirty = false;
-    setStatus('Saved');
-    renderEditor();
+    invalidateTextFileCache(profile.id, savedPath);
+    invalidateExplorerParentDirectoryCache(profile.id, savedPath);
+    const latestContent = currentEditorContentForFile(file);
+    const changedSinceSave = !sameEditorContent(latestContent, content);
+    const pathChangedSinceSave = file.path !== savedPath;
+    if (!pathChangedSinceSave) file.content = content;
+    // The secure form already owns the current parsed line objects. Preserve
+    // them so saving does not invalidate its live inputs; raw mode must update
+    // the parsed representation for a later switch back to the secure form.
+    if (file.masked && file.rawMode) file.lines = parseSecretLinesCached(latestContent, file.path);
+    const remainsDirty = pathChangedSinceSave || changedSinceSave;
+    file.draftContent = file.masked && !file.rawMode || !remainsDirty ? undefined : latestContent;
+    file.dirty = remainsDirty;
+    setStatus(pathChangedSinceSave
+      ? 'Saved previous path; renamed file remains unsaved'
+      : changedSinceSave
+        ? 'Saved; newer edits remain unsaved'
+        : 'Saved');
+    // A full render rebuilds/detaches the split surface. Reattaching the same
+    // CodeMirror DOM can reset its scroller to the top even though the document
+    // and selection did not change. Saving only changes editor chrome/state.
+    renderEditorTabs();
+    if (state.openFile === file) {
+      updateEditorLabel();
+      el.saveFile.disabled = false;
+    }
     saveActiveWorkspaceSnapshot();
   } catch (error) {
     setStatus(String(error), true);
   }
+}
+
+function currentEditorContentForFile(file: OpenFileState) {
+  if (file.masked && !file.rawMode) return serializeSecretLines(file.lines);
+  for (const viewState of editorPaneViewState.values()) {
+    if (viewState.file === file && viewState.view) return viewState.view.state.doc.toString();
+  }
+  return file.draftContent ?? file.content;
 }
 
 function toggleRawMode() {
@@ -33557,7 +33604,8 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
 }
 
 function isTerminalPaneAlive(pane: TerminalPane) {
-  return !pane.closed
+  return !appShutdownStarted
+    && !pane.closed
     && terminalPaneById.get(pane.paneId) === pane
     && pane.host.isConnected;
 }

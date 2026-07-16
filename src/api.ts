@@ -1,6 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse } from './types';
 
+// Each WebView generation receives a backend-issued token during init. Keeping
+// it inside this module means every persistent runtime start is automatically
+// tied to the renderer that requested it, including promises dispatched late
+// after a WebView reload.
+let rendererRuntimeEpoch = 0;
+
 export interface MainWebviewBoundsRefreshResult {
   applied: boolean;
   mismatched: boolean;
@@ -77,7 +83,7 @@ export const api = {
   copyProfilePaths: (profileId: string, sourcePaths: string[], targetDir: string) =>
     invoke<string[]>('copy_profile_paths', { profileId, sourcePaths, targetDir }),
   startExportPath: (profileId: string, path: string) =>
-    invoke<ExportStartResult>('start_export_path', { profileId, path }),
+    invoke<ExportStartResult>('start_export_path', { profileId, path, rendererRuntimeEpoch }),
   cancelExportPath: (id: string) => invoke<void>('cancel_export_path', { id }),
   openExportPath: (path: string) => invoke<void>('open_export_path', { path }),
   saveAttachment: (
@@ -112,20 +118,28 @@ export const api = {
       cols,
       workspaceId,
       title,
-      shellHistoryId
+      shellHistoryId,
+      rendererRuntimeEpoch
     }),
   writeTerminal: (id: string, data: string) => invoke<void>('write_terminal', { id, data }),
   flushTerminalInput: (id: string) => invoke<void>('flush_terminal_input', { id }),
   resizeTerminal: (id: string, rows: number, cols: number) =>
     invoke<void>('resize_terminal', { id, rows, cols }),
   killTerminal: (id: string) => invoke<void>('kill_terminal', { id }),
-  shutdownRuntimeSessions: () => invoke<void>('shutdown_runtime_sessions_command'),
+  prepareRendererRuntime: async () => {
+    rendererRuntimeEpoch = await invoke<number>('prepare_renderer_runtime');
+  },
   startPortForward: (profileId: string, remotePort: number, localPort: number) =>
-    invoke<PortForwardResult>('start_port_forward', { profileId, remotePort, localPort }),
+    invoke<PortForwardResult>('start_port_forward', {
+      profileId,
+      remotePort,
+      localPort,
+      rendererRuntimeEpoch
+    }),
   probeLocalHttpUrl: (targetUrl: string) =>
     invoke<boolean>('probe_local_http_url', { targetUrl }),
   startPreviewProxy: (targetUrl: string) =>
-    invoke<PreviewProxyResult>('start_preview_proxy', { targetUrl }),
+    invoke<PreviewProxyResult>('start_preview_proxy', { targetUrl, rendererRuntimeEpoch }),
   showBrowserWebview: (
     label: string,
     url: string,
@@ -135,19 +149,31 @@ export const api = {
     height: number,
     navigate = true
   ) =>
-    invoke<void>('show_browser_webview', { label, url, x, y, width, height, navigate }),
-  hideBrowserWebview: (label?: string) => invoke<void>('hide_browser_webview', { label }),
-  closeBrowserWebview: (label?: string) => invoke<void>('close_browser_webview', { label }),
-  reloadBrowserWebview: (label?: string) => invoke<void>('reload_browser_webview', { label }),
+    invoke<void>('show_browser_webview', {
+      label,
+      url,
+      x,
+      y,
+      width,
+      height,
+      navigate,
+      rendererRuntimeEpoch
+    }),
+  hideBrowserWebview: (label?: string) =>
+    invoke<void>('hide_browser_webview', { label, rendererRuntimeEpoch }),
+  closeBrowserWebview: (label?: string) =>
+    invoke<void>('close_browser_webview', { label, rendererRuntimeEpoch }),
+  reloadBrowserWebview: (label?: string) =>
+    invoke<void>('reload_browser_webview', { label, rendererRuntimeEpoch }),
   startEdgeDevtoolsSession: (workspaceId: string) =>
-    invoke<EdgeDevtoolsSession>('start_edge_devtools_session', { workspaceId }),
+    invoke<EdgeDevtoolsSession>('start_edge_devtools_session', { workspaceId, rendererRuntimeEpoch }),
   edgeDevtoolsNewPage: (sessionId: string, url: string) =>
-    invoke<EdgeDevtoolsPage>('edge_devtools_new_page', { sessionId, url }),
+    invoke<EdgeDevtoolsPage>('edge_devtools_new_page', { sessionId, url, rendererRuntimeEpoch }),
   edgeDevtoolsActivatePage: (sessionId: string, targetId: string) =>
-    invoke<void>('edge_devtools_activate_page', { sessionId, targetId }),
+    invoke<void>('edge_devtools_activate_page', { sessionId, targetId, rendererRuntimeEpoch }),
   edgeDevtoolsClosePage: (sessionId: string, targetId: string) =>
-    invoke<void>('edge_devtools_close_page', { sessionId, targetId }),
+    invoke<void>('edge_devtools_close_page', { sessionId, targetId, rendererRuntimeEpoch }),
   stopEdgeDevtoolsSession: (sessionId: string) =>
-    invoke<void>('stop_edge_devtools_session', { sessionId }),
+    invoke<void>('stop_edge_devtools_session', { sessionId, rendererRuntimeEpoch }),
   stopPortForward: (id: string) => invoke<void>('stop_port_forward', { id })
 };
