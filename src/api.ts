@@ -40,16 +40,40 @@ export const api = {
     invoke<LlmTmuxPaneTitleResult>('llm_tmux_pane_title', { profileId, cwd, sessionName }),
   llmTmuxPaneProbe: (profileId: string, cwd: string, sessionName: string) =>
     invoke<LlmTmuxPaneProbeResult>('llm_tmux_pane_probe', { profileId, cwd, sessionName }),
-  resolveProfilePath: (profileId: string, path: string) =>
-    invoke<string>('resolve_profile_path', { profileId, path }),
+  resolveProfilePath: (profileId: string, path: string, operationId: string = crypto.randomUUID()) =>
+    invoke<string>('resolve_profile_path', { profileId, path, operationId, rendererRuntimeEpoch }),
   profileDirectoryIsDir: (profileId: string, path: string) =>
     invoke<boolean>('profile_directory_is_dir', { profileId, path }),
-  listDirectory: (profileId: string, path: string, includeSizes = true) =>
-    invoke<FileEntry[]>('list_directory', { profileId, path, includeSizes }),
-  listDirectories: (profileId: string, paths: string[], includeSizes = true) =>
-    invoke<DirectoryListingResult[]>('list_directories', { profileId, paths, includeSizes }),
-  directorySignatures: (profileId: string, paths: string[], includeSizes = true) =>
-    invoke<DirectorySignatureResult[]>('directory_signatures', { profileId, paths, includeSizes }),
+  listDirectory: (
+    profileId: string,
+    path: string,
+    includeSizes = true,
+    operationId: string = crypto.randomUUID()
+  ) => invoke<FileEntry[]>('list_directory', { profileId, path, includeSizes, operationId, rendererRuntimeEpoch }),
+  listDirectories: (
+    profileId: string,
+    paths: string[],
+    includeSizes = true,
+    operationId: string = crypto.randomUUID()
+  ) => invoke<DirectoryListingResult[]>('list_directories', {
+    profileId,
+    paths,
+    includeSizes,
+    operationId,
+    rendererRuntimeEpoch
+  }),
+  directorySignatures: (
+    profileId: string,
+    paths: string[],
+    includeSizes = true,
+    operationId: string = crypto.randomUUID()
+  ) => invoke<DirectorySignatureResult[]>('directory_signatures', {
+    profileId,
+    paths,
+    includeSizes,
+    operationId,
+    rendererRuntimeEpoch
+  }),
   readTextFile: (profileId: string, path: string) =>
     invoke<string>('read_text_file', { profileId, path }),
   fileSignature: (profileId: string, path: string) =>
@@ -108,7 +132,8 @@ export const api = {
     cols: number,
     workspaceId = '',
     title = 'shell',
-    shellHistoryId = ''
+    shellHistoryId = '',
+    operationId: string = crypto.randomUUID()
   ) =>
     invoke<string>('spawn_terminal', {
       profileId,
@@ -119,6 +144,7 @@ export const api = {
       workspaceId,
       title,
       shellHistoryId,
+      operationId,
       rendererRuntimeEpoch
     }),
   writeTerminal: (id: string, data: string) => invoke<void>('write_terminal', { id, data }),
@@ -126,6 +152,8 @@ export const api = {
   resizeTerminal: (id: string, rows: number, cols: number) =>
     invoke<void>('resize_terminal', { id, rows, cols }),
   killTerminal: (id: string) => invoke<void>('kill_terminal', { id }),
+  cancelRuntimeOperation: (operationId: string) =>
+    invoke<void>('cancel_runtime_operation', { operationId, rendererRuntimeEpoch }),
   prepareRendererRuntime: async () => {
     rendererRuntimeEpoch = await invoke<number>('prepare_renderer_runtime');
   },

@@ -51,6 +51,13 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 한 화면에 띄워
 
 각 shell widget 안에는 여러 shell tab을 만들 수 있습니다.
 
+### WSL이 응답하지 않을 때
+
+- shell 시작과 Explorer의 WSL/SSH 조회는 workspace를 닫거나 요청 제한시간이 지나면 backend 작업까지 취소합니다. 화면에서만 timeout 처리한 뒤 같은 `wsl.exe`를 계속 남겨두지 않습니다.
+- WSL client가 시작됐지만 30초 안에 shell prompt 준비 신호를 보내지 않으면 해당 client를 정리하고 실패 상태로 바꿉니다. 같은 workspace tab을 다시 누르면 저장된 shell 배치를 재시도할 수 있습니다.
+- 한 distro가 응답하지 않을 때 짧은 WSL helper를 동시에 무제한 실행하지 않습니다. 실패 직후에는 짧은 cooldown을 두어 빠른 workspace/Explorer 전환이 helper를 계속 쌓지 않게 합니다.
+- 앱은 이 정리를 위해 distro 전체를 `wsl --shutdown`하지 않으며, WSL/SSH 안의 tmux server를 직접 종료하지 않습니다.
+
 ### 복사 / 붙여넣기
 
 - shell에서 텍스트를 선택한 상태로 `Ctrl+C`: 복사
@@ -198,6 +205,7 @@ workspace는 현재 작업 맥락을 저장합니다.
 `Set` 패널의 `Workspace memory saver` 기본값은 `Balanced`입니다.
 
 - workspace가 많아졌을 때 오래 안 쓴 inactive workspace의 shell/PTY를 정리해 RAM 사용량을 줄입니다.
+- `Balanced`는 10분 이상 inactive인 workspace를 대상으로 live workspace가 3개를 넘거나 live pane이 8개를 넘을 때 정리합니다. `Aggressive`는 2분, 1개 workspace, 4개 pane 기준입니다.
 - inactive 시간은 해당 workspace를 실제로 떠난 시점부터 계산합니다.
 - 해당 workspace tab과 layout snapshot은 유지되고, 다시 열면 shell이 새로 시작됩니다.
 - sleep된 workspace를 열면 tab에 `waking`이 표시되고, 저장된 split shell 복원이 끝난 뒤 해제됩니다. 복원이 실패하면 같은 workspace tab을 다시 눌러 재시도할 수 있습니다.

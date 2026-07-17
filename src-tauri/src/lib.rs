@@ -11,7 +11,7 @@ use std::process::{Child as ProcessChild, Command, Output, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -169,6 +169,17 @@ const RENDERER_RECOVERY_RELOAD_COOLDOWN: Duration = Duration::from_secs(120);
 const RENDERER_RECOVERY_STABLE_AFTER: Duration = Duration::from_secs(35);
 const RENDERER_RECOVERY_WARN_ATTEMPTS: u32 = 3;
 const PROCESS_TREE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const PROCESS_REAPER_WORKERS: usize = 4;
+const PROCESS_REAPER_MAX_OWNED_CHILDREN: u32 = 256;
+const PROCESS_REAPER_FAST_ATTEMPTS: u32 = 3;
+const PROCESS_REAPER_KILL_ATTEMPTS: u32 = 6;
+const PROCESS_REAPER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const RUNTIME_OPERATION_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+const RUNTIME_OPERATION_MAX_TOMBSTONES: usize = 512;
+const RUNTIME_OPERATION_ID_MAX_LEN: usize = 256;
+const WSL_SHORT_HELPER_CONCURRENCY: usize = 2;
+const WSL_HELPER_COOLDOWN_MAX: Duration = Duration::from_secs(15);
 const APP_EXIT_HARD_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNTIME_CLEANUP_PARALLELISM: usize = 8;
 #[cfg(windows)]
@@ -186,8 +197,130 @@ static WSL_WARMUP_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 static WSL_WARMUP_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static WSL_DISTRO_LIST_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
 static TRANSIENT_PROCESS_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static RUNTIME_OPERATIONS: OnceLock<Mutex<HashMap<String, Arc<RuntimeOperationState>>>> =
+    OnceLock::new();
+static WSL_HELPER_GATES: OnceLock<Mutex<HashMap<String, Arc<WslHelperGate>>>> = OnceLock::new();
+static PROCESS_REAPER_QUEUE: OnceLock<Arc<ProcessReaperQueue>> = OnceLock::new();
+static PROCESS_REAPER_ACTIVE_ITEMS: AtomicU32 = AtomicU32::new(0);
+static PROCESS_REAPER_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 #[cfg(windows)]
 static WINDOWS_SSH_AGENT_STATUS_CACHE: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
+
+struct RuntimeOperationState {
+    cancelled: AtomicBool,
+    active: AtomicBool,
+    renderer_runtime_epoch: u64,
+    created_at: Instant,
+    spawned_terminal_id: Mutex<Option<String>>,
+}
+
+struct RuntimeOperationRegistration {
+    id: String,
+    state: Arc<RuntimeOperationState>,
+}
+
+impl RuntimeOperationRegistration {
+    fn process_scope(&self) -> RuntimeProcessScope<'_> {
+        RuntimeProcessScope {
+            cancel: &self.state.cancelled,
+            renderer_runtime_epoch: self.state.renderer_runtime_epoch,
+            cancellation_error: "runtime operation cancelled",
+            renderer_error: "renderer runtime was replaced during the operation",
+        }
+    }
+
+    fn commit_spawned_terminal_id(&self, terminal_id: &str) -> Result<(), String> {
+        let mut spawned_terminal_id = self
+            .state
+            .spawned_terminal_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.state.cancelled.load(Ordering::SeqCst) {
+            return Err("runtime operation cancelled while the terminal was launching".to_string());
+        }
+        *spawned_terminal_id = Some(terminal_id.to_string());
+        Ok(())
+    }
+}
+
+impl Drop for RuntimeOperationRegistration {
+    fn drop(&mut self) {
+        self.state.active.store(false, Ordering::SeqCst);
+        let operations = RUNTIME_OPERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retain_completed_terminal = self
+            .state
+            .spawned_terminal_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if !retain_completed_terminal
+            && guard
+                .get(&self.id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+        {
+            guard.remove(&self.id);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeProcessScope<'a> {
+    cancel: &'a AtomicBool,
+    renderer_runtime_epoch: u64,
+    cancellation_error: &'static str,
+    renderer_error: &'static str,
+}
+
+struct WslHelperGateState {
+    in_flight: usize,
+    consecutive_failures: u32,
+    failure_generation: u64,
+    cooldown_until: Option<Instant>,
+}
+
+struct WslHelperGate {
+    state: Mutex<WslHelperGateState>,
+    ready: Condvar,
+}
+
+struct WslHelperPermit {
+    gate: Arc<WslHelperGate>,
+    failure_generation: u64,
+}
+
+impl Drop for WslHelperPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        self.gate.ready.notify_all();
+    }
+}
+
+enum ProcessReaperChild {
+    Terminal(Box<dyn portable_pty::Child + Send>),
+    Process(ProcessChild),
+}
+
+struct ProcessReaperItem {
+    child: ProcessReaperChild,
+    attempts: u32,
+    next_attempt: Instant,
+    quarantined: bool,
+    wsl_gate_key: Option<String>,
+    _wsl_permit: Option<WslHelperPermit>,
+}
+
+struct ProcessReaperQueue {
+    items: Mutex<Vec<ProcessReaperItem>>,
+    ready: Condvar,
+}
 
 struct IdeState {
     terminals: Mutex<HashMap<String, TerminalSession>>,
@@ -223,15 +356,23 @@ struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     rows: u16,
     cols: u16,
+    wsl_gate_key: Option<String>,
 }
 
 struct PendingTerminalChild {
     child: Option<Box<dyn portable_pty::Child + Send>>,
+    wsl_permit: Option<WslHelperPermit>,
 }
 
 impl PendingTerminalChild {
-    fn new(child: Box<dyn portable_pty::Child + Send>) -> Self {
-        Self { child: Some(child) }
+    fn new(
+        child: Box<dyn portable_pty::Child + Send>,
+        wsl_permit: Option<WslHelperPermit>,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            wsl_permit,
+        }
     }
 
     fn child(&self) -> &(dyn portable_pty::Child + Send) {
@@ -249,8 +390,8 @@ impl PendingTerminalChild {
 
 impl Drop for PendingTerminalChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            terminate_terminal_child(child.as_mut());
+        if let Some(child) = self.child.take() {
+            schedule_terminal_child_termination_with_wsl_permit(child, self.wsl_permit.take());
         }
     }
 }
@@ -296,8 +437,8 @@ impl PendingProcessChild {
 
 impl Drop for PendingProcessChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            terminate_process_child(&mut child);
+        if let Some(child) = self.child.take() {
+            schedule_process_child_termination(child);
         }
     }
 }
@@ -720,18 +861,31 @@ fn default_windows_root() -> String {
         .unwrap_or_else(|| "C:\\\\".to_string())
 }
 
+#[allow(dead_code)]
 fn cached_or_detect_wsl_home(distro: &str) -> Option<String> {
+    cached_or_detect_wsl_home_with_scope(distro, None)
+        .ok()
+        .flatten()
+}
+
+fn cached_or_detect_wsl_home_with_scope(
+    distro: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Option<String>, String> {
+    check_runtime_process_scope(scope)?;
     let cache = WSL_HOME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
         if let Some(root) = guard.get(distro) {
-            return Some(root.clone());
+            return Ok(Some(root.clone()));
         }
     }
-    let root = detect_wsl_home(distro)?;
+    let Some(root) = detect_wsl_home_with_scope(distro, scope)? else {
+        return Ok(None);
+    };
     if let Ok(mut guard) = cache.lock() {
         guard.insert(distro.to_string(), root.clone());
     }
-    Some(root)
+    Ok(Some(root))
 }
 
 fn wsl_start_directory_arg(cwd: &str, fallback_cwd: &str) -> String {
@@ -3264,6 +3418,274 @@ fn renderer_runtime_epoch_is_current(epoch: u64) -> bool {
         && epoch == RENDERER_RUNTIME_EPOCH.load(Ordering::SeqCst)
 }
 
+fn prune_runtime_operation_tombstones(
+    operations: &mut HashMap<String, Arc<RuntimeOperationState>>,
+) {
+    operations.retain(|_, operation| {
+        operation.active.load(Ordering::SeqCst)
+            || operation.created_at.elapsed() <= RUNTIME_OPERATION_TOMBSTONE_TTL
+    });
+    let mut tombstones = operations
+        .iter()
+        .filter(|(_, operation)| !operation.active.load(Ordering::SeqCst))
+        .map(|(id, operation)| (id.clone(), operation.created_at))
+        .collect::<Vec<_>>();
+    if tombstones.len() <= RUNTIME_OPERATION_MAX_TOMBSTONES {
+        return;
+    }
+    tombstones.sort_by_key(|(_, created_at)| *created_at);
+    let remove_count = tombstones.len() - RUNTIME_OPERATION_MAX_TOMBSTONES;
+    for (id, _) in tombstones.into_iter().take(remove_count) {
+        operations.remove(&id);
+    }
+}
+
+fn normalized_runtime_operation_id(operation_id: &str) -> Result<String, String> {
+    let operation_id = operation_id.trim();
+    if operation_id.is_empty() {
+        return Err("runtime operation id is required".to_string());
+    }
+    if operation_id.len() > RUNTIME_OPERATION_ID_MAX_LEN {
+        return Err("runtime operation id is too long".to_string());
+    }
+    Ok(operation_id.to_string())
+}
+
+fn begin_runtime_operation(
+    operation_id: &str,
+    renderer_runtime_epoch: u64,
+) -> Result<RuntimeOperationRegistration, String> {
+    let operation_id = normalized_runtime_operation_id(operation_id)?;
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Err("renderer runtime was replaced before the operation started".to_string());
+    }
+    let operations = RUNTIME_OPERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = operations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_runtime_operation_tombstones(&mut guard);
+    if let Some(previous) = guard.get(&operation_id) {
+        let was_cancelled = previous.cancelled.load(Ordering::SeqCst);
+        let was_active = previous.active.load(Ordering::SeqCst);
+        let same_epoch = previous.renderer_runtime_epoch == renderer_runtime_epoch;
+        if was_cancelled && !was_active && same_epoch {
+            guard.remove(&operation_id);
+            return Err("runtime operation cancelled before it started".to_string());
+        }
+        // Operation ids are launch/request identities. A duplicate means a
+        // stale invoke is still running; cancel it before replacing its slot.
+        previous.cancelled.store(true, Ordering::SeqCst);
+    }
+    let state = Arc::new(RuntimeOperationState {
+        cancelled: AtomicBool::new(false),
+        active: AtomicBool::new(true),
+        renderer_runtime_epoch,
+        created_at: Instant::now(),
+        spawned_terminal_id: Mutex::new(None),
+    });
+    guard.insert(operation_id.clone(), state.clone());
+    Ok(RuntimeOperationRegistration {
+        id: operation_id,
+        state,
+    })
+}
+
+fn cancel_runtime_operation_host(
+    operation_id: &str,
+    renderer_runtime_epoch: u64,
+) -> Result<(bool, Option<String>), String> {
+    let operation_id = normalized_runtime_operation_id(operation_id)?;
+    let operations = RUNTIME_OPERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = operations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_runtime_operation_tombstones(&mut guard);
+    if let Some(operation) = guard.get(&operation_id) {
+        if operation.renderer_runtime_epoch != renderer_runtime_epoch {
+            return Ok((false, None));
+        }
+        operation.cancelled.store(true, Ordering::SeqCst);
+        let terminal_id = operation
+            .spawned_terminal_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        return Ok((operation.active.load(Ordering::SeqCst), terminal_id));
+    }
+    // Preserve an early cancellation briefly so IPC scheduling cannot let a
+    // delayed spawn/list invoke slip through after its workspace was closed.
+    if renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        guard.insert(
+            operation_id,
+            Arc::new(RuntimeOperationState {
+                cancelled: AtomicBool::new(true),
+                active: AtomicBool::new(false),
+                renderer_runtime_epoch,
+                created_at: Instant::now(),
+                spawned_terminal_id: Mutex::new(None),
+            }),
+        );
+        prune_runtime_operation_tombstones(&mut guard);
+    }
+    Ok((false, None))
+}
+
+fn cancel_all_runtime_operations() {
+    if let Some(operations) = RUNTIME_OPERATIONS.get() {
+        let guard = operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for operation in guard.values() {
+            operation.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn check_runtime_process_scope(scope: Option<RuntimeProcessScope<'_>>) -> Result<(), String> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    if scope.cancel.load(Ordering::SeqCst) {
+        return Err(scope.cancellation_error.to_string());
+    }
+    if !renderer_runtime_epoch_is_current(scope.renderer_runtime_epoch) {
+        return Err(scope.renderer_error.to_string());
+    }
+    Ok(())
+}
+
+fn sleep_with_runtime_process_scope(
+    duration: Duration,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    loop {
+        check_runtime_process_scope(scope)?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(50)),
+        );
+    }
+}
+
+fn wsl_helper_gate(key: &str) -> Arc<WslHelperGate> {
+    let gates = WSL_HELPER_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = gates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(key.to_string())
+        .or_insert_with(|| {
+            Arc::new(WslHelperGate {
+                state: Mutex::new(WslHelperGateState {
+                    in_flight: 0,
+                    consecutive_failures: 0,
+                    failure_generation: 0,
+                    cooldown_until: None,
+                }),
+                ready: Condvar::new(),
+            })
+        })
+        .clone()
+}
+
+fn acquire_wsl_helper_permit(
+    key: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+    wait_for_cooldown: bool,
+) -> Result<WslHelperPermit, String> {
+    let gate = wsl_helper_gate(key);
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        check_runtime_process_scope(scope)?;
+        if let Some(cooldown_until) = state.cooldown_until {
+            let now = Instant::now();
+            if now < cooldown_until {
+                if wait_for_cooldown {
+                    let wait_for = cooldown_until
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(50));
+                    let (next_state, _) = gate
+                        .ready
+                        .wait_timeout(state, wait_for)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = next_state;
+                    continue;
+                }
+                return Err(format!(
+                    "WSL helper cooldown is active for {}ms after an unresponsive service",
+                    cooldown_until.saturating_duration_since(now).as_millis()
+                ));
+            }
+            state.cooldown_until = None;
+        }
+        if state.in_flight < WSL_SHORT_HELPER_CONCURRENCY {
+            state.in_flight += 1;
+            let failure_generation = state.failure_generation;
+            drop(state);
+            return Ok(WslHelperPermit {
+                gate,
+                failure_generation,
+            });
+        }
+        let (next_state, _) = gate
+            .ready
+            .wait_timeout(state, Duration::from_millis(50))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next_state;
+    }
+}
+
+fn reserve_wsl_helper_reaper_blocker(key: &str) -> WslHelperPermit {
+    let gate = wsl_helper_gate(key);
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.in_flight = state.in_flight.saturating_add(1);
+    let failure_generation = state.failure_generation;
+    drop(state);
+    WslHelperPermit {
+        gate,
+        failure_generation,
+    }
+}
+
+fn record_wsl_helper_success(permit: &WslHelperPermit) {
+    let mut state = permit
+        .gate
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.failure_generation == permit.failure_generation {
+        state.consecutive_failures = 0;
+        state.cooldown_until = None;
+        permit.gate.ready.notify_all();
+    }
+}
+
+fn record_wsl_helper_failure(key: &str) {
+    let gate = wsl_helper_gate(key);
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    state.failure_generation = state.failure_generation.wrapping_add(1);
+    let shift = state.consecutive_failures.saturating_sub(1).min(4);
+    let cooldown_ms = (1_000_u64 << shift).min(WSL_HELPER_COOLDOWN_MAX.as_millis() as u64);
+    state.cooldown_until = Some(Instant::now() + Duration::from_millis(cooldown_ms));
+    gate.ready.notify_all();
+}
+
 #[cfg(windows)]
 fn set_window_capture_protection<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
@@ -3553,24 +3975,63 @@ where
 }
 
 #[tauri::command]
-async fn resolve_profile_path(profile_id: String, path: String) -> Result<String, String> {
+fn cancel_runtime_operation(
+    app: AppHandle,
+    operation_id: String,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    let (_, terminal_id) = cancel_runtime_operation_host(&operation_id, renderer_runtime_epoch)?;
+    if let Some(terminal_id) = terminal_id {
+        kill_terminal_host(app.state::<IdeState>().inner(), terminal_id)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn resolve_profile_path(
+    profile_id: String,
+    path: String,
+    operation_id: String,
+    renderer_runtime_epoch: u64,
+) -> Result<String, String> {
+    let operation = begin_runtime_operation(&operation_id, renderer_runtime_epoch)?;
     run_blocking_command("resolve profile path", move || {
-        resolve_profile_path_blocking(profile_id, path)
+        resolve_profile_path_blocking_scoped(profile_id, path, operation.process_scope())
     })
     .await
 }
 
 fn resolve_profile_path_blocking(profile_id: String, path: String) -> Result<String, String> {
+    resolve_profile_path_blocking_with_scope(profile_id, path, None)
+}
+
+fn resolve_profile_path_blocking_scoped(
+    profile_id: String,
+    path: String,
+    scope: RuntimeProcessScope<'_>,
+) -> Result<String, String> {
+    resolve_profile_path_blocking_with_scope(profile_id, path, Some(scope))
+}
+
+fn resolve_profile_path_blocking_with_scope(
+    profile_id: String,
+    path: String,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<String, String> {
+    check_runtime_process_scope(scope)?;
     let profile = profile_from_id(&profile_id);
     let trimmed = path.trim();
     if profile.kind == "wsl" && (trimmed.is_empty() || trimmed == "~") {
         let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
-        return resolve_wsl_home(distro);
+        return resolve_wsl_home_with_scope(distro, scope);
     }
     if profile.kind == "wsl" {
         if let Some(rest) = trimmed.strip_prefix("~/") {
             let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
-            return Ok(join_posix(&resolve_wsl_home(distro)?, rest));
+            return Ok(join_posix(
+                &resolve_wsl_home_with_scope(distro, scope)?,
+                rest,
+            ));
         }
     }
     if profile.kind == "windows" && trimmed.is_empty() {
@@ -3579,6 +4040,7 @@ fn resolve_profile_path_blocking(profile_id: String, path: String) -> Result<Str
     if profile.kind == "ssh" && trimmed.is_empty() {
         return Ok(".".to_string());
     }
+    check_runtime_process_scope(scope)?;
     Ok(normalize_profile_path(&profile, trimmed))
 }
 
@@ -3630,18 +4092,41 @@ async fn list_directory(
     profile_id: String,
     path: String,
     include_sizes: Option<bool>,
+    operation_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<Vec<FileEntry>, String> {
+    let operation = begin_runtime_operation(&operation_id, renderer_runtime_epoch)?;
     run_blocking_command("list directory", move || {
-        list_directory_blocking(profile_id, path, include_sizes)
+        list_directory_blocking_scoped(profile_id, path, include_sizes, operation.process_scope())
     })
     .await
 }
 
+#[allow(dead_code)]
 fn list_directory_blocking(
     profile_id: String,
     path: String,
     include_sizes: Option<bool>,
 ) -> Result<Vec<FileEntry>, String> {
+    list_directory_blocking_with_scope(profile_id, path, include_sizes, None)
+}
+
+fn list_directory_blocking_scoped(
+    profile_id: String,
+    path: String,
+    include_sizes: Option<bool>,
+    scope: RuntimeProcessScope<'_>,
+) -> Result<Vec<FileEntry>, String> {
+    list_directory_blocking_with_scope(profile_id, path, include_sizes, Some(scope))
+}
+
+fn list_directory_blocking_with_scope(
+    profile_id: String,
+    path: String,
+    include_sizes: Option<bool>,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<FileEntry>, String> {
+    check_runtime_process_scope(scope)?;
     let profile = profile_from_id(&profile_id);
     let path = normalize_profile_path(&profile, &path);
     let include_sizes = include_sizes.unwrap_or(true);
@@ -3651,10 +4136,10 @@ fn list_directory_blocking(
             if let Some(windows_path) = wsl_posix_path_to_windows_path(&profile, &path) {
                 list_wsl_directory(&windows_path, &path, include_sizes)
             } else {
-                list_remote_directory(&profile, &path, include_sizes)
+                list_remote_directory_with_scope(&profile, &path, include_sizes, scope)
             }
         }
-        "ssh" => list_remote_directory(&profile, &path, include_sizes),
+        "ssh" => list_remote_directory_with_scope(&profile, &path, include_sizes, scope),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
 }
@@ -3664,18 +4149,46 @@ async fn list_directories(
     profile_id: String,
     paths: Vec<String>,
     include_sizes: Option<bool>,
+    operation_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<Vec<DirectoryListingResult>, String> {
+    let operation = begin_runtime_operation(&operation_id, renderer_runtime_epoch)?;
     run_blocking_command("list directories", move || {
-        list_directories_blocking(profile_id, paths, include_sizes)
+        list_directories_blocking_scoped(
+            profile_id,
+            paths,
+            include_sizes,
+            operation.process_scope(),
+        )
     })
     .await
 }
 
+#[allow(dead_code)]
 fn list_directories_blocking(
     profile_id: String,
     paths: Vec<String>,
     include_sizes: Option<bool>,
 ) -> Result<Vec<DirectoryListingResult>, String> {
+    list_directories_blocking_with_scope(profile_id, paths, include_sizes, None)
+}
+
+fn list_directories_blocking_scoped(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+    scope: RuntimeProcessScope<'_>,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    list_directories_blocking_with_scope(profile_id, paths, include_sizes, Some(scope))
+}
+
+fn list_directories_blocking_with_scope(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    check_runtime_process_scope(scope)?;
     let profile = profile_from_id(&profile_id);
     let include_sizes = include_sizes.unwrap_or(true);
     let paths: Vec<String> = paths
@@ -3686,8 +4199,8 @@ fn list_directories_blocking(
 
     match profile.kind.as_str() {
         "windows" => Ok(list_local_directories(paths, include_sizes)),
-        "wsl" => list_wsl_directories(&profile, &paths, include_sizes),
-        "ssh" => list_remote_directories(&profile, &paths, include_sizes),
+        "wsl" => list_wsl_directories_with_scope(&profile, &paths, include_sizes, scope),
+        "ssh" => list_remote_directories_with_scope(&profile, &paths, include_sizes, scope),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
 }
@@ -3697,18 +4210,46 @@ async fn directory_signatures(
     profile_id: String,
     paths: Vec<String>,
     include_sizes: Option<bool>,
+    operation_id: String,
+    renderer_runtime_epoch: u64,
 ) -> Result<Vec<DirectorySignatureResult>, String> {
+    let operation = begin_runtime_operation(&operation_id, renderer_runtime_epoch)?;
     run_blocking_command("directory signatures", move || {
-        directory_signatures_blocking(profile_id, paths, include_sizes)
+        directory_signatures_blocking_scoped(
+            profile_id,
+            paths,
+            include_sizes,
+            operation.process_scope(),
+        )
     })
     .await
 }
 
+#[allow(dead_code)]
 fn directory_signatures_blocking(
     profile_id: String,
     paths: Vec<String>,
     include_sizes: Option<bool>,
 ) -> Result<Vec<DirectorySignatureResult>, String> {
+    directory_signatures_blocking_with_scope(profile_id, paths, include_sizes, None)
+}
+
+fn directory_signatures_blocking_scoped(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+    scope: RuntimeProcessScope<'_>,
+) -> Result<Vec<DirectorySignatureResult>, String> {
+    directory_signatures_blocking_with_scope(profile_id, paths, include_sizes, Some(scope))
+}
+
+fn directory_signatures_blocking_with_scope(
+    profile_id: String,
+    paths: Vec<String>,
+    include_sizes: Option<bool>,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<DirectorySignatureResult>, String> {
+    check_runtime_process_scope(scope)?;
     let profile = profile_from_id(&profile_id);
     let include_sizes = include_sizes.unwrap_or(true);
     let paths: Vec<String> = paths
@@ -3719,12 +4260,10 @@ fn directory_signatures_blocking(
 
     match profile.kind.as_str() {
         "windows" => Ok(list_local_directory_signatures(paths, include_sizes)),
-        "wsl" => list_wsl_directory_signatures(&profile, &paths, include_sizes),
-        "ssh" => Ok(directory_signatures_from_listings(list_remote_directories(
-            &profile,
-            &paths,
-            include_sizes,
-        )?)),
+        "wsl" => list_wsl_directory_signatures_with_scope(&profile, &paths, include_sizes, scope),
+        "ssh" => Ok(directory_signatures_from_listings(
+            list_remote_directories_with_scope(&profile, &paths, include_sizes, scope)?,
+        )),
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
 }
@@ -4578,7 +5117,10 @@ fn spawn_terminal_direct(
     _title: Option<String>,
     shell_history_id: Option<String>,
     renderer_runtime_epoch: u64,
+    operation: &RuntimeOperationRegistration,
 ) -> Result<String, String> {
+    let operation_scope = Some(operation.process_scope());
+    check_runtime_process_scope(operation_scope)?;
     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
         return Err("app shutdown is already in progress".to_string());
     }
@@ -4587,7 +5129,8 @@ fn spawn_terminal_direct(
     }
     let profile = profile_from_id(&profile_id);
     let cwd = normalize_profile_path(&profile, &cwd);
-    warm_wsl_profile(&profile)?;
+    warm_wsl_profile_with_scope(&profile, operation_scope)?;
+    check_runtime_process_scope(operation_scope)?;
     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
         return Err("app shutdown is already in progress".to_string());
     }
@@ -4600,6 +5143,7 @@ fn spawn_terminal_direct(
     let read_id = terminal_id.clone();
     let read_batcher = AppOutputBatcher::new(read_id.clone(), app.clone())?;
     let (program, args) = terminal_command(&profile, &cwd, command.clone(), &shell_history_id);
+    check_runtime_process_scope(operation_scope)?;
     let _runtime_guard = runtime_lifecycle_read();
     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
         return Err("app shutdown is already in progress".to_string());
@@ -4607,6 +5151,12 @@ fn spawn_terminal_direct(
     if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
         return Err("renderer runtime was replaced while the terminal was launching".to_string());
     }
+    let terminal_wsl_permit = if profile.kind == "wsl" {
+        let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
+        Some(acquire_wsl_helper_permit(distro, operation_scope, false)?)
+    } else {
+        None
+    };
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -4634,10 +5184,11 @@ fn spawn_terminal_direct(
         .slave
         .spawn_command(cmd)
         .map_err(|err| err.to_string())?;
-    let mut pending_child = PendingTerminalChild::new(child);
+    let mut pending_child = PendingTerminalChild::new(child, terminal_wsl_permit);
     if let Some(pid) = pending_child.child().process_id() {
         assign_child_to_cleanup_job(pid);
     }
+    check_runtime_process_scope(operation_scope)?;
     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
         return Err("app shutdown started while the terminal was launching".to_string());
     }
@@ -4707,6 +5258,7 @@ fn spawn_terminal_direct(
         .terminals
         .lock()
         .map_err(|_| "terminal state poisoned".to_string())?;
+    check_runtime_process_scope(operation_scope)?;
     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
         return Err("app shutdown started while the terminal was launching".to_string());
     }
@@ -4721,8 +5273,22 @@ fn spawn_terminal_direct(
             master: pair.master,
             rows,
             cols,
+            wsl_gate_key: (profile.kind == "wsl").then(|| {
+                profile
+                    .distro
+                    .clone()
+                    .unwrap_or_else(|| "Ubuntu".to_string())
+            }),
         },
     );
+    if let Err(error) = operation.commit_spawned_terminal_id(&terminal_id) {
+        let session = terminals.remove(&terminal_id);
+        drop(terminals);
+        if let Some(session) = session {
+            terminate_terminal_session(session);
+        }
+        return Err(error);
+    }
 
     Ok(terminal_id)
 }
@@ -4901,50 +5467,272 @@ fn kill_terminal_host(state: &IdeState, id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_terminal_child_exit(child: &mut (dyn portable_pty::Child + Send)) {
+fn wait_for_terminal_child_exit(child: &mut (dyn portable_pty::Child + Send)) -> bool {
     let deadline = Instant::now() + PROCESS_TREE_KILL_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Ok(None) => return,
+            Ok(None) => return false,
         }
     }
 }
 
-fn terminate_terminal_child(child: &mut (dyn portable_pty::Child + Send)) {
+fn terminate_terminal_child(child: &mut (dyn portable_pty::Child + Send)) -> bool {
     if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
+        return true;
     }
     if let Some(pid) = child.process_id() {
         kill_process_tree(pid);
     }
     let _ = child.kill();
-    wait_for_terminal_child_exit(child);
+    wait_for_terminal_child_exit(child)
 }
 
-fn terminate_process_child(child: &mut ProcessChild) {
+fn terminate_process_child(child: &mut ProcessChild) -> bool {
     if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
+        return true;
     }
     kill_process_tree(child.id());
     let _ = child.kill();
     let deadline = Instant::now() + PROCESS_TREE_KILL_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Ok(None) => return,
+            Ok(None) => return false,
         }
     }
 }
 
-fn terminate_terminal_session(mut session: TerminalSession) {
-    terminate_terminal_child(session.child.as_mut());
+fn process_reaper_queue() -> &'static Arc<ProcessReaperQueue> {
+    PROCESS_REAPER_QUEUE.get_or_init(|| {
+        let queue = Arc::new(ProcessReaperQueue {
+            items: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+        });
+        for index in 0..PROCESS_REAPER_WORKERS {
+            let worker_queue = queue.clone();
+            let _ = thread::Builder::new()
+                .name(format!("simple-vibe-process-reaper-{index}"))
+                .spawn(move || run_process_reaper(worker_queue));
+        }
+        queue
+    })
+}
+
+fn nudge_process_reaper() {
+    let Some(queue) = PROCESS_REAPER_QUEUE.get() else {
+        return;
+    };
+    let now = Instant::now();
+    let mut items = queue
+        .items
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for item in items.iter_mut() {
+        item.next_attempt = now;
+    }
+    drop(items);
+    queue.ready.notify_all();
+}
+
+fn run_process_reaper(queue: Arc<ProcessReaperQueue>) {
+    loop {
+        let mut items = queue
+            .items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut item = loop {
+            let now = Instant::now();
+            if let Some((index, _)) = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.next_attempt <= now)
+                .min_by_key(|(_, item)| item.next_attempt)
+            {
+                break items.swap_remove(index);
+            }
+            let wait_for = items
+                .iter()
+                .map(|item| item.next_attempt.saturating_duration_since(now))
+                .min()
+                .unwrap_or(Duration::from_secs(60));
+            let (next_items, _) = queue
+                .ready
+                .wait_timeout(items, wait_for)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            items = next_items;
+        };
+        drop(items);
+        if item._wsl_permit.is_none() {
+            if let Some(key) = item.wsl_gate_key.as_deref() {
+                item._wsl_permit = Some(reserve_wsl_helper_reaper_blocker(key));
+            }
+        }
+        let terminated = match (&mut item.child, item.quarantined) {
+            (ProcessReaperChild::Terminal(child), false) => {
+                terminate_terminal_child(child.as_mut())
+            }
+            (ProcessReaperChild::Process(child), false) => terminate_process_child(child),
+            (ProcessReaperChild::Terminal(child), true) => {
+                matches!(child.try_wait(), Ok(Some(_)))
+            }
+            (ProcessReaperChild::Process(child), true) => {
+                matches!(child.try_wait(), Ok(Some(_)))
+            }
+        };
+        if terminated {
+            forget_process_reaper_pid(process_reaper_item_pid(&item));
+            PROCESS_REAPER_ACTIVE_ITEMS.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
+        if !item.quarantined {
+            item.attempts = item.attempts.saturating_add(1);
+            if item.attempts >= PROCESS_REAPER_KILL_ATTEMPTS {
+                item.quarantined = true;
+            }
+        }
+        let delay = if item.quarantined {
+            PROCESS_REAPER_MAX_RETRY_DELAY
+        } else if item.attempts < PROCESS_REAPER_FAST_ATTEMPTS {
+            Duration::from_millis(250_u64 << item.attempts.min(3))
+        } else {
+            let slow_shift = item
+                .attempts
+                .saturating_sub(PROCESS_REAPER_FAST_ATTEMPTS)
+                .min(4);
+            Duration::from_secs(5_u64 << slow_shift).min(PROCESS_REAPER_MAX_RETRY_DELAY)
+        };
+        item.next_attempt = Instant::now() + delay;
+        queue
+            .items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(item);
+        queue.ready.notify_one();
+    }
+}
+
+fn process_reaper_item_pid(item: &ProcessReaperItem) -> u32 {
+    match &item.child {
+        ProcessReaperChild::Terminal(child) => child.process_id().unwrap_or(0),
+        ProcessReaperChild::Process(child) => child.id(),
+    }
+}
+
+fn remember_process_reaper_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    PROCESS_REAPER_PIDS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(pid);
+}
+
+fn forget_process_reaper_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    PROCESS_REAPER_PIDS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&pid);
+}
+
+fn schedule_process_reaper_item(item: ProcessReaperItem) {
+    let pid = process_reaper_item_pid(&item);
+    let reserved = PROCESS_REAPER_ACTIVE_ITEMS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < PROCESS_REAPER_MAX_OWNED_CHILDREN).then_some(current + 1)
+        })
+        .is_ok();
+    if !reserved {
+        eprintln!(
+            "process cleanup ownership limit reached; pid {pid} remains covered by the app cleanup job"
+        );
+        return;
+    }
+    remember_process_reaper_pid(pid);
+    let queue = process_reaper_queue();
+    queue
+        .items
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(item);
+    queue.ready.notify_one();
+}
+
+fn schedule_terminal_child_termination_with_wsl_permit(
+    child: Box<dyn portable_pty::Child + Send>,
+    wsl_permit: Option<WslHelperPermit>,
+) {
+    schedule_terminal_child_termination_with_wsl_context(child, wsl_permit, None);
+}
+
+fn schedule_terminal_child_termination_with_wsl_context(
+    child: Box<dyn portable_pty::Child + Send>,
+    wsl_permit: Option<WslHelperPermit>,
+    wsl_gate_key: Option<String>,
+) {
+    let wsl_permit = wsl_permit.or_else(|| {
+        wsl_gate_key
+            .as_deref()
+            .map(reserve_wsl_helper_reaper_blocker)
+    });
+    schedule_process_reaper_item(ProcessReaperItem {
+        child: ProcessReaperChild::Terminal(child),
+        attempts: 0,
+        next_attempt: Instant::now(),
+        quarantined: false,
+        wsl_gate_key,
+        _wsl_permit: wsl_permit,
+    });
+}
+
+fn schedule_process_child_termination(child: ProcessChild) {
+    schedule_process_child_termination_with_wsl_permit(child, None);
+}
+
+fn schedule_process_child_termination_with_wsl_permit(
+    child: ProcessChild,
+    wsl_permit: Option<WslHelperPermit>,
+) {
+    schedule_process_reaper_item(ProcessReaperItem {
+        child: ProcessReaperChild::Process(child),
+        attempts: 0,
+        next_attempt: Instant::now(),
+        quarantined: false,
+        wsl_gate_key: None,
+        _wsl_permit: wsl_permit,
+    });
+}
+
+fn terminate_pending_process_child_with_wsl_permit(
+    pending_child: &mut PendingProcessChild,
+    wsl_permit: &mut Option<WslHelperPermit>,
+) -> bool {
+    let terminated = terminate_process_child(pending_child.child_mut());
+    let child = pending_child.take();
+    if terminated {
+        drop(child);
+    } else {
+        schedule_process_child_termination_with_wsl_permit(child, wsl_permit.take());
+    }
+    terminated
+}
+
+fn terminate_terminal_session(session: TerminalSession) {
+    schedule_terminal_child_termination_with_wsl_context(session.child, None, session.wsl_gate_key);
 }
 
 enum RuntimeCleanupTask {
@@ -4963,8 +5751,8 @@ impl RuntimeCleanupTask {
                 if let Some(stop) = forward.stop.take() {
                     stop.store(true, Ordering::SeqCst);
                 }
-                if let Some(mut child) = forward.child.take() {
-                    terminate_process_child(&mut child);
+                if let Some(child) = forward.child.take() {
+                    schedule_process_child_termination(child);
                 }
                 if let Some(worker) = forward.worker.take() {
                     let _ = worker.join();
@@ -4977,8 +5765,8 @@ impl RuntimeCleanupTask {
                 }
             }
             Self::Edge(mut session) => {
-                if let Some(mut child) = session.child.take() {
-                    terminate_process_child(&mut child);
+                if let Some(child) = session.child.take() {
+                    schedule_process_child_termination(child);
                 }
             }
             Self::Transient(pid) => kill_process_tree(pid),
@@ -5015,19 +5803,27 @@ fn drain_runtime_sessions(state: &IdeState) -> RuntimeShutdownBatch {
         .drain()
         .map(|(_, session)| session)
         .collect();
-    let transient_pids = TRANSIENT_PROCESS_PIDS
+    let mut transient_pids = TRANSIENT_PROCESS_PIDS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .copied()
-        .collect();
+        .collect::<HashSet<_>>();
+    transient_pids.extend(
+        PROCESS_REAPER_PIDS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .copied(),
+    );
     RuntimeShutdownBatch {
         terminals,
         forwards,
         exports,
         edge_sessions,
-        transient_pids,
+        transient_pids: transient_pids.into_iter().collect(),
     }
 }
 
@@ -5075,10 +5871,12 @@ fn terminate_runtime_sessions(batch: RuntimeShutdownBatch) {
             });
         }
     });
+    nudge_process_reaper();
 }
 
 fn reload_renderer_after_runtime_shutdown(app: AppHandle) -> Result<(), String> {
     let mut reset_request = RendererRuntimeResetRequest::new();
+    cancel_all_runtime_operations();
     thread::Builder::new()
         .name("simple-vibe-runtime-shutdown".to_string())
         .spawn(move || {
@@ -5117,6 +5915,7 @@ fn request_app_exit(app: AppHandle) {
     if APP_EXIT_REQUESTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    cancel_all_runtime_operations();
     if let Some(window) = main_webview_window(&app) {
         let _ = window.hide();
     }
@@ -5628,8 +6427,8 @@ fn stop_port_forward_host(state: &IdeState, id: String) -> Result<(), String> {
         if let Some(stop) = forward.stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
-        if let Some(mut child) = forward.child.take() {
-            terminate_process_child(&mut child);
+        if let Some(child) = forward.child.take() {
+            schedule_process_child_termination(child);
         }
         if let Some(worker) = forward.worker.take() {
             let _ = worker.join();
@@ -5649,8 +6448,10 @@ async fn spawn_terminal(
     workspace_id: Option<String>,
     title: Option<String>,
     shell_history_id: Option<String>,
+    operation_id: String,
     renderer_runtime_epoch: u64,
 ) -> Result<String, String> {
+    let operation = begin_runtime_operation(&operation_id, renderer_runtime_epoch)?;
     run_blocking_command("spawn terminal", move || {
         let state = app.state::<IdeState>();
         spawn_terminal_direct(
@@ -5665,6 +6466,7 @@ async fn spawn_terminal(
             title,
             shell_history_id,
             renderer_runtime_epoch,
+            &operation,
         )
     })
     .await
@@ -5760,6 +6562,7 @@ async fn stop_port_forward(app: tauri::AppHandle, id: String) -> Result<(), Stri
 #[tauri::command]
 async fn prepare_renderer_runtime(app: AppHandle) -> Result<u64, String> {
     let mut reset_request = RendererRuntimeResetRequest::new();
+    cancel_all_runtime_operations();
     let cleanup_app = app.clone();
     let renderer_runtime_epoch = run_blocking_command("prepare renderer runtime", move || {
         let _runtime_guard = runtime_lifecycle_write();
@@ -6229,8 +7032,8 @@ fn stop_edge_devtools_session(
         .map_err(|_| "edge session state poisoned".to_string())?
         .remove(&id);
     if let Some(mut session) = session {
-        if let Some(mut child) = session.child.take() {
-            terminate_process_child(&mut child);
+        if let Some(child) = session.child.take() {
+            schedule_process_child_termination(child);
         }
     }
     Ok(())
@@ -6484,7 +7287,13 @@ fn detect_wsl_distros() -> Vec<String> {
     }
     let mut command = Command::new("wsl.exe");
     command.current_dir(windows_spawn_cwd()).arg("-l").arg("-q");
-    let output = command_output_with_timeout(&mut command, WSL_DISTRO_LIST_TIMEOUT);
+    let output = command_output_with_timeout_scoped(
+        &mut command,
+        WSL_DISTRO_LIST_TIMEOUT,
+        None,
+        Some("__wsl_service__"),
+        false,
+    );
     let Ok(output) = output else {
         return cached_wsl_distros(true).unwrap_or_default();
     };
@@ -6519,15 +7328,24 @@ fn store_wsl_distros(distros: &[String]) {
     }
 }
 
+#[allow(dead_code)]
 fn detect_wsl_home(distro: &str) -> Option<String> {
-    if let Some(user) = detect_wsl_user(distro) {
+    detect_wsl_home_with_scope(distro, None).ok().flatten()
+}
+
+fn detect_wsl_home_with_scope(
+    distro: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Option<String>, String> {
+    check_runtime_process_scope(scope)?;
+    if let Some(user) = detect_wsl_user_with_scope(distro, scope)? {
         if user == "root" {
-            return Some("/root".to_string());
+            return Ok(Some("/root".to_string()));
         }
-        if let Some(home) = detect_wsl_home_for_user(distro, &user) {
-            return Some(home);
+        if let Some(home) = detect_wsl_home_for_user_with_scope(distro, &user, scope)? {
+            return Ok(Some(home));
         }
-        return Some(format!("/{}/{}", "home", user));
+        return Ok(Some(format!("/{}/{}", "home", user)));
     }
 
     let mut direct = Command::new("wsl.exe");
@@ -6539,11 +7357,22 @@ fn detect_wsl_home(distro: &str) -> Option<String> {
         .arg("~")
         .arg("--exec")
         .arg("pwd");
-    if let Ok(output) = command_output_with_timeout(&mut direct, WSL_HOME_DETECT_TIMEOUT) {
-        if let Some(home) = detect_wsl_home_from_output(output) {
-            return Some(home);
+    match command_output_with_timeout_scoped(
+        &mut direct,
+        WSL_HOME_DETECT_TIMEOUT,
+        scope,
+        Some(distro),
+        false,
+    ) {
+        Ok(output) => {
+            if let Some(home) = detect_wsl_home_from_output(output) {
+                return Ok(Some(home));
+            }
         }
+        Err(error) if scope.is_some() => return Err(error),
+        Err(_) => {}
     }
+    check_runtime_process_scope(scope)?;
 
     let mut command = Command::new("wsl.exe");
     command
@@ -6554,13 +7383,22 @@ fn detect_wsl_home(distro: &str) -> Option<String> {
         .arg("sh")
         .arg("-lc")
         .arg("printf %s \"$HOME\"");
-    if let Ok(output) = command_output_with_timeout(&mut command, WSL_HOME_DETECT_TIMEOUT) {
-        if let Some(home) = detect_wsl_home_from_output(output) {
-            return Some(home);
+    match command_output_with_timeout_scoped(
+        &mut command,
+        WSL_HOME_DETECT_TIMEOUT,
+        scope,
+        Some(distro),
+        false,
+    ) {
+        Ok(output) => {
+            if let Some(home) = detect_wsl_home_from_output(output) {
+                return Ok(Some(home));
+            }
         }
+        Err(error) if scope.is_some() => return Err(error),
+        Err(_) => {}
     }
-
-    None
+    Ok(None)
 }
 
 fn detect_wsl_home_from_output(output: std::process::Output) -> Option<String> {
@@ -6577,7 +7415,16 @@ fn detect_wsl_home_from_output(output: std::process::Output) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn detect_wsl_user(distro: &str) -> Option<String> {
+    detect_wsl_user_with_scope(distro, None).ok().flatten()
+}
+
+fn detect_wsl_user_with_scope(
+    distro: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Option<String>, String> {
+    check_runtime_process_scope(scope)?;
     let mut command = Command::new("wsl.exe");
     command
         .current_dir(windows_spawn_cwd())
@@ -6586,20 +7433,42 @@ fn detect_wsl_user(distro: &str) -> Option<String> {
         .arg("--exec")
         .arg("id")
         .arg("-un");
-    let output = command_output_with_timeout(&mut command, WSL_FAST_HOME_DETECT_TIMEOUT).ok()?;
+    let output = match command_output_with_timeout_scoped(
+        &mut command,
+        WSL_FAST_HOME_DETECT_TIMEOUT,
+        scope,
+        Some(distro),
+        false,
+    ) {
+        Ok(output) => output,
+        Err(error) if scope.is_some() => return Err(error),
+        Err(_) => return Ok(None),
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let text = decode_wsl_text(&output.stdout);
     let user = text.trim();
-    (!user.is_empty()
+    Ok((!user.is_empty()
         && !user.contains('/')
         && !user.contains('\\')
         && !user.contains(char::is_whitespace))
-    .then(|| user.to_string())
+    .then(|| user.to_string()))
 }
 
+#[allow(dead_code)]
 fn detect_wsl_home_for_user(distro: &str, user: &str) -> Option<String> {
+    detect_wsl_home_for_user_with_scope(distro, user, None)
+        .ok()
+        .flatten()
+}
+
+fn detect_wsl_home_for_user_with_scope(
+    distro: &str,
+    user: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Option<String>, String> {
+    check_runtime_process_scope(scope)?;
     let script = format!(
         "h=$(/usr/bin/getent passwd {} 2>/dev/null | /usr/bin/cut -d: -f6); [ -n \"$h\" ] && printf %s \"$h\"",
         shell_quote(user)
@@ -6613,8 +7482,18 @@ fn detect_wsl_home_for_user(distro: &str, user: &str) -> Option<String> {
         .arg("sh")
         .arg("-lc")
         .arg(script);
-    let output = command_output_with_timeout(&mut command, WSL_FAST_HOME_DETECT_TIMEOUT).ok()?;
-    detect_wsl_home_from_output(output)
+    let output = match command_output_with_timeout_scoped(
+        &mut command,
+        WSL_FAST_HOME_DETECT_TIMEOUT,
+        scope,
+        Some(distro),
+        false,
+    ) {
+        Ok(output) => output,
+        Err(error) if scope.is_some() => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    Ok(detect_wsl_home_from_output(output))
 }
 
 fn detect_ssh_aliases() -> Vec<String> {
@@ -7147,11 +8026,22 @@ fn list_wsl_directory(
     sort_entries(entries)
 }
 
+#[allow(dead_code)]
 fn list_wsl_directories(
     profile: &ConnectionProfile,
     paths: &[String],
     include_sizes: bool,
 ) -> Result<Vec<DirectoryListingResult>, String> {
+    list_wsl_directories_with_scope(profile, paths, include_sizes, None)
+}
+
+fn list_wsl_directories_with_scope(
+    profile: &ConnectionProfile,
+    paths: &[String],
+    include_sizes: bool,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    check_runtime_process_scope(scope)?;
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -7238,12 +8128,17 @@ fn list_wsl_directories(
         }
     }
 
+    check_runtime_process_scope(scope)?;
     if !remote_paths.is_empty() {
-        for (index, result) in remote_indexes.into_iter().zip(list_remote_directories(
-            profile,
-            &remote_paths,
-            include_sizes,
-        )?) {
+        for (index, result) in remote_indexes
+            .into_iter()
+            .zip(list_remote_directories_with_scope(
+                profile,
+                &remote_paths,
+                include_sizes,
+                scope,
+            )?)
+        {
             results[index] = Some(result);
         }
     }
@@ -7261,11 +8156,22 @@ fn list_wsl_directories(
         .collect())
 }
 
+#[allow(dead_code)]
 fn list_wsl_directory_signatures(
     profile: &ConnectionProfile,
     paths: &[String],
     include_sizes: bool,
 ) -> Result<Vec<DirectorySignatureResult>, String> {
+    list_wsl_directory_signatures_with_scope(profile, paths, include_sizes, None)
+}
+
+fn list_wsl_directory_signatures_with_scope(
+    profile: &ConnectionProfile,
+    paths: &[String],
+    include_sizes: bool,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<DirectorySignatureResult>, String> {
+    check_runtime_process_scope(scope)?;
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -7353,12 +8259,11 @@ fn list_wsl_directory_signatures(
         }
     }
 
+    check_runtime_process_scope(scope)?;
     if !remote_paths.is_empty() {
-        let remote_signatures = directory_signatures_from_listings(list_remote_directories(
-            profile,
-            &remote_paths,
-            include_sizes,
-        )?);
+        let remote_signatures = directory_signatures_from_listings(
+            list_remote_directories_with_scope(profile, &remote_paths, include_sizes, scope)?,
+        );
         for (index, result) in remote_indexes.into_iter().zip(remote_signatures) {
             results[index] = Some(result);
         }
@@ -7390,11 +8295,22 @@ fn should_skip_wsl_shell_fallback(error: &str) -> bool {
         || lower.contains("os error 20")
 }
 
+#[allow(dead_code)]
 fn list_remote_directory(
     profile: &ConnectionProfile,
     path: &str,
     include_sizes: bool,
 ) -> Result<Vec<FileEntry>, String> {
+    list_remote_directory_with_scope(profile, path, include_sizes, None)
+}
+
+fn list_remote_directory_with_scope(
+    profile: &ConnectionProfile,
+    path: &str,
+    include_sizes: bool,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<FileEntry>, String> {
+    check_runtime_process_scope(scope)?;
     let quoted_path = shell_quote(path);
     let size_format = if include_sizes { "%s" } else { "0" };
     let script = format!(
@@ -7402,8 +8318,13 @@ fn list_remote_directory(
 find {quoted_path} -mindepth 1 -maxdepth 1 -printf '%y\t{size_format}\t%f\n' 2>/dev/null || exit 3
 "#,
     );
-    let bytes =
-        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
+    let bytes = run_profile_shell_with_timeout_scoped(
+        profile,
+        &script,
+        None,
+        REMOTE_DIRECTORY_COMMAND_TIMEOUT,
+        scope,
+    )?;
     let text = String::from_utf8_lossy(&bytes);
     let mut entries = Vec::new();
     for line in text.lines() {
@@ -7438,11 +8359,22 @@ find {quoted_path} -mindepth 1 -maxdepth 1 -printf '%y\t{size_format}\t%f\n' 2>/
     sort_entries(entries)
 }
 
+#[allow(dead_code)]
 fn list_remote_directories(
     profile: &ConnectionProfile,
     paths: &[String],
     include_sizes: bool,
 ) -> Result<Vec<DirectoryListingResult>, String> {
+    list_remote_directories_with_scope(profile, paths, include_sizes, None)
+}
+
+fn list_remote_directories_with_scope(
+    profile: &ConnectionProfile,
+    paths: &[String],
+    include_sizes: bool,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<Vec<DirectoryListingResult>, String> {
+    check_runtime_process_scope(scope)?;
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -7462,8 +8394,13 @@ printf '__SVIDE_DIR_END__\\t{index}\\n'\n"
         ));
     }
 
-    let bytes =
-        run_profile_shell_with_timeout(profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
+    let bytes = run_profile_shell_with_timeout_scoped(
+        profile,
+        &script,
+        None,
+        REMOTE_DIRECTORY_COMMAND_TIMEOUT,
+        scope,
+    )?;
     Ok(parse_remote_directory_batch(
         paths,
         &String::from_utf8_lossy(&bytes),
@@ -8931,13 +9868,13 @@ fn run_profile_shell_with_timeout_for_renderer(
     cancel: &AtomicBool,
     renderer_runtime_epoch: u64,
 ) -> Result<Vec<u8>, String> {
-    run_profile_shell_with_timeout_scoped(
-        profile,
-        script,
-        stdin_data,
-        timeout,
-        Some((cancel, renderer_runtime_epoch)),
-    )
+    let scope = RuntimeProcessScope {
+        cancel,
+        renderer_runtime_epoch,
+        cancellation_error: "Export cancelled",
+        renderer_error: "renderer runtime was replaced while the export was preparing",
+    };
+    run_profile_shell_with_timeout_scoped(profile, script, stdin_data, timeout, Some(scope))
 }
 
 fn run_profile_shell_with_timeout_scoped(
@@ -8945,7 +9882,7 @@ fn run_profile_shell_with_timeout_scoped(
     script: &str,
     stdin_data: Option<Vec<u8>>,
     timeout: Duration,
-    renderer_scope: Option<(&AtomicBool, u64)>,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
 ) -> Result<Vec<u8>, String> {
     let attempts = if profile.kind == "wsl" {
         WSL_TRANSIENT_RETRY_ATTEMPTS
@@ -8954,8 +9891,15 @@ fn run_profile_shell_with_timeout_scoped(
     };
     let mut last_error = None;
     for attempt in 0..attempts {
-        check_renderer_process_scope(renderer_scope)?;
-        match run_profile_shell_once(profile, script, stdin_data.clone(), timeout, renderer_scope) {
+        check_runtime_process_scope(runtime_scope)?;
+        match run_profile_shell_once(
+            profile,
+            script,
+            stdin_data.clone(),
+            timeout,
+            runtime_scope,
+            attempt > 0,
+        ) {
             Ok(stdout) => {
                 record_wsl_profile_warmup_success(profile);
                 return Ok(stdout);
@@ -8966,7 +9910,10 @@ fn run_profile_shell_with_timeout_scoped(
                     && attempt + 1 < attempts =>
             {
                 last_error = Some(error);
-                thread::sleep(wsl_transient_retry_delay(attempt));
+                sleep_with_runtime_process_scope(
+                    wsl_transient_retry_delay(attempt),
+                    runtime_scope,
+                )?;
             }
             Err(error) => return Err(error),
         }
@@ -8979,8 +9926,23 @@ fn run_profile_shell_once(
     script: &str,
     stdin_data: Option<Vec<u8>>,
     timeout: Duration,
-    renderer_scope: Option<(&AtomicBool, u64)>,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
+    wait_for_wsl_cooldown: bool,
 ) -> Result<Vec<u8>, String> {
+    let wsl_gate_key = profile
+        .distro
+        .as_deref()
+        .filter(|_| profile.kind == "wsl")
+        .unwrap_or("Ubuntu");
+    let mut wsl_permit = if profile.kind == "wsl" {
+        Some(acquire_wsl_helper_permit(
+            wsl_gate_key,
+            runtime_scope,
+            wait_for_wsl_cooldown,
+        )?)
+    } else {
+        None
+    };
     let mut command = match profile.kind.as_str() {
         "wsl" => {
             let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
@@ -9021,7 +9983,7 @@ fn run_profile_shell_once(
         if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
             return Err("app shutdown is already in progress".to_string());
         }
-        check_renderer_process_scope(renderer_scope)?;
+        check_runtime_process_scope(runtime_scope)?;
         let child = hide_command_window(&mut command)
             .spawn()
             .map_err(|err| format!("failed to run remote shell: {err}"))?;
@@ -9029,44 +9991,42 @@ fn run_profile_shell_once(
         let pid = pending_child.child().id();
         assign_child_to_cleanup_job(pid);
         let registration = TransientProcessRegistration::new(pid);
-        check_renderer_process_scope(renderer_scope)?;
+        check_runtime_process_scope(runtime_scope)?;
         (pending_child.take(), registration)
     };
     let mut pending_child = PendingProcessChild::new(child);
     let stdout = pending_child.child_mut().stdout.take();
     let stderr = pending_child.child_mut().stderr.take();
-    let stdout_reader =
-        stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
-    let stderr_reader =
-        stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
+    let stdout_reader = stdout.map(spawn_process_output_reader);
+    let stderr_reader = stderr.map(spawn_process_output_reader);
     let stdin_writer = stdin_data.and_then(|data| {
-        pending_child.child_mut().stdin.take().map(|mut stdin| {
-            thread::spawn(move || {
-                stdin
-                    .write_all(&data)
-                    .and_then(|_| stdin.flush())
-                    .map_err(|err| err.to_string())
-            })
-        })
+        pending_child
+            .child_mut()
+            .stdin
+            .take()
+            .map(|stdin| spawn_process_stdin_writer(stdin, data))
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
         match pending_child.child_mut().try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if let Err(error) = check_renderer_process_scope(renderer_scope) {
-                    terminate_process_child(pending_child.child_mut());
-                    let _ = join_stdin_writer(stdin_writer);
-                    let _ = join_process_output(stdout_reader);
-                    let _ = join_process_output(stderr_reader);
+                if let Err(error) = check_runtime_process_scope(runtime_scope) {
+                    terminate_pending_process_child_with_wsl_permit(
+                        &mut pending_child,
+                        &mut wsl_permit,
+                    );
                     drop(_process_registration);
                     return Err(error);
                 }
                 if Instant::now() >= deadline {
-                    terminate_process_child(pending_child.child_mut());
-                    let _ = join_stdin_writer(stdin_writer);
-                    let _ = join_process_output(stdout_reader);
-                    let _ = join_process_output(stderr_reader);
+                    if profile.kind == "wsl" {
+                        record_wsl_helper_failure(wsl_gate_key);
+                    }
+                    terminate_pending_process_child_with_wsl_permit(
+                        &mut pending_child,
+                        &mut wsl_permit,
+                    );
                     if profile.kind == "ssh" {
                         clear_ssh_askpass_cache_for_profile(profile);
                     }
@@ -9079,10 +10039,13 @@ fn run_profile_shell_once(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
-                terminate_process_child(pending_child.child_mut());
-                let _ = join_stdin_writer(stdin_writer);
-                let _ = join_process_output(stdout_reader);
-                let _ = join_process_output(stderr_reader);
+                if profile.kind == "wsl" {
+                    record_wsl_helper_failure(wsl_gate_key);
+                }
+                terminate_pending_process_child_with_wsl_permit(
+                    &mut pending_child,
+                    &mut wsl_permit,
+                );
                 drop(_process_registration);
                 return Err(format!("failed to wait for remote shell: {err}"));
             }
@@ -9105,48 +10068,73 @@ fn run_profile_shell_once(
         } else {
             String::from_utf8_lossy(&stderr).trim().to_string()
         };
+        if profile.kind == "wsl" {
+            if is_wsl_transient_error(&message) {
+                record_wsl_helper_failure(wsl_gate_key);
+            } else {
+                if let Some(permit) = wsl_permit.as_ref() {
+                    record_wsl_helper_success(permit);
+                }
+            }
+        }
         return Err(message);
+    }
+    if profile.kind == "wsl" {
+        if let Some(permit) = wsl_permit.as_ref() {
+            record_wsl_helper_success(permit);
+        }
     }
     stdin_result?;
     Ok(stdout)
 }
 
-fn check_renderer_process_scope(renderer_scope: Option<(&AtomicBool, u64)>) -> Result<(), String> {
-    let Some((cancel, renderer_runtime_epoch)) = renderer_scope else {
-        return Ok(());
-    };
-    if cancel.load(Ordering::SeqCst) {
-        return Err("Export cancelled".to_string());
-    }
-    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
-        return Err("renderer runtime was replaced while the export was preparing".to_string());
-    }
-    Ok(())
+#[allow(dead_code)]
+fn warm_wsl_profile(profile: &ConnectionProfile) -> Result<(), String> {
+    warm_wsl_profile_with_scope(profile, None)
 }
 
-fn warm_wsl_profile(profile: &ConnectionProfile) -> Result<(), String> {
+fn warm_wsl_profile_with_scope(
+    profile: &ConnectionProfile,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<(), String> {
+    check_runtime_process_scope(scope)?;
     if profile.kind != "wsl" {
         return Ok(());
     }
 
     let distro = profile.distro.as_deref().unwrap_or("Ubuntu");
-    warm_wsl_distro_coordinated(distro)
+    warm_wsl_distro_coordinated_with_scope(distro, scope)
 }
 
+#[allow(dead_code)]
 fn warm_wsl_distro(distro: &str) -> Result<(), String> {
+    warm_wsl_distro_with_scope(distro, None)
+}
+
+fn warm_wsl_distro_with_scope(
+    distro: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 0..WSL_TRANSIENT_RETRY_ATTEMPTS {
+        check_runtime_process_scope(scope)?;
         let mut command = Command::new("wsl.exe");
         command
             .current_dir(windows_spawn_cwd())
             .args(wsl_warmup_command_args(distro));
-        match command_output_with_timeout(&mut command, WSL_WARMUP_TIMEOUT) {
+        match command_output_with_timeout_scoped(
+            &mut command,
+            WSL_WARMUP_TIMEOUT,
+            scope,
+            Some(distro),
+            attempt > 0,
+        ) {
             Ok(output) if output.status.success() => return Ok(()),
             Ok(output) => {
                 let error = command_output_error_message(&output);
                 if is_wsl_transient_error(&error) && attempt + 1 < WSL_TRANSIENT_RETRY_ATTEMPTS {
                     last_error = Some(error);
-                    thread::sleep(wsl_transient_retry_delay(attempt));
+                    sleep_with_runtime_process_scope(wsl_transient_retry_delay(attempt), scope)?;
                     continue;
                 }
                 return Err(format!("WSL warmup failed: {error}"));
@@ -9155,7 +10143,7 @@ fn warm_wsl_distro(distro: &str) -> Result<(), String> {
                 if is_wsl_transient_error(&error) && attempt + 1 < WSL_TRANSIENT_RETRY_ATTEMPTS =>
             {
                 last_error = Some(error);
-                thread::sleep(wsl_transient_retry_delay(attempt));
+                sleep_with_runtime_process_scope(wsl_transient_retry_delay(attempt), scope)?;
             }
             Err(error) => return Err(format!("WSL warmup failed: {error}")),
         }
@@ -9209,23 +10197,49 @@ fn wsl_warmup_command_args(distro: &str) -> [&str; 4] {
     ["-d", distro, "--exec", "true"]
 }
 
+#[allow(dead_code)]
 fn warm_wsl_distro_coordinated(distro: &str) -> Result<(), String> {
+    warm_wsl_distro_coordinated_with_scope(distro, None)
+}
+
+fn warm_wsl_distro_coordinated_with_scope(
+    distro: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<(), String> {
+    check_runtime_process_scope(scope)?;
     if wsl_warmup_recent(distro) {
         return Ok(());
     }
     let lock = wsl_warmup_lock(distro);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = loop {
+        check_runtime_process_scope(scope)?;
+        match lock.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                sleep_with_runtime_process_scope(Duration::from_millis(50), scope)?;
+            }
+        }
+    };
     if wsl_warmup_recent(distro) {
         return Ok(());
     }
-    warm_wsl_distro(distro)?;
+    warm_wsl_distro_with_scope(distro, scope)?;
     record_wsl_warmup_success(distro);
     Ok(())
 }
 
+#[allow(dead_code)]
 fn resolve_wsl_home(distro: &str) -> Result<String, String> {
-    warm_wsl_distro_coordinated(distro)?;
-    cached_or_detect_wsl_home(distro)
+    resolve_wsl_home_with_scope(distro, None)
+}
+
+fn resolve_wsl_home_with_scope(
+    distro: &str,
+    scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<String, String> {
+    warm_wsl_distro_coordinated_with_scope(distro, scope)?;
+    cached_or_detect_wsl_home_with_scope(distro, scope)?
         .ok_or_else(|| format!("failed to resolve WSL home for distro {distro}"))
 }
 
@@ -9306,7 +10320,27 @@ fn command_output_error_message(output: &Output) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output, String> {
+    command_output_with_timeout_scoped(command, timeout, None, None, false)
+}
+
+fn command_output_with_timeout_scoped(
+    command: &mut Command,
+    timeout: Duration,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
+    wsl_gate_key: Option<&str>,
+    wait_for_wsl_cooldown: bool,
+) -> Result<Output, String> {
+    check_runtime_process_scope(runtime_scope)?;
+    let mut wsl_permit = match wsl_gate_key {
+        Some(key) => Some(acquire_wsl_helper_permit(
+            key,
+            runtime_scope,
+            wait_for_wsl_cooldown,
+        )?),
+        None => None,
+    };
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -9316,39 +10350,55 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
         if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
             return Err("app shutdown is already in progress".to_string());
         }
+        check_runtime_process_scope(runtime_scope)?;
         let child = hide_command_window(command)
             .spawn()
             .map_err(|err| format!("failed to start process: {err}"))?;
         let pid = child.id();
         assign_child_to_cleanup_job(pid);
         let registration = TransientProcessRegistration::new(pid);
+        check_runtime_process_scope(runtime_scope)?;
         (child, registration)
     };
     let mut pending_child = PendingProcessChild::new(child);
     let stdout = pending_child.child_mut().stdout.take();
     let stderr = pending_child.child_mut().stderr.take();
-    let stdout_reader =
-        stdout.map(|mut stdout| thread::spawn(move || read_process_output(&mut stdout)));
-    let stderr_reader =
-        stderr.map(|mut stderr| thread::spawn(move || read_process_output(&mut stderr)));
+    let stdout_reader = stdout.map(spawn_process_output_reader);
+    let stderr_reader = stderr.map(spawn_process_output_reader);
     let deadline = Instant::now() + timeout;
     let status = loop {
         match pending_child.child_mut().try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if let Err(error) = check_runtime_process_scope(runtime_scope) {
+                    terminate_pending_process_child_with_wsl_permit(
+                        &mut pending_child,
+                        &mut wsl_permit,
+                    );
+                    drop(_process_registration);
+                    return Err(error);
+                }
                 if Instant::now() >= deadline {
-                    terminate_process_child(pending_child.child_mut());
-                    let _ = join_process_output(stdout_reader);
-                    let _ = join_process_output(stderr_reader);
+                    if let Some(key) = wsl_gate_key {
+                        record_wsl_helper_failure(key);
+                    }
+                    terminate_pending_process_child_with_wsl_permit(
+                        &mut pending_child,
+                        &mut wsl_permit,
+                    );
                     drop(_process_registration);
                     return Err(format!("process timed out after {}s", timeout.as_secs()));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
-                terminate_process_child(pending_child.child_mut());
-                let _ = join_process_output(stdout_reader);
-                let _ = join_process_output(stderr_reader);
+                if let Some(key) = wsl_gate_key {
+                    record_wsl_helper_failure(key);
+                }
+                terminate_pending_process_child_with_wsl_permit(
+                    &mut pending_child,
+                    &mut wsl_permit,
+                );
                 drop(_process_registration);
                 return Err(format!("failed to wait for process: {err}"));
             }
@@ -9359,35 +10409,74 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
     let stderr = join_process_output(stderr_reader);
     drop(_process_registration);
     drop(completed_child);
-    Ok(Output {
+    let output = Output {
         status,
         stdout: stdout?,
         stderr: stderr?,
-    })
+    };
+    if let Some(key) = wsl_gate_key {
+        let error = command_output_error_message(&output);
+        if !output.status.success() && is_wsl_transient_error(&error) {
+            record_wsl_helper_failure(key);
+        } else {
+            if let Some(permit) = wsl_permit.as_ref() {
+                record_wsl_helper_success(permit);
+            }
+        }
+    }
+    Ok(output)
 }
 
-fn read_process_output(reader: &mut dyn Read) -> Vec<u8> {
-    let mut output = Vec::new();
-    let _ = reader.read_to_end(&mut output);
-    output
+fn spawn_process_output_reader<R>(mut reader: R) -> Receiver<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = sync_channel(1);
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = reader.read_to_end(&mut output);
+        let _ = sender.send(output);
+    });
+    receiver
 }
 
-fn join_process_output(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Result<Vec<u8>, String> {
-    let Some(handle) = handle else {
+fn spawn_process_stdin_writer<W>(mut writer: W, data: Vec<u8>) -> Receiver<Result<(), String>>
+where
+    W: Write + Send + 'static,
+{
+    let (sender, receiver) = sync_channel(1);
+    thread::spawn(move || {
+        let result = writer
+            .write_all(&data)
+            .and_then(|_| writer.flush())
+            .map_err(|err| err.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn join_process_output(receiver: Option<Receiver<Vec<u8>>>) -> Result<Vec<u8>, String> {
+    let Some(receiver) = receiver else {
         return Ok(Vec::new());
     };
-    handle
-        .join()
-        .map_err(|_| "remote shell output reader failed".to_string())
+    receiver
+        .recv_timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT)
+        .map_err(|error| match error {
+            RecvTimeoutError::Timeout => "remote shell output reader timed out".to_string(),
+            RecvTimeoutError::Disconnected => "remote shell output reader failed".to_string(),
+        })
 }
 
-fn join_stdin_writer(handle: Option<thread::JoinHandle<Result<(), String>>>) -> Result<(), String> {
-    let Some(handle) = handle else {
+fn join_stdin_writer(receiver: Option<Receiver<Result<(), String>>>) -> Result<(), String> {
+    let Some(receiver) = receiver else {
         return Ok(());
     };
-    handle
-        .join()
-        .map_err(|_| "remote shell stdin writer failed".to_string())?
+    receiver
+        .recv_timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT)
+        .map_err(|error| match error {
+            RecvTimeoutError::Timeout => "remote shell stdin writer timed out".to_string(),
+            RecvTimeoutError::Disconnected => "remote shell stdin writer failed".to_string(),
+        })?
 }
 
 fn proxy_stream(
@@ -10284,6 +11373,80 @@ mod wsl_recovery_tests {
         record_wsl_profile_warmup_success(&profile);
 
         assert!(wsl_warmup_recent(&distro));
+    }
+
+    #[test]
+    fn runtime_operation_registry_cancels_duplicates_and_consumes_early_cancel() {
+        let epoch = RENDERER_RUNTIME_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        let duplicate_id = format!("test-duplicate-{}", Uuid::new_v4());
+        let first =
+            begin_runtime_operation(&duplicate_id, epoch).expect("register first operation");
+        let second =
+            begin_runtime_operation(&duplicate_id, epoch).expect("replace duplicate operation");
+
+        assert!(check_runtime_process_scope(Some(first.process_scope())).is_err());
+        assert!(check_runtime_process_scope(Some(second.process_scope())).is_ok());
+        drop(first);
+        assert!(check_runtime_process_scope(Some(second.process_scope())).is_ok());
+        drop(second);
+
+        let cancelled_id = format!("test-early-cancel-{}", Uuid::new_v4());
+        assert_eq!(
+            cancel_runtime_operation_host(&cancelled_id, epoch).expect("cancel early"),
+            (false, None)
+        );
+        let error = begin_runtime_operation(&cancelled_id, epoch)
+            .err()
+            .expect("early cancellation should reject delayed operation");
+        assert!(error.contains("cancelled before it started"));
+
+        let terminal_operation_id = format!("test-terminal-result-{}", Uuid::new_v4());
+        let terminal_operation = begin_runtime_operation(&terminal_operation_id, epoch)
+            .expect("register terminal operation");
+        terminal_operation
+            .commit_spawned_terminal_id("terminal-result")
+            .expect("commit terminal result");
+        drop(terminal_operation);
+        assert_eq!(
+            cancel_runtime_operation_host(&terminal_operation_id, epoch)
+                .expect("cancel completed terminal operation"),
+            (false, Some("terminal-result".to_string()))
+        );
+    }
+
+    #[test]
+    fn wsl_helper_gate_limits_concurrency_and_applies_failure_cooldown() {
+        let key = format!("test-gate-{}", Uuid::new_v4());
+        let first = acquire_wsl_helper_permit(&key, None, false).expect("first permit");
+        let second = acquire_wsl_helper_permit(&key, None, false).expect("second permit");
+        let gate = wsl_helper_gate(&key);
+        assert_eq!(
+            gate.state.lock().expect("gate state").in_flight,
+            WSL_SHORT_HELPER_CONCURRENCY
+        );
+        record_wsl_helper_failure(&key);
+        record_wsl_helper_success(&first);
+        assert!(gate
+            .state
+            .lock()
+            .expect("newer failure remains")
+            .cooldown_until
+            .is_some());
+        drop(first);
+        drop(second);
+
+        let error = acquire_wsl_helper_permit(&key, None, false)
+            .err()
+            .expect("cooldown should reject new helper");
+        assert!(error.contains("cooldown"));
+        {
+            let mut state = gate.state.lock().expect("gate state after failure");
+            state.cooldown_until = None;
+        }
+        let recovery = acquire_wsl_helper_permit(&key, None, false).expect("recovery permit");
+        record_wsl_helper_success(&recovery);
+        drop(recovery);
+        drop(acquire_wsl_helper_permit(&key, None, false).expect("success clears cooldown"));
     }
 
     #[test]
@@ -11238,6 +12401,7 @@ pub fn run() {
             refresh_main_webview_bounds,
             set_capture_protection,
             force_quit_app,
+            cancel_runtime_operation,
             resolve_profile_path,
             profile_directory_is_dir,
             list_directory,

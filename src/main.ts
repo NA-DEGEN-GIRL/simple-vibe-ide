@@ -151,6 +151,8 @@ interface TerminalPane {
   inputWriteQueue?: TerminalInputPacket[];
   inputWriteQueuedChars?: number;
   inputBackendPending?: boolean;
+  backendStartPending?: boolean;
+  pendingRuntimeOperationId?: string;
   inputReconnectFrozen?: boolean;
   shellReadyAt?: number;
   shellReadyConfirmed?: boolean;
@@ -158,6 +160,10 @@ interface TerminalPane {
   pendingShellReadyActions?: TerminalShellReadyAction[];
   startupNoticeTimer?: number;
   startupStallTimer?: number;
+  startupDeadlineTimer?: number;
+  startupDeadlineExpired?: boolean;
+  backendTerminationTimer?: number;
+  backendTerminationAttempts?: number;
   closed?: boolean;
   typingPadOpen?: boolean;
   typingPadDraft?: string;
@@ -1782,6 +1788,7 @@ const TERMINAL_RESTORE_SPAWN_CONCURRENCY = 4;
 const TERMINAL_SHELL_READY_PROBE_CHARS = 2048;
 const TERMINAL_STARTUP_NOTICE_MS = 900;
 const TERMINAL_STARTUP_STALL_MS = 10000;
+const TERMINAL_WSL_SHELL_READY_TIMEOUT_MS = 30_000;
 const TERMINAL_CLOSE_BACKEND_TIMEOUT_MS = 5000;
 const TERMINAL_SHELL_READY_FALLBACK_MS = 4500;
 const TERMINAL_SHELL_READY_ACTION_FALLBACK_MS = 6500;
@@ -1842,6 +1849,7 @@ const WORKSPACE_LLM_SCROLL_DONE_SUPPRESS_MS = 10_000;
 const WORKSPACE_LLM_SCROLLBACK_DONE_RECHECK_MS = 2500;
 const WORKSPACE_LLM_TMUX_TITLE_POLL_MS = 1200;
 const WORKSPACE_LLM_TMUX_TITLE_POLL_RETRY_MS = 4000;
+const WORKSPACE_LLM_TMUX_TITLE_INACTIVE_POLL_MS = 10_000;
 const WORKSPACE_LLM_HOOK_ACTIVE_MS = 30 * 60_000;
 const LLM_TMUX_SESSION_MAX_LEN = 48;
 const LLM_TMUX_ENV_DANGEROUS_PATTERN = /(?:TOKEN|SECRET|PASSWORD|PASSWD|AUTH|COOKIE|KEY)/i;
@@ -1988,10 +1996,10 @@ const BROWSER_FRAME_WORKSPACE_RETAIN_LIMIT = 4;
 const WORKSPACE_RESTORE_BACKGROUND_DELAY_MS = 1800;
 const WORKSPACE_MEMORY_SAVER_CHECK_DELAY_MS = 3000;
 const WORKSPACE_MEMORY_SAVER_BALANCED_LIVE_LIMIT = 3;
-const WORKSPACE_MEMORY_SAVER_BALANCED_MIN_WORKSPACES = 6;
+const WORKSPACE_MEMORY_SAVER_BALANCED_PANE_LIMIT = 8;
 const WORKSPACE_MEMORY_SAVER_BALANCED_IDLE_MS = 10 * 60_000;
 const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_LIVE_LIMIT = 1;
-const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_MIN_WORKSPACES = 3;
+const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_PANE_LIMIT = 4;
 const WORKSPACE_MEMORY_SAVER_AGGRESSIVE_IDLE_MS = 2 * 60_000;
 const DEFAULT_BROWSER_DEVICE_ID = 'iphone-15';
 const BROWSER_ZOOM_LEVELS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
@@ -3735,6 +3743,9 @@ let restoringWorkspace = false;
 let workspaceRestoreGeneration = 0;
 let workspaceActivationGeneration = 0;
 let workspacePathSwitchGeneration = 0;
+let workspaceOpenInFlight = false;
+let workspaceOpenOperationId = '';
+let savedWorkspaceLoadInFlight = false;
 let storedActiveWorkspaceId = '';
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
 const autoForwardingPorts = new Set<string>();
@@ -3752,6 +3763,9 @@ const stringFingerprintCache = new Map<string, string>();
 const profileById = new Map<string, ConnectionProfile>();
 const terminalPaneById = new Map<string, TerminalPane>();
 const terminalPaneByBackendId = new Map<string, TerminalPane>();
+const terminalBackendTerminationPromises = new Map<string, Promise<void>>();
+const terminalBackendTerminationRetryTimers = new Map<string, number>();
+const terminalBackendTerminationRetryAttempts = new Map<string, number>();
 const pendingTerminalDataByBackendId = new Map<string, string>();
 const pendingTerminalCursorQueriesByBackendId = new Map<string, number>();
 const pendingTerminalExitByBackendId = new Map<string, TerminalExitEvent>();
@@ -3809,6 +3823,7 @@ const calculatorHistoryElementCache = new Map<string, HTMLElement>();
 const explorerDirectorySignatureCache = new WeakMap<FileEntry[], string>();
 const explorerDirectoryCache = new Map<string, { entries: FileEntry[]; cachedAt: number }>();
 const explorerDirectoryReads = new Map<string, Promise<FileEntry[]>>();
+const explorerRuntimeOperationIds = new Set<string>();
 const explorerDirectoryPrefetchTimers = new Map<string, number>();
 const explorerDirectoryPrefetchPending = new Set<string>();
 const workspaceRuntimeCache = new Map<string, WorkspaceRuntimeCache>();
@@ -14090,8 +14105,8 @@ function renderSavedWorkspaceSelect() {
       : '';
   }
   const selected = Boolean(selectedSavedWorkspaceEntry());
-  setDisabledIfChanged(el.loadSavedWorkspace, !selected);
-  setDisabledIfChanged(el.deleteSavedWorkspace, !selected);
+  setDisabledIfChanged(el.loadSavedWorkspace, !selected || savedWorkspaceLoadInFlight);
+  setDisabledIfChanged(el.deleteSavedWorkspace, !selected || savedWorkspaceLoadInFlight);
 }
 
 function savedWorkspaceProfileKind(entry: SavedWorkspaceEntry): ConnectionProfile['kind'] | undefined {
@@ -14241,6 +14256,7 @@ async function saveCurrentWorkspaceForLater() {
 }
 
 async function loadSelectedSavedWorkspace() {
+  if (savedWorkspaceLoadInFlight) return;
   const saved = selectedSavedWorkspaceEntry();
   if (!saved) return;
   if (!profileForId(saved.snapshot.profileId)) {
@@ -14248,42 +14264,66 @@ async function loadSelectedSavedWorkspace() {
     return;
   }
 
-  await saveAllDirtyNotes();
-  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
-  saveActiveWorkspaceRuntimeCache();
-  const snapshot = cloneWorkspaceSnapshotForSavedLoad(saved);
-  if (IS_TERMINAL_APP) {
-    const previousActiveId = state.activeWorkspaceId;
-    if (previousActiveId) {
-      await closeTerminalsForWorkspace(previousActiveId, {
-        backgroundKill: true,
-        saveSnapshot: false,
-        renderShellTabs: false
-      });
-      discardWorkspacePreviewRuntime(previousActiveId);
+  savedWorkspaceLoadInFlight = true;
+  renderSavedWorkspaceSelect();
+  const operationGeneration = beginWorkspaceActivationOperation();
+  try {
+    await saveAllDirtyNotes();
+    if (operationGeneration !== workspaceActivationGeneration) return;
+    workspacePathSwitchGeneration += 1;
+    cancelWorkspaceRestore();
+    saveActiveWorkspaceSnapshot({ immediate: true, persist: 'none' });
+    saveActiveWorkspaceRuntimeCache();
+    const snapshot = cloneWorkspaceSnapshotForSavedLoad(saved);
+    if (IS_TERMINAL_APP) {
+      const previousActiveId = state.activeWorkspaceId;
+      if (previousActiveId) {
+        await closeTerminalsForWorkspace(previousActiveId, {
+          backgroundKill: true,
+          saveSnapshot: false,
+          renderShellTabs: false
+        });
+        if (operationGeneration !== workspaceActivationGeneration) return;
+        discardWorkspacePreviewRuntime(previousActiveId);
+      }
+      const activeIndex = previousActiveId ? workspaceSnapshotIndexById(previousActiveId) : -1;
+      workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
+      if (activeIndex >= 0) replaceWorkspaceSnapshot(activeIndex, snapshot);
+      else insertWorkspaceSnapshot(state.workspaceSnapshots.length, snapshot);
+      state.activeWorkspaceId = snapshot.id;
+      markWorkspaceActive(snapshot.id);
+      renderWorkspaceTabs();
+      persistWorkspaceStore();
+      await restoreWorkspaceSnapshot(snapshot);
+      await waitForWorkspaceTerminalRestoreSettlement(snapshot.id, operationGeneration);
+      if (operationGeneration === workspaceActivationGeneration) setStatus(`Layout loaded: ${saved.name}`);
+      return;
     }
-    const activeIndex = previousActiveId ? workspaceSnapshotIndexById(previousActiveId) : -1;
     workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
-    if (activeIndex >= 0) replaceWorkspaceSnapshot(activeIndex, snapshot);
-    else insertWorkspaceSnapshot(state.workspaceSnapshots.length, snapshot);
+    const activeIndex = workspaceSnapshotIndexById(state.activeWorkspaceId);
+    insertWorkspaceSnapshot(activeIndex >= 0 ? activeIndex + 1 : state.workspaceSnapshots.length, snapshot);
+    const previousActiveId = state.activeWorkspaceId;
+    markWorkspaceInactive(previousActiveId);
     state.activeWorkspaceId = snapshot.id;
     markWorkspaceActive(snapshot.id);
-    renderWorkspaceTabs();
+    renderWorkspaceTabActivation(previousActiveId, snapshot);
     persistWorkspaceStore();
     await restoreWorkspaceSnapshot(snapshot);
-    setStatus(`Layout loaded: ${saved.name}`);
-    return;
+    await waitForWorkspaceTerminalRestoreSettlement(snapshot.id, operationGeneration);
+  } finally {
+    savedWorkspaceLoadInFlight = false;
+    renderSavedWorkspaceSelect();
   }
-  workspaceSnapshotSignatures.set(snapshot.id, workspaceSnapshotSignature(snapshot));
-  const activeIndex = workspaceSnapshotIndexById(state.activeWorkspaceId);
-  insertWorkspaceSnapshot(activeIndex >= 0 ? activeIndex + 1 : state.workspaceSnapshots.length, snapshot);
-  const previousActiveId = state.activeWorkspaceId;
-  markWorkspaceInactive(previousActiveId);
-  state.activeWorkspaceId = snapshot.id;
-  markWorkspaceActive(snapshot.id);
-  renderWorkspaceTabActivation(previousActiveId, snapshot);
-  persistWorkspaceStore();
-  await restoreWorkspaceSnapshot(snapshot);
+}
+
+async function waitForWorkspaceTerminalRestoreSettlement(workspaceId: string, activationGeneration: number) {
+  while (
+    activationGeneration === workspaceActivationGeneration
+    && state.activeWorkspaceId === workspaceId
+    && workspaceTerminalRestoreInProgress(workspaceId)
+  ) {
+    await delay(80);
+  }
 }
 
 function deleteSelectedSavedWorkspace() {
@@ -16076,6 +16116,9 @@ function scheduleWorkspaceLlmTmuxTitlePoll(
 ) {
   if (!terminalPaneShouldPollTmuxTitle(pane)) return;
   if (pane.llmTmuxTitlePollTimer || pane.llmTmuxTitlePollPromise) return;
+  if (document.hidden || pane.workspaceId !== state.activeWorkspaceId) {
+    delayMs = Math.max(delayMs, WORKSPACE_LLM_TMUX_TITLE_INACTIVE_POLL_MS);
+  }
   pane.llmTmuxTitlePollTimer = window.setTimeout(() => {
     pane.llmTmuxTitlePollTimer = undefined;
     void pollWorkspaceLlmTmuxTitle(pane);
@@ -16359,6 +16402,8 @@ function maybeRecoverTerminalTmuxStaleDelivery(
   const recovery = recoverTerminalTmuxStaleDelivery(pane, sessionName, reason, dataAge)
     .catch((error) => {
       if (!pane.backendId) {
+        pane.startupState = 'failed';
+        pane.startupError = String(error);
         failPendingTerminalInput(pane, 'tmux reconnect ended before pending input delivery was confirmed');
       }
       appendDiagnosticLog(
@@ -16444,17 +16489,23 @@ async function recoverTerminalTmuxStaleDelivery(
     'warn',
     { force: true }
   );
+  let reconnectOperationId = '';
   try {
     pane.term.write('\r\n\x1b[33m[simple-vibe-ide] tmux output delivery looks stale; reconnecting this terminal client to the same tmux session...\x1b[0m\r\n');
     setTerminalBackendId(pane, undefined);
     dropPendingTerminalBackendEvents(oldBackendId);
-    await withTimeout(
-      api.killTerminal(oldBackendId),
-      TERMINAL_CLOSE_BACKEND_TIMEOUT_MS,
+    await terminateTerminalBackendEventually(
+      oldBackendId,
       `Closing stale tmux client ${pane.title}`
     );
     if (!isTerminalPaneAlive(pane)) return;
     let disposeLateBackend = false;
+    pane.startupState = 'starting';
+    pane.startupError = undefined;
+    scheduleTerminalStartupWatch(pane, profile, `${pane.title} reconnect`);
+    reconnectOperationId = crypto.randomUUID();
+    pane.backendStartPending = true;
+    pane.pendingRuntimeOperationId = reconnectOperationId;
     const spawnPromise = api.spawnTerminal(
       profile.id,
       pane.cwd,
@@ -16463,29 +16514,37 @@ async function recoverTerminalTmuxStaleDelivery(
       pane.term.cols,
       pane.workspaceId,
       `${pane.title} reconnect`,
-      pane.shellHistoryId
+      pane.shellHistoryId,
+      reconnectOperationId
     );
     spawnPromise.then((lateBackendId) => {
+      if (pane.pendingRuntimeOperationId === reconnectOperationId) pane.pendingRuntimeOperationId = undefined;
       if (disposeLateBackend || !isTerminalPaneAlive(pane)) {
-        void api.killTerminal(lateBackendId).catch(() => undefined);
+        void terminateTerminalBackendEventually(lateBackendId, 'Closing late tmux reconnect client')
+          .catch(() => undefined);
       }
-    }).catch(() => undefined);
+    }, () => {
+      if (pane.pendingRuntimeOperationId === reconnectOperationId) pane.pendingRuntimeOperationId = undefined;
+    });
     let backendId = '';
     try {
       backendId = await withTimeout(
         spawnPromise,
         terminalStartTimeoutMs(profile),
-        `${profile.kind.toUpperCase()} tmux reconnect`
+        `${profile.kind.toUpperCase()} tmux reconnect`,
+        () => cancelTerminalRuntimeOperation(pane, reconnectOperationId)
       );
     } catch (error) {
       disposeLateBackend = String(error).includes('timed out');
       throw error;
     }
     if (!isTerminalPaneAlive(pane)) {
-      void api.killTerminal(backendId).catch(() => undefined);
+      void terminateTerminalBackendEventually(backendId, 'Closing abandoned tmux reconnect client')
+        .catch(() => undefined);
       return;
     }
     setTerminalBackendId(pane, backendId);
+    if (profile.kind === 'wsl') scheduleTerminalWslShellReadyDeadline(pane, backendId);
     pane.tmuxStaleDeliveryCount = 0;
     const now = performance.now();
     pane.lastTerminalDataAt = now;
@@ -16504,6 +16563,10 @@ async function recoverTerminalTmuxStaleDelivery(
       { force: true }
     );
   } finally {
+    pane.backendStartPending = false;
+    if (reconnectOperationId && !pane.backendId) {
+      cancelTerminalRuntimeOperation(pane, reconnectOperationId);
+    }
     pane.inputReconnectFrozen = false;
     if (pane.backendId) drainTerminalInputQueue(pane);
   }
@@ -17531,6 +17594,19 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
+function cancelWorkspaceOpenOperation(expectedOperationId?: string) {
+  if (
+    !workspaceOpenOperationId
+    || (expectedOperationId && workspaceOpenOperationId !== expectedOperationId)
+  ) return;
+  void api.cancelRuntimeOperation(workspaceOpenOperationId).catch(() => undefined);
+}
+
+function beginWorkspaceActivationOperation() {
+  cancelWorkspaceOpenOperation();
+  return ++workspaceActivationGeneration;
+}
+
 function createConcurrencyGate(limit: number) {
   let active = 0;
   const waiters: Array<() => void> = [];
@@ -17551,7 +17627,7 @@ function createConcurrencyGate(limit: number) {
 }
 
 async function createBlankWorkspaceTab() {
-  const operationGeneration = ++workspaceActivationGeneration;
+  const operationGeneration = beginWorkspaceActivationOperation();
   await saveAllDirtyNotes();
   if (operationGeneration !== workspaceActivationGeneration) return;
   workspacePathSwitchGeneration += 1;
@@ -17589,7 +17665,7 @@ async function createBlankWorkspaceTab() {
 async function copyWorkspaceTab(id: string) {
   const sourceIndex = workspaceSnapshotIndexById(id);
   if (sourceIndex < 0) return;
-  const operationGeneration = ++workspaceActivationGeneration;
+  const operationGeneration = beginWorkspaceActivationOperation();
   await saveAllDirtyNotes();
   if (operationGeneration !== workspaceActivationGeneration) return;
   workspacePathSwitchGeneration += 1;
@@ -17764,7 +17840,7 @@ function cloneJson<T>(value: T): T {
 }
 
 async function closeWorkspaceTab(id: string) {
-  const operationGeneration = ++workspaceActivationGeneration;
+  const operationGeneration = beginWorkspaceActivationOperation();
   const wasActive = state.activeWorkspaceId === id;
   let cancellationGeneration = 0;
   if (wasActive) {
@@ -17841,7 +17917,7 @@ async function closeWorkspaceTab(id: string) {
 }
 
 async function activateWorkspaceTab(id: string, options: { imeSettled?: boolean } = {}) {
-  const activationGeneration = ++workspaceActivationGeneration;
+  const activationGeneration = beginWorkspaceActivationOperation();
   if (id === state.activeWorkspaceId && state.workspaceOpen && workspaceRuntimeOwnerId !== id) {
     const snapshot = workspaceSnapshotForId(id);
     if (snapshot?.profileId && profileForId(snapshot.profileId)) {
@@ -17855,7 +17931,8 @@ async function activateWorkspaceTab(id: string, options: { imeSettled?: boolean 
     const snapshot = workspaceSnapshotForId(id);
     const profile = snapshot ? profileForId(snapshot.profileId) : null;
     const hasFailedShell = state.terminals.some((pane) => (
-      pane.workspaceId === id && pane.startupState === 'failed'
+      pane.workspaceId === id
+      && (pane.startupState === 'failed' || !terminalPaneOwnsRuntime(pane))
     ));
     const wakingFromMemorySaver = workspaceMemorySleepingIds.has(id);
     const retryingFailedRestore = workspaceTerminalRestoreFailedPreserveIds.has(id);
@@ -18722,18 +18799,24 @@ async function runWorkspaceMemorySaver() {
   const mode = workspaceMemorySaverMode(state.ideSettings.memorySaver);
   if (mode === 'off') return;
   const policy = workspaceMemorySaverPolicy(mode);
-  if (state.workspaceSnapshots.length < policy.minWorkspaces) return;
   const liveWorkspaceIds = liveTerminalWorkspaceIds();
-  if (liveWorkspaceIds.size <= policy.liveLimit) return;
+  const livePaneCount = liveTerminalPaneCount();
+  if (liveWorkspaceIds.size <= policy.liveLimit && livePaneCount <= policy.paneLimit) return;
   const now = Date.now();
   const candidates = [...liveWorkspaceIds]
     .filter((workspaceId) => workspaceMemorySaverCanSleep(workspaceId, now, policy.idleMs))
     .sort((a, b) => (workspaceLastActiveAt.get(a) ?? 0) - (workspaceLastActiveAt.get(b) ?? 0));
   for (const workspaceId of candidates) {
-    if (liveTerminalWorkspaceIds().size <= policy.liveLimit) break;
+    if (
+      liveTerminalWorkspaceIds().size <= policy.liveLimit
+      && liveTerminalPaneCount() <= policy.paneLimit
+    ) break;
     await sleepWorkspaceTerminals(workspaceId);
   }
-  if (liveTerminalWorkspaceIds().size > policy.liveLimit) {
+  if (
+    liveTerminalWorkspaceIds().size > policy.liveLimit
+    || liveTerminalPaneCount() > policy.paneLimit
+  ) {
     scheduleWorkspaceMemorySaver(60_000);
   }
 }
@@ -18742,12 +18825,12 @@ function workspaceMemorySaverPolicy(mode = workspaceMemorySaverMode(state.ideSet
   return mode === 'aggressive'
     ? {
         liveLimit: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_LIVE_LIMIT,
-        minWorkspaces: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_MIN_WORKSPACES,
+        paneLimit: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_PANE_LIMIT,
         idleMs: WORKSPACE_MEMORY_SAVER_AGGRESSIVE_IDLE_MS
       }
     : {
         liveLimit: WORKSPACE_MEMORY_SAVER_BALANCED_LIVE_LIMIT,
-        minWorkspaces: WORKSPACE_MEMORY_SAVER_BALANCED_MIN_WORKSPACES,
+        paneLimit: WORKSPACE_MEMORY_SAVER_BALANCED_PANE_LIMIT,
         idleMs: WORKSPACE_MEMORY_SAVER_BALANCED_IDLE_MS
       };
 }
@@ -18759,12 +18842,17 @@ function workspaceMemorySaverIdleMs() {
 function liveTerminalWorkspaceIds() {
   const ids = new Set<string>();
   for (const pane of state.terminals) {
-    const ownsRuntime = Boolean(pane.backendId)
-      || pane.inputBackendPending === true
-      || pane.startupState === 'starting';
-    if (pane.workspaceId && !pane.closed && ownsRuntime) ids.add(pane.workspaceId);
+    if (pane.workspaceId && terminalPaneOwnsRuntime(pane)) ids.add(pane.workspaceId);
   }
   return ids;
+}
+
+function liveTerminalPaneCount() {
+  let count = 0;
+  for (const pane of state.terminals) {
+    if (terminalPaneOwnsRuntime(pane)) count += 1;
+  }
+  return count;
 }
 
 function workspaceMemorySaverCanSleep(workspaceId: string, now: number, idleMs: number) {
@@ -19030,7 +19118,7 @@ async function restoreWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
     if (!isWorkspacePrimaryRestoreCurrent(snapshot.id, restoreGeneration)) return;
 
     const hasLiveTerminals = state.terminals.some((pane) => (
-      pane.workspaceId === snapshot.id && pane.startupState !== 'failed'
+      pane.workspaceId === snapshot.id && terminalPaneOwnsRuntime(pane)
     ));
     if (hasLiveTerminals) {
       await restoreWorkspaceTerminals(snapshot, profile);
@@ -19465,6 +19553,27 @@ async function waitForRestoredSshShellReady(
   return confirmed;
 }
 
+async function waitForRestoredWslShellReady(
+  pane: TerminalPane,
+  stillCurrent: () => boolean
+) {
+  while (
+    stillCurrent()
+    && isTerminalPaneAlive(pane)
+    && pane.backendId
+    && pane.startupState === 'starting'
+  ) {
+    await delay(80);
+  }
+  return Boolean(
+    stillCurrent()
+    && isTerminalPaneAlive(pane)
+    && pane.backendId
+    && pane.startupState === 'ready'
+    && pane.shellReadyConfirmed
+  );
+}
+
 function queueWorkspaceTerminalRestoreTurn(workspaceId: string) {
   const previous = workspaceTerminalRestoreTails.get(workspaceId) ?? Promise.resolve();
   let releaseTurn: () => void = () => undefined;
@@ -19539,6 +19648,7 @@ async function restoreWorkspaceTerminalsInner(
     const preparedPlans: PreparedWorkspaceTerminalRestore[] = [];
     const windowsCwdResolutions = new Map<string, Promise<string>>();
     const sshRestoreScopes = new Map<string, WorkspaceTerminalRestoreSshScope>();
+    const wslReadyPaneIds = new Set<string>();
     let queuedExplorerLoadAfterReady = false;
     let restoreCompleted = false;
     const activeSnapshotIndex = clamp(snapshot.activeTerminalIndex || 0, 0, terminalSnapshots.length - 1);
@@ -19787,6 +19897,12 @@ async function restoreWorkspaceTerminalsInner(
               plan.pane,
               () => isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)
             );
+          } else if (plan.terminalProfile.kind === 'wsl' && plan.pane.backendId) {
+            const wslReadyConfirmed = await waitForRestoredWslShellReady(
+              plan.pane,
+              () => isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token)
+            );
+            if (wslReadyConfirmed) wslReadyPaneIds.add(plan.pane.paneId);
           }
         } finally {
           releaseSpawnSlot?.();
@@ -19845,6 +19961,7 @@ async function restoreWorkspaceTerminalsInner(
           isTerminalPaneAlive(plan.pane)
           && Boolean(plan.pane.backendId)
           && plan.pane.startupState !== 'failed'
+          && (plan.terminalProfile.kind !== 'wsl' || wslReadyPaneIds.has(plan.pane.paneId))
         ));
     } finally {
       for (const widget of createdWidgets) {
@@ -22187,9 +22304,15 @@ function formatCalculatorResult(value: number) {
   return Number(value.toPrecision(12)).toString();
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  onTimeout?: () => void
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => {
+      onTimeout?.();
       reject(new Error(`${label} timed out after ${(timeoutMs / 1000).toFixed(1)}s`));
     }, timeoutMs);
     promise.then(
@@ -22555,23 +22678,49 @@ function bindEvents() {
   document.addEventListener('pointerout', handleWorkspaceHoverOnlyPointerOut, { passive: true });
   document.addEventListener('pointermove', handleWorkspaceHoverOnlyPointerMove, { passive: true });
   el.profileSelect.addEventListener('change', async () => {
+    const operationGeneration = beginWorkspaceActivationOperation();
     saveActiveWorkspaceSnapshot();
     const canFillActiveEmptyWorkspace = workspaceSnapshotCanAcceptOpen(activeWorkspaceSnapshot());
-    if (state.workspaceOpen && !await closeWorkspace()) return;
+    if (state.workspaceOpen && !await closeWorkspace({ activationGeneration: operationGeneration })) return;
+    if (operationGeneration !== workspaceActivationGeneration) return;
     if (!canFillActiveEmptyWorkspace) state.activeWorkspaceId = '';
     renderWorkspaceTabs();
     selectProfile(el.profileSelect.value);
   });
   el.openRoot.addEventListener('click', async () => {
+    if (workspaceOpenInFlight) return;
     if (!state.activeProfile && !selectProfile(el.profileSelect.value)) {
       setStatus('Select a profile first', true);
       return;
     }
+    const profileId = state.activeProfile?.id;
+    if (!profileId) return;
+    const operationGeneration = beginWorkspaceActivationOperation();
+    const pathOperationGeneration = ++workspacePathSwitchGeneration;
+    const operationId = crypto.randomUUID();
+    workspaceOpenOperationId = operationId;
+    workspaceOpenInFlight = true;
+    setDisabledIfChanged(el.openRoot, true);
     try {
-      state.workspaceRoot = await resolveSelectedRoot();
-      await switchWorkspace(state.workspaceRoot);
+      const resolvedRoot = await resolveSelectedRoot(operationId);
+      if (workspaceOpenOperationId === operationId) workspaceOpenOperationId = '';
+      if (
+        operationGeneration !== workspaceActivationGeneration
+        || pathOperationGeneration !== workspacePathSwitchGeneration
+        || state.activeProfile?.id !== profileId
+      ) return;
+      await switchWorkspace(resolvedRoot);
     } catch (error) {
+      if (
+        operationGeneration !== workspaceActivationGeneration
+        || pathOperationGeneration !== workspacePathSwitchGeneration
+        || state.activeProfile?.id !== profileId
+      ) return;
       setStatus(`Open workspace failed: ${String(error)}`, true);
+    } finally {
+      if (workspaceOpenOperationId === operationId) workspaceOpenOperationId = '';
+      workspaceOpenInFlight = false;
+      setDisabledIfChanged(el.openRoot, false);
     }
   });
   el.saveWorkspace.addEventListener('click', () => void saveCurrentWorkspaceForLater());
@@ -23482,16 +23631,17 @@ async function toggleCurrentWindowMaximize() {
   await currentWindow.toggleMaximize();
   scheduleMainWebviewBoundsRefresh('toggle-maximize', { delay: 120, force: true });
 }
-async function resolveSelectedRoot() {
+async function resolveSelectedRoot(operationId: string) {
   if (!state.activeProfile) return '.';
-  const requested = el.rootInput.value.trim() || state.activeProfile.root || '.';
-  setStatus(`Resolving ${state.activeProfile.label} root...`);
+  const profile = state.activeProfile;
+  const requested = el.rootInput.value.trim() || profile.root || '.';
+  setStatus(`Resolving ${profile.label} root...`);
   const resolved = await withTimeout(
-    api.resolveProfilePath(state.activeProfile.id, requested),
+    api.resolveProfilePath(profile.id, requested, operationId),
     RESOLVE_PROFILE_PATH_TIMEOUT_MS,
-    `Resolving ${state.activeProfile.label} root`
+    `Resolving ${profile.label} root`,
+    () => cancelWorkspaceOpenOperation(operationId)
   );
-  el.rootInput.value = resolved;
   return resolved;
 }
 
@@ -25555,7 +25705,7 @@ function loadWorkspaceDirectoryInBackground(path: string, profileId: string, wor
 }
 
 async function switchWorkspace(path: string) {
-  const operationGeneration = ++workspaceActivationGeneration;
+  const operationGeneration = beginWorkspaceActivationOperation();
   const pathOperationGeneration = ++workspacePathSwitchGeneration;
   if (!state.activeProfile) {
     setStatus('Select a profile first', true);
@@ -25655,7 +25805,7 @@ async function closeWorkspace(options: {
   preserveCaptureProtection?: boolean;
   activationGeneration?: number;
 } = {}) {
-  const operationGeneration = options.activationGeneration ?? ++workspaceActivationGeneration;
+  const operationGeneration = options.activationGeneration ?? beginWorkspaceActivationOperation();
   await saveAllDirtyNotes();
   if (operationGeneration !== workspaceActivationGeneration) return false;
   workspacePathSwitchGeneration += 1;
@@ -26184,11 +26334,12 @@ function queueTerminalShellReadyAction(
 }
 
 function markTerminalShellReady(pane: TerminalPane, options: { confirmed?: boolean } = {}) {
-  if (!pane.backendId || !isTerminalPaneAlive(pane)) return;
+  if (!pane.backendId || !isTerminalPaneAlive(pane) || pane.startupState === 'failed') return;
   pane.startupState = 'ready';
   pane.startupError = undefined;
   if (!pane.shellReadyAt) pane.shellReadyAt = performance.now();
   if (options.confirmed) pane.shellReadyConfirmed = true;
+  clearTerminalStartupDeadline(pane);
   clearTerminalStartupWatch(pane);
   clearTerminalShellReadyFallback(pane);
   const actions = pane.pendingShellReadyActions;
@@ -26208,11 +26359,15 @@ function handleTerminalExitEvent(pane: TerminalPane) {
   flushTerminalWriteBuffer(pane);
   failPendingTerminalShellReadyActions(pane, 'shell exited before it became ready');
   setTerminalBackendId(pane, undefined);
+  pane.inputReconnectFrozen = false;
   // The backend reader can report EOF before a very fast process has been
   // inserted into the Rust session map. Reap only after the event has been
   // associated with its pane/backend ID; buffered startup exits reach this
   // same path after insertion.
-  if (exitedBackendId) void api.killTerminal(exitedBackendId).catch(() => undefined);
+  if (exitedBackendId) {
+    void terminateTerminalBackendEventually(exitedBackendId, 'Reaping exited terminal client')
+      .catch(() => undefined);
+  }
   failPendingTerminalInput(pane, 'Shell exited before pending terminal input delivery was confirmed');
   if (exitedDuringStartup) {
     pane.startupState = 'failed';
@@ -26427,6 +26582,8 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
         activity: 'Exited'
       });
     }
+    clearTerminalBackendTerminationRetry(pane);
+    clearTerminalStartupDeadline(pane);
     clearTerminalStartupWatch(pane);
     clearWorkspaceLlmWaitingForPane(pane);
     clearWorkspaceLlmTitleActivityForPane(pane);
@@ -26449,7 +26606,8 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
     resetWorkspaceLlmTitleStatusTracker(pane);
     if (!terminalNeedsShellReadyGate(pane)) {
       pane.shellReadyAt = performance.now();
-      pane.shellReadyConfirmed = true;
+      if (terminalShellReadyProfile(pane)?.kind === 'wsl') pane.shellReadyProbeBuffer = '';
+      else pane.shellReadyConfirmed = true;
     } else {
       if (terminalShellReadyProfile(pane)?.kind === 'ssh') pane.shellReadyProbeBuffer = '';
       scheduleTerminalShellReadyFallback(pane);
@@ -26652,7 +26810,26 @@ function clearExplorerBackgroundWork() {
   explorerDirectoryPrefetchPending.clear();
   for (const timer of textFilePrefetchTimers.values()) window.clearTimeout(timer);
   textFilePrefetchTimers.clear();
-  explorerDirectoryPrefetchActive = 0;
+  cancelExplorerRuntimeOperations();
+}
+
+function trackExplorerRuntimeOperation<T>(operationId: string, promise: Promise<T>) {
+  explorerRuntimeOperationIds.add(operationId);
+  const release = () => explorerRuntimeOperationIds.delete(operationId);
+  promise.then(release, release);
+  return promise;
+}
+
+function cancelExplorerRuntimeOperation(operationId: string) {
+  if (!explorerRuntimeOperationIds.has(operationId)) return;
+  void api.cancelRuntimeOperation(operationId).catch(() => undefined);
+}
+
+function cancelExplorerRuntimeOperations() {
+  const operationIds = [...explorerRuntimeOperationIds];
+  for (const operationId of operationIds) {
+    void api.cancelRuntimeOperation(operationId).catch(() => undefined);
+  }
 }
 
 function cancelExplorerWatchSchedule() {
@@ -26815,10 +26992,8 @@ function scheduleExplorerDirectoryCachePrune() {
 function invalidateExplorerDirectoryCache(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
   const sizeKey = explorerDirectoryCacheKey(profileId, path, workspaceId, true);
   explorerDirectoryCache.delete(sizeKey);
-  explorerDirectoryReads.delete(sizeKey);
   const noSizeKey = explorerDirectoryCacheKey(profileId, path, workspaceId, false);
   explorerDirectoryCache.delete(noSizeKey);
-  explorerDirectoryReads.delete(noSizeKey);
 }
 
 function invalidateExplorerParentDirectoryCache(profileId: string, path: string, workspaceId = state.activeWorkspaceId) {
@@ -26852,21 +27027,30 @@ async function fetchExplorerDirectory(profileId: string, path: string, workspace
     if (cached) return cached;
   }
   const pending = explorerDirectoryReads.get(key);
-  if (pending && !force) return cloneExplorerEntries(await pending);
+  if (pending) return cloneExplorerEntries(await pending);
 
+  const operationId = crypto.randomUUID();
+  const backendRead = trackExplorerRuntimeOperation(
+    operationId,
+    api.listDirectory(profileId, path, state.showFileSizes, operationId)
+  );
   let read: Promise<FileEntry[]>;
   read = withExplorerDirectoryTimeout(
     profileId,
-    api.listDirectory(profileId, path, state.showFileSizes),
-    `Loading ${path}`
+    backendRead,
+    `Loading ${path}`,
+    operationId
   )
     .then((entries) => {
       cacheExplorerDirectory(profileId, path, entries, workspaceId);
       return cloneExplorerEntries(entries);
-    })
-    .finally(() => {
-      if (explorerDirectoryReads.get(key) === read) explorerDirectoryReads.delete(key);
     });
+  const releaseRead = () => {
+    if (explorerDirectoryReads.get(key) === read) explorerDirectoryReads.delete(key);
+  };
+  // Keep the rejected timeout promise in the pending map until the backend has
+  // actually acknowledged cancellation, so a retry cannot overlap the old WSL/SSH helper.
+  backendRead.then(releaseRead, releaseRead);
   explorerDirectoryReads.set(key, read);
   return cloneExplorerEntries(await read);
 }
@@ -26898,17 +27082,17 @@ async function fetchExplorerDirectories(
         results.set(resultKey, { path, entries: cached, error: null });
         continue;
       }
-      const pending = explorerDirectoryReads.get(cacheKey);
-      if (pending) {
-        pendingReads.push(pending
-          .then((entries) => {
-            results.set(resultKey, { path, entries: cloneExplorerEntries(entries), error: null });
-          })
-          .catch((error) => {
-            results.set(resultKey, { path, entries: [], error: String(error) });
-          }));
-        continue;
-      }
+    }
+    const pending = explorerDirectoryReads.get(cacheKey);
+    if (pending) {
+      pendingReads.push(pending
+        .then((entries) => {
+          results.set(resultKey, { path, entries: cloneExplorerEntries(entries), error: null });
+        })
+        .catch((error) => {
+          results.set(resultKey, { path, entries: [], error: String(error) });
+        }));
+      continue;
     }
     if (!missKeys.has(cacheKey)) {
       missKeys.add(cacheKey);
@@ -26919,6 +27103,14 @@ async function fetchExplorerDirectories(
   if (pendingReads.length) await Promise.all(pendingReads);
   if (misses.length) {
     const batchReads = new Map<string, ReturnType<typeof createExplorerDirectoryPendingRead>>();
+    let backendRead: Promise<DirectoryListingResult[]> | null = null;
+    let backendSettled = false;
+    let batchFinished = false;
+    const releaseBatchReads = () => {
+      for (const [key, pending] of batchReads) {
+        if (explorerDirectoryReads.get(key) === pending.promise) explorerDirectoryReads.delete(key);
+      }
+    };
     for (const path of misses) {
       const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
       if (explorerDirectoryReads.has(key)) continue;
@@ -26927,10 +27119,26 @@ async function fetchExplorerDirectories(
       batchReads.set(key, pending);
     }
     try {
+      const operationId = crypto.randomUUID();
+      backendRead = trackExplorerRuntimeOperation(
+        operationId,
+        api.listDirectories(profileId, misses, state.showFileSizes, operationId)
+      );
+      backendRead.then(
+        () => {
+          backendSettled = true;
+          if (batchFinished) releaseBatchReads();
+        },
+        () => {
+          backendSettled = true;
+          if (batchFinished) releaseBatchReads();
+        }
+      );
       const listings = await withExplorerDirectoryTimeout(
         profileId,
-        api.listDirectories(profileId, misses, state.showFileSizes),
-        `Loading ${misses.length} director${misses.length === 1 ? 'y' : 'ies'}`
+        backendRead,
+        `Loading ${misses.length} director${misses.length === 1 ? 'y' : 'ies'}`,
+        operationId
       );
       const completedKeys = new Set<string>();
       for (const listing of listings) {
@@ -26953,35 +27161,51 @@ async function fetchExplorerDirectories(
         pending.reject(new Error('Directory listing was unavailable'));
       }
     } catch (error) {
-      for (const [key, pending] of batchReads) {
-        if (explorerDirectoryReads.get(key) === pending.promise) explorerDirectoryReads.delete(key);
-      }
-      await Promise.all(misses.map(async (path) => {
-        const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId);
-        const pending = batchReads.get(cacheKey);
-        try {
-          const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force);
-          results.set(explorerPathKey(path), { path, entries, error: null });
-          pending?.resolve(cloneExplorerEntries(entries));
-        } catch (readError) {
-          results.set(explorerPathKey(path), { path, entries: [], error: String(readError || error) });
-          pending?.reject(readError || error);
+      const profile = profileForIdWithWindowsFallback(profileId) ?? state.activeProfile;
+      if (profile?.kind === 'wsl' || profile?.kind === 'ssh') {
+        for (const path of misses) {
+          const pending = batchReads.get(explorerDirectoryCacheKey(profileId, path, workspaceId));
+          results.set(explorerPathKey(path), { path, entries: [], error: String(error) });
+          pending?.reject(error);
         }
-      }));
-    } finally {
-      for (const [key, pending] of batchReads) {
-        if (explorerDirectoryReads.get(key) === pending.promise) explorerDirectoryReads.delete(key);
+      } else {
+        releaseBatchReads();
+        await Promise.all(misses.map(async (path) => {
+          const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId);
+          const pending = batchReads.get(cacheKey);
+          try {
+            const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force);
+            results.set(explorerPathKey(path), { path, entries, error: null });
+            pending?.resolve(cloneExplorerEntries(entries));
+          } catch (readError) {
+            results.set(explorerPathKey(path), { path, entries: [], error: String(readError || error) });
+            pending?.reject(readError || error);
+          }
+        }));
       }
+    } finally {
+      batchFinished = true;
+      if (!backendRead || backendSettled) releaseBatchReads();
     }
   }
 
   return results;
 }
 
-function withExplorerDirectoryTimeout<T>(profileId: string, promise: Promise<T>, label: string) {
+function withExplorerDirectoryTimeout<T>(
+  profileId: string,
+  promise: Promise<T>,
+  label: string,
+  operationId: string
+) {
   const profile = profileForIdWithWindowsFallback(profileId) ?? state.activeProfile;
   if (profile?.kind !== 'ssh' && profile?.kind !== 'wsl') return promise;
-  return withTimeout(promise, EXPLORER_REMOTE_DIRECTORY_LOAD_TIMEOUT_MS, label);
+  return withTimeout(
+    promise,
+    EXPLORER_REMOTE_DIRECTORY_LOAD_TIMEOUT_MS,
+    label,
+    () => cancelExplorerRuntimeOperation(operationId)
+  );
 }
 
 function explorerDirectoryCacheTtl(profileId: string) {
@@ -29474,7 +29698,6 @@ function scheduleExplorerWatch(delayMs = explorerWatchInterval()) {
 
 function stopExplorerWatch() {
   cancelExplorerWatchSchedule();
-  explorerWatchInFlight = false;
 }
 
 function runExplorerWatch() {
@@ -29609,7 +29832,16 @@ async function changedExplorerWatchPaths(profileId: string, paths: string[], wor
   if (!signaturePaths.length) return changedPaths;
   if (shouldPauseExplorerBackgroundWork()) return changedPaths;
 
-  const signatures = await api.directorySignatures(profileId, signaturePaths, state.showFileSizes);
+  const operationId = crypto.randomUUID();
+  const signatures = await withExplorerDirectoryTimeout(
+    profileId,
+    trackExplorerRuntimeOperation(
+      operationId,
+      api.directorySignatures(profileId, signaturePaths, state.showFileSizes, operationId)
+    ),
+    `Checking ${signaturePaths.length} director${signaturePaths.length === 1 ? 'y' : 'ies'}`,
+    operationId
+  );
   const signatureKeys: string[] = [];
   for (const result of signatures) signatureKeys.push(explorerPathKey(result.path));
 
@@ -33668,6 +33900,7 @@ async function startTerminalPaneBackend(
   terminalCreateStartedAt = performance.now()
 ) {
   if (!isTerminalPaneAlive(pane)) return pane;
+  pane.backendStartPending = true;
   pane.command = command;
   scheduleTerminalStartupWatch(pane, terminalProfile, title);
   const term = pane.term;
@@ -33688,6 +33921,8 @@ async function startTerminalPaneBackend(
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (!isTerminalPaneAlive(pane)) return pane;
       let disposeLateBackend = false;
+      const operationId = crypto.randomUUID();
+      pane.pendingRuntimeOperationId = operationId;
       const spawnPromise = api.spawnTerminal(
         terminalProfile.id,
         pane.cwd,
@@ -33696,18 +33931,24 @@ async function startTerminalPaneBackend(
         term.cols,
         widget.workspaceId,
         title,
-        pane.shellHistoryId
+        pane.shellHistoryId,
+        operationId
       );
       spawnPromise.then((lateBackendId) => {
+        if (pane.pendingRuntimeOperationId === operationId) pane.pendingRuntimeOperationId = undefined;
         if (disposeLateBackend || !isTerminalPaneAlive(pane)) {
-          void api.killTerminal(lateBackendId).catch(() => undefined);
+          void terminateTerminalBackendEventually(lateBackendId, 'Closing late terminal client')
+            .catch(() => undefined);
         }
-      }).catch(() => undefined);
+      }, () => {
+        if (pane.pendingRuntimeOperationId === operationId) pane.pendingRuntimeOperationId = undefined;
+      });
       try {
         backendId = await withTimeout(
           spawnPromise,
           terminalStartTimeoutMs(terminalProfile),
-          `${terminalProfile.kind.toUpperCase()} shell start`
+          `${terminalProfile.kind.toUpperCase()} shell start`,
+          () => cancelTerminalRuntimeOperation(pane, operationId)
         );
         break;
       } catch (error) {
@@ -33725,10 +33966,12 @@ async function startTerminalPaneBackend(
     }
     if (!backendId) throw new Error('WSL shell start returned no terminal session');
     if (!isTerminalPaneAlive(pane)) {
-      void api.killTerminal(backendId).catch(() => undefined);
+      void terminateTerminalBackendEventually(backendId, 'Closing abandoned terminal client')
+        .catch(() => undefined);
       return pane;
     }
     setTerminalBackendId(pane, backendId);
+    if (terminalProfile.kind === 'wsl') scheduleTerminalWslShellReadyDeadline(pane, backendId);
     appendPerformanceDiagnostic(
       'terminal-backend-attached',
       terminalCreateStartedAt,
@@ -33779,6 +34022,9 @@ async function startTerminalPaneBackend(
       scheduleAppGlassOwnerRefresh(widget.element, { delay: 180, reason: 'terminal-failed' });
     }
     setStatus(String(error), true);
+  } finally {
+    pane.backendStartPending = false;
+    if (!pane.backendId) cancelTerminalRuntimeOperation(pane);
   }
   return pane;
 }
@@ -33787,6 +34033,9 @@ async function closeTerminalPane(paneId: string, options: CloseTerminalOptions =
   const pane = terminalPaneById.get(paneId) ?? state.terminals.find((item) => item.paneId === paneId);
   if (!pane) return;
   pane.closed = true;
+  cancelTerminalRuntimeOperation(pane);
+  clearTerminalBackendTerminationRetry(pane);
+  clearTerminalStartupDeadline(pane);
   clearTerminalStartupWatch(pane);
   clearTerminalPendingShellReadyActions(pane);
   const workspaceId = pane.workspaceId;
@@ -33842,6 +34091,102 @@ function isTerminalPaneAlive(pane: TerminalPane) {
     && pane.host.isConnected;
 }
 
+function terminalPaneOwnsRuntime(pane: TerminalPane) {
+  return !pane.closed && Boolean(
+    pane.backendId
+    || pane.inputBackendPending
+    || pane.backendStartPending
+    || pane.pendingRuntimeOperationId
+  );
+}
+
+function cancelTerminalRuntimeOperation(pane: TerminalPane, expectedOperationId?: string) {
+  const operationId = pane.pendingRuntimeOperationId;
+  if (!operationId || (expectedOperationId && operationId !== expectedOperationId)) return;
+  pane.pendingRuntimeOperationId = undefined;
+  void api.cancelRuntimeOperation(operationId).catch(() => undefined);
+}
+
+function scheduleTerminalWslShellReadyDeadline(pane: TerminalPane, backendId: string) {
+  clearTerminalStartupDeadline(pane);
+  if (pane.startupState !== 'starting') return;
+  armTerminalWslShellReadyDeadline(pane, backendId, TERMINAL_WSL_SHELL_READY_TIMEOUT_MS);
+}
+
+function armTerminalWslShellReadyDeadline(pane: TerminalPane, backendId: string, delayMs: number) {
+  pane.startupDeadlineTimer = window.setTimeout(() => {
+    pane.startupDeadlineTimer = undefined;
+    if (
+      !isTerminalPaneAlive(pane)
+      || pane.backendId !== backendId
+      || pane.startupState !== 'starting'
+    ) return;
+    // WebView timers and terminal events can be paused/reordered while the app is
+    // hidden. Require a visible foreground confirmation grace before declaring
+    // the WSL client stuck, so queued OSC7 output gets a chance to drain first.
+    if (document.hidden || !document.hasFocus() || terminalWindowWakeCatchingUp()) {
+      pane.startupDeadlineExpired = false;
+      armTerminalWslShellReadyDeadline(pane, backendId, 2000);
+      return;
+    }
+    if (!pane.startupDeadlineExpired) {
+      pane.startupDeadlineExpired = true;
+      armTerminalWslShellReadyDeadline(pane, backendId, 2000);
+      return;
+    }
+    const message = 'WSL shell started but did not become ready';
+    failPendingTerminalShellReadyActions(pane, message);
+    failPendingTerminalInput(pane, `${message} before pending terminal input delivery was confirmed`);
+    pane.startupState = 'failed';
+    pane.startupError = message;
+    pane.shellReadyProbeBuffer = undefined;
+    pane.inputReconnectFrozen = true;
+    pane.term.write(`\r\n${message} after ${Math.round(TERMINAL_WSL_SHELL_READY_TIMEOUT_MS / 1000)}s. Stopping the stuck WSL client; close this shell or reopen the workspace to retry.\r\n`);
+    terminateUnreadyWslBackend(pane, backendId);
+    const widget = terminalWidgetForPane(pane);
+    if (widget) renderTerminalWidgetTabs(widget);
+    refreshWorkspaceLlmActivityAfterPaneChange(pane.workspaceId);
+    if (terminalShellReadyStatusApplies(pane)) setStatus(message, true);
+  }, delayMs);
+}
+
+function clearTerminalStartupDeadline(pane: TerminalPane) {
+  if (pane.startupDeadlineTimer) window.clearTimeout(pane.startupDeadlineTimer);
+  pane.startupDeadlineTimer = undefined;
+  pane.startupDeadlineExpired = false;
+}
+
+function terminateUnreadyWslBackend(pane: TerminalPane, backendId: string) {
+  const attempt = (pane.backendTerminationAttempts ?? 0) + 1;
+  pane.backendTerminationAttempts = attempt;
+  void withTimeout(
+    api.killTerminal(backendId),
+    TERMINAL_CLOSE_BACKEND_TIMEOUT_MS,
+    'Stopping unready WSL terminal'
+  )
+    .then(() => {
+      if (pane.backendId === backendId) setTerminalBackendId(pane, undefined);
+      pane.inputReconnectFrozen = false;
+    })
+    .catch((error) => {
+      if (!isTerminalPaneAlive(pane) || pane.backendId !== backendId) return;
+      const retryMs = Math.min(5000, 250 * (2 ** Math.min(attempt, 5)));
+      pane.backendTerminationTimer = window.setTimeout(() => {
+        pane.backendTerminationTimer = undefined;
+        terminateUnreadyWslBackend(pane, backendId);
+      }, retryMs);
+      if (attempt === 1 && terminalShellReadyStatusApplies(pane)) {
+        setStatus(`Retrying stuck WSL client cleanup: ${String(error)}`, true);
+      }
+    });
+}
+
+function clearTerminalBackendTerminationRetry(pane: TerminalPane) {
+  if (pane.backendTerminationTimer) window.clearTimeout(pane.backendTerminationTimer);
+  pane.backendTerminationTimer = undefined;
+  pane.backendTerminationAttempts = undefined;
+}
+
 function scheduleTerminalStartupWatch(pane: TerminalPane, profile: ConnectionProfile, title: string) {
   clearTerminalStartupWatch(pane);
   const label = title || 'terminal';
@@ -33878,13 +34223,52 @@ function clearTerminalStartupWatch(pane: TerminalPane) {
 function closeTerminalBackend(pane: TerminalPane) {
   const backendId = pane.backendId;
   if (!backendId) return Promise.resolve();
-  return withTimeout(
+  return terminateTerminalBackendEventually(backendId, `Closing terminal ${pane.title}`)
+    .catch((error) => {
+      console.warn(`Terminal backend close timed out or failed for ${backendId}:`, error);
+    });
+}
+
+function terminateTerminalBackendEventually(backendId: string, label: string): Promise<void> {
+  const existing = terminalBackendTerminationPromises.get(backendId);
+  if (existing) return existing;
+  const retryTimer = terminalBackendTerminationRetryTimers.get(backendId);
+  if (retryTimer) {
+    window.clearTimeout(retryTimer);
+    terminalBackendTerminationRetryTimers.delete(backendId);
+  }
+  let request: Promise<void>;
+  request = withTimeout(
     api.killTerminal(backendId),
     TERMINAL_CLOSE_BACKEND_TIMEOUT_MS,
-    `Closing terminal ${pane.title}`
-  ).catch((error) => {
-    console.warn(`Terminal backend close timed out or failed for ${backendId}:`, error);
-  });
+    label
+  )
+    .then(() => {
+      terminalBackendTerminationRetryAttempts.delete(backendId);
+    })
+    .catch((error) => {
+      scheduleTerminalBackendTerminationRetry(backendId, label);
+      throw error;
+    })
+    .finally(() => {
+      if (terminalBackendTerminationPromises.get(backendId) === request) {
+        terminalBackendTerminationPromises.delete(backendId);
+      }
+    });
+  terminalBackendTerminationPromises.set(backendId, request);
+  return request;
+}
+
+function scheduleTerminalBackendTerminationRetry(backendId: string, label: string) {
+  if (appShutdownStarted || terminalBackendTerminationRetryTimers.has(backendId)) return;
+  const attempt = (terminalBackendTerminationRetryAttempts.get(backendId) ?? 0) + 1;
+  terminalBackendTerminationRetryAttempts.set(backendId, attempt);
+  const retryMs = Math.min(5000, 250 * (2 ** Math.min(attempt, 5)));
+  const timer = window.setTimeout(() => {
+    terminalBackendTerminationRetryTimers.delete(backendId);
+    void terminateTerminalBackendEventually(backendId, label).catch(() => undefined);
+  }, retryMs);
+  terminalBackendTerminationRetryTimers.set(backendId, timer);
 }
 
 async function closeTerminalWidget(widgetId: string, options: CloseTerminalOptions = {}) {
@@ -34357,7 +34741,7 @@ function firstActiveWorkspaceTerminalWidget() {
 
 function hasActiveWorkspaceTerminalPane() {
   for (const pane of state.terminals) {
-    if (pane.workspaceId === state.activeWorkspaceId && pane.startupState !== 'failed') return true;
+    if (pane.workspaceId === state.activeWorkspaceId && terminalPaneOwnsRuntime(pane)) return true;
   }
   return false;
 }

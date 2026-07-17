@@ -52,6 +52,44 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-07-17 - Bound unresponsive WSL clients during workspace switching
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
+- Terminal launches and WSL/SSH Explorer helpers now carry cancelable operation IDs tied to the
+  renderer epoch. Closing a pane, superseding an Open request, switching Explorer context, or hitting
+  a remote-read timeout cancels the backend operation instead of only abandoning its frontend promise.
+- WSL short helpers are capped per distro. A failing distro enters a bounded cooldown, unreaped helper
+  processes keep occupying their permits, and stale successes cannot erase a newer failure. Cleanup
+  retries are bounded; a still-owned child is quarantined without repeated `taskkill` churn and remains
+  covered by the app cleanup Job.
+- Terminal cleanup transfers failed process termination to a bounded backend reaper. The frontend also
+  retains/retries backend IDs when a kill IPC fails, and a cancellation racing with terminal insertion
+  rolls that terminal back instead of leaving an unowned session.
+- A WSL PTY must emit the bootstrap OSC7 readiness marker. A visible shell that remains unready for
+  roughly 30 seconds gets a foreground confirmation grace, is marked failed, and its client is stopped.
+  Hidden/minimized WebView timer pauses do not immediately kill a healthy shell on resume.
+- Saved workspace Load remains single-flight through WSL split-pane readiness. Explorer forced refreshes
+  still bypass cache but never bypass an existing read, remote batch failures no longer fan out into more
+  helpers, and cancellation ownership is retained until the backend request settles.
+- Memory Saver now also budgets live panes: Balanced keeps at most eight panes across up to three live
+  workspaces after the existing ten-minute idle grace; Aggressive uses four panes, one workspace,
+  and a two-minute grace. `Keep live`, active work, Browser state, and important LLM activity remain exempt.
+- Inactive workspace tmux title polling is reduced to a ten-second cadence. Duplicate Open/Load actions
+  are fenced so stale path resolution or repeated saved-workspace clicks cannot start overlapping restores.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `git diff --check`
+- Real packaged Windows/WebView2 smoke is still required with an intentionally unresponsive WSL distro,
+  repeated workspace/Open/Load/Explorer switching, 2x2 split restore, minimize/resume, and verification
+  that local IDE-owned `wsl.exe` clients stay bounded while tmux inside the distro remains available.
+
 ### 2026-07-16 - Prevent false SSH workspace wakes and Explorer hover Glass trails
 
 #### Changed (`src/main.ts`, `src/styles.css`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
