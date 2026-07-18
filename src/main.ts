@@ -24250,14 +24250,26 @@ function handleEditorSaveShortcut(event: KeyboardEvent) {
 
 function handleResizeShortcut(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
-  if (isEditableShortcutTarget(event.target)) return;
+  const editablePanel = editableFontResizePanel(event.target);
+  if (isEditableShortcutTarget(event.target) && !editablePanel) return;
   if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
   const direction = shortcutResizeDirection(event);
   if (!direction) return;
 
   event.preventDefault();
   event.stopPropagation();
-  resizeKeyboardTarget(direction);
+  if (editablePanel === 'editor') resizeEditorFont(direction);
+  else if (editablePanel === 'notes') resizeNoteFont(direction);
+  else resizeKeyboardTarget(direction);
+}
+
+function editableFontResizePanel(target: EventTarget | null): 'editor' | 'notes' | null {
+  const panel = target instanceof Element
+    ? target.closest<HTMLElement>('[data-panel="editor"], [data-panel="notes"]')
+    : null;
+  return panel?.dataset.panel === 'editor' || panel?.dataset.panel === 'notes'
+    ? panel.dataset.panel
+    : null;
 }
 
 function handleWidgetFocusShortcut(event: KeyboardEvent) {
