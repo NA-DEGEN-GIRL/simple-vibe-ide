@@ -2282,9 +2282,11 @@ body.glass-mode-on .window-control-icon {
   gap: var(--workspace-glass-row-gap);
   overflow-x: hidden;
   overflow-y: auto;
-  scrollbar-gutter: auto;
+  scrollbar-gutter: stable;
 }
 .shell.workspace-dock-side .workspace-tab {
+  /* Expanded agent details belong to the row's scroll height; never compress rows to fit the dock. */
+  flex: 0 0 auto;
   width: 100%;
   min-width: 0;
   max-width: none;
@@ -2592,13 +2594,16 @@ body.workspace-dock-resizing * {
   color: var(--workspace-glass-header-color);
 }
 .shell.workspace-dock-side.workspace-side-glass .workspace-tabs {
-  scrollbar-gutter: auto;
+  scrollbar-gutter: stable;
   gap: var(--workspace-glass-row-gap);
   box-sizing: border-box;
   padding-block: var(--workspace-glass-row-edge-gap);
   padding-inline: var(--workspace-glass-row-inline-safe-gap);
-  margin-inline: calc(0px - var(--workspace-glass-row-inline-safe-gap));
-  width: calc(100% + var(--workspace-glass-row-inline-safe-gap) + var(--workspace-glass-row-inline-safe-gap));
+  /* Let row glow borrow space only on the inline-start edge. The end edge stays
+     inside the dock so the reserved scrollbar gutter remains on the container Glass. */
+  margin-inline-start: calc(0px - var(--workspace-glass-row-inline-safe-gap));
+  margin-inline-end: 0;
+  width: calc(100% + var(--workspace-glass-row-inline-safe-gap));
   isolation: auto;
   z-index: auto;
 }
