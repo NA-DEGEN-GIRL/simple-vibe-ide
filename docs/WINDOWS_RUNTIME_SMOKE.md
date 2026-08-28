@@ -23,6 +23,8 @@ that built exe as a portable artifact for older or different CPUs.
 
 ## One-Command Build Gate
 
+### Windows-local checkout
+
 Run from PowerShell in the repo root:
 
 ```powershell
@@ -34,6 +36,10 @@ If dependencies are already installed and you want to skip dependency install:
 ```powershell
 .\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall
 ```
+
+`-SkipNpmInstall` is valid only when the existing `node_modules` was installed
+for Windows. The script now checks Windows npm shims and native esbuild/Rollup
+packages first and fails with a clear message for a WSL-created or mixed tree.
 
 If you only want build/link validation without launching:
 
@@ -48,6 +54,24 @@ this process only:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall
 ```
 
+### WSL-hosted checkout
+
+Never run Windows npm over the same `node_modules` used by WSL. From a Visual
+Studio Developer PowerShell with Git for Windows available, map the source
+temporarily and invoke the staged gate instead:
+
+```powershell
+cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows-staged-runtime-smoke.ps1 -NoLaunch'
+```
+
+The staged gate uses Git's tracked manifest, copies current working-tree source
+to Windows-local `%TEMP%`, runs `npm ci --no-audit --no-fund`, verifies
+`npm audit --audit-level=low`, then runs this smoke with `-SkipNpmInstall`.
+Pass `-StageRoot` and `-CargoTargetDir` to keep both on another Windows-local
+drive. The script refuses a WSL/UNC stage and refuses to delete a directory it
+did not create. Pass `-IncludeUntracked` only when new untracked source is
+required; common environment/private-key patterns make the preflight fail.
+
 The script runs:
 
 - `node --version`
@@ -55,14 +79,15 @@ The script runs:
 - `rustc --version`
 - `cargo --version`
 - `Get-Command link.exe` (reported as advisory; build result is authoritative)
+- `npm.cmd audit --audit-level=low`
 - `npm.cmd run check`
 - `npm.cmd run build`
 - `npm.cmd run build:terminal`
 - `cargo check --manifest-path src-tauri/Cargo.toml`
 - `npm.cmd run tauri -- build --no-bundle`
 - `npm.cmd run tauri:terminal:build`
-- launch of the built `simple-vibe-ide.exe` and `simple-vibe-terminal.exe` unless
-  `-NoLaunch` is passed
+- launch of the built `simple-vibe-ide.exe` unless `-NoLaunch` is passed; the
+  Terminal executable is built and reported for separate manual launch
 
 ## Manual Runtime Smoke Checklist
 
@@ -89,12 +114,34 @@ The script runs:
 
 - Create several terminal widgets and multiple tabs per widget.
 - In a Windows-local workspace, launch Codex and Claude from their buttons.
-- Confirm the Codex launch line includes `approval_policy="never"` and
-  `sandbox_mode="danger-full-access"`, and the Claude launch line includes
-  `--permission-mode bypassPermissions`.
+- Confirm the Codex launch line includes exactly one
+  `--dangerously-bypass-approvals-and-sandbox`, with no `--enable goals` or
+  approval/sandbox config overrides.
+- Confirm the Claude launch line includes exactly one
+  `--dangerously-skip-permissions`, with no extra `--permission-mode` argument.
 - Confirm both CLIs enter their bypass/no-approval mode and do not ask for an
   approval on a harmless read-only action. Do not use a destructive action for
   this smoke.
+- In WSL and one SSH profile with tmux installed, confirm the typed launcher line
+  starts with `__svi_launch_v=8` and Codex/Claude remains usable for a normal turn.
+- From another client attached to the IDE-created session, confirm
+  `tmux show-options -v -t "$TMUX_PANE" destroy-unattached` reports `off` without
+  changing the server-wide default.
+- Exit one agent normally, then test a harmless wrapper that returns a nonzero
+  status and another wrapper function that uses `exec` or `exit`. Confirm every
+  case retains the tmux session as a dead pane with `remain-on-exit on`, showing
+  the last output and actual status instead of only `[exited]`.
+- Leave a visible tmux-backed agent running long enough for stale probes, then
+  switch/focus panes. Confirm diagnostics may report `autoReconnect=off` but the
+  IDE never replaces or terminates the current PTY automatically.
+- With `Terminal renderer` set to `Auto`, open a normal shell whose badge has
+  reached `GL`, type `opencode`, and press Enter. Confirm the badge changes to
+  `DOM` before the TUI starts drawing. Exercise Korean/mixed-width streaming
+  output, scroll, resize, and workspace switching; confirm old glyph fragments
+  do not remain at the left edge. This is a runtime check for the scoped
+  OpenTUI compatibility path, not an OpenCode launcher/status integration.
+- Switch an existing `GL` shell to `DOM compatibility` in Settings and save.
+  Confirm that live pane changes to `DOM` without reopening the shell.
 - Switch active shell tabs rapidly.
 - Close active and inactive tabs.
 - Close a whole terminal widget.

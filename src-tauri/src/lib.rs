@@ -157,6 +157,7 @@ const WSL_DISTRO_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 const WSL_TRANSIENT_RETRY_ATTEMPTS: usize = 4;
 const REMOTE_SHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const REMOTE_DIRECTORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(18);
+const GIT_WORKSPACE_ROOT_TIMEOUT: Duration = Duration::from_secs(4);
 const LLM_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 const LLM_TMUX_TITLE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDERER_HEARTBEAT_STARTUP_GRACE: Duration = Duration::from_secs(30);
@@ -543,6 +544,16 @@ struct RegisterAgentBridgeSessionPayload {
     pane_id: String,
     workspace_id: String,
     cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorkspaceRoots {
+    launch_cwd: String,
+    worktree_root: String,
+    main_checkout_root: String,
+    settings_use_launch_cwd: bool,
+    claude_main_checkout_settings_supported: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2423,7 +2434,7 @@ fn handle_agent_bridge_http_request(
         .or_else(|| registered.as_ref().map(|session| session.agent_id.clone()))
         .unwrap_or_else(|| "agent".to_string());
     let raw_event_name = agent_bridge_event_name(&value);
-    let status = agent_bridge_status_for_event(&raw_event_name).map(str::to_string);
+    let status = agent_bridge_status_for_event(&raw_event_name, &value).map(str::to_string);
     let activity = agent_bridge_activity_for_event(&raw_event_name, &value);
     let event = AgentBridgeEvent {
         agent_id,
@@ -2432,7 +2443,11 @@ fn handle_agent_bridge_http_request(
         workspace_id: registered
             .as_ref()
             .map(|session| session.workspace_id.clone()),
-        cwd: registered.as_ref().map(|session| session.cwd.clone()),
+        cwd: value
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| registered.as_ref().map(|session| session.cwd.clone())),
         raw_event_name,
         status,
         activity,
@@ -2508,6 +2523,7 @@ fn agent_bridge_canonical_event_name(value: &str) -> String {
         "subagent_stop" | "SubagentStop" | "subagent_end" | "SubagentEnd" => "SubagentStop",
         "pre_compact" | "PreCompact" => "PreCompact",
         "post_compact" | "PostCompact" => "PostCompact",
+        "cwd_changed" | "CwdChanged" => "CwdChanged",
         "stop" | "Stop" => "Stop",
         "stop_failure" | "StopFailure" => "StopFailure",
         "session_end" | "SessionEnd" => "SessionEnd",
@@ -2516,17 +2532,41 @@ fn agent_bridge_canonical_event_name(value: &str) -> String {
     .to_string()
 }
 
-fn agent_bridge_status_for_event(event_name: &str) -> Option<&'static str> {
+fn agent_bridge_status_for_event(
+    event_name: &str,
+    value: &serde_json::Value,
+) -> Option<&'static str> {
     match event_name {
-        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart" | "PreCompact" => {
-            Some("working")
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        | "PermissionDenied" | "SubagentStart" | "PreCompact" => Some("working"),
+        "PostCompact" => match value.get("trigger").and_then(|value| value.as_str()) {
+            Some("manual") => Some("idle"),
+            Some("auto") => Some("working"),
+            _ => None,
+        },
+        "PermissionRequest" => Some("waiting"),
+        "Notification" if agent_bridge_notification_is_actionable(value) => Some("waiting"),
+        "Notification" => None,
+        "SessionStart"
+            if value.get("source").and_then(|value| value.as_str()) == Some("compact") =>
+        {
+            None
         }
-        "Notification" | "PermissionRequest" => Some("waiting"),
-        "Stop" | "SubagentStop" | "PostCompact" | "SessionStart" => Some("idle"),
-        "StopFailure" | "PostToolUseFailure" | "PermissionDenied" => Some("error"),
+        "Stop" | "SessionStart" => Some("idle"),
+        "StopFailure" => Some("error"),
         "SessionEnd" => Some("exited"),
         _ => None,
     }
+}
+
+fn agent_bridge_notification_is_actionable(value: &serde_json::Value) -> bool {
+    matches!(
+        value
+            .get("notification_type")
+            .or_else(|| value.get("notificationType"))
+            .and_then(|value| value.as_str()),
+        Some("permission_prompt" | "idle_prompt" | "elicitation_dialog")
+    )
 }
 
 fn agent_bridge_activity_for_event(event_name: &str, value: &serde_json::Value) -> Option<String> {
@@ -2544,18 +2584,32 @@ fn agent_bridge_activity_for_event(event_name: &str, value: &serde_json::Value) 
         "PostToolUse" => "Tool finished".to_string(),
         "PostToolUseFailure" => "Tool failed".to_string(),
         "SubagentStart" => "Subagent started".to_string(),
-        "Notification" | "PermissionRequest" => value
+        "Notification" if agent_bridge_notification_is_actionable(value) => value
+            .get("message")
+            .or_else(|| value.get("notification"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("Waiting for your response")
+            .to_string(),
+        "Notification" => return None,
+        "PermissionRequest" => value
             .get("message")
             .or_else(|| value.get("notification"))
             .and_then(|value| value.as_str())
             .unwrap_or("Waiting for your response")
             .to_string(),
         "PermissionDenied" => "Permission denied".to_string(),
-        "Stop" | "SubagentStop" => "Finished".to_string(),
-        "StopFailure" => "Stop hook failed".to_string(),
+        "Stop" => "Finished".to_string(),
+        "SubagentStop" => "Subagent finished".to_string(),
+        "StopFailure" => "Turn failed".to_string(),
         "PreCompact" => "Compacting conversation".to_string(),
         "PostCompact" => "Compaction finished".to_string(),
+        "CwdChanged" => "Working directory changed".to_string(),
         "SessionEnd" => "Session ended".to_string(),
+        "SessionStart"
+            if value.get("source").and_then(|value| value.as_str()) == Some("compact") =>
+        {
+            "Compaction finished".to_string()
+        }
         "SessionStart" => "Session started".to_string(),
         _ => return None,
     };
@@ -2834,9 +2888,10 @@ fn kill_llm_tmux_session_direct(
     if profile.kind == "windows" {
         return Err("tmux is only used for WSL/SSH profiles".to_string());
     }
+    let target = exact_llm_tmux_session_target(session_name);
     let script = format!(
         "if ! command -v tmux >/dev/null 2>&1; then echo 'tmux is not installed' >&2; exit 127; fi; tmux kill-session -t {}",
-        shell_quote(session_name)
+        shell_quote(&target)
     );
     run_profile_shell_with_timeout(profile, &script, None, LLM_TMUX_COMMAND_TIMEOUT).map(|_| ())
 }
@@ -2857,13 +2912,16 @@ fn llm_tmux_pane_title_direct(
             message: Some("tmux is only used for WSL/SSH profiles".to_string()),
         });
     }
+    let session_target = exact_llm_tmux_session_target(session_name);
+    let pane_target = exact_llm_tmux_pane_target(session_name);
     let script = format!(
         concat!(
             "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; ",
             "if ! tmux has-session -t {session} 2>/dev/null; then printf '__SVI_TMUX_NOT_FOUND__\\n'; exit 0; fi; ",
-            "tmux display-message -p -t {session}: '#{{pane_title}}\t#{{window_name}}\t#{{pane_in_mode}}\t#{{pane_dead}}' 2>/dev/null || printf '__SVI_TMUX_NOT_FOUND__\\n'"
+            "tmux display-message -p -t {pane} '#{{pane_title}}\t#{{window_name}}\t#{{pane_in_mode}}\t#{{pane_dead}}' 2>/dev/null || printf '__SVI_TMUX_NOT_FOUND__\\n'"
         ),
-        session = shell_quote(session_name)
+        session = shell_quote(&session_target),
+        pane = shell_quote(&pane_target)
     );
     let output = run_profile_shell_with_timeout(profile, &script, None, LLM_TMUX_TITLE_TIMEOUT)?;
     let text = String::from_utf8_lossy(&output);
@@ -3002,7 +3060,7 @@ fn llm_tmux_pane_probe_direct(
             Some("tmux is only used for WSL/SSH profiles".to_string()),
         ));
     }
-    let target = format!("{}:", session_name);
+    let target = exact_llm_tmux_pane_target(session_name);
     let script = format!(
         concat!(
             "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; ",
@@ -3131,6 +3189,31 @@ fn is_safe_llm_tmux_session_name(name: &str) -> bool {
         && name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn exact_llm_tmux_session_target(session_name: &str) -> String {
+    format!("={session_name}")
+}
+
+fn exact_llm_tmux_pane_target(session_name: &str) -> String {
+    format!("{}:", exact_llm_tmux_session_target(session_name))
+}
+
+#[cfg(test)]
+mod llm_tmux_target_tests {
+    use super::*;
+
+    #[test]
+    fn targets_require_exact_session_names() {
+        assert_eq!(
+            exact_llm_tmux_session_target("svi_demo_codex_1"),
+            "=svi_demo_codex_1"
+        );
+        assert_eq!(
+            exact_llm_tmux_pane_target("svi_demo_codex_1"),
+            "=svi_demo_codex_1:"
+        );
+    }
 }
 
 fn is_llm_tmux_session_for_base(name: &str, base: &str) -> bool {
@@ -4001,6 +4084,223 @@ async fn resolve_profile_path(
     .await
 }
 
+#[tauri::command]
+async fn resolve_git_workspace_roots(
+    profile_id: String,
+    cwd: String,
+) -> Result<GitWorkspaceRoots, String> {
+    run_blocking_command("resolve git workspace roots", move || {
+        resolve_git_workspace_roots_blocking(profile_id, cwd)
+    })
+    .await
+}
+
+fn resolve_git_workspace_roots_blocking(
+    profile_id: String,
+    cwd: String,
+) -> Result<GitWorkspaceRoots, String> {
+    let profile = profile_from_id(&profile_id);
+    let cwd = normalize_profile_path(
+        &profile,
+        if cwd.trim().is_empty() {
+            "."
+        } else {
+            cwd.trim()
+        },
+    );
+    if profile.kind != "wsl" {
+        return Ok(GitWorkspaceRoots {
+            launch_cwd: cwd.clone(),
+            worktree_root: cwd.clone(),
+            main_checkout_root: cwd,
+            settings_use_launch_cwd: false,
+            claude_main_checkout_settings_supported: None,
+        });
+    }
+    let quoted_cwd = shell_quote(&cwd);
+    let frame = Uuid::new_v4().simple().to_string();
+    let script = format!(
+        r#"cwd={quoted_cwd}
+cwd="$(cd -- "$cwd" 2>/dev/null && pwd -P)" || exit 74
+printf '{frame}CWD%s\n' "$cwd"
+cd -- "$cwd" || exit 74
+if command -v timeout >/dev/null 2>&1; then
+  if ! timeout 2s bash -ic 'version="$(claude --version 2>/dev/null | head -n 1 || true)"; printf "{frame}CLAUDE_VERSION%s\n" "$version"' 2>/dev/null; then
+    printf '{frame}CLAUDE_VERSION\n'
+  fi
+elif ! bash -ic 'version="$(claude --version 2>/dev/null | head -n 1 || true)"; printf "{frame}CLAUDE_VERSION%s\n" "$version"' 2>/dev/null; then
+  printf '{frame}CLAUDE_VERSION\n'
+fi
+top="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)" || {{
+  printf '{frame}NON_REPO1\n'
+  exit 0
+}}
+top="$(cd "$top" 2>/dev/null && pwd -P)" || exit 74
+main="$(git -C "$cwd" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | head -n 1)"
+if [ -z "$main" ]; then
+  printf 'Git main checkout could not be resolved\n' >&2
+  exit 74
+fi
+main="$(cd "$main" 2>/dev/null && pwd -P)" || exit 74
+home="${{HOME:-}}"
+if [ -n "$home" ]; then
+  home="$(cd "$home" 2>/dev/null && pwd -P)" || exit 74
+fi
+printf '{frame}TOP%s\n{frame}MAIN%s\n{frame}HOME%s\n' "$top" "$main" "$home"
+"#
+    );
+    let output =
+        run_profile_shell_with_timeout(&profile, &script, None, GIT_WORKSPACE_ROOT_TIMEOUT)?;
+    Ok(git_workspace_roots_from_output(&cwd, &output, &frame))
+}
+
+fn git_workspace_roots_from_output(cwd: &str, output: &[u8], frame: &str) -> GitWorkspaceRoots {
+    let text = String::from_utf8_lossy(output);
+    let marker_value = |suffix: &str| {
+        let prefix = format!("{frame}{suffix}");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.strip_suffix('\r').unwrap_or(value))
+    };
+    let launch_cwd = marker_value("CWD")
+        .filter(|value| value.starts_with('/'))
+        .unwrap_or(cwd)
+        .to_string();
+    let worktree_root = marker_value("TOP")
+        .filter(|value| value.starts_with('/'))
+        .unwrap_or(&launch_cwd)
+        .to_string();
+    let main_checkout = marker_value("MAIN")
+        .filter(|value| value.starts_with('/'))
+        .unwrap_or(&worktree_root);
+    let home = marker_value("HOME").unwrap_or_default();
+    let settings_use_launch_cwd = !home.is_empty() && main_checkout == home;
+    let main_checkout_root = if settings_use_launch_cwd {
+        launch_cwd.clone()
+    } else {
+        main_checkout.to_string()
+    };
+    GitWorkspaceRoots {
+        launch_cwd,
+        worktree_root,
+        main_checkout_root,
+        settings_use_launch_cwd,
+        claude_main_checkout_settings_supported: marker_value("CLAUDE_VERSION")
+            .and_then(claude_main_checkout_settings_supported),
+    }
+}
+
+fn claude_main_checkout_settings_supported(version_text: &str) -> Option<bool> {
+    let token = version_text.trim_start().split_whitespace().next()?;
+    let token = token.strip_prefix('v').unwrap_or(token);
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let version = (major, minor, patch);
+    Some(version >= (2, 1, 211))
+}
+
+#[tauri::command]
+async fn protect_git_local_claude_files(
+    profile_id: String,
+    root: String,
+    include_script: bool,
+) -> Result<(), String> {
+    run_blocking_command("protect local Claude hook files", move || {
+        protect_git_local_claude_files_blocking(profile_id, root, include_script)
+    })
+    .await
+}
+
+fn protect_git_local_claude_files_blocking(
+    profile_id: String,
+    root: String,
+    include_script: bool,
+) -> Result<(), String> {
+    let profile = profile_from_id(&profile_id);
+    if profile.kind != "wsl" {
+        return Err(
+            "local Claude hook privacy protection currently requires a WSL profile".to_string(),
+        );
+    }
+    let root = normalize_profile_path(&profile, &root);
+    let script = format!(
+        r#"set -u
+root={root}
+root="$(cd -- "$root" 2>/dev/null && pwd -P)" || exit 74
+has_git_marker() {{
+  probe="$root"
+  while :; do
+    if [ -e "$probe/.git" ] || [ -L "$probe/.git" ]; then return 0; fi
+    [ "$probe" = "/" ] && break
+    probe="${{probe%/*}}"
+    [ -n "$probe" ] || probe="/"
+  done
+  return 1
+}}
+if ! command -v git >/dev/null 2>&1; then
+  if has_git_marker; then
+    printf 'Git metadata was found but Git is unavailable\n' >&2
+    exit 74
+  fi
+  exit 0
+fi
+if ! top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)"; then
+  if has_git_marker; then
+    printf 'Git metadata was found but could not be inspected safely\n' >&2
+    exit 74
+  fi
+  exit 0
+fi
+prefix="$(git -C "$root" rev-parse --show-prefix 2>/dev/null)" || exit 74
+settings_rel="${{prefix}}.claude/settings.local.json"
+script_rel="${{prefix}}.claude/simple-vibe-ide-hook.sh"
+temp_rel="${{prefix}}.claude/.simple-vibe-ide-new.test"
+if git -C "$top" ls-files --error-unmatch -- "$settings_rel" >/dev/null 2>&1; then
+  printf 'refusing to put a local absolute hook path in a tracked Claude settings file\n' >&2
+  exit 75
+fi
+if [ {include_script} -eq 1 ] && git -C "$top" ls-files --error-unmatch -- "$script_rel" >/dev/null 2>&1; then
+  printf 'refusing to update a tracked local Claude hook script\n' >&2
+  exit 75
+fi
+exclude="$(git -C "$root" rev-parse --git-path info/exclude 2>/dev/null)" || exit 74
+case "$exclude" in
+  /*) ;;
+  *) exclude="$root/$exclude" ;;
+esac
+if [ -L "$exclude" ]; then
+  printf 'refusing to update a symbolic-link Git exclude file\n' >&2
+  exit 74
+fi
+mkdir -p "$(dirname -- "$exclude")" || exit 70
+touch "$exclude" || exit 70
+if ! grep -Fqx -- '**/.claude/settings.local.json' "$exclude"; then
+  printf '\n%s\n' '**/.claude/settings.local.json' >> "$exclude" || exit 70
+fi
+if ! grep -Fqx -- '**/.claude/.simple-vibe-ide-new.*' "$exclude"; then
+  printf '\n%s\n' '**/.claude/.simple-vibe-ide-new.*' >> "$exclude" || exit 70
+fi
+if [ {include_script} -eq 1 ] && ! grep -Fqx -- '**/.claude/simple-vibe-ide-hook.sh' "$exclude"; then
+  printf '\n%s\n' '**/.claude/simple-vibe-ide-hook.sh' >> "$exclude" || exit 70
+fi
+git -C "$root" check-ignore -q --no-index -- "$settings_rel" || exit 74
+git -C "$root" check-ignore -q --no-index -- "$temp_rel" || exit 74
+if [ {include_script} -eq 1 ]; then
+  git -C "$root" check-ignore -q --no-index -- "$script_rel" || exit 74
+fi
+"#,
+        root = shell_quote(&root),
+        include_script = if include_script { 1 } else { 0 },
+    );
+    run_profile_shell_with_timeout(&profile, &script, None, REMOTE_DIRECTORY_COMMAND_TIMEOUT)?;
+    Ok(())
+}
+
 fn resolve_profile_path_blocking(profile_id: String, path: String) -> Result<String, String> {
     resolve_profile_path_blocking_with_scope(profile_id, path, None)
 }
@@ -4437,6 +4737,118 @@ fn write_text_file_blocking(
         }
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
+}
+
+#[tauri::command]
+async fn write_text_file_atomic_if_unchanged(
+    profile_id: String,
+    path: String,
+    expected_text: Option<String>,
+    content: String,
+) -> Result<(), String> {
+    run_blocking_command("atomic text file write", move || {
+        write_text_file_atomic_if_unchanged_blocking(profile_id, path, expected_text, content)
+    })
+    .await
+}
+
+fn write_text_file_atomic_if_unchanged_blocking(
+    profile_id: String,
+    path: String,
+    expected_text: Option<String>,
+    content: String,
+) -> Result<(), String> {
+    let profile = profile_from_id(&profile_id);
+    if profile.kind != "wsl" {
+        return Err("atomic hook settings writes currently require a WSL profile".to_string());
+    }
+    let path = normalize_profile_path(&profile, &path);
+    let dir = parent_posix(&path);
+    let expected_exists = expected_text.is_some();
+    let expected = expected_text.unwrap_or_default();
+    let expected_len = expected.len();
+    let content_len = content.len();
+    let mut stdin =
+        Vec::with_capacity(expected_len.saturating_mul(2).saturating_add(content.len()));
+    stdin.extend_from_slice(expected.as_bytes());
+    stdin.extend_from_slice(content.as_bytes());
+    if expected_exists {
+        stdin.extend_from_slice(expected.as_bytes());
+    }
+    let script = format!(
+        r#"set -u
+umask 077
+dir={dir}
+target={target}
+mkdir -p "$dir" || exit 70
+if [ -L "$target" ]; then
+  printf 'refusing to replace a symbolic-link hook file\n' >&2
+  exit 74
+fi
+find "$dir" -maxdepth 1 -type f -name '.simple-vibe-ide-new.*' -uid "$(id -u)" -mmin +10 -delete 2>/dev/null || true
+if [ {expected_exists} -eq 1 ]; then
+  if [ ! -f "$target" ] || [ -L "$target" ] || ! head -c {expected_len} | cmp -s - "$target"; then
+    printf 'settings changed during migration\n' >&2
+    exit 73
+  fi
+else
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    printf 'settings changed during migration\n' >&2
+    exit 73
+  fi
+fi
+new="$(mktemp "$dir/.simple-vibe-ide-new.XXXXXX")" || exit 70
+cleanup() {{
+  if [ -n "${{new:-}}" ]; then rm -f "$new"; fi
+}}
+trap cleanup EXIT
+trap 'exit 70' HUP INT TERM
+head -c {content_len} > "$new" || exit 70
+new_size="$(wc -c < "$new" 2>/dev/null)" || exit 70
+[ "$new_size" -eq {content_len} ] || exit 70
+if [ {expected_exists} -eq 1 ]; then
+  chmod --reference="$target" "$new" 2>/dev/null || chmod 600 "$new" 2>/dev/null || true
+else
+  chmod 600 "$new" 2>/dev/null || true
+fi
+sync -f "$new" 2>/dev/null || true
+if [ {expected_exists} -eq 1 ]; then
+  if [ ! -f "$target" ] || [ -L "$target" ] || ! head -c {expected_len} | cmp -s - "$target"; then
+    printf 'settings changed during migration\n' >&2
+    exit 73
+  fi
+else
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    printf 'settings changed during migration\n' >&2
+    exit 73
+  fi
+fi
+if [ {expected_exists} -eq 1 ]; then
+  mv -T -f -- "$new" "$target" || exit 70
+  new=
+else
+  if ! ln -T -- "$new" "$target"; then
+    printf 'settings changed during migration\n' >&2
+    exit 73
+  fi
+  rm -f -- "$new" || exit 70
+  new=
+fi
+sync -f "$dir" 2>/dev/null || true
+"#,
+        dir = shell_quote(&dir),
+        target = shell_quote(&path),
+        expected_len = expected_len,
+        content_len = content_len,
+        expected_exists = if expected_exists { 1 } else { 0 },
+    );
+    run_profile_shell_with_timeout(
+        &profile,
+        &script,
+        Some(stdin),
+        REMOTE_DIRECTORY_COMMAND_TIMEOUT,
+    )?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -11066,6 +11478,135 @@ fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &st
 }
 
 #[cfg(test)]
+mod agent_bridge_state_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn main_turn_events_keep_working_until_stop() {
+        let empty = json!({});
+        for event in [
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionDenied",
+            "SubagentStart",
+            "PreCompact",
+        ] {
+            assert_eq!(
+                agent_bridge_status_for_event(event, &empty),
+                Some("working"),
+                "{event}"
+            );
+        }
+        assert_eq!(
+            agent_bridge_status_for_event("PostCompact", &json!({ "trigger": "manual" })),
+            Some("idle")
+        );
+        assert_eq!(
+            agent_bridge_status_for_event("PostCompact", &json!({ "trigger": "auto" })),
+            Some("working")
+        );
+        assert_eq!(
+            agent_bridge_status_for_event("SessionStart", &json!({ "source": "compact" })),
+            None
+        );
+        assert_eq!(
+            agent_bridge_status_for_event("SessionStart", &json!({ "source": "startup" })),
+            Some("idle")
+        );
+        assert_eq!(agent_bridge_status_for_event("PostCompact", &empty), None);
+        assert_eq!(agent_bridge_status_for_event("SubagentStop", &empty), None);
+        assert_eq!(agent_bridge_status_for_event("Stop", &empty), Some("idle"));
+        assert_eq!(
+            agent_bridge_status_for_event("StopFailure", &empty),
+            Some("error")
+        );
+        assert_eq!(
+            agent_bridge_status_for_event("SessionEnd", &empty),
+            Some("exited")
+        );
+    }
+
+    #[test]
+    fn only_actionable_notifications_wait_for_the_user() {
+        for notification_type in ["permission_prompt", "idle_prompt", "elicitation_dialog"] {
+            let payload = json!({ "notification_type": notification_type });
+            assert_eq!(
+                agent_bridge_status_for_event("Notification", &payload),
+                Some("waiting")
+            );
+        }
+        assert_eq!(
+            agent_bridge_status_for_event(
+                "Notification",
+                &json!({ "notification_type": "auth_success" })
+            ),
+            None
+        );
+        assert_eq!(
+            agent_bridge_activity_for_event(
+                "Notification",
+                &json!({ "notification_type": "auth_success" })
+            ),
+            None
+        );
+        assert_eq!(
+            agent_bridge_status_for_event("Notification", &json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn git_workspace_roots_use_main_checkout_except_for_home_repositories() {
+        let frame = "__TEST_FRAME__";
+        let linked = git_workspace_roots_from_output(
+            "/worktrees/feature",
+            b"shell banner\n__TEST_FRAME__CWD/worktrees/feature\n__TEST_FRAME__CLAUDE_VERSION2.1.220 (Claude Code)\n__TEST_FRAME__TOP/worktrees/feature\n__TEST_FRAME__MAIN/projects/app\n__TEST_FRAME__HOME/home/dev\n",
+            frame,
+        );
+        assert_eq!(linked.launch_cwd, "/worktrees/feature");
+        assert_eq!(linked.worktree_root, "/worktrees/feature");
+        assert_eq!(linked.main_checkout_root, "/projects/app");
+        assert!(!linked.settings_use_launch_cwd);
+        assert_eq!(linked.claude_main_checkout_settings_supported, Some(true));
+
+        let home_repo = git_workspace_roots_from_output(
+            "/home/dev/project-view",
+            b"__TEST_FRAME__CWD/home/dev/project-view\n__TEST_FRAME__CLAUDE_VERSION2.1.210\n__TEST_FRAME__TOP/home/dev\n__TEST_FRAME__MAIN/home/dev\n__TEST_FRAME__HOME/home/dev\n",
+            frame,
+        );
+        assert_eq!(home_repo.launch_cwd, "/home/dev/project-view");
+        assert_eq!(home_repo.worktree_root, "/home/dev");
+        assert_eq!(home_repo.main_checkout_root, "/home/dev/project-view");
+        assert!(home_repo.settings_use_launch_cwd);
+        assert_eq!(
+            home_repo.claude_main_checkout_settings_supported,
+            Some(false)
+        );
+
+        let unknown = git_workspace_roots_from_output(
+            ".",
+            b"__SVIDE_CLAUDE_VERSION__9.9.9\nshell banner\n__TEST_FRAME__CWD/home/dev/project\n__TEST_FRAME__CLAUDE_VERSIONcustom wrapper\n__TEST_FRAME__NON_REPO1\n",
+            frame,
+        );
+        assert_eq!(unknown.launch_cwd, "/home/dev/project");
+        assert_eq!(unknown.worktree_root, "/home/dev/project");
+        assert_eq!(unknown.main_checkout_root, "/home/dev/project");
+        assert_eq!(unknown.claude_main_checkout_settings_supported, None);
+        assert_eq!(
+            claude_main_checkout_settings_supported("Using node 22.4.0; Claude 2.1.200"),
+            None
+        );
+        assert_eq!(
+            claude_main_checkout_settings_supported("v2.1.211 (Claude Code)"),
+            Some(true)
+        );
+    }
+}
+
+#[cfg(test)]
 mod renderer_watchdog_tests {
     use super::*;
 
@@ -12403,6 +12944,8 @@ pub fn run() {
             force_quit_app,
             cancel_runtime_operation,
             resolve_profile_path,
+            resolve_git_workspace_roots,
+            protect_git_local_claude_files,
             profile_directory_is_dir,
             list_directory,
             list_directories,
@@ -12411,6 +12954,7 @@ pub fn run() {
             file_signature,
             read_file_data_url,
             write_text_file,
+            write_text_file_atomic_if_unchanged,
             create_directory,
             create_file,
             rename_path,

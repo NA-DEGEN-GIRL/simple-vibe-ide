@@ -1,6 +1,7 @@
 # Grok Build terminal inline redraw stabilization
 
-**Status:** patched on 2026-07-05.
+**Status:** Grok patched on 2026-07-05; the same compatibility profile was
+extended to detected OpenCode panes on 2026-08-28.
 
 This note documents the Grok Build terminal corruption fix that was validated
 against the user-visible left-edge text artifact. It is intentionally
@@ -37,6 +38,20 @@ The final fix treats this as a combined terminal-embedding problem:
 The app therefore aligns the embedded terminal behavior around Grok instead of
 trying to parse or rewrite Grok's full TUI protocol.
 
+## OpenCode extension (2026-08-28)
+
+OpenCode can show the same left-edge stale-cell pattern during Korean/mixed-width
+partial redraws. Because users start it manually from a normal shell, it used to
+remain on the default WebGL + Unicode 11 + `convertEol: true` path and missed all
+of the proven Grok/OpenTUI safeguards.
+
+The terminal now recognizes an `opencode` executable at command submission or
+an OpenCode terminal title and enables the shared OpenTUI compatibility profile
+before the TUI redraw begins. If the normal shell has already promoted itself to
+WebGL, the app disposes that pane's WebGL add-on and immediately falls back to
+DOM. This does not add an OpenCode launcher, agent status card, hook, or Grok
+launcher environment flags.
+
 ## Applied patch
 
 ### Grok-only launcher contract
@@ -54,18 +69,18 @@ Grok launcher panes now get a reduced embedded-terminal contract:
 This is scoped to Grok launcher panes. Other shells and other LLM launchers keep
 their existing command behavior.
 
-### Grok-only DOM renderer in auto mode
+### Detected OpenTUI DOM renderer in auto mode
 
-When the global terminal renderer is `auto`, Grok panes now use xterm's DOM
-renderer instead of WebGL. Other panes can still use WebGL.
+When the global terminal renderer is `auto`, Grok panes and detected OpenCode
+panes use xterm's DOM renderer instead of WebGL. Other panes can still use WebGL.
 
-This avoids the stale glyph fragments seen in Grok's aggressive redraw path
+This avoids the stale glyph fragments seen in aggressive OpenTUI redraw paths
 without clearing shared WebGL glyph atlases or disturbing healthy GL terminals.
 
-### Grok-only Unicode width fallback
+### Detected OpenTUI Unicode width fallback
 
-Grok panes use xterm's built-in Unicode 6 width provider. Other panes keep the
-Unicode 11 add-on.
+Grok panes and detected OpenCode panes use xterm's built-in Unicode 6 width
+provider. Other panes keep the Unicode 11 add-on.
 
 This is intentionally surgical: it targets Grok/OpenTUI-style inline redraw
 desync without changing emoji or wide-symbol behavior in normal shells, Claude,
@@ -73,25 +88,26 @@ Codex, or other panes.
 
 ### Disable `convertEol` for LLM TUI panes
 
-LLM launcher panes now use `convertEol: false`; plain shell panes keep the
-previous behavior.
+LLM launcher panes and detected OpenCode panes use `convertEol: false`; plain
+shell panes keep the previous behavior.
 
 Reason: LLM TUIs own cursor movement and line redraw. xterm's `convertEol`
 compatibility mode is more appropriate for simple streams and can interfere
 with relative-cursor TUI output.
 
-### Grok carriage-return cleanup
+### Detected OpenTUI carriage-return cleanup
 
-Grok output is normalized so bare carriage-return redraws clear to end-of-line
-before the next partial repaint. This prevents stale cells from an older,
-longer frame remaining at the left/front edge.
+Grok and detected OpenCode output is normalized so bare carriage-return redraws
+clear to end-of-line before the next partial repaint. This prevents stale cells
+from an older, longer frame remaining at the left/front edge.
 
-The cleanup is Grok-only and runs before xterm writes.
+The cleanup is limited to the detected OpenTUI compatibility path and runs
+before xterm writes.
 
-### Grok post-write and scroll refresh
+### Detected OpenTUI post-write and scroll refresh
 
-After xterm's write queue drains, Grok panes get a throttled viewport refresh.
-Scroll events can also trigger the same Grok-only refresh path.
+After xterm's write queue drains, Grok and detected OpenCode panes get a
+throttled viewport refresh. Scroll events can trigger the same scoped refresh.
 
 The refresh is deliberately narrow and delayed until the write pipeline is
 drained, so it does not add heavy synchronous work to normal terminal output.
@@ -115,8 +131,9 @@ because this bug depends on live TUI output and WebView rendering behavior.
 - Do not switch Grok to fullscreen alt-screen as the fix. The app relies on
   inline scrollback/status parsing for Grok working/waiting detection.
 - Do not change every terminal to Unicode 6. Keep the width fallback scoped to
-  Grok panes only.
-- Do not globally disable WebGL. Only Grok's redraw path needs DOM in auto mode.
+  Grok and detected OpenCode/OpenTUI panes.
+- Do not globally disable WebGL. Only the detected Grok/OpenCode OpenTUI redraw
+  path needs DOM in auto mode.
 - Do not add per-frame observers or heavy synchronous width recomputation on the
   terminal write path; terminal responsiveness is product-critical.
 
@@ -125,10 +142,12 @@ because this bug depends on live TUI output and WebView rendering behavior.
 Search by symbol name rather than line number:
 
 - `LLM_LAUNCHERS.grok`
-- `terminalUnicodeVersionForLlm`
-- `terminalConvertEolForLlm`
-- `applyTerminalCompatibilityForLlm`
+- `terminalCommandUsesOpenTuiCompatibility`
+- `terminalTitleUsesOpenTuiCompatibility`
+- `terminalUnicodeVersionForCompatibility`
+- `terminalConvertEolForCompatibility`
+- `applyTerminalCompatibility`
 - `normalizeTerminalOutputForPaneWrite`
-- `terminalLlmShouldUseWebglRenderer`
-- `scheduleGrokTerminalViewportRefresh`
+- `terminalPaneShouldUseWebglRenderer`
+- `scheduleOpenTuiTerminalViewportRefresh`
 - `refreshTerminalViewportIfRecentOutput`

@@ -20,14 +20,15 @@ Simple Vibe IDE is a Windows-first Tauri v2 desktop app for fast WSL/SSH/Windows
 - Tauri release: `npm run tauri -- build --no-bundle`
 - Rust format check: `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
 - Rust Windows check: `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
-- Windows smoke build: `.\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch`
-- Windows release from a WSL checkout: load the Visual Studio developer environment, set `CARGO_TARGET_DIR` to a spacious Windows-local folder, then run the smoke script through `cmd pushd`.
+- Windows-local smoke build: `.\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch`
+- Windows release from a WSL checkout: load the Visual Studio developer environment, use Git for Windows, then run `scripts\windows-staged-runtime-smoke.ps1 -NoLaunch` through `cmd pushd`. The helper stages source and npm dependencies on Windows-local NTFS.
 
 When running from a WSL-hosted checkout with Windows tools, prefer `cmd /d /c "pushd ""\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide"" && ..."` so Windows gets a temporary drive mapping instead of a raw UNC working directory.
 
 ## Build And Runtime Notes
 
 - Set `CARGO_TARGET_DIR` to a Windows-local folder such as `%TEMP%\simple-vibe-ide-target` for Windows builds from a WSL checkout. If `%TEMP%` quota is tight, use another spacious local path such as `D:\build-cache\simple-vibe-ide-target`; do not put Cargo target output on a WSL/UNC path.
+- Never alternate WSL npm and Windows npm in one checkout's `node_modules`. Use the staged Windows smoke for a WSL-hosted checkout or a Windows-local clone/worktree for HMR development.
 - Release builds use `.cargo/config.toml` with `target-cpu=native`; produced binaries are intended for the build machine, not portable distribution.
 - `scripts/windows-runtime-smoke.ps1` redacts local usernames in displayed paths. Keep that behavior.
 - If running Windows tools from WSL says `cmd.exe: command not found` or `.exe` returns `Exec format error`, verify WSL interop/binfmt before declaring Windows builds impossible.
@@ -54,7 +55,7 @@ When running from a WSL-hosted checkout with Windows tools, prefer `cmd /d /c "p
 - There is no dedicated unit-test suite in this repo right now; use typecheck/build/smoke commands as the baseline.
 - For frontend-only changes, run `npm run check`; run `npm run build` when UI bundling could be affected.
 - For Rust/backend changes, run `cargo fmt --manifest-path src-tauri/Cargo.toml --check` and `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`.
-- For runtime-sensitive changes, run `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch` on Windows and manually smoke the affected feature in the built app.
+- For runtime-sensitive changes in a Windows-local checkout, run `scripts/windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch`. From a WSL-hosted checkout, run `scripts/windows-staged-runtime-smoke.ps1 -NoLaunch` through a Windows developer shell. Then manually smoke the affected feature in the built app.
 - Clearly separate verified Windows runtime results from assumptions.
 
 ## Privacy And Public Repo Safety

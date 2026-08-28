@@ -31,7 +31,52 @@ function Invoke-Step {
 
   Write-Host ""
   Write-Host "==> $Name" -ForegroundColor Cyan
+  $global:LASTEXITCODE = 0
   & $Script
+  $exitCode = $global:LASTEXITCODE
+  if ($exitCode -ne 0) {
+    throw "$Name failed with exit code $exitCode."
+  }
+}
+
+function Assert-WindowsNodeModules {
+  $requiredPaths = @(
+    "node_modules\.bin\esbuild",
+    "node_modules\.bin\nanoid",
+    "node_modules\.bin\vite",
+    "node_modules\.bin\tsc.cmd",
+    "node_modules\.bin\vite.cmd",
+    "node_modules\.bin\tauri.cmd",
+    "node_modules\@esbuild\win32-x64\package.json",
+    "node_modules\@rollup\rollup-win32-x64-msvc\package.json",
+    "node_modules\@tauri-apps\cli-win32-x64-msvc\package.json"
+  )
+  $missingPaths = @($requiredPaths | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+  if ($missingPaths.Count -gt 0) {
+    throw @"
+node_modules is not a complete Windows dependency tree. Do not run Windows npm
+over dependencies created by WSL. For a WSL-hosted checkout, run
+scripts\windows-staged-runtime-smoke.ps1 so Windows uses its own NTFS stage.
+Missing Windows files: $($missingPaths -join ", ")
+"@
+  }
+
+  foreach ($path in @("node_modules\.bin\esbuild", "node_modules\.bin\nanoid", "node_modules\.bin\vite")) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      throw "node_modules contains a non-Windows npm bin link. Use the Windows-local staged smoke."
+    }
+  }
+}
+
+function Test-NonLocalWindowsPath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if ($Path.StartsWith("\\")) { return $true }
+  $qualifier = Split-Path -Qualifier $Path
+  if (-not $qualifier) { return $false }
+  $drive = Get-PSDrive -Name $qualifier.Substring(0, 1) -ErrorAction SilentlyContinue
+  return [bool]($drive -and $drive.DisplayRoot)
 }
 
 function Find-BuiltExe {
@@ -82,7 +127,7 @@ function Remove-StaleBuiltExe {
     try {
       Remove-Item -LiteralPath $path -Force
     } catch {
-      throw "Could not remove stale $BinaryName build artifact before rebuild: $(Format-DisplayPath $path). Close running apps that use it. $($_.Exception.Message)"
+      throw "Could not remove stale $BinaryName build artifact before rebuild: $(Format-DisplayPath $path). Close running apps that use it. $(Format-DisplayPath $_.Exception.Message)"
     }
   }
 }
@@ -122,21 +167,22 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $repoProviderPath = $repoRoot.ProviderPath
 
 if ($repoProviderPath.StartsWith("\\")) {
-  $passArgs = @()
-  if ($NoLaunch) { $passArgs += "-NoLaunch" }
-  if ($SkipNpmInstall) { $passArgs += "-SkipNpmInstall" }
-  $argLine = $passArgs -join " "
-  $psExe = (Get-Process -Id $PID).Path
-  $cmd = "pushd ""$repoProviderPath"" && ""$psExe"" -NoProfile -ExecutionPolicy Bypass -File ""scripts\windows-runtime-smoke.ps1"" $argLine"
-  cmd.exe /d /s /c $cmd
-  exit $LASTEXITCODE
+  throw "Direct Windows smoke requires a Windows-local checkout. For WSL/UNC source, run scripts\windows-staged-runtime-smoke.ps1."
 }
 
 Set-Location $repoRoot
 
+if (Test-NonLocalWindowsPath $repoProviderPath) {
+  throw "Direct Windows smoke requires a Windows-local checkout. For WSL/UNC source, run scripts\windows-staged-runtime-smoke.ps1."
+}
+
 if (-not $env:CARGO_INCREMENTAL) { $env:CARGO_INCREMENTAL = "0" }
 if (-not $env:CARGO_TARGET_DIR) {
   $env:CARGO_TARGET_DIR = Join-Path $env:TEMP "simple-vibe-ide-target"
+}
+$env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+if (Test-NonLocalWindowsPath $env:CARGO_TARGET_DIR) {
+  throw "CARGO_TARGET_DIR must be on a Windows-local filesystem: $(Format-DisplayPath $env:CARGO_TARGET_DIR)"
 }
 
 Write-Host "Simple Vibe IDE Windows runtime smoke"
@@ -145,9 +191,13 @@ Write-Host "Cargo target: $(Format-DisplayPath $env:CARGO_TARGET_DIR)"
 
 Invoke-Step "Tool versions" {
   node --version
+  if ($LASTEXITCODE -ne 0) { throw "node --version failed with exit code $LASTEXITCODE." }
   npm.cmd --version
+  if ($LASTEXITCODE -ne 0) { throw "npm --version failed with exit code $LASTEXITCODE." }
   rustc --version
+  if ($LASTEXITCODE -ne 0) { throw "rustc --version failed with exit code $LASTEXITCODE." }
   cargo --version
+  if ($LASTEXITCODE -ne 0) { throw "cargo --version failed with exit code $LASTEXITCODE." }
   $link = Get-Command link.exe -ErrorAction SilentlyContinue
   if ($link) {
     Write-Host "link.exe: $(Format-DisplayPath $link.Source)"
@@ -156,9 +206,14 @@ Invoke-Step "Tool versions" {
   }
 }
 
-if (-not $SkipNpmInstall -and -not (Test-Path "node_modules")) {
-  Invoke-Step "npm install" { npm.cmd install }
+if (-not $SkipNpmInstall) {
+  Invoke-Step "Clean Windows npm install" { npm.cmd ci --no-audit --no-fund }
+} elseif ($SkipNpmInstall) {
+  Write-Host "npm install skipped; validating the existing Windows dependency tree."
 }
+
+Invoke-Step "Windows npm dependency preflight" { Assert-WindowsNodeModules }
+Invoke-Step "npm audit" { npm.cmd audit --audit-level=low }
 
 Invoke-Step "TypeScript check" { npm.cmd run check }
 Invoke-Step "Frontend build" { npm.cmd run build }

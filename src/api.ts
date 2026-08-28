@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse } from './types';
+import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, GitWorkspaceRoots, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse } from './types';
 
 // Each WebView generation receives a backend-issued token during init. Keeping
 // it inside this module means every persistent runtime start is automatically
@@ -42,6 +42,10 @@ export const api = {
     invoke<LlmTmuxPaneProbeResult>('llm_tmux_pane_probe', { profileId, cwd, sessionName }),
   resolveProfilePath: (profileId: string, path: string, operationId: string = crypto.randomUUID()) =>
     invoke<string>('resolve_profile_path', { profileId, path, operationId, rendererRuntimeEpoch }),
+  resolveGitWorkspaceRoots: (profileId: string, cwd: string) =>
+    invoke<GitWorkspaceRoots>('resolve_git_workspace_roots', { profileId, cwd }),
+  protectGitLocalClaudeFiles: (profileId: string, root: string, includeScript: boolean) =>
+    invoke<void>('protect_git_local_claude_files', { profileId, root, includeScript }),
   profileDirectoryIsDir: (profileId: string, path: string) =>
     invoke<boolean>('profile_directory_is_dir', { profileId, path }),
   listDirectory: (
@@ -82,6 +86,12 @@ export const api = {
     invoke<string>('read_file_data_url', { profileId, path }),
   writeTextFile: (profileId: string, path: string, content: string) =>
     invoke<void>('write_text_file', { profileId, path, content }),
+  writeTextFileAtomicIfUnchanged: (
+    profileId: string,
+    path: string,
+    expectedText: string | null,
+    content: string
+  ) => invoke<void>('write_text_file_atomic_if_unchanged', { profileId, path, expectedText, content }),
   createDirectory: (profileId: string, path: string) =>
     invoke<void>('create_directory', { profileId, path }),
   createFile: (profileId: string, path: string) =>

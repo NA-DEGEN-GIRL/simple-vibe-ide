@@ -27,15 +27,16 @@ For a Windows runtime smoke build:
 .\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch
 ```
 
-If building from a WSL checkout with Windows tools, run from a Windows shell and
-use a Windows-local Cargo target directory:
+If building from a WSL checkout with Windows tools, do not share that checkout's
+`node_modules` between WSL and Windows. Run the staged gate from a Visual Studio
+Developer PowerShell with Git for Windows available:
 
 ```powershell
-$env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
-.\scripts\windows-runtime-smoke.ps1 -SkipNpmInstall -NoLaunch
+cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows-staged-runtime-smoke.ps1 -NoLaunch'
 ```
 
-If `%TEMP%` is too small, use a spacious local path such as
+If `%TEMP%` is too small, pass `-StageRoot` and `-CargoTargetDir` with spacious
+Windows-local paths such as `D:\build-cache\simple-vibe-ide-win-src` and
 `D:\build-cache\simple-vibe-ide-target`.
 
 ## Browser Preview Context

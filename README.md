@@ -55,7 +55,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - Widget opacity, active widget 표시 방식, per-workspace panel geometry 저장
 - Liquid Glass / background 설정, bundled 기본 Glass theme, 현재 설정을 theme JSON으로 저장
 - Windows/WSL/SSH PTY terminal, terminal tab, split right/down, split resize, Type pad
-- Terminal history cache / scrollback 설정, `GL`/`DOM` renderer badge, Grok 전용 DOM 호환 렌더링
+- Terminal history cache / scrollback 설정, `GL`/`DOM` renderer badge, Grok/OpenCode OpenTUI DOM 호환 렌더링
 - Codex / Claude / Grok / Antigravity launcher 버튼
 - WSL/SSH LLM launcher의 tmux session 자동 사용, 기존 session attach, 개별 kill, LLM별 `Kill all`
 - Claude local hook / Grok global hook 기반 agent 상태 bridge
@@ -79,6 +79,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - Node.js 22 이상
 - Windows Rust toolchain via rustup, MSVC toolchain 기준
 - Rust/Tauri가 요구할 경우 Visual Studio Build Tools C++ workload
+- WSL checkout을 Windows-local stage로 빌드할 경우 Git for Windows
 
 작업 방식에 따라 선택적으로 필요합니다.
 
@@ -111,20 +112,26 @@ npm run tauri:dev
 
 Tauri dev server는 `127.0.0.1:15320`으로 고정되어 있습니다. Windows reserved port range와 부딪혀 일반적인 dev port가 `listen EACCES`를 내는 상황을 피하기 위해서입니다.
 
-## WSL 안에 있는 checkout을 Windows에서 실행하기
+## WSL 안에 있는 checkout을 Windows에서 빌드하기
 
-repo가 WSL 안에 있고 Windows Node/Rust/Tauri로 실행해야 한다면 raw UNC 경로에서 바로 실행하기보다 `cmd pushd`로 임시 drive letter를 잡는 편이 안정적입니다. Cargo target은 Windows-local temp 폴더로 분리하세요.
+WSL과 Windows npm은 같은 `node_modules`를 공유하면 안 됩니다. Linux `.bin` symlink와
+Windows `.cmd` shim, 플랫폼별 esbuild/Rollup 패키지가 섞여 `EISDIR`/`EPERM` 또는 잘못된
+Windows 빌드가 발생할 수 있습니다. WSL checkout의 현재 tracked working-tree source를
+Windows-local NTFS 임시 폴더로 복사한 뒤 깨끗하게 설치·빌드하는 staged smoke를 사용하세요.
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-$env:CARGO_INCREMENTAL = "0"
-$env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
-cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && npm install && npm run check && npm run build && cd src-tauri && cargo check && cd .. && npm run tauri:dev'
+cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows-staged-runtime-smoke.ps1 -NoLaunch'
 ```
 
 `[DISTRO]`, `[USER]`는 본인 환경에 맞게 바꿔서 사용하세요.
+기본 stage와 Cargo target은 각각 Windows `%TEMP%` 아래에 생성됩니다. 용량이 큰 다른
+Windows-local drive를 쓰려면 `-StageRoot`와 `-CargoTargetDir`를 전달하세요.
 
-같은 WSL UNC checkout을 대상으로 `npm`/Vite/Tauri 명령을 동시에 여러 개 돌리지 않는 것을 권장합니다. 임시 drive mapping이나 path resolution이 꼬일 수 있습니다.
+Windows HMR 개발이 필요하면 Windows-local clone/worktree를 사용하세요. 같은 WSL checkout의
+`node_modules`에서 WSL `npm install`과 Windows `npm install`을 번갈아 실행하지 마세요.
+staged helper는 기본적으로 tracked working-tree file만 복사합니다. 새 untracked source까지
+필요할 때만 `-IncludeUntracked`를 쓰고, private local file은 먼저 ignore 처리하세요.
 
 ## 빌드와 실행
 
@@ -190,17 +197,17 @@ WSL profile은 첫 화면이 먼저 반응 가능해진 뒤 background로 로드
 - `Ctrl+V`는 clipboard text를 shell에 붙여넣습니다.
 - Type pad는 긴 한글 프롬프트나 붙여넣기 전용 입력에 유용합니다. `Ctrl+Enter`로 shell에 보내고 자동 실행은 하지 않습니다.
 - Terminal renderer는 기본 `Auto`입니다. 보통 WebGL을 쓰고, WebGL이 불가능하거나 context가 손실되면 DOM으로 fallback합니다.
-- Grok Build pane은 glyph artifact를 줄이기 위해 DOM renderer와 더 보수적인 terminal 환경으로 실행됩니다.
+- Grok Build pane과 직접 실행한 OpenCode pane은 glyph artifact를 줄이기 위해 감지 시 DOM/OpenTUI 호환 렌더링을 사용합니다. Grok launcher의 보수적인 환경 설정은 OpenCode에 적용하지 않습니다.
 - Terminal history cache는 실행 중 메모리에만 보관되며 disk/workspace snapshot에 저장되지 않습니다.
 
 기본 launcher flag:
 
-- Codex: `--dangerously-bypass-approvals-and-sandbox --enable goals`
+- Codex: `--dangerously-bypass-approvals-and-sandbox`
 - Claude: `--dangerously-skip-permissions`
 - Grok: `--always-approve --permission-mode bypassPermissions`
 - Antigravity/Agy: `agy --dangerously-skip-permissions`
 
-실행 전에 실제로 선택된 alias/function/wrapper script를 확인해서 이미 들어간 canonical flag는 다시 붙이지 않습니다. Windows profile은 source-text 중복 판정이 빗나가도 bypass가 풀리지 않도록 Codex에 repeatable config override(`approval_policy="never"`, `sandbox_mode="danger-full-access"`)를, Claude에 명시적 `--permission-mode bypassPermissions`를 함께 전달합니다. 터미널의 `[simple-vibe-ide] launching ...` 줄에서 실제 app-added argv를 확인할 수 있습니다. 이 flag들은 의도적으로 approval/permission prompt를 줄이기 위한 것입니다. 더 보수적으로 쓰고 싶다면 일반 terminal에서 직접 CLI를 실행하세요.
+Codex와 Claude 버튼은 alias/function/wrapper 내용을 해석하지 않고 위 canonical bypass flag를 앱에서 정확히 한 번 추가합니다. 따라서 사용자 wrapper는 계정/실행 경로만 선택하고 자체 bypass flag는 추가하지 않아야 합니다. Grok/Agy의 호환성 flag에는 기존 best-effort 중복 판정이 유지됩니다. Windows 터미널의 `[simple-vibe-ide] launching ...` 줄에서 실제 app-added argv를 확인할 수 있습니다. 이 flag들은 의도적으로 approval/permission prompt를 줄이기 위한 것입니다. 더 보수적으로 쓰고 싶다면 일반 terminal에서 직접 CLI를 실행하세요.
 
 ### tmux 재접속
 
@@ -212,6 +219,8 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 - session 선택 시 현재 widget에 새 tab으로 attach합니다.
 - `Kill`은 해당 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
 - `Kill all`은 현재 목록에 보이는 해당 LLM session만 확인 후 종료합니다.
+- stale-output probe는 진단 경고만 남기며 기존 PTY를 자동 종료/재접속하지 않습니다. 화면이 멈춘 경우 `Tmux` 메뉴에서 같은 session을 새 tab으로 직접 attach하세요.
+- IDE가 만든 session은 전역 tmux 설정을 바꾸지 않고 `destroy-unattached off`를 session 단위로 강제합니다. IDE client가 끊겨도 session을 유지하고, agent command가 종료되면 `remain-on-exit` dead-pane에 실제 status와 마지막 출력을 남깁니다. 새 launcher marker는 `__svi_launch_v=8`입니다.
 - `tmux`가 없거나 Windows profile이면 기존처럼 직접 실행합니다.
 
 ### Agent bridge와 알림
@@ -293,7 +302,7 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 
 ### WSL UNC checkout에서 build가 느리거나 path resolution이 깨짐
 
-위의 WSL checkout 명령처럼 `cmd pushd`와 Windows-local `CARGO_TARGET_DIR`를 사용하세요. raw UNC working directory에서 Windows tool을 직접 돌리면 npm, Vite, Cargo, Tauri가 서로 다른 방식으로 path 문제를 낼 수 있습니다.
+위의 WSL checkout 명령처럼 `cmd pushd`는 staged helper를 시작할 때만 쓰고, source stage와 `CARGO_TARGET_DIR`는 모두 Windows-local 경로에 두세요. raw UNC checkout에서 Windows npm/Vite/Cargo/Tauri를 직접 실행하지 마세요.
 
 ### built app에서 `wsl.exe` path translation 오류가 보임
 
@@ -309,7 +318,7 @@ Windows OpenSSH config의 literal `Host` alias만 자동 import됩니다. wildca
 
 ### Terminal glyph가 깨지거나 GL 문제가 보임
 
-`Set` -> `Terminal renderer`를 `DOM compatibility`로 바꾼 뒤 새 shell에서 확인하세요. Grok Build pane은 기본적으로 DOM 호환 경로를 사용합니다.
+`Set` -> `Terminal renderer`를 `DOM compatibility`로 바꾸면 기존 shell도 즉시 DOM으로 전환됩니다. Grok Build와 감지된 OpenCode pane은 기본적으로 DOM/OpenTUI 호환 경로를 사용합니다.
 
 ### Browser preview가 실제 브라우저와 다르게 보임
 
@@ -374,7 +383,7 @@ When asking an LLM or coding agent to install, build, or verify the app, provide
 - Per-widget opacity, active-widget indicators, saved per-workspace geometry
 - Liquid Glass/background controls, bundled Glass theme, theme JSON export
 - Windows/WSL/SSH PTY terminal, terminal tabs, right/down splits, split resizing, Type pad
-- Terminal history cache / scrollback settings, `GL`/`DOM` renderer badges, Grok DOM compatibility path
+- Terminal history cache / scrollback settings, `GL`/`DOM` renderer badges, and a Grok/OpenCode OpenTUI DOM compatibility path
 - Codex, Claude, Grok, and Antigravity launcher buttons
 - tmux-backed WSL/SSH LLM sessions with attach, per-session kill, and LLM-specific `Kill all`
 - Claude local hook and Grok global hook bridge for better agent state detection
@@ -398,6 +407,7 @@ Required for development:
 - Node.js 22 or newer
 - Rust for Windows via rustup using the MSVC toolchain
 - Visual Studio Build Tools with the C++ workload if Rust or Tauri asks for it
+- Git for Windows when staging a WSL-hosted checkout for a Windows build
 
 Optional depending on your workflow:
 
@@ -430,20 +440,29 @@ npm run tauri:dev
 
 The Tauri dev server is pinned to `127.0.0.1:15320` to avoid Windows reserved-port conflicts that can make common dev ports fail with `listen EACCES`.
 
-## Running A WSL Checkout From Windows
+## Building A WSL Checkout From Windows
 
-If the repo lives inside WSL and you are running Windows Node/Rust/Tauri tools against it, use `cmd pushd` so Windows gets a temporary drive letter. Keep Cargo output on a Windows-local filesystem.
+Do not share one `node_modules` tree between WSL and Windows npm. Linux `.bin`
+symlinks, Windows `.cmd` shims, and platform-specific esbuild/Rollup packages can
+otherwise produce `EISDIR`/`EPERM` cleanup failures or an invalid Windows build.
+Use the staged smoke script, which copies current tracked working-tree source to
+a Windows-local NTFS directory before doing a clean install and build.
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-$env:CARGO_INCREMENTAL = "0"
-$env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
-cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && npm install && npm run check && npm run build && cd src-tauri && cargo check && cd .. && npm run tauri:dev'
+cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows-staged-runtime-smoke.ps1 -NoLaunch'
 ```
 
 Replace `[DISTRO]` and `[USER]` with your environment values.
+The default stage and Cargo target are under Windows `%TEMP%`; pass `-StageRoot`
+and `-CargoTargetDir` to use another spacious Windows-local drive.
 
-Avoid running multiple npm/Vite/Tauri commands in parallel against the same WSL UNC checkout. Temporary drive mapping and path resolution can race.
+For Windows HMR development, use a Windows-local clone/worktree. Never alternate
+WSL `npm install` and Windows `npm install` in the same WSL checkout's
+`node_modules` directory.
+The staged helper copies tracked working-tree files by default. Use
+`-IncludeUntracked` only when new untracked source is required, after ensuring
+all private local files are ignored.
 
 ## Build And Launch
 
@@ -509,17 +528,17 @@ WSL profiles load in the background after the first screen is interactive. SSH p
 - `Ctrl+V` pastes clipboard text into the shell.
 - The Type pad is useful for long Korean prompts or staged paste input. `Ctrl+Enter` sends text to the shell but does not auto-execute it.
 - Terminal renderer defaults to `Auto`: WebGL when available, DOM fallback when WebGL is unavailable or context is lost.
-- Grok Build panes use a DOM-compatible path and conservative terminal environment to reduce glyph artifacts.
+- Grok Build panes and manually launched OpenCode panes use a detected DOM/OpenTUI compatibility path to reduce glyph artifacts. Grok's conservative launcher environment is not applied to OpenCode.
 - Terminal history cache is in-memory only and is not written to disk or workspace snapshots.
 
 Default launcher flags:
 
-- Codex: `--dangerously-bypass-approvals-and-sandbox --enable goals`
+- Codex: `--dangerously-bypass-approvals-and-sandbox`
 - Claude: `--dangerously-skip-permissions`
 - Grok: `--always-approve --permission-mode bypassPermissions`
 - Antigravity/Agy: `agy --dangerously-skip-permissions`
 
-Before launching, the app checks the effective alias, function, or wrapper script and skips canonical flags already present. On Windows profiles it also passes repeatable Codex config overrides (`approval_policy="never"`, `sandbox_mode="danger-full-access"`) and Claude's explicit `--permission-mode bypassPermissions`, so an imperfect source-text dedup result cannot silently disable bypass. The terminal's `[simple-vibe-ide] launching ...` line shows the argv added by the app. These flags intentionally reduce approval/permission prompts. If you want normal prompts, launch the CLI manually in a terminal instead.
+The Codex and Claude buttons do not inspect alias, function, or wrapper source. The app adds the canonical bypass flag above exactly once, so user wrappers should select only the account/executable and must not inject their own bypass flag. Existing best-effort duplicate detection remains for Grok/Agy compatibility flags. On Windows, the terminal's `[simple-vibe-ide] launching ...` line shows the argv added by the app. These flags intentionally reduce approval/permission prompts. If you want normal prompts, launch the CLI manually in a terminal instead.
 
 ### tmux Attach/Reconnect
 
@@ -531,6 +550,8 @@ On POSIX profiles such as WSL/SSH, LLM launchers use `tmux` when it is installed
 - Selecting a session attaches it as a new tab in the current widget.
 - `Kill` terminates the tmux session. Closing the IDE tab only closes the local PTY/tab.
 - `Kill all` terminates only the currently listed sessions for that LLM after confirmation.
+- Stale-output probes only report diagnostics; they do not automatically terminate or reconnect the current PTY. If a pane appears frozen, attach the same session in a new tab from `Tmux`.
+- IDE-created sessions override `destroy-unattached off` for that session without changing the user's global tmux defaults. A lost IDE client therefore leaves the session alive, while `remain-on-exit` retains an agent-exited pane with its last output and real status. The new launcher marker is `__svi_launch_v=8`.
 - If `tmux` is missing or the profile is Windows, launchers run directly.
 
 ### Agent Bridge And Alerts
@@ -612,7 +633,7 @@ The dev port is pinned to `127.0.0.1:15320`. If another process already uses tha
 
 ### WSL UNC builds feel slow or path resolution breaks
 
-Use the WSL checkout command above with `cmd pushd` and a Windows-local `CARGO_TARGET_DIR`. Raw UNC working directories can confuse npm, Vite, Cargo, and Tauri in different ways.
+Use `cmd pushd` only to launch the staged helper shown above, with both its source stage and `CARGO_TARGET_DIR` on Windows-local storage. Do not run Windows npm, Vite, Cargo, or Tauri directly in the raw UNC checkout.
 
 ### The built app shows `wsl.exe` path translation errors
 
@@ -628,7 +649,7 @@ Only literal `Host` aliases from your Windows OpenSSH config are auto-imported. 
 
 ### Terminal glyphs break or GL looks wrong
 
-Switch `Set` -> `Terminal renderer` to `DOM compatibility`, then open a new shell. Grok Build panes use the DOM-compatible path by default.
+Switch `Set` -> `Terminal renderer` to `DOM compatibility` to demote existing shells immediately. Grok Build and detected OpenCode panes use the DOM/OpenTUI-compatible path by default.
 
 ### Browser preview differs from a real browser
 

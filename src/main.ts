@@ -124,6 +124,8 @@ interface TerminalPane {
   detectedLlmId?: string;
   llmBridgeSessionId?: string;
   llmHookActive?: boolean;
+  llmHookAuthoritative?: boolean;
+  llmHookLastEventAt?: number;
   profileId: string;
   cwd: string;
   shellHistoryId: string;
@@ -207,12 +209,14 @@ interface TerminalPane {
   tmuxFreezeProbeLastLoggedAt?: number;
   tmuxFreezeProbeLastChangedAt?: number;
   tmuxStaleDeliveryCount?: number;
-  tmuxStaleRecoveryLastAt?: number;
-  tmuxStaleRecoveryPromise?: Promise<void>;
+  tmuxStaleNoticeLastAt?: number;
   llmTitleDisposable?: { dispose: () => void };
-  grokOutputPendingCarriageReturn?: boolean;
-  grokPostWriteRefreshFrame?: number;
-  grokScrollRefreshDisposable?: { dispose: () => void };
+  // Runtime-only compatibility for OpenTUI-style inline redraws. Grok gets the
+  // same profile from llmId; this flag covers manually launched OpenCode panes.
+  openTuiCompatibility?: boolean;
+  openTuiOutputPendingCarriageReturn?: boolean;
+  openTuiPostWriteRefreshFrame?: number;
+  openTuiScrollRefreshDisposable?: { dispose: () => void };
   activePythonEnv?: TerminalPythonEnvSnapshot;
   pendingTerminalWrites?: number;
   lastTerminalDataAt?: number;
@@ -1556,56 +1560,61 @@ type LlmLauncherFlag = {
 
 type LlmLauncherConfig = {
   executable: string;
-  flags: LlmLauncherFlag[];
+  // Arguments that define the IDE button's fixed launch mode. Unlike `flags`, these are appended
+  // exactly once without inspecting aliases, functions, or wrapper source. User wrappers should
+  // route the executable/account only and leave the button's bypass policy to the IDE.
+  buttonArgs?: string[];
+  // POSIX-only safety gate. Claude refuses its bypass flag as root; Windows has no uid gate.
+  buttonArgsSkipWhenRoot?: boolean;
+  // Best-effort duplicate detection remains available for third-party launchers whose wrappers may
+  // already provide compatibility flags. Codex and Claude intentionally do not use this path.
+  flags?: LlmLauncherFlag[];
   env?: Record<string, string>;
-  // Repeatable/idempotent Windows-only arguments that enforce the intended mode even if a
-  // wrapper's source text makes the best-effort duplicate detector skip a canonical flag.
-  powershellAlwaysArgs?: string[];
 };
 
 type AgentBridgeLaunchContext = {
   agentId: string;
   sessionId: string;
   bridge: AgentBridgeInfo;
+  hookAuthoritative: boolean;
 };
 
 type AgentHookState = {
   hooksInstalled: boolean;
+  managedInstallationPresent?: boolean;
   envCurrent: boolean;
+  authoritative?: boolean;
+  repairError?: string;
+};
+
+type ClaudeHookPaths = {
+  settingsPath: string;
+  scriptPath: string;
+  legacySettingsPaths: string[];
+  legacyScriptPaths: string[];
+  mode: 'current' | 'repair-existing';
+};
+
+type OptionalClaudeFile = {
+  exists: boolean;
+  text: string;
+};
+
+type ClaudeHookOwnership = {
+  commands: ReadonlySet<string>;
+  scriptOperands: ReadonlySet<string>;
 };
 
 const LLM_LAUNCHERS: Record<string, LlmLauncherConfig> = {
   codex: {
     executable: 'codex',
-    powershellAlwaysArgs: [
-      '-c', 'approval_policy="never"',
-      '-c', 'sandbox_mode="danger-full-access"'
-    ],
-    flags: [
-      {
-        bashPattern: '*--dangerously-bypass-approvals-and-sandbox*',
-        powershellPattern: '--dangerously-bypass-approvals-and-sandbox',
-        args: ['--dangerously-bypass-approvals-and-sandbox']
-      },
-      {
-        bashPattern: '*--enable[[:space:]]goals*|*--enable=goals*',
-        powershellPattern: '--enable\\s+goals|--enable=goals',
-        args: ['--enable', 'goals']
-      }
-    ]
+    buttonArgs: ['--dangerously-bypass-approvals-and-sandbox']
   },
   claude: {
     executable: 'claude',
-    powershellAlwaysArgs: ['--permission-mode', 'bypassPermissions'],
-    flags: [
-      {
-        // claude rejects --dangerously-skip-permissions as root, so skip it when uid 0.
-        skipWhenRoot: true,
-        bashPattern: '*--dangerously-skip-permissions*|*--permission-mode[[:space:]]bypassPermissions*|*--permission-mode=bypassPermissions*',
-        powershellPattern: '--dangerously-skip-permissions|--permission-mode\\s+bypassPermissions|--permission-mode=bypassPermissions',
-        args: ['--dangerously-skip-permissions']
-      }
-    ]
+    buttonArgs: ['--dangerously-skip-permissions'],
+    // Claude rejects --dangerously-skip-permissions as root, so run plain Claude there.
+    buttonArgsSkipWhenRoot: true
   },
   grok: {
     executable: 'grok',
@@ -1760,16 +1769,26 @@ const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
 const TERMINAL_RENDER_WATCHDOG_MS = 420;
 const TERMINAL_RENDER_WATCHDOG_STALE_RAF_MS = 500;
 const TERMINAL_RENDER_REFRESH_MIN_MS = 260;
-const TERMINAL_GROK_RENDER_REFRESH_MIN_MS = 80;
+const TERMINAL_OPENTUI_RENDER_REFRESH_MIN_MS = 80;
+const TERMINAL_SHELL_COMMAND_PREFIX_PATTERN = String.raw`(?:(?:exec|command|builtin|nohup)\s+|sudo(?:\s+--?[^\s]+)*\s+|env(?:\s+--?[^\s]+)*\s+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*`;
+const TERMINAL_OPENCODE_DIRECT_EXECUTABLE_PATTERN = String.raw`(?:"(?:[^"]*[\\/])?opencode(?:\.exe)?"|'(?:[^']*[\\/])?opencode(?:\.exe)?'|(?:[^\s]*[\\/])?opencode(?:\.exe)?)`;
+const TERMINAL_OPENCODE_DIRECT_COMMAND_PATTERN = new RegExp(
+  `^${TERMINAL_SHELL_COMMAND_PREFIX_PATTERN}${TERMINAL_OPENCODE_DIRECT_EXECUTABLE_PATTERN}(?=$|\\s)`,
+  'i'
+);
+const TERMINAL_OPENCODE_RUNNER_OPTIONS_PATTERN = String.raw`(?:\s+(?:-y|--yes|--quiet|--no-install|--ignore-existing|--bun))*`;
+const TERMINAL_OPENCODE_PACKAGE_RUNNER_PATTERN = new RegExp(
+  `^${TERMINAL_SHELL_COMMAND_PREFIX_PATTERN}(?:(?:npx|bunx)${TERMINAL_OPENCODE_RUNNER_OPTIONS_PATTERN}|pnpm\\s+dlx)\\s+opencode(?:-ai)?(?:@[A-Za-z0-9._-]+)?(?=$|\\s)`,
+  'i'
+);
 const LLM_TMUX_SESSION_MENU_CACHE_LIMIT = 64;
 const TERMINAL_TMUX_FREEZE_PROBE_INTERVAL_MS = 12_000;
 const TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS = 150;
 const TERMINAL_TMUX_FREEZE_PROBE_MIN_LOG_MS = 20_000;
 const TERMINAL_TMUX_FREEZE_STALE_DATA_MS = 5_000;
-const TERMINAL_TMUX_STALE_RECOVERY_COUNT = 2;
-const TERMINAL_TMUX_STALE_RECOVERY_MIN_AGE_MS = 15_000;
-const TERMINAL_TMUX_STALE_RECOVERY_COOLDOWN_MS = 60_000;
-const TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS = 1500;
+const TERMINAL_TMUX_STALE_NOTICE_COUNT = 2;
+const TERMINAL_TMUX_STALE_NOTICE_MIN_AGE_MS = 15_000;
+const TERMINAL_TMUX_STALE_NOTICE_COOLDOWN_MS = 60_000;
 const TERMINAL_INPUT_BATCH_MS = 4;
 const TERMINAL_INPUT_FORCE_FLUSH_CHARS = 4096;
 const TERMINAL_INPUT_PENDING_MAX_CHARS = 64 * 1024;
@@ -1851,17 +1870,20 @@ const WORKSPACE_LLM_TMUX_TITLE_POLL_MS = 1200;
 const WORKSPACE_LLM_TMUX_TITLE_POLL_RETRY_MS = 4000;
 const WORKSPACE_LLM_TMUX_TITLE_INACTIVE_POLL_MS = 10_000;
 const WORKSPACE_LLM_HOOK_ACTIVE_MS = 30 * 60_000;
+const WORKSPACE_LLM_HOOK_AUTHORITY_LEASE_MS = 5 * 60_000;
 const LLM_TMUX_SESSION_MAX_LEN = 48;
 const LLM_TMUX_ENV_DANGEROUS_PATTERN = /(?:TOKEN|SECRET|PASSWORD|PASSWD|AUTH|COOKIE|KEY)/i;
 const CLAUDE_HOOK_DIR = '.claude';
+const CLAUDE_HOOK_SETTINGS_NAME = 'settings.local.json';
 const CLAUDE_HOOK_SCRIPT_NAME = 'simple-vibe-ide-hook.sh';
-const CLAUDE_HOOK_COMMAND = `/bin/sh ${CLAUDE_HOOK_DIR}/${CLAUDE_HOOK_SCRIPT_NAME}`;
+const CLAUDE_HOOK_SCRIPT_VERSION = 3;
+const CLAUDE_HOOK_SCRIPT_VERSION_MARKER = `# simple-vibe-ide-claude-hook-version: ${CLAUDE_HOOK_SCRIPT_VERSION}`;
 const GROK_HOOK_DIR = '.grok/hooks';
 const GROK_HOOK_CONFIG_NAME = 'simple-vibe-ide.json';
 const GROK_HOOK_SCRIPT_NAME = 'simple-vibe-ide-hook.sh';
 const GROK_HOOK_COMMAND = `/bin/sh "$HOME/${GROK_HOOK_DIR}/${GROK_HOOK_SCRIPT_NAME}"`;
 const WORKSPACE_LLM_TMUX_TITLE_STALE_REPEAT_MS = 8000;
-const IDE_LLM_LAUNCHER_VERSION = 5;
+const IDE_LLM_LAUNCHER_VERSION = 8;
 const CLAUDE_HOOK_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
@@ -1871,6 +1893,10 @@ const CLAUDE_HOOK_EVENTS = [
   'PermissionRequest',
   'PermissionDenied',
   'Notification',
+  'SubagentStart',
+  'PreCompact',
+  'PostCompact',
+  'CwdChanged',
   'Stop',
   'StopFailure',
   'SubagentStop',
@@ -4006,7 +4032,14 @@ const agentSessionProgressByPaneId = new Map<string, AgentSessionProgress>();
 const agentSessionProgressTimers = new Map<string, number>();
 const agentHookStateCache = new Map<string, { value: AgentHookState; cachedAt: number }>();
 const agentHookStateReads = new Map<string, Promise<AgentHookState>>();
-const agentHookInstallations = new Map<string, Promise<AgentHookState>>();
+const agentHookInstallations = new Map<string, Promise<AgentHookState | null>>();
+const agentHookInstallPrompts = new Map<string, Promise<boolean>>();
+const agentHookInstallPromptDecisions = new Map<string, { approved: boolean; decidedAt: number }>();
+const claudeHookPathCache = new Map<string, {
+  value?: ClaudeHookPaths;
+  cachedAt?: number;
+  pending?: Promise<ClaudeHookPaths>;
+}>();
 let agentBridgeInfoPromise: Promise<AgentBridgeInfo> | null = null;
 const agentAlertLastByPaneId = new Map<string, { kind: AgentAlertKind; at: number }>();
 const agentWaitingAlertSignatureByPaneId = new Map<string, string>();
@@ -6956,7 +6989,9 @@ function saveSettingsFromForm() {
   };
   persistIdeSettings();
   applyIdeSettings();
-  if (previousTerminalRenderer === 'dom' && state.ideSettings.terminalRenderer === 'auto') {
+  if (previousTerminalRenderer !== 'dom' && state.ideSettings.terminalRenderer === 'dom') {
+    for (const pane of state.terminals) demoteTerminalPaneFromWebglForCompatibility(pane);
+  } else if (previousTerminalRenderer === 'dom' && state.ideSettings.terminalRenderer === 'auto') {
     for (const pane of state.terminals) {
       if (pane.webglPromotionUnavailable && !pane.webglContextLost) pane.webglPromotionUnavailable = false;
       scheduleTerminalWebglPromotion(pane);
@@ -15240,14 +15275,19 @@ function handleAgentBridgeEvent(event: AgentBridgeEvent) {
     'hook',
     `${agentId} event=${event.rawEventName || 'unknown'} status=${event.status || 'none'} pane=${pane.paneId.slice(0, 6)}`
   );
-  pane.llmHookActive = true;
+  pane.llmHookActive = pane.llmHookAuthoritative !== false;
+  pane.llmHookLastEventAt = Date.now();
   pane.llmBridgeSessionId = event.sessionId || pane.llmBridgeSessionId;
   if (!pane.llmId) setDetectedTerminalLlmId(pane, agentId);
+  const eventCwd = event.rawEventName === 'CwdChanged' && event.cwd
+    ? event.cwd
+    : undefined;
   const status = agentSessionStatusFromBridgeStatus(event.status);
   if (!status) {
     updateAgentSessionProgressForPane(pane, {
       agentId,
       source: 'hook',
+      cwd: eventCwd,
       activity: sanitizeAgentProgressText(event.activity ?? event.rawEventName, AGENT_SESSION_ACTIVITY_MAX_CHARS)
     });
     return;
@@ -15283,6 +15323,10 @@ function handleAgentBridgeEvent(event: AgentBridgeEvent) {
     doneAlertEligible: status === 'working' ? true : undefined,
     doneAlertOnExpire: status === 'working' ? false : undefined
   });
+  if (status === 'exited') {
+    pane.llmHookActive = false;
+    pane.llmHookLastEventAt = undefined;
+  }
   if (status === 'working') markWorkspaceLlmActivity(pane.workspaceId, WORKSPACE_LLM_HOOK_ACTIVE_MS);
 }
 
@@ -15525,52 +15569,147 @@ function terminalPaneLlmId(pane: TerminalPane | null | undefined) {
   return normalizeTerminalLlmId(pane?.llmId) ?? normalizeTerminalLlmId(pane?.detectedLlmId);
 }
 
-function terminalUnicodeVersionForLlm(llmId: string | null | undefined) {
-  // Grok Build/OpenTUI's inline diff redraw can drift from xterm's newer
-  // Unicode width tables on ambiguous-width symbols. Keep this surgical:
-  // only Grok panes fall back to xterm's built-in Unicode 6 provider.
-  return normalizeTerminalLlmId(llmId) === 'grok' ? '6' : '11';
+function terminalShellCommandSegments(text: string) {
+  const segments: string[] = [];
+  let current = '';
+  let quote = '';
+  let escaped = false;
+  for (const char of text) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      current += char;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      current += char;
+      if (char === quote) quote = '';
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === '\r' || char === '\n' || char === ';' || char === '&' || char === '|') {
+      if (current.trim()) segments.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments;
 }
 
-function terminalConvertEolForLlm(llmId: string | null | undefined) {
+function terminalCommandUsesOpenTuiCompatibility(text: string | null | undefined) {
+  if (!text) return false;
+  return terminalShellCommandSegments(text).some((segment) => (
+    TERMINAL_OPENCODE_DIRECT_COMMAND_PATTERN.test(segment)
+    || TERMINAL_OPENCODE_PACKAGE_RUNNER_PATTERN.test(segment)
+  ));
+}
+
+function terminalTitleUsesOpenTuiCompatibility(title: string | null | undefined) {
+  const candidates = workspaceLlmTerminalTitleCandidates(title ?? '');
+  return candidates.some((candidate) => (
+    /^(?:OpenCode|Open\s+Code)(?:\b|[:\-—·|])/i.test(candidate)
+    || /^OC\s*\|/i.test(candidate)
+  ));
+}
+
+function terminalPaneCanEnableOpenTuiCompatibilityFromTitle(pane: TerminalPane) {
+  const llmId = terminalPaneLlmId(pane);
+  return !llmId || llmId === 'grok';
+}
+
+function terminalUsesOpenTuiCompatibility(
+  llmId: string | null | undefined,
+  openTuiCompatibility = false
+) {
+  return openTuiCompatibility || normalizeTerminalLlmId(llmId) === 'grok';
+}
+
+function terminalPaneUsesOpenTuiCompatibility(pane: TerminalPane | null | undefined) {
+  return terminalUsesOpenTuiCompatibility(terminalPaneLlmId(pane), pane?.openTuiCompatibility === true);
+}
+
+function terminalUnicodeVersionForCompatibility(
+  llmId: string | null | undefined,
+  openTuiCompatibility = false
+) {
+  // Grok Build and OpenCode/OpenTUI inline diffs can drift from xterm's newer
+  // Unicode width tables on ambiguous-width symbols. Keep this scoped to the
+  // detected OpenTUI compatibility path.
+  return terminalUsesOpenTuiCompatibility(llmId, openTuiCompatibility) ? '6' : '11';
+}
+
+function terminalConvertEolForCompatibility(
+  llmId: string | null | undefined,
+  openTuiCompatibility = false
+) {
   // LLM TUIs own cursor movement and line redraws. xterm's convertEol is
   // documented for non-PTY streams and can inject CRs on LF, which can desync
-  // inline TUI diffs. Keep the existing plain-shell behavior for now.
-  return !normalizeTerminalLlmId(llmId);
+  // inline TUI diffs. A manually launched OpenCode pane has no llmId, so its
+  // OpenTUI compatibility flag must also disable this non-PTY conversion.
+  return !normalizeTerminalLlmId(llmId) && !openTuiCompatibility;
 }
 
-function applyTerminalUnicodeVersionForLlm(term: XTermTerminal, llmId: string | null | undefined) {
-  const version = terminalUnicodeVersionForLlm(llmId);
-  if (term.unicode.activeVersion === version) return;
-  try {
-    term.unicode.activeVersion = version;
-  } catch (error) {
-    console.warn(`Failed to activate xterm Unicode ${version} width table.`, error);
+function applyTerminalCompatibility(
+  term: XTermTerminal,
+  llmId: string | null | undefined,
+  openTuiCompatibility = false
+) {
+  const version = terminalUnicodeVersionForCompatibility(llmId, openTuiCompatibility);
+  if (term.unicode.activeVersion !== version) {
+    try {
+      term.unicode.activeVersion = version;
+    } catch (error) {
+      console.warn(`Failed to activate xterm Unicode ${version} width table.`, error);
+    }
   }
-}
-
-function applyTerminalCompatibilityForLlm(term: XTermTerminal, llmId: string | null | undefined) {
-  applyTerminalUnicodeVersionForLlm(term, llmId);
-  const convertEol = terminalConvertEolForLlm(llmId);
+  const convertEol = terminalConvertEolForCompatibility(llmId, openTuiCompatibility);
   if (term.options.convertEol !== convertEol) term.options.convertEol = convertEol;
 }
 
+function applyTerminalCompatibilityForPane(pane: TerminalPane) {
+  applyTerminalCompatibility(
+    pane.term,
+    terminalPaneLlmId(pane),
+    pane.openTuiCompatibility === true
+  );
+}
+
+function enableTerminalOpenTuiCompatibility(pane: TerminalPane) {
+  if (pane.openTuiCompatibility === true) return false;
+  pane.openTuiCompatibility = true;
+  applyTerminalCompatibilityForPane(pane);
+  demoteTerminalPaneFromWebglForCompatibility(pane);
+  return true;
+}
+
 function normalizeTerminalOutputForPaneWrite(pane: TerminalPane, data: string) {
-  if (!data || terminalPaneLlmId(pane) !== 'grok') return data;
+  if (!data || !terminalPaneUsesOpenTuiCompatibility(pane)) return data;
   let normalized = data;
-  if (pane.grokOutputPendingCarriageReturn) {
-    normalized = normalized.startsWith('\n') ? `\r${normalized}` : `\r\x1b[K${normalized}`;
-    pane.grokOutputPendingCarriageReturn = false;
+  if (pane.openTuiOutputPendingCarriageReturn) {
+    // Rejoin the split CR first. The replacement below preserves CRLF and adds
+    // exactly one erase-to-EOL sequence when the next chunk is not LF.
+    normalized = `\r${normalized}`;
+    pane.openTuiOutputPendingCarriageReturn = false;
   }
   if (normalized.endsWith('\r')) {
-    pane.grokOutputPendingCarriageReturn = true;
+    pane.openTuiOutputPendingCarriageReturn = true;
     normalized = normalized.slice(0, -1);
   }
-  // Grok's TUI frequently redraws status/progress rows from column 0 with a
+  // OpenTUI clients frequently redraw status/progress rows from column 0 with a
   // bare carriage return. If the new row is narrower, or if Grok/tmux and
   // xterm disagree about wide/zero-width glyph widths, stale cells at the
   // front edge remain in xterm's buffer even in DOM renderer. Clear to EOL on
-  // Grok-only bare CR redraws so the following partial repaint starts clean.
+  // this scoped compatibility path so the following partial repaint starts clean.
   return normalized.replace(/\r(?!\n)/g, '\r\x1b[K');
 }
 
@@ -15583,16 +15722,20 @@ function terminalPaneUsesTitleOnlyLlmStatus(pane: TerminalPane | null | undefine
 }
 
 function terminalPaneUsesHookLlmStatus(pane: TerminalPane | null | undefined) {
-  return pane?.llmHookActive === true;
+  return pane?.llmHookActive === true
+    && pane.llmHookAuthoritative !== false
+    && typeof pane.llmHookLastEventAt === 'number'
+    && Date.now() - pane.llmHookLastEventAt <= WORKSPACE_LLM_HOOK_AUTHORITY_LEASE_MS;
 }
 
 function setDetectedTerminalLlmId(pane: TerminalPane, llmId: string | null | undefined) {
   const normalized = normalizeTerminalLlmId(llmId);
   if (!normalized || pane.llmId) return terminalPaneLlmId(pane);
+  if (normalized === 'grok') enableTerminalOpenTuiCompatibility(pane);
   if (pane.detectedLlmId === normalized) return normalized;
   const previousState = workspaceLlmIndicatorState(pane.workspaceId);
   pane.detectedLlmId = normalized;
-  applyTerminalCompatibilityForLlm(pane.term, normalized);
+  applyTerminalCompatibilityForPane(pane);
   updateAgentSessionProgressForPane(pane, {
     agentId: normalized,
     status: pane.backendId ? 'idle' : 'idle',
@@ -16036,9 +16179,16 @@ function updateWorkspaceLlmTitleFromTerminalTitle(
   title: string,
   options: { ignoreScrollSuppression?: boolean; trustedTmuxPoll?: boolean } = {}
 ) {
-  if (!options.ignoreScrollSuppression && llmDetectionSuppressedAfterTerminalScroll(pane)) return;
   if ((pane.llmTitleDetectionSuppressUntil ?? 0) > performance.now()) return;
   pane.llmTitleDetectionSuppressUntil = undefined;
+  // OpenCode can be started manually in an already-WebGL shell. Apply the
+  // renderer/parser profile as soon as its OSC title is observed, independent
+  // of scroll-based status suppression, but not during snapshot/replay gates.
+  if (
+    terminalPaneCanEnableOpenTuiCompatibilityFromTitle(pane)
+    && terminalTitleUsesOpenTuiCompatibility(title)
+  ) enableTerminalOpenTuiCompatibility(pane);
+  if (!options.ignoreScrollSuppression && llmDetectionSuppressedAfterTerminalScroll(pane)) return;
   const llmId = terminalPaneLlmId(pane)
     ?? setDetectedTerminalLlmId(pane, llmIdFromTerminalTitleText(title));
   if (!llmId || !pane.workspaceId || !workspaceLlmSupportsWaitingDetection(llmId)) return;
@@ -16361,7 +16511,7 @@ async function pollTerminalTmuxFreezeProbe(pane: TerminalPane, reason = 'periodi
             ].join(' '),
             'warn'
           );
-          maybeRecoverTerminalTmuxStaleDelivery(pane, result, reason, now, dataAge);
+          maybeReportTerminalTmuxStaleDelivery(pane, result, reason, now, dataAge);
         }
       }
     })
@@ -16382,7 +16532,7 @@ async function pollTerminalTmuxFreezeProbe(pane: TerminalPane, reason = 'periodi
   await poll;
 }
 
-function maybeRecoverTerminalTmuxStaleDelivery(
+function maybeReportTerminalTmuxStaleDelivery(
   pane: TerminalPane,
   result: LlmTmuxPaneProbeResult,
   reason: string,
@@ -16391,185 +16541,20 @@ function maybeRecoverTerminalTmuxStaleDelivery(
 ) {
   if (!terminalPaneShouldProbeTmuxFreeze(pane)) return;
   if (!result.available || result.paneDead) return;
-  if ((pane.tmuxStaleDeliveryCount ?? 0) < TERMINAL_TMUX_STALE_RECOVERY_COUNT) return;
-  if (dataAge < TERMINAL_TMUX_STALE_RECOVERY_MIN_AGE_MS) return;
-  if (pane.tmuxStaleRecoveryPromise) return;
-  if (now - (pane.tmuxStaleRecoveryLastAt ?? 0) < TERMINAL_TMUX_STALE_RECOVERY_COOLDOWN_MS) return;
+  if ((pane.tmuxStaleDeliveryCount ?? 0) < TERMINAL_TMUX_STALE_NOTICE_COUNT) return;
+  if (dataAge < TERMINAL_TMUX_STALE_NOTICE_MIN_AGE_MS) return;
+  if (now - (pane.tmuxStaleNoticeLastAt ?? 0) < TERMINAL_TMUX_STALE_NOTICE_COOLDOWN_MS) return;
   const sessionName = safeLlmTmuxSessionName(pane.llmTmuxSessionName);
   if (!sessionName) return;
-  pane.tmuxStaleRecoveryLastAt = now;
-  pane.inputBackendPending = true;
-  const recovery = recoverTerminalTmuxStaleDelivery(pane, sessionName, reason, dataAge)
-    .catch((error) => {
-      if (!pane.backendId) {
-        pane.startupState = 'failed';
-        pane.startupError = String(error);
-        failPendingTerminalInput(pane, 'tmux reconnect ended before pending input delivery was confirmed');
-      }
-      appendDiagnosticLog(
-        'terminal',
-        `tmux stale-reconnect failed pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} error=${sanitizeDiagnosticLogPart(String(error), 160)}`,
-        'warn',
-        { force: true }
-      );
-      setStatus(`tmux reconnect failed: ${String(error)}`, true);
-    })
-    .finally(() => {
-      pane.inputBackendPending = false;
-      if (pane.tmuxStaleRecoveryPromise === recovery) pane.tmuxStaleRecoveryPromise = undefined;
-    });
-  pane.tmuxStaleRecoveryPromise = recovery;
-}
-
-function llmTmuxAttachCommand(sessionName: string) {
-  const safeName = safeLlmTmuxSessionName(sessionName);
-  if (!safeName) return null;
-  const target = `${safeName}:`;
-  return [
-    `if command -v tmux >/dev/null 2>&1; then`,
-    `  if tmux has-session -t ${bashQuote(target)} 2>/dev/null; then`,
-    `    tmux attach-session -t ${bashQuote(safeName)};`,
-    `  else`,
-    `    printf '\\n[simple-vibe-ide] tmux session not found: %s\\n' ${bashQuote(safeName)};`,
-    `  fi`,
-    `else`,
-    `  printf '\\n[simple-vibe-ide] tmux is not installed; cannot reconnect session %s\\n' ${bashQuote(safeName)};`,
-    `fi`
-  ].join('\n');
-}
-
-async function recoverTerminalTmuxStaleDelivery(
-  pane: TerminalPane,
-  sessionName: string,
-  reason: string,
-  dataAge: number
-) {
-  if (!isTerminalPaneAlive(pane) || !pane.backendId) return;
-  const profile = profileForIdWithWindowsFallback(pane.profileId);
-  const command = llmTmuxAttachCommand(sessionName);
-  if (!profile || profile.kind === 'windows' || !command) return;
-  const inputDrained = await drainTerminalInputBeforeReconnect(pane);
-  if (!inputDrained || !isTerminalPaneAlive(pane) || !pane.backendId) {
-    appendDiagnosticLog(
-      'terminal',
-      `tmux stale-reconnect deferred pane=${diagnosticPaneLabel(pane)} reason=input-not-drained`,
-      'warn'
-    );
-    return;
-  }
-  // Stop new type-ahead at the JS boundary, then place a barrier behind every packet already
-  // accepted by the Rust channel. The barrier is acknowledged only after the PTY writer has
-  // completed write_all + flush, so killing the old tmux client cannot drop queued Hangul/input.
-  pane.inputReconnectFrozen = true;
-  const oldBackendId = pane.backendId;
-  try {
-    await withTimeout(
-      api.flushTerminalInput(oldBackendId),
-      TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS,
-      'Confirming terminal input before tmux reconnect'
-    );
-  } catch (error) {
-    pane.inputReconnectFrozen = false;
-    if (pane.backendId) drainTerminalInputQueue(pane);
-    appendDiagnosticLog(
-      'terminal',
-      `tmux stale-reconnect deferred pane=${diagnosticPaneLabel(pane)} reason=pty-input-barrier error=${sanitizeDiagnosticLogPart(String(error), 120)}`,
-      'warn'
-    );
-    return;
-  }
-  if (!isTerminalPaneAlive(pane) || pane.backendId !== oldBackendId) {
-    pane.inputReconnectFrozen = false;
-    if (pane.backendId) drainTerminalInputQueue(pane);
-    return;
-  }
+  pane.tmuxStaleNoticeLastAt = now;
+  pane.tmuxStaleDeliveryCount = 0;
   appendDiagnosticLog(
     'terminal',
-    `tmux stale-reconnect start pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} oldBackend=${oldBackendId.slice(0, 8)} reason=${sanitizeDiagnosticLogPart(reason, 24)} dataAge=${Math.round(dataAge)}ms`,
+    `tmux stale-delivery detected pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} reason=${sanitizeDiagnosticLogPart(reason, 24)} dataAge=${Math.round(dataAge)}ms autoReconnect=off`,
     'warn',
     { force: true }
   );
-  let reconnectOperationId = '';
-  try {
-    pane.term.write('\r\n\x1b[33m[simple-vibe-ide] tmux output delivery looks stale; reconnecting this terminal client to the same tmux session...\x1b[0m\r\n');
-    setTerminalBackendId(pane, undefined);
-    dropPendingTerminalBackendEvents(oldBackendId);
-    await terminateTerminalBackendEventually(
-      oldBackendId,
-      `Closing stale tmux client ${pane.title}`
-    );
-    if (!isTerminalPaneAlive(pane)) return;
-    let disposeLateBackend = false;
-    pane.startupState = 'starting';
-    pane.startupError = undefined;
-    scheduleTerminalStartupWatch(pane, profile, `${pane.title} reconnect`);
-    reconnectOperationId = crypto.randomUUID();
-    pane.backendStartPending = true;
-    pane.pendingRuntimeOperationId = reconnectOperationId;
-    const spawnPromise = api.spawnTerminal(
-      profile.id,
-      pane.cwd,
-      command,
-      pane.term.rows,
-      pane.term.cols,
-      pane.workspaceId,
-      `${pane.title} reconnect`,
-      pane.shellHistoryId,
-      reconnectOperationId
-    );
-    spawnPromise.then((lateBackendId) => {
-      if (pane.pendingRuntimeOperationId === reconnectOperationId) pane.pendingRuntimeOperationId = undefined;
-      if (disposeLateBackend || !isTerminalPaneAlive(pane)) {
-        void terminateTerminalBackendEventually(lateBackendId, 'Closing late tmux reconnect client')
-          .catch(() => undefined);
-      }
-    }, () => {
-      if (pane.pendingRuntimeOperationId === reconnectOperationId) pane.pendingRuntimeOperationId = undefined;
-    });
-    let backendId = '';
-    try {
-      backendId = await withTimeout(
-        spawnPromise,
-        terminalStartTimeoutMs(profile),
-        `${profile.kind.toUpperCase()} tmux reconnect`,
-        () => cancelTerminalRuntimeOperation(pane, reconnectOperationId)
-      );
-    } catch (error) {
-      disposeLateBackend = String(error).includes('timed out');
-      throw error;
-    }
-    if (!isTerminalPaneAlive(pane)) {
-      void terminateTerminalBackendEventually(backendId, 'Closing abandoned tmux reconnect client')
-        .catch(() => undefined);
-      return;
-    }
-    setTerminalBackendId(pane, backendId);
-    if (profile.kind === 'wsl') scheduleTerminalWslShellReadyDeadline(pane, backendId);
-    pane.tmuxStaleDeliveryCount = 0;
-    const now = performance.now();
-    pane.lastTerminalDataAt = now;
-    pane.lastTerminalRefreshAt = now;
-    scheduleTerminalTmuxFreezeProbe(pane, TERMINAL_TMUX_FREEZE_PROBE_IMMEDIATE_MS);
-    const widget = terminalWidgetForPane(pane);
-    if (widget) {
-      renderTerminalWidgetTabs(widget);
-      renderTerminalWidgetSplitLayout(widget);
-    }
-    setStatus(`Reconnected tmux session: ${sessionName}`);
-    appendDiagnosticLog(
-      'terminal',
-      `tmux stale-reconnect ok pane=${diagnosticPaneLabel(pane)} session=${sanitizeDiagnosticLogPart(sessionName, 48)} newBackend=${backendId.slice(0, 8)}`,
-      'info',
-      { force: true }
-    );
-  } finally {
-    pane.backendStartPending = false;
-    if (reconnectOperationId && !pane.backendId) {
-      cancelTerminalRuntimeOperation(pane, reconnectOperationId);
-    }
-    pane.inputReconnectFrozen = false;
-    if (pane.backendId) drainTerminalInputQueue(pane);
-  }
+  setStatus('tmux output delivery looks stale. The IDE kept the current client alive; use Tmux to attach a new tab if needed.', true);
 }
 
 function classifyWorkspaceLlmTerminalTitle(llmId: string, title: string): WorkspaceLlmTitleSignal {
@@ -23661,27 +23646,68 @@ async function prepareAgentBridgeForLlmLaunch(
     console.info(`${agentSessionLabel(normalized)} hook bridge is currently enabled only for WSL workspaces.`);
     return null;
   }
-  const hookStateKey = agentHookStateCacheKey(normalized, profile, cwd);
-  let hookState = await cachedAgentHookState(hookStateKey, () => (
-    normalized === 'claude'
-      ? claudeLocalHookState(profile, cwd)
-      : grokGlobalHookState(profile)
-  )).catch(() => ({ hooksInstalled: false, envCurrent: normalized === 'grok' }));
-  if (hookMode === 'ask' && !hookState.hooksInstalled) {
-    if (options.allowPrompt === false) return null;
-    const approved = window.confirm(
-      normalized === 'claude'
-        ? 'Install/update Simple Vibe IDE local Claude hooks for this workspace? This writes .claude/settings.local.json and a small local hook script without secrets.'
-        : 'Install/update Simple Vibe IDE global Grok hooks for this WSL user? This writes ~/.grok/hooks/simple-vibe-ide.* without secrets. The hook stays inert unless Grok is launched by this IDE.'
-    );
-    if (!approved) return null;
+  let claudePaths: ClaudeHookPaths | null = null;
+  if (normalized === 'claude') {
+    try {
+      claudePaths = await cachedClaudeLocalHookPaths(profile, cwd);
+    } catch (error) {
+      console.warn('Failed to resolve Claude hook settings location', error);
+      setStatus('Claude hook bridge setup failed while resolving repository settings; falling back to terminal detection', true);
+      return null;
+    }
   }
+  const hookStateKey = agentHookStateCacheKey(normalized, profile, cwd, claudePaths);
+  const loadHookState = (): Promise<AgentHookState> => (
+    normalized === 'claude' && claudePaths
+      ? claudeLocalHookState(profile, claudePaths)
+      : grokGlobalHookState(profile)
+  );
+  let hookState = await cachedAgentHookState(
+    hookStateKey,
+    loadHookState,
+    normalized === 'claude' ? 0 : AGENT_HOOK_STATE_CACHE_MS
+  ).catch((error) => ({
+    hooksInstalled: false,
+    managedInstallationPresent: false,
+    envCurrent: normalized === 'grok',
+    authoritative: false,
+    repairError: String(error)
+  }));
+  if (hookState.repairError) {
+    setStatus(`${agentSessionLabel(normalized)} hook settings need repair; falling back to terminal detection: ${hookState.repairError}`, true);
+    return null;
+  }
+  const installationKey = agentHookInstallationKey(normalized, profile, cwd, claudePaths);
   try {
     if (!hookState.hooksInstalled || !hookState.envCurrent) {
-      hookState = await installAgentHooksOnce(hookStateKey, async () => {
-        if (normalized === 'claude') await installClaudeLocalHooks(profile, cwd);
-        else await installGrokGlobalHooks(profile);
+      const installedState = await queueAgentHookInstallation(installationKey, async () => {
+        let queuedState = await loadHookState();
+        if (queuedState.repairError) throw new Error(queuedState.repairError);
+        if (queuedState.hooksInstalled && queuedState.envCurrent) return queuedState;
+        if (hookMode === 'ask' && !queuedState.managedInstallationPresent) {
+          if (options.allowPrompt === false) return null;
+          const approved = await confirmAgentHookInstallOnce(
+            installationKey,
+            normalized === 'claude'
+              ? 'Install Simple Vibe IDE local Claude hooks for this repository? This writes Claude’s active repository-local settings, a small local hook script without secrets, and local Git exclude entries when needed.'
+              : 'Install/update Simple Vibe IDE global Grok hooks for this WSL user? This writes ~/.grok/hooks/simple-vibe-ide.* without secrets. The hook stays inert unless Grok is launched by this IDE.'
+          );
+          if (!approved) return null;
+          queuedState = await loadHookState();
+          if (queuedState.repairError) throw new Error(queuedState.repairError);
+          if (queuedState.hooksInstalled && queuedState.envCurrent) return queuedState;
+        }
+        if (normalized === 'claude' && claudePaths) return installClaudeLocalHooks(profile, claudePaths);
+        await installGrokGlobalHooks(profile);
+        return grokGlobalHookState(profile);
       });
+      if (!installedState) return null;
+      hookState = await loadHookState();
+      if (hookState.repairError) throw new Error(hookState.repairError);
+      if (!hookState.hooksInstalled || !hookState.envCurrent) {
+        throw new Error('installed hook files did not pass verification');
+      }
+      agentHookStateCache.set(hookStateKey, { value: hookState, cachedAt: Date.now() });
     }
     agentBridgeInfoPromise ??= api.agentBridgeInfo().catch((error) => {
       agentBridgeInfoPromise = null;
@@ -23691,7 +23717,8 @@ async function prepareAgentBridgeForLlmLaunch(
     return {
       agentId: normalized,
       sessionId: crypto.randomUUID().replace(/[^A-Za-z0-9_-]+/g, '_'),
-      bridge
+      bridge,
+      hookAuthoritative: normalized !== 'claude' || hookState.authoritative === true
     };
   } catch (error) {
     console.warn(`Failed to prepare ${normalized} agent hook bridge`, error);
@@ -23700,15 +23727,31 @@ async function prepareAgentBridgeForLlmLaunch(
   }
 }
 
-function installAgentHooksOnce(key: string, installer: () => Promise<void>) {
-  const pending = agentHookInstallations.get(key);
+function confirmAgentHookInstallOnce(key: string, message: string) {
+  const recentDecision = agentHookInstallPromptDecisions.get(key);
+  if (recentDecision && Date.now() - recentDecision.decidedAt <= AGENT_HOOK_STATE_CACHE_MS) {
+    return Promise.resolve(recentDecision.approved);
+  }
+  if (recentDecision) agentHookInstallPromptDecisions.delete(key);
+  const pending = agentHookInstallPrompts.get(key);
   if (pending) return pending;
-  const installation = installer()
-    .then((): AgentHookState => ({ hooksInstalled: true, envCurrent: true }))
-    .then((value) => {
-      agentHookStateCache.set(key, { value, cachedAt: Date.now() });
-      return value;
+  const prompt = Promise.resolve()
+    .then(() => window.confirm(message))
+    .then((approved) => {
+      agentHookInstallPromptDecisions.set(key, { approved, decidedAt: Date.now() });
+      return approved;
     })
+    .finally(() => {
+      if (agentHookInstallPrompts.get(key) === prompt) agentHookInstallPrompts.delete(key);
+    });
+  agentHookInstallPrompts.set(key, prompt);
+  return prompt;
+}
+
+function queueAgentHookInstallation(key: string, installer: () => Promise<AgentHookState | null>) {
+  const previous = agentHookInstallations.get(key);
+  const installation = (previous ? previous.catch(() => undefined) : Promise.resolve())
+    .then(installer)
     .finally(() => {
       if (agentHookInstallations.get(key) === installation) agentHookInstallations.delete(key);
     });
@@ -23716,23 +23759,57 @@ function installAgentHooksOnce(key: string, installer: () => Promise<void>) {
   return installation;
 }
 
-function agentHookStateCacheKey(agentId: string, profile: ConnectionProfile, cwd: string) {
+function agentHookStateCacheKey(
+  agentId: string,
+  profile: ConnectionProfile,
+  cwd: string,
+  claudePaths: ClaudeHookPaths | null = null
+) {
+  const demoEnvExpected = safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough).includes('IS_DEMO')
+    ? 'demo'
+    : 'normal';
   return agentId === 'claude'
-    ? `${agentId}\0${profile.id}\0${cwd}`
+    ? [
+        agentId,
+        profile.id,
+        claudePaths?.settingsPath ?? cwd,
+        ...(claudePaths?.legacySettingsPaths ?? []),
+        ...(claudePaths?.legacyScriptPaths ?? []),
+        claudePaths?.mode ?? '',
+        `v${CLAUDE_HOOK_SCRIPT_VERSION}`,
+        demoEnvExpected
+      ].join('\0')
+    : `${agentId}\0${profile.id}`;
+}
+
+function agentHookInstallationKey(
+  agentId: string,
+  profile: ConnectionProfile,
+  cwd: string,
+  claudePaths: ClaudeHookPaths | null
+) {
+  return agentId === 'claude'
+    ? [
+        agentId,
+        profile.id,
+        claudePaths?.settingsPath ?? cwd,
+        claudePaths?.scriptPath ?? ''
+      ].join('\0')
     : `${agentId}\0${profile.id}`;
 }
 
 async function cachedAgentHookState(
   key: string,
-  loader: () => Promise<AgentHookState>
+  loader: () => Promise<AgentHookState>,
+  maxAgeMs = AGENT_HOOK_STATE_CACHE_MS
 ): Promise<AgentHookState> {
   const cached = agentHookStateCache.get(key);
-  if (cached && Date.now() - cached.cachedAt <= AGENT_HOOK_STATE_CACHE_MS) return cached.value;
+  if (maxAgeMs > 0 && cached && Date.now() - cached.cachedAt <= maxAgeMs) return cached.value;
   const pending = agentHookStateReads.get(key);
   if (pending) return pending;
   const read = loader()
     .then((value) => {
-      agentHookStateCache.set(key, { value, cachedAt: Date.now() });
+      if (!value.repairError) agentHookStateCache.set(key, { value, cachedAt: Date.now() });
       return value;
     })
     .finally(() => {
@@ -23742,31 +23819,114 @@ async function cachedAgentHookState(
   return read;
 }
 
-async function claudeLocalHookState(profile: ConnectionProfile, cwd: string) {
-  const settingsPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, 'settings.local.json');
-  const scriptPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SCRIPT_NAME);
-  const [settingsText, scriptText] = await Promise.all([
-    api.readTextFile(profile.id, settingsPath).catch(() => ''),
-    api.readTextFile(profile.id, scriptPath).catch(() => '')
-  ]);
-  if (!scriptText.includes('SVIDE_AGENT_BRIDGE_PORT') || !scriptText.includes('/agent-event?agent=')) {
-    return { hooksInstalled: false, envCurrent: false };
+async function claudeLocalHookPaths(profile: ConnectionProfile, cwd: string): Promise<ClaudeHookPaths> {
+  const resolvedCwd = normalizePosixTerminalPath(await api.resolveProfilePath(profile.id, cwd)) || '.';
+  const roots = await api.resolveGitWorkspaceRoots(profile.id, resolvedCwd);
+  const launchCwd = normalizePosixTerminalPath(roots.launchCwd);
+  if (!launchCwd.startsWith('/')) {
+    throw new Error('Claude hook setup requires an absolute WSL working directory');
   }
-  const settings = parseClaudeLocalSettings(settingsText);
-  const hooks = normalizeClaudeHookSettings(settings.hooks);
-  const hooksInstalled = CLAUDE_HOOK_EVENTS.some((eventName) =>
-    Array.isArray(hooks[eventName])
-    && hooks[eventName].some((group) => {
-      const groupHooks = Array.isArray((group as { hooks?: unknown }).hooks) ? (group as { hooks: unknown[] }).hooks : [];
-      return groupHooks.some((hook) => {
-        if (!hook || typeof hook !== 'object') return false;
-        return String((hook as { command?: unknown }).command ?? '').includes(CLAUDE_HOOK_SCRIPT_NAME);
-      });
+  const settingsRoot = roots.claudeMainCheckoutSettingsSupported === true
+    ? normalizePosixTerminalPath(roots.mainCheckoutRoot || launchCwd)
+    : launchCwd;
+  if (!settingsRoot.startsWith('/')) {
+    throw new Error('Claude hook settings location could not be resolved safely');
+  }
+  const legacyRoots = Array.from(new Set([
+    ...(roots.claudeMainCheckoutSettingsSupported && !roots.settingsUseLaunchCwd
+      ? [normalizePosixTerminalPath(roots.worktreeRoot || launchCwd), launchCwd]
+      : [])
+  ])).filter((root) => root && root !== settingsRoot);
+  return {
+    settingsPath: posixJoinPath(settingsRoot, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SETTINGS_NAME),
+    scriptPath: posixJoinPath(settingsRoot, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SCRIPT_NAME),
+    legacySettingsPaths: legacyRoots.map((root) => posixJoinPath(root, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SETTINGS_NAME)),
+    legacyScriptPaths: legacyRoots.map((root) => posixJoinPath(root, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SCRIPT_NAME)),
+    mode: roots.claudeMainCheckoutSettingsSupported === true ? 'current' : 'repair-existing'
+  };
+}
+
+function cachedClaudeLocalHookPaths(profile: ConnectionProfile, cwd: string) {
+  const key = `${profile.id}\0${cwd}`;
+  const cached = claudeHookPathCache.get(key);
+  if (cached?.value && cached.cachedAt && Date.now() - cached.cachedAt <= AGENT_HOOK_STATE_CACHE_MS) {
+    return Promise.resolve(cached.value);
+  }
+  if (cached?.pending) return cached.pending;
+  const pending = claudeLocalHookPaths(profile, cwd)
+    .then((value) => {
+      claudeHookPathCache.set(key, { value, cachedAt: Date.now() });
+      return value;
     })
-  );
+    .catch((error) => {
+      if (claudeHookPathCache.get(key)?.pending === pending) claudeHookPathCache.delete(key);
+      throw error;
+    });
+  claudeHookPathCache.set(key, { pending });
+  return pending;
+}
+
+async function claudeLocalHookState(profile: ConnectionProfile, paths: ClaudeHookPaths): Promise<AgentHookState> {
+  const [settingsFile, scriptFile, legacySettingsFiles, legacyScriptFiles] = await Promise.all([
+    readOptionalClaudeFile(profile, paths.settingsPath),
+    readOptionalClaudeFile(profile, paths.scriptPath),
+    Promise.all(paths.legacySettingsPaths.map((path) => readOptionalClaudeFile(profile, path))),
+    Promise.all(paths.legacyScriptPaths.map((path) => readOptionalClaudeFile(profile, path)))
+  ]);
+  const settings = parseClaudeLocalSettings(settingsFile.text);
+  validateClaudeLocalSettingsShape(settings);
+  const hooks = normalizeClaudeHookSettings(settings.hooks);
+  const legacySettings = legacySettingsFiles.map((file) => {
+    const value = parseClaudeLocalSettings(file.text);
+    validateClaudeLocalSettingsShape(value);
+    return value;
+  });
+  const expectedCommand = claudeHookCommand(paths.scriptPath);
+  const ownership = claudeHookOwnership(paths);
+  const expectedEvents = paths.mode === 'current'
+    ? CLAUDE_HOOK_EVENTS
+    : simpleVibeClaudeHookEventNames(hooks, ownership);
+  const mainHookState = inspectSimpleVibeClaudeHooks(hooks, expectedCommand, expectedEvents, ownership);
+  const legacyManagedHooks = legacySettings.some((value) => (
+    inspectSimpleVibeClaudeHooks(
+      normalizeClaudeHookSettings(value.hooks),
+      expectedCommand,
+      CLAUDE_HOOK_EVENTS,
+      ownership
+    ).managedCount > 0
+  ));
+  const scriptManaged = [scriptFile.text, ...legacyScriptFiles.map((file) => file.text)].some((text) => (
+    text.includes('SVIDE_AGENT_BRIDGE_PORT') && text.includes('/agent-event?agent=')
+  ));
+  const scriptCurrent = scriptFile.text === claudeHookScriptContent();
+  const mainDefinesDisableAllHooks = Object.prototype.hasOwnProperty.call(settings, 'disableAllHooks');
+  const hooksDisabled = mainDefinesDisableAllHooks
+    ? settings.disableAllHooks === true
+    : legacySettings.some((value) => value.disableAllHooks === true);
+  if (hooksDisabled) {
+    return {
+      hooksInstalled: false,
+      managedInstallationPresent: mainHookState.managedCount > 0 || legacyManagedHooks || scriptManaged,
+      envCurrent: claudeLocalSettingsEnvCurrent(settings),
+      authoritative: false,
+      repairError: 'Claude hooks are disabled by the active or legacy local settings'
+    };
+  }
+  if (paths.mode === 'repair-existing' && mainHookState.managedCount === 0) {
+    return {
+      hooksInstalled: false,
+      managedInstallationPresent: false,
+      envCurrent: claudeLocalSettingsEnvCurrent(settings),
+      authoritative: false,
+      repairError: 'Claude Code 2.1.211 or newer is required for a new local hook installation; using terminal detection'
+    };
+  }
+  const hooksInstalled = scriptCurrent && mainHookState.current && !legacyManagedHooks;
   return {
     hooksInstalled,
-    envCurrent: claudeLocalSettingsEnvCurrent(settings)
+    managedInstallationPresent: mainHookState.managedCount > 0 || legacyManagedHooks || scriptManaged,
+    envCurrent: claudeLocalSettingsEnvCurrent(settings),
+    authoritative: hooksInstalled && paths.mode === 'current'
   };
 }
 
@@ -23790,6 +23950,9 @@ function claudeLocalSettingsEnvCurrent(settings: Record<string, any>) {
 
 async function registerAgentBridgeForPane(pane: TerminalPane, context: AgentBridgeLaunchContext | null) {
   if (!context) return;
+  pane.llmHookActive = false;
+  pane.llmHookAuthoritative = context.hookAuthoritative;
+  pane.llmHookLastEventAt = undefined;
   pane.llmBridgeSessionId = context.sessionId;
   try {
     await api.registerAgentBridgeSession({
@@ -23801,23 +23964,37 @@ async function registerAgentBridgeForPane(pane: TerminalPane, context: AgentBrid
     });
   } catch (error) {
     pane.llmBridgeSessionId = undefined;
+    pane.llmHookAuthoritative = undefined;
+    pane.llmHookLastEventAt = undefined;
     console.warn('Failed to register agent bridge session', error);
     setStatus(`Agent bridge registration failed: ${String(error)}`, true);
   }
 }
 
-async function installClaudeLocalHooks(profile: ConnectionProfile, cwd: string) {
-  const settingsPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, 'settings.local.json');
-  const scriptPath = posixJoinPath(cwd, CLAUDE_HOOK_DIR, CLAUDE_HOOK_SCRIPT_NAME);
-  await api.writeTextFile(profile.id, scriptPath, claudeHookScriptContent());
-  const existingText = await api.readTextFile(profile.id, settingsPath).catch(() => '');
-  const settings = parseClaudeLocalSettings(existingText);
-  const hooks = normalizeClaudeHookSettings(settings.hooks);
-  for (const eventName of CLAUDE_HOOK_EVENTS) {
-    const groups = removeSimpleVibeClaudeHookGroups(hooks[eventName]);
-    groups.push({
-      hooks: [{ type: 'command', command: CLAUDE_HOOK_COMMAND, timeout: 5 }]
-    });
+async function installClaudeLocalHooks(
+  profile: ConnectionProfile,
+  paths: ClaudeHookPaths
+): Promise<AgentHookState> {
+  const [mainFile, scriptFile, legacyFiles] = await Promise.all([
+    readOptionalClaudeFile(profile, paths.settingsPath),
+    readOptionalClaudeFile(profile, paths.scriptPath),
+    Promise.all(paths.legacySettingsPaths.map((path) => readOptionalClaudeFile(profile, path)))
+  ]);
+  const settings = parseClaudeLocalSettings(mainFile.text);
+  validateClaudeLocalSettingsShape(settings);
+  const previousMainHooks = normalizeClaudeHookSettings(settings.hooks);
+  const ownership = claudeHookOwnership(paths);
+  const events = paths.mode === 'current'
+    ? CLAUDE_HOOK_EVENTS
+    : simpleVibeClaudeHookEventNames(previousMainHooks, ownership);
+  if (paths.mode === 'repair-existing' && events.length === 0) {
+    throw new Error('No existing Simple Vibe IDE Claude hooks were found to repair');
+  }
+  const hooks = removeSimpleVibeClaudeHooks(previousMainHooks, ownership);
+  const handler = simpleVibeClaudeHookHandler(paths.scriptPath);
+  for (const eventName of events) {
+    const groups = hooks[eventName] ?? [];
+    groups.push({ hooks: [{ ...handler }] });
     hooks[eventName] = groups;
   }
   if (safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough).includes('IS_DEMO')) {
@@ -23830,7 +24007,50 @@ async function installClaudeLocalHooks(profile: ConnectionProfile, cwd: string) 
     };
   }
   settings.hooks = hooks;
-  await api.writeTextFile(profile.id, settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+  const nextMainText = `${JSON.stringify(settings, null, 2)}\n`;
+  const legacyUpdates = legacyFiles.map((file, index) => {
+    const legacySettings = parseClaudeLocalSettings(file.text);
+    validateClaudeLocalSettingsShape(legacySettings);
+    const previousHooks = normalizeClaudeHookSettings(legacySettings.hooks);
+    const nextHooks = removeSimpleVibeClaudeHooks(previousHooks, ownership);
+    if (simpleVibeClaudeHookCount(previousHooks, ownership) === 0) return null;
+    if (Object.values(nextHooks).some((groups) => groups.length > 0)) legacySettings.hooks = nextHooks;
+    else delete legacySettings.hooks;
+    return {
+      path: paths.legacySettingsPaths[index],
+      original: file,
+      nextText: `${JSON.stringify(legacySettings, null, 2)}\n`
+    };
+  }).filter((value): value is {
+    path: string;
+    original: { exists: boolean; text: string };
+    nextText: string;
+  } => Boolean(value));
+
+  const privacyRoots = new Map<string, boolean>([
+    [posixParentPath(posixParentPath(paths.settingsPath)), true]
+  ]);
+  for (const update of legacyUpdates) {
+    const root = posixParentPath(posixParentPath(update.path));
+    privacyRoots.set(root, privacyRoots.get(root) === true);
+  }
+  try {
+    for (const [root, includeScript] of privacyRoots) {
+      await api.protectGitLocalClaudeFiles(profile.id, root, includeScript);
+    }
+  } catch {
+    throw new Error('Claude local hook files are tracked or could not be protected by the repository-local Git exclude; no hook files were changed');
+  }
+  await writeClaudeFileIfUnchanged(profile, paths.scriptPath, scriptFile, claudeHookScriptContent());
+  for (const update of legacyUpdates) {
+    await writeClaudeFileIfUnchanged(profile, update.path, update.original, update.nextText);
+  }
+  await writeClaudeFileIfUnchanged(profile, paths.settingsPath, mainFile, nextMainText);
+  const verified = await claudeLocalHookState(profile, paths);
+  if (!verified.hooksInstalled || !verified.envCurrent) {
+    throw new Error('Claude hook migration could not be verified');
+  }
+  return verified;
 }
 
 async function installGrokGlobalHooks(profile: ConnectionProfile) {
@@ -23854,65 +24074,422 @@ async function grokGlobalHookPaths(profile: ConnectionProfile) {
   };
 }
 
+async function readOptionalClaudeFile(
+  profile: ConnectionProfile,
+  path: string
+): Promise<OptionalClaudeFile> {
+  try {
+    return { exists: true, text: await api.readTextFile(profile.id, path) };
+  } catch {
+    try {
+      const parent = posixParentPath(path);
+      const parentExists = await api.profileDirectoryIsDir(profile.id, parent);
+      if (!parentExists) return { exists: false, text: '' };
+      const entries = await api.listDirectory(profile.id, parent, false);
+      if (!entries.some((entry) => entry.name === posixBaseName(path))) {
+        return { exists: false, text: '' };
+      }
+    } catch {
+      throw new Error('Claude local hook file could not be inspected; no changes were made');
+    }
+    throw new Error('Claude local hook file could not be read; no changes were made');
+  }
+}
+
+async function writeClaudeFileIfUnchanged(
+  profile: ConnectionProfile,
+  path: string,
+  original: OptionalClaudeFile,
+  nextText: string
+) {
+  try {
+    await api.writeTextFileAtomicIfUnchanged(
+      profile.id,
+      path,
+      original.exists ? original.text : null,
+      nextText
+    );
+  } catch {
+    throw new Error('Claude local hook files changed or could not be updated safely; retry the Claude launch');
+  }
+  const verified = await readOptionalClaudeFile(profile, path);
+  if (!verified.exists || verified.text !== nextText) {
+    throw new Error('Claude local hook file write could not be verified');
+  }
+}
+
 function parseClaudeLocalSettings(text: string): Record<string, any> {
   if (!text.trim()) return {};
   try {
     const parsed = JSON.parse(text);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
   } catch {
-    return {};
+    throw new Error('Claude local settings JSON is invalid; no changes were made');
+  }
+  throw new Error('Claude local settings must contain a JSON object; no changes were made');
+}
+
+function validateClaudeLocalSettingsShape(settings: Record<string, any>) {
+  if (
+    settings.disableAllHooks !== undefined
+    && typeof settings.disableAllHooks !== 'boolean'
+  ) {
+    throw new Error('Claude local settings disableAllHooks must be a boolean; no changes were made');
+  }
+  if (
+    settings.env !== undefined
+    && (!settings.env || typeof settings.env !== 'object' || Array.isArray(settings.env))
+  ) {
+    throw new Error('Claude local settings env must contain a JSON object; no changes were made');
   }
 }
 
 function normalizeClaudeHookSettings(value: unknown): Record<string, any[]> {
   const hooks: Record<string, any[]> = {};
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return hooks;
+  if (value === undefined || value === null) return hooks;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Claude local hook settings are invalid; no changes were made');
+  }
   for (const [key, groups] of Object.entries(value as Record<string, unknown>)) {
-    hooks[key] = Array.isArray(groups) ? groups.filter((group) => group && typeof group === 'object') : [];
+    if (!Array.isArray(groups) || groups.some((group) => (
+      !group
+      || typeof group !== 'object'
+      || Array.isArray(group)
+      || !Array.isArray((group as { hooks?: unknown }).hooks)
+      || (group as { hooks: unknown[] }).hooks.some((hook) => (
+        !hook || typeof hook !== 'object' || Array.isArray(hook)
+      ))
+    ))) {
+      throw new Error('Claude local hook settings are invalid; no changes were made');
+    }
+    hooks[key] = groups;
   }
   return hooks;
 }
 
-function removeSimpleVibeClaudeHookGroups(groups: unknown): any[] {
-  if (!Array.isArray(groups)) return [];
-  return groups.filter((group) => {
-    if (!group || typeof group !== 'object') return false;
-    const hooks = Array.isArray((group as { hooks?: unknown }).hooks) ? (group as { hooks: unknown[] }).hooks : [];
-    return !hooks.some((hook) => {
-      if (!hook || typeof hook !== 'object') return false;
-      const command = String((hook as { command?: unknown }).command ?? '');
-      return command.includes(CLAUDE_HOOK_SCRIPT_NAME);
+function claudeHookCommand(scriptPath: string) {
+  const quotedPath = bashQuote(scriptPath);
+  return `if [ ! -r ${quotedPath} ]; then cat >/dev/null; printf '%s\\n' '{"continue":true,"suppressOutput":true}'; exit 0; fi; exec /bin/sh ${quotedPath}`;
+}
+
+function simpleVibeClaudeHookHandler(scriptPath: string) {
+  return {
+    type: 'command',
+    command: claudeHookCommand(scriptPath),
+    timeout: 5
+  };
+}
+
+function claudeHookOwnership(paths: ClaudeHookPaths): ClaudeHookOwnership {
+  const relativeScriptPath = `${CLAUDE_HOOK_DIR}/${CLAUDE_HOOK_SCRIPT_NAME}`;
+  const scriptOperands = new Set([
+    relativeScriptPath,
+    `./${relativeScriptPath}`,
+    paths.scriptPath,
+    ...paths.legacyScriptPaths
+  ]);
+  const commands = new Set<string>();
+  for (const operand of scriptOperands) {
+    for (const executable of ['/bin/sh', 'sh']) {
+      commands.add(`${executable} ${operand}`);
+      commands.add(`${executable} ${bashQuote(operand)}`);
+      if (!/["\\$`]/.test(operand)) commands.add(`${executable} "${operand}"`);
+    }
+    commands.add(claudeHookCommand(operand));
+  }
+  return { commands, scriptOperands };
+}
+
+function isSimpleVibeClaudeHook(value: unknown, ownership: ClaudeHookOwnership) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const hook = value as { type?: unknown; command?: unknown; args?: unknown };
+  if (hook.type !== undefined && hook.type !== 'command') return false;
+  const command = typeof hook.command === 'string' ? hook.command.trim() : '';
+  if (ownership.commands.has(command)) return true;
+  const directWords = literalPosixShellWords(command);
+  if (
+    directWords
+    && directWords.length === 2
+    && (directWords[0] === '/bin/sh' || directWords[0] === 'sh')
+    && isSimpleVibeClaudeScriptOperand(directWords[1])
+  ) {
+    return true;
+  }
+  const generatedExecMarker = '; fi; exec /bin/sh ';
+  const generatedExecAt = command.lastIndexOf(generatedExecMarker);
+  if (generatedExecAt >= 0) {
+    const generatedOperand = command.slice(generatedExecAt + generatedExecMarker.length);
+    const generatedWords = literalPosixShellWords(`/bin/sh ${generatedOperand}`);
+    if (
+      generatedWords
+      && generatedWords.length === 2
+      && isSimpleVibeClaudeScriptOperand(generatedWords[1])
+      && command === claudeHookCommand(generatedWords[1])
+    ) {
+      return true;
+    }
+  }
+  return (command === '/bin/sh' || command === 'sh')
+    && Array.isArray(hook.args)
+    && hook.args.length === 1
+    && typeof hook.args[0] === 'string'
+    && (
+      ownership.scriptOperands.has(hook.args[0])
+      || isSimpleVibeClaudeScriptOperand(hook.args[0])
+    );
+}
+
+function isSimpleVibeClaudeScriptOperand(value: string) {
+  const relativePath = `${CLAUDE_HOOK_DIR}/${CLAUDE_HOOK_SCRIPT_NAME}`;
+  return value === relativePath
+    || value === `./${relativePath}`
+    || value.endsWith(`/${relativePath}`);
+}
+
+function literalPosixShellWords(command: string): string[] | null {
+  const words: string[] = [];
+  let word = '';
+  let started = false;
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      else word += character;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      } else if (character === '\\') {
+        index += 1;
+        if (index >= command.length || command[index] === '\n' || command[index] === '\r') return null;
+        const escaped = command[index];
+        word += '$`"\\'.includes(escaped) ? escaped : `\\${escaped}`;
+      } else {
+        if (character === '$' || character === '`' || character === '\n' || character === '\r') return null;
+        word += character;
+      }
+      continue;
+    }
+    if (character === '\n' || character === '\r') return null;
+    if (character === ' ' || character === '\t') {
+      if (started) {
+        words.push(word);
+        word = '';
+        started = false;
+      }
+      continue;
+    }
+    if (/\s/.test(character)) return null;
+    if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (character === '\\') {
+      index += 1;
+      if (index >= command.length || command[index] === '\n' || command[index] === '\r') return null;
+      word += command[index];
+      started = true;
+      continue;
+    }
+    if ('$`;&|<>()*?[]{}~\n\r'.includes(character)) return null;
+    word += character;
+    started = true;
+  }
+  if (quote) return null;
+  if (started) words.push(word);
+  return words;
+}
+
+function isCurrentSimpleVibeClaudeHook(value: unknown, expectedCommand: string) {
+  if (!value || typeof value !== 'object') return false;
+  const hook = value as { type?: unknown; command?: unknown; timeout?: unknown };
+  const keys = Object.keys(hook).sort();
+  return hook.type === 'command'
+    && hook.command === expectedCommand
+    && hook.timeout === 5
+    && keys.length === 3
+    && keys[0] === 'command'
+    && keys[1] === 'timeout'
+    && keys[2] === 'type';
+}
+
+function isCurrentSimpleVibeClaudeGroup(value: unknown, expectedCommand: string) {
+  if (!value || typeof value !== 'object') return false;
+  const group = value as { hooks?: unknown };
+  const keys = Object.keys(group);
+  return keys.length === 1
+    && keys[0] === 'hooks'
+    && Array.isArray(group.hooks)
+    && group.hooks.length === 1
+    && isCurrentSimpleVibeClaudeHook(group.hooks[0], expectedCommand);
+}
+
+function simpleVibeClaudeHookCount(hooks: Record<string, any[]>, ownership: ClaudeHookOwnership) {
+  let count = 0;
+  for (const groups of Object.values(hooks)) {
+    for (const group of groups) {
+      const handlers = Array.isArray((group as { hooks?: unknown }).hooks)
+        ? (group as { hooks: unknown[] }).hooks
+        : [];
+      count += handlers.filter((hook) => isSimpleVibeClaudeHook(hook, ownership)).length;
+    }
+  }
+  return count;
+}
+
+function simpleVibeClaudeHookEventNames(
+  hooks: Record<string, any[]>,
+  ownership: ClaudeHookOwnership
+) {
+  return Object.entries(hooks)
+    .filter(([, groups]) => groups.some((group) => (
+      Array.isArray((group as { hooks?: unknown }).hooks)
+      && (group as { hooks: unknown[] }).hooks.some((hook) => isSimpleVibeClaudeHook(hook, ownership))
+    )))
+    .map(([eventName]) => eventName);
+}
+
+function inspectSimpleVibeClaudeHooks(
+  hooks: Record<string, any[]>,
+  expectedCommand: string,
+  expectedEvents: readonly string[],
+  ownership: ClaudeHookOwnership
+) {
+  let managedCount = 0;
+  let current = true;
+  const requiredEvents = new Set<string>(expectedEvents);
+  for (const [eventName, groups] of Object.entries(hooks)) {
+    const managedGroups = groups.filter((group) => (
+      Array.isArray((group as { hooks?: unknown }).hooks)
+      && (group as { hooks: unknown[] }).hooks.some((hook) => isSimpleVibeClaudeHook(hook, ownership))
+    ));
+    const managed = managedGroups.flatMap((group) => (
+      (group as { hooks: unknown[] }).hooks.filter((hook) => isSimpleVibeClaudeHook(hook, ownership))
+    ));
+    managedCount += managed.length;
+    if (requiredEvents.has(eventName)) {
+      if (
+        managed.length !== 1
+        || managedGroups.length !== 1
+        || !isCurrentSimpleVibeClaudeGroup(managedGroups[0], expectedCommand)
+      ) {
+        current = false;
+      }
+      requiredEvents.delete(eventName);
+    } else if (managed.length > 0) {
+      current = false;
+    }
+  }
+  if (requiredEvents.size > 0 || managedCount !== expectedEvents.length) current = false;
+  return { current, managedCount };
+}
+
+function removeSimpleVibeClaudeHooks(
+  hooks: Record<string, any[]>,
+  ownership: ClaudeHookOwnership
+) {
+  const next: Record<string, any[]> = {};
+  for (const [eventName, groups] of Object.entries(hooks)) {
+    const nextGroups = groups.flatMap((group) => {
+      if (!group || typeof group !== 'object') return [];
+      if (!Array.isArray((group as { hooks?: unknown }).hooks)) return [group];
+      const handlers = (group as { hooks: unknown[] }).hooks;
+      const remaining = handlers.filter((hook) => !isSimpleVibeClaudeHook(hook, ownership));
+      if (!remaining.length && handlers.length) return [];
+      return [{ ...group, hooks: remaining }];
     });
-  });
+    if (nextGroups.length > 0) next[eventName] = nextGroups;
+  }
+  return next;
 }
 
 function claudeHookScriptContent() {
   return `#!/bin/sh
-set -eu
+${CLAUDE_HOOK_SCRIPT_VERSION_MARKER}
+set -u
 port="\${SVIDE_AGENT_BRIDGE_PORT:-}"
 token="\${SVIDE_AGENT_BRIDGE_TOKEN:-}"
 session="\${SVIDE_AGENT_SESSION_ID:-}"
 agent="\${SVIDE_AGENT_ID:-claude}"
-if [ -z "$port" ] || [ -z "$token" ] || [ -z "$session" ]; then
+continue_json() {
   printf '{"continue":true,"suppressOutput":true}\\n'
+}
+if [ -z "$port" ] || [ -z "$token" ] || [ -z "$session" ]; then
+  cat >/dev/null || true
+  continue_json
   exit 0
 fi
-tmp="\${TMPDIR:-/tmp}/svi-claude-hook-$$.json"
-cat > "$tmp" || true
+umask 077
+tmp="$(mktemp "\${TMPDIR:-/tmp}/svi-claude-hook.XXXXXX" 2>/dev/null || true)"
+if [ -z "$tmp" ]; then
+  cat >/dev/null || true
+  continue_json
+  exit 0
+fi
+cleanup() {
+  rm -f "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 0' HUP INT TERM
+if [ ! -x /usr/bin/python3 ]; then
+  cat >/dev/null || true
+  continue_json
+  exit 0
+fi
+if ! /usr/bin/python3 -I -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+
+def pick(limit, *names):
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, str) and value:
+            return value[:limit]
+    return None
+
+compact = {
+    "hook_event_name": pick(80, "hook_event_name", "hookEventName", "event", "event_name"),
+    "session_id": pick(160, "session_id", "sessionId"),
+    "cwd": pick(2048, "cwd"),
+    "tool_name": pick(160, "tool_name", "toolName"),
+    "notification_type": pick(80, "notification_type", "notificationType"),
+    "trigger": pick(32, "trigger"),
+    "source": pick(32, "source")
+}
+json.dump(
+    {key: value for key, value in compact.items() if value is not None},
+    sys.stdout,
+    ensure_ascii=False,
+    separators=(",", ":")
+)
+' > "$tmp" 2>/dev/null; then
+  cat >/dev/null || true
+  continue_json
+  exit 0
+fi
+if [ ! -x /usr/bin/curl ]; then
+  continue_json
+  exit 0
+fi
 hosts="127.0.0.1 localhost"
 if [ -r /etc/resolv.conf ]; then
   ns="$(awk '/^nameserver[[:space:]]+/ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)"
   if [ -n "$ns" ]; then hosts="$hosts $ns"; fi
 fi
 for host in $hosts; do
-  curl -fsS -m 1 --connect-timeout 0.25 \\
+  /usr/bin/curl -fsS -m 1 --connect-timeout 0.25 \\
     -H "content-type: application/json" \\
     -H "x-svi-agent-token: $token" \\
     --data-binary "@$tmp" \\
     "http://$host:$port/agent-event?agent=$agent&session=$session" >/dev/null 2>&1 && break
 done
-rm -f "$tmp"
-printf '{"continue":true,"suppressOutput":true}\\n'
+continue_json
+exit 0
 `;
 }
 
@@ -23999,6 +24576,20 @@ function posixJoinPath(base: string, ...parts: string[]) {
   return out;
 }
 
+function posixBaseName(path: string) {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  const separator = normalized.lastIndexOf('/');
+  return separator >= 0 ? normalized.slice(separator + 1) : normalized;
+}
+
+function posixParentPath(path: string) {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  const split = normalized.lastIndexOf('/');
+  if (split < 0) return '.';
+  if (split === 0) return '/';
+  return normalized.slice(0, split);
+}
+
 function launchLlm(id: string) {
   void startLlmLauncher(id);
 }
@@ -24041,12 +24632,11 @@ async function startLlmLauncher(id: string) {
   saveActiveWorkspaceSnapshot();
 }
 
-// `define` is sourced silently in the shell rcfile (no echo) to COMPUTE the args; `call` is typed
-// at the prompt. The launch (`call`) is a BARE command (e.g. `codex "${__svi_args[@]}"`), NOT a
-// function call: node-launched CLIs (coding's nvm codex) only enter bypass/YOLO when started as a
-// directly-typed foreground command — wrapping the launch in a function breaks that. On Windows we
-// type the whole command as-is (no separate define). Root-unsafe launchers also re-check uid in
-// the typed command before executing the CLI.
+// `define` is sourced silently in the shell rcfile (no echo) to compute fixed button args and
+// transient env; `call` is typed at the prompt. The tmux path starts a fresh interactive bash so
+// the user's alias/function routing (for example an account selector) still resolves there. The
+// executable is not hidden in another shell function. On Windows we type the whole command as-is
+// (no separate define). Root-unsafe launchers also re-check uid in the typed command.
 function llmLauncherParts(
   id: string,
   profileKind: string | undefined = state.activeProfile?.kind,
@@ -24073,19 +24663,21 @@ function bashLlmLauncherParts(
   options: { agentBridge?: AgentBridgeLaunchContext | null; envPassthrough?: string[] } = {}
 ): { define: string; call: string } {
   const executable = launcher.executable;
-  // Add the bypass flag only when it is NOT already in the resolved command. `type` reveals an
-  // alias/function body; a wrapper SCRIPT on PATH only shows its path via `type`, so also fold in
-  // the script's own text (shebang files only). If the flag is found there, the user's
-  // alias/wrapper already supplies it — don't add a second one (codex errors on a duplicate).
-  // Otherwise add it. claude additionally refuses the flag as root, so gate it on a non-zero uid.
-  // These lines only COMPUTE __svi_args (no CLI is run), so running them in the rcfile is silent.
-  const needsRootGate = launcher.flags.some((flag) => flag.skipWhenRoot);
+  const detectedFlags = launcher.flags ?? [];
+  const buttonArgs = launcher.buttonArgs ?? [];
+  // Codex and Claude use fixed buttonArgs, so their aliases/functions/wrappers are not inspected.
+  // Best-effort source inspection remains only for launchers with detected flags.
+  const inspectCommandSource = detectedFlags.length > 0;
+  const needsRootGate = launcher.buttonArgsSkipWhenRoot === true
+    || detectedFlags.some((flag) => flag.skipWhenRoot);
   const envPassthrough = options.envPassthrough ?? safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough);
   const bridge = options.agentBridge ?? null;
   const lines = [
-    `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
-    `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
-    `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`,
+    ...(inspectCommandSource ? [
+      `__svi_source="$(type ${executable} 2>/dev/null || true)"`,
+      `__svi_path="$(command -v ${executable} 2>/dev/null || true)"`,
+      `case "$__svi_path" in /*) if [ -f "$__svi_path" ] && [ "$(head -c 2 "$__svi_path" 2>/dev/null)" = '#!' ]; then __svi_source="$__svi_source $(head -c 8192 "$__svi_path" 2>/dev/null)"; fi ;; esac`
+    ] : []),
     'unset __svi_args',
     '__svi_args=()',
     'unset __svi_env_args',
@@ -24107,7 +24699,10 @@ function bashLlmLauncherParts(
       '__svi_env_args+=("SVIDE_AGENT_BRIDGE_PORT=$__svi_agent_bridge_port" "SVIDE_AGENT_BRIDGE_TOKEN=$__svi_agent_bridge_token" "SVIDE_AGENT_SESSION_ID=$__svi_agent_session_id" "SVIDE_AGENT_ID=$__svi_agent_id")'
     );
   }
-  for (const flag of launcher.flags) {
+  if (buttonArgs.length > 0) {
+    lines.push(`__svi_args+=(${buttonArgs.map(bashQuote).join(' ')})`);
+  }
+  for (const flag of detectedFlags) {
     const add = `case "$__svi_source" in ${flag.bashPattern}) ;; *) __svi_args+=(${flag.args.map(bashQuote).join(' ')}) ;; esac`;
     lines.push(flag.skipWhenRoot ? `if [ "$__svi_euid" != 0 ]; then ${add}; fi` : add);
   }
@@ -24120,7 +24715,13 @@ function bashLlmLauncherParts(
     `${launchArgs};`,
     `__svi_launcher_cmd="$(printf '%q ' "\${__svi_env_args[@]}" ${executableCommand} "\${__svi_launch_args[@]}")";`,
     `if command -v tmux >/dev/null 2>&1; then`,
-    `  __svi_tmux_cmd="$(printf '%q ' bash -ic "eval $__svi_launcher_cmd")";`,
+    // __svi_launcher_cmd is already shell-escaped by printf %q. The tmux shell unwraps the outer
+    // command and bash -ic parses the launcher once; an extra eval would parse its argv twice.
+    // Protect the IDE-owned session from a frontend/client-loss gap without changing the user's
+    // global tmux defaults. Then retain an agent-exited pane so tmux records its real status even
+    // when a user routing function calls exit/exec.
+    `  __svi_tmux_inner='tmux set-option -t "$TMUX_PANE" destroy-unattached off; tmux set-option -w -t "$TMUX_PANE" remain-on-exit on; '"$__svi_launcher_cmd";`,
+    `  __svi_tmux_cmd="$(printf '%q ' bash -ic "$__svi_tmux_inner")";`,
     `  tmux new-session -A -s ${bashQuote(tmuxSessionName)} "$__svi_tmux_cmd";`,
     `else`,
     `  eval "$__svi_launcher_cmd";`,
@@ -24181,7 +24782,9 @@ async function nextLlmTmuxSessionName(
 
 function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
   const executable = launcher.executable;
-  const alwaysArgs = launcher.powershellAlwaysArgs ?? [];
+  const detectedFlags = launcher.flags ?? [];
+  const buttonArgs = launcher.buttonArgs ?? [];
+  const inspectCommandSource = detectedFlags.length > 0;
   // Keep setup and invocation in one submitted PSReadLine command. PowerShell host/PSReadLine
   // versions can handle raw embedded LF input differently during fresh ConPTY startup; a single
   // ordered submission avoids depending on those multiline-input details.
@@ -24192,21 +24795,22 @@ function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
   // effective function definition or a bounded text-wrapper prefix; never scan a native CLI
   // binary, whose embedded option/help strings are not evidence that a wrapper injects the flag.
   return [
-    `$sviCommand = Get-Command ${powershellQuote(executable)} -ErrorAction SilentlyContinue`,
-    '$sviSource = ""',
-    '$sviAliasDepth = 0',
-    'while ($sviCommand -and $sviCommand.CommandType -eq "Alias" -and $sviAliasDepth -lt 8) { $sviSource += " $($sviCommand.CommandType) $($sviCommand.Name) $($sviCommand.Definition)"; $sviCommand = Get-Command $sviCommand.Definition -ErrorAction SilentlyContinue; $sviAliasDepth += 1 }',
-    'if ($sviCommand) { $sviSource += " $($sviCommand.CommandType) $($sviCommand.Name) $($sviCommand.Definition) $($sviCommand.Source)" }',
-    'if ($sviCommand -and $sviCommand.Path -match "\\.(?:ps1|psm1|cmd|bat)$") { $sviWrapperSource = (Get-Content -LiteralPath $sviCommand.Path -TotalCount 160 -ErrorAction SilentlyContinue) -join "`n"; $sviSource += " $sviWrapperSource" }',
-    '$sviArgs = @()',
+    ...(inspectCommandSource ? [
+      `$sviCommand = Get-Command ${powershellQuote(executable)} -ErrorAction SilentlyContinue`,
+      '$sviSource = ""',
+      '$sviAliasDepth = 0',
+      'while ($sviCommand -and $sviCommand.CommandType -eq "Alias" -and $sviAliasDepth -lt 8) { $sviSource += " $($sviCommand.CommandType) $($sviCommand.Name) $($sviCommand.Definition)"; $sviCommand = Get-Command $sviCommand.Definition -ErrorAction SilentlyContinue; $sviAliasDepth += 1 }',
+      'if ($sviCommand) { $sviSource += " $($sviCommand.CommandType) $($sviCommand.Name) $($sviCommand.Definition) $($sviCommand.Source)" }',
+      'if ($sviCommand -and $sviCommand.Path -match "\\.(?:ps1|psm1|cmd|bat)$") { $sviWrapperSource = (Get-Content -LiteralPath $sviCommand.Path -TotalCount 160 -ErrorAction SilentlyContinue) -join "`n"; $sviSource += " $sviWrapperSource" }'
+    ] : []),
+    `$sviArgs = @(${buttonArgs.map(powershellQuote).join(', ')})`,
     ...Object.entries(launcher.env ?? {}).map(([envName, envValue]) => `$env:${envName} = ${powershellQuote(envValue)}`),
-    ...launcher.flags.map((flag) =>
+    ...detectedFlags.map((flag) =>
       `if ($sviSource -notmatch ${powershellQuote(flag.powershellPattern)}) { $sviArgs += @(${flag.args.map(powershellQuote).join(', ')}) }`
     ),
-    ...(alwaysArgs.length > 0
-      ? [`$sviArgs += @(${alwaysArgs.map(powershellQuote).join(', ')})`]
+    ...(inspectCommandSource
+      ? ["Remove-Variable -Name 'sviCommand','sviSource','sviAliasDepth','sviWrapperSource' -ErrorAction SilentlyContinue"]
       : []),
-    "Remove-Variable -Name 'sviCommand','sviSource','sviAliasDepth','sviWrapperSource' -ErrorAction SilentlyContinue",
     `$sviDisplayArgs = @(${powershellQuote(executable)}) + $sviArgs`,
     'Write-Host ("[simple-vibe-ide] launching " + ($sviDisplayArgs -join " "))',
     `& ${powershellQuote(executable)} @sviArgs`
@@ -25905,8 +26509,8 @@ async function closeAllTerminals() {
 function disposeTerminalPaneRenderer(pane: TerminalPane) {
   pane.webglContextLossDisposable?.dispose();
   pane.webglContextLossDisposable = undefined;
-  pane.grokScrollRefreshDisposable?.dispose();
-  pane.grokScrollRefreshDisposable = undefined;
+  pane.openTuiScrollRefreshDisposable?.dispose();
+  pane.openTuiScrollRefreshDisposable = undefined;
   pane.webgl?.dispose();
   pane.webgl = undefined;
 }
@@ -26044,8 +26648,8 @@ function markTerminalWriteStarted(pane: TerminalPane) {
 function markTerminalWriteFinished(pane: TerminalPane) {
   pane.pendingTerminalWrites = Math.max(0, (pane.pendingTerminalWrites ?? 0) - 1);
   resolveTerminalWriteDrainIfReady(pane);
-  if (terminalWriteDrainReady(pane) && terminalPaneLlmId(pane) === 'grok') {
-    scheduleGrokTerminalViewportRefresh(pane, 'write-drain');
+  if (terminalWriteDrainReady(pane) && terminalPaneUsesOpenTuiCompatibility(pane)) {
+    scheduleOpenTuiTerminalViewportRefresh(pane, 'write-drain');
   }
 }
 
@@ -26057,19 +26661,20 @@ function resolveTerminalWriteDrainIfReady(pane: TerminalPane) {
   if (resolve) resolve();
 }
 
-function scheduleGrokTerminalViewportRefresh(pane: TerminalPane, reason: string) {
-  if (pane.grokPostWriteRefreshFrame || !isTerminalPaneAlive(pane)) return;
-  pane.grokPostWriteRefreshFrame = window.requestAnimationFrame(() => {
-    pane.grokPostWriteRefreshFrame = undefined;
+function scheduleOpenTuiTerminalViewportRefresh(pane: TerminalPane, reason: string) {
+  if (pane.openTuiPostWriteRefreshFrame || !isTerminalPaneAlive(pane)) return;
+  pane.openTuiPostWriteRefreshFrame = window.requestAnimationFrame(() => {
+    pane.openTuiPostWriteRefreshFrame = undefined;
     if (!isTerminalPaneAlive(pane) || terminalPaneVisibility(pane) !== 'visible') return;
     const refreshed = refreshTerminalViewportIfRecentOutput(pane, performance.now(), {
       force: reason === 'scroll',
-      minIntervalMs: TERMINAL_GROK_RENDER_REFRESH_MIN_MS
+      minIntervalMs: TERMINAL_OPENTUI_RENDER_REFRESH_MIN_MS
     });
     if (refreshed) {
       // Force a cheap layout read after xterm.refresh(). In WebView + transparent
       // DOM renderer paths this nudges the compositor similarly to a resize, but
-      // only for Grok panes and only after xterm has processed the write batch.
+      // only for detected OpenTUI panes and only after xterm has processed the
+      // write batch.
       void pane.host.offsetHeight;
     }
   });
@@ -26479,32 +27084,6 @@ async function flushTerminalInput(pane: TerminalPane): Promise<void> {
   const data = pane.inputWriteBuffer;
   pane.inputWriteBuffer = '';
   await enqueueTerminalInputPacket(pane, data);
-}
-
-async function drainTerminalInputBeforeReconnect(pane: TerminalPane) {
-  const deadline = performance.now() + TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS;
-  try {
-    await withTimeout(
-      flushTerminalInput(pane),
-      TERMINAL_TMUX_RECONNECT_INPUT_DRAIN_MS,
-      'Draining terminal input before tmux reconnect'
-    );
-  } catch {
-    return false;
-  }
-  while (
-    !pane.closed
-    && (pane.inputWritePromise || pane.inputWriteQueue?.length || pane.inputWriteBuffer)
-    && performance.now() < deadline
-  ) {
-    const pending = pane.inputWritePromise;
-    if (pending) await Promise.race([pending.catch(() => undefined), delay(16)]);
-    else {
-      drainTerminalInputQueue(pane);
-      await delay(16);
-    }
-  }
-  return !pane.inputWritePromise && !pane.inputWriteQueue?.length && !pane.inputWriteBuffer;
 }
 
 function failPendingTerminalInput(pane: TerminalPane, reason: string) {
@@ -32235,10 +32814,35 @@ function scheduleTerminalRuntimeWarmup() {
   });
 }
 
+function demoteTerminalPaneFromWebglForCompatibility(pane: TerminalPane) {
+  const webgl = pane.webgl;
+  if (webgl) {
+    pane.webglContextLossDisposable?.dispose();
+    pane.webglContextLossDisposable = undefined;
+    pane.webgl = undefined;
+    try {
+      webgl.dispose();
+    } catch {
+      // xterm keeps its DOM renderer even if an add-on rejects late disposal.
+    }
+    if (isTerminalPaneAlive(pane)) {
+      try {
+        pane.term.refresh(0, Math.max(0, pane.term.rows - 1));
+      } catch {
+        // The pane may be closing while compatibility is detected.
+      }
+      scheduleFitTerminal(pane);
+    }
+  }
+  const widget = terminalWidgetForPane(pane);
+  if (widget) updateTerminalWidgetRendererBadge(widget, pane);
+  return Boolean(webgl);
+}
+
 async function promoteTerminalPaneToWebgl(pane: TerminalPane) {
   if (!isTerminalPaneAlive(pane) || pane.webgl || pane.webglContextLost || pane.webglPromotionUnavailable) return;
   if (state.ideSettings.terminalRenderer !== 'auto') return;
-  if (!terminalLlmShouldUseWebglRenderer(terminalPaneLlmId(pane))) return;
+  if (!terminalPaneShouldUseWebglRenderer(pane)) return;
   if (terminalPaneVisibility(pane) !== 'visible' || !pane.backendId) return;
   const runtime = await ensureTerminalWebglRuntime();
   if (!runtime) {
@@ -32256,7 +32860,7 @@ async function promoteTerminalPaneToWebgl(pane: TerminalPane) {
   ) return;
   if (
     state.ideSettings.terminalRenderer !== 'auto'
-    || !terminalLlmShouldUseWebglRenderer(terminalPaneLlmId(pane))
+    || !terminalPaneShouldUseWebglRenderer(pane)
     || terminalPaneVisibility(pane) !== 'visible'
   ) return;
   let addon: XTermWebglAddon | undefined;
@@ -32294,7 +32898,7 @@ function scheduleTerminalWebglPromotion(pane: TerminalPane) {
     || terminalPaneVisibility(pane) !== 'visible'
   ) return;
   if (state.ideSettings.terminalRenderer !== 'auto') return;
-  if (!terminalLlmShouldUseWebglRenderer(terminalPaneLlmId(pane))) return;
+  if (!terminalPaneShouldUseWebglRenderer(pane)) return;
   pane.webglPromotionScheduled = true;
   runWhenUiIdle(() => {
     void promoteTerminalPaneToWebgl(pane).finally(() => {
@@ -32303,13 +32907,12 @@ function scheduleTerminalWebglPromotion(pane: TerminalPane) {
   }, 900);
 }
 
-function terminalLlmShouldUseWebglRenderer(llmId: string | null | undefined) {
-  // Grok Build's fullscreen TUI rewrites and scrolls wide-character rows much more
-  // aggressively than plain shells. In xterm WebGL this can leave stale glyph
-  // fragments after output/scroll, and clearing the shared glyph atlas can disturb
-  // other GL terminals. Keep Grok panes on xterm's DOM renderer until the upstream
-  // WebGL/wide-character path is stable.
-  return normalizeTerminalLlmId(llmId) !== 'grok';
+function terminalPaneShouldUseWebglRenderer(pane: TerminalPane | null | undefined) {
+  // Grok Build and OpenCode/OpenTUI rewrite and scroll wide-character rows much
+  // more aggressively than plain shells. In xterm WebGL this can leave stale
+  // glyph fragments after output/scroll. Keep only detected OpenTUI panes on
+  // xterm's DOM renderer until the upstream width/redraw path is stable.
+  return !terminalPaneUsesOpenTuiCompatibility(pane);
 }
 
 function registerTerminalWebglContextLoss(pane: TerminalPane) {
@@ -33793,12 +34396,17 @@ async function createTerminalTab(
   const runtime = await ensureTerminalRuntime();
   appendPerformanceDiagnostic('terminal-core-ready', terminalCreateStartedAt);
   const terminalLlmId = normalizeTerminalLlmId(options.llmId) ?? undefined;
+  const terminalOpenTuiCompatibility = terminalUsesOpenTuiCompatibility(
+    terminalLlmId,
+    !terminalLlmId
+      && (terminalCommandUsesOpenTuiCompatibility(command) || terminalTitleUsesOpenTuiCompatibility(title))
+  );
 
   const term = new runtime.Terminal({
     allowTransparency: true,
     allowProposedApi: true,
     cursorBlink: true,
-    convertEol: terminalConvertEolForLlm(terminalLlmId),
+    convertEol: terminalConvertEolForCompatibility(terminalLlmId, terminalOpenTuiCompatibility),
     fontFamily: fontChoice(MONO_FONT_CHOICES, state.ideSettings.monoFont).stack,
     fontSize: terminalFontSize,
     scrollback: normalizeTerminalScrollbackRows(state.ideSettings.terminalScrollbackRows),
@@ -33807,7 +34415,7 @@ async function createTerminalTab(
   const fit = new runtime.FitAddon();
   const unicode11 = new runtime.Unicode11Addon();
   term.loadAddon(unicode11);
-  applyTerminalCompatibilityForLlm(term, terminalLlmId);
+  applyTerminalCompatibility(term, terminalLlmId, terminalOpenTuiCompatibility);
   term.loadAddon(fit);
   term.open(host);
   appendPerformanceDiagnostic('terminal-dom-open', terminalCreateStartedAt);
@@ -33821,6 +34429,7 @@ async function createTerminalTab(
     title,
     command,
     llmId: terminalLlmId,
+    openTuiCompatibility: terminalOpenTuiCompatibility,
     llmTmuxSessionName: safeLlmTmuxSessionName(options.llmTmuxSessionName) ?? undefined,
     profileId: terminalProfile.id,
     cwd: terminalCwd,
@@ -33855,8 +34464,8 @@ async function createTerminalTab(
   pane.llmTitleDisposable = term.onTitleChange((terminalTitle) => {
     updateWorkspaceLlmTitleFromTerminalTitle(pane, terminalTitle);
   });
-  pane.grokScrollRefreshDisposable = term.onScroll(() => {
-    if (terminalPaneLlmId(pane) === 'grok') scheduleGrokTerminalViewportRefresh(pane, 'scroll');
+  pane.openTuiScrollRefreshDisposable = term.onScroll(() => {
+    if (terminalPaneUsesOpenTuiCompatibility(pane)) scheduleOpenTuiTerminalViewportRefresh(pane, 'scroll');
   });
   detectTerminalPaneLlmFromMetadata(pane);
   const group = rememberPaneInTerminalGroup(widget, pane, options);
@@ -35186,11 +35795,11 @@ function terminalRendererBadgeState(pane: TerminalPane | null | undefined) {
       title: 'Terminal WebGL context was lost; xterm is using its DOM fallback'
     };
   }
-  if (terminalPaneLlmId(pane) === 'grok') {
+  if (terminalPaneUsesOpenTuiCompatibility(pane)) {
     return {
-      key: 'grok-dom',
+      key: 'dom',
       label: 'DOM',
-      title: 'Terminal renderer: DOM selected for Grok Build compatibility'
+      title: 'Terminal renderer: DOM selected for OpenTUI compatibility'
     };
   }
   if (state.ideSettings.terminalRenderer === 'dom') {
@@ -37965,7 +38574,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.imeTracePending = [];
   if (pane.writeFrame) window.cancelAnimationFrame(pane.writeFrame);
   if (pane.focusFrame) window.cancelAnimationFrame(pane.focusFrame);
-  if (pane.grokPostWriteRefreshFrame) window.cancelAnimationFrame(pane.grokPostWriteRefreshFrame);
+  if (pane.openTuiPostWriteRefreshFrame) window.cancelAnimationFrame(pane.openTuiPostWriteRefreshFrame);
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
   if (pane.renderWatchdogTimer) window.clearTimeout(pane.renderWatchdogTimer);
   if (pane.llmOutputDetectionTimer) window.clearTimeout(pane.llmOutputDetectionTimer);
@@ -37984,7 +38593,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.writeFrame = undefined;
   pane.writeFrameScheduledAt = undefined;
   pane.focusFrame = undefined;
-  pane.grokPostWriteRefreshFrame = undefined;
+  pane.openTuiPostWriteRefreshFrame = undefined;
   pane.writeTimer = undefined;
   pane.writeTimerScheduledAt = undefined;
   pane.renderWatchdogTimer = undefined;
@@ -38025,7 +38634,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.imeDeferredXtermBlur = false;
   pane.imeCompositionStartedAt = undefined;
   pane.writeBuffer = '';
-  pane.grokOutputPendingCarriageReturn = false;
+  pane.openTuiOutputPendingCarriageReturn = false;
   pane.pendingTerminalWrites = 0;
   pane.writeDrainResolve?.();
   pane.writeDrainPromise = undefined;
@@ -38138,6 +38747,8 @@ function trackTerminalCwdFromInput(pane: TerminalPane, data: string) {
   if (pane.command) return;
   for (const char of data) {
     if (char === '\r' || char === '\n') {
+      updateTerminalOpenTuiCompatibilityFromCommand(pane, pane.inputBuffer);
+      updateTerminalOpenTuiCompatibilityFromScreenLine(pane);
       updateTerminalCwdFromCommand(pane, pane.inputBuffer);
       updateTerminalPythonEnvFromCommand(pane, pane.inputBuffer);
       updateTerminalPythonEnvFromScreenLine(pane);
@@ -38148,6 +38759,21 @@ function trackTerminalCwdFromInput(pane: TerminalPane, data: string) {
       pane.inputBuffer = `${pane.inputBuffer}${char}`.slice(-1000);
     }
   }
+}
+
+function updateTerminalOpenTuiCompatibilityFromCommand(pane: TerminalPane, command: string) {
+  if (terminalPaneUsesOpenTuiCompatibility(pane)) return;
+  if (terminalCommandUsesOpenTuiCompatibility(command)) enableTerminalOpenTuiCompatibility(pane);
+}
+
+function updateTerminalOpenTuiCompatibilityFromScreenLine(pane: TerminalPane) {
+  if (terminalPaneUsesOpenTuiCompatibility(pane) || terminalUsesAlternateBuffer(pane)) return;
+  const line = terminalLogicalLineAtCursor(pane);
+  if (!line) return;
+  // History recall and tab completion reach the shell as control bytes, so the
+  // typed buffer may not contain the final executable. The echoed prompt line
+  // is the last chance to demote WebGL before Enter starts OpenCode's TUI.
+  updateTerminalOpenTuiCompatibilityFromCommand(pane, line.replace(/^.*?[$#%>❯]\s+/, ''));
 }
 
 function updateTerminalCwdFromCommand(pane: TerminalPane, command: string) {

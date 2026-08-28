@@ -84,7 +84,8 @@ Simple Vibe IDE는 Windows에서 WSL, SSH, Windows shell을 한 화면에 띄워
 
 - 기본적으로 WebGL 렌더러를 사용해 resize/scroll 때 생기는 terminal 글자 깨짐을 줄입니다.
 - WebGL을 사용할 수 없거나 context가 손실되면 DOM 렌더러로 자동 fallback됩니다.
-- 문제가 생기면 `DOM compatibility`로 바꿔 새 shell에서 확인할 수 있습니다.
+- Grok Build와 일반 shell에서 직접 실행한 OpenCode는 OpenTUI의 한글/혼합 폭 부분 redraw 잔상을 줄이기 위해 자동으로 DOM 호환 경로를 사용합니다. OpenCode는 입력한 `opencode` 명령 또는 terminal title로 감지합니다.
+- 문제가 생기면 `DOM compatibility`로 바꿀 수 있습니다. 설정을 저장하면 이미 열려 있는 WebGL shell도 즉시 DOM으로 전환됩니다.
 - shell 제목줄의 `GL`/`DOM` 배지는 해당 shell이 실제로 사용하는 렌더러 상태를 간단히 표시합니다. `GL!`은 WebGL context 손실 후 fallback 상태입니다.
 
 ### 터미널 scrollback / History cache
@@ -253,9 +254,11 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 - LLM shell widget의 `+` 버튼도 plain shell이 아니라 같은 agent의 새 tmux session tab을 추가합니다.
 - LLM shell widget의 `Tmux` 버튼은 기존 tmux session 목록을 보여줍니다. session을 선택하면 현재 widget에 새 tab으로 attach합니다.
 - `Tmux` 목록의 `Kill`은 확인 후 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
+- stale-output probe는 현재 PTY를 자동으로 끊거나 재접속하지 않고 진단 경고만 남깁니다. 화면이 멈춘 경우 `Tmux` 메뉴에서 같은 session을 새 tab으로 직접 attach하세요.
+- IDE가 만든 session은 전역 tmux 설정은 바꾸지 않고 해당 session에만 `destroy-unattached off`를 적용합니다. IDE client가 끊겨도 session을 유지하고, agent command가 종료되면 `remain-on-exit` dead-pane에 실제 status와 마지막 출력을 남깁니다. 이 동작은 `__svi_launch_v=8`부터 적용됩니다.
 - `tmux`가 없거나 Windows profile에서는 기존처럼 직접 실행합니다.
-- 기존 bypass/YOLO 인자 자동 추가와 중복 방지는 그대로 유지됩니다.
-- Windows profile의 직접 실행은 한 줄짜리 PowerShell command로 전달되며, 실제 effective alias/function/wrapper만 중복 판정에 사용합니다. Codex는 repeatable config override로 approval `never`/sandbox `danger-full-access`를, Claude는 `--permission-mode bypassPermissions`를 한 번 더 명시하므로 wrapper 판정이 빗나가도 일반 mode로 조용히 내려가지 않습니다.
+- Codex와 Claude 버튼은 wrapper 내용을 판정하지 않고 각각 canonical bypass 인자 하나를 항상 추가합니다. 사용자 wrapper는 계정/실행 경로만 선택하고 bypass 인자를 자체 추가하지 않아야 합니다. Codex의 별도 `--enable goals`와 Windows 추가 override는 사용하지 않습니다.
+- Grok/Agy 호환성 인자에는 기존 best-effort 중복 판정이 유지됩니다. Claude는 bypass 인자를 거부하는 POSIX root 환경에서만 plain `claude`로 실행합니다.
 - Windows terminal에 표시되는 `[simple-vibe-ide] launching ...` 줄은 app이 실제로 더한 argv이므로 bypass 실행 여부를 확인할 때 사용합니다.
 - `Set` -> `Agent event bridge`의 `tmux env passthrough`는 tmux 안에서 새 LLM을 띄울 때 유지할 환경변수 이름을 지정합니다. 기본값은 `IS_DEMO`이며, token/secret/key/password 계열 이름은 안전상 무시됩니다.
 
@@ -263,13 +266,18 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 
 `Set` -> `Agent event bridge`에서 Claude Code / Grok Build hook 기반 상태 판정을 설정할 수 있습니다.
 
-- `Ask before installing local hook`: Claude 버튼을 눌렀을 때 현재 workspace의 `.claude/settings.local.json`과 `.claude/simple-vibe-ide-hook.sh`를 설치/갱신할지 묻습니다.
+- `Ask before installing local hook`: Claude 버튼을 처음 눌렀을 때 Claude가 사용하는 repository local settings와 작은 bridge script를 설치할지 묻습니다.
 - `Auto install/update local hook`: 묻지 않고 설치/갱신합니다.
 - `Off`: hook을 쓰지 않고 기존 terminal title/output 기반 상태 판정만 사용합니다.
-- `Ask` 모드에서도 Simple Vibe IDE hook이 이미 설치되어 있으면 다시 묻지 않습니다.
+- `Ask` 모드에서도 Simple Vibe IDE hook이 이미 설치되어 있으면 다시 묻지 않습니다. 이전 상대경로 형식, 수동으로 고쳤거나 repository 이동 뒤 낡아진 절대경로 형식, 일부 이벤트만 남은 설치는 다음 Claude 실행 전에 현재 버전으로 자동 migration합니다.
+- migration은 Simple Vibe IDE handler만 교체하고 같은 matcher group의 사용자 hook과 다른 local settings는 보존합니다. JSON이 손상되면 수정하지 않으며, 각 파일은 atomic replace/create 직전에 외부 변경을 다시 확인합니다. 여러 파일을 옮기는 중 충돌하면 완료된 파일은 유지하고 terminal 기반 상태 판정으로 돌아간 뒤 다음 launch에서 다시 검증/수선합니다.
+- Git workspace에서는 local settings, bridge script, migration 임시 파일을 repository-local exclude에 먼저 추가합니다. 대상 파일이 이미 Git에 tracked되어 있으면 로컬 절대경로가 public diff에 들어가지 않도록 수정하지 않고 terminal 상태 판정으로 돌아갑니다.
 - 기본 `tmux env passthrough`에 `IS_DEMO`가 들어 있는 경우, local Claude settings의 `env.IS_DEMO`도 `1`로 맞춰 Claude 자체 demo/privacy 표시가 일반 shell 실행과 달라지지 않게 합니다.
-- 현재 자동 설치는 WSL workspace를 대상으로 합니다. hook 파일에는 bridge port/token 값이 저장되지 않고, Claude 실행 시점의 임시 환경변수로만 전달됩니다.
-- hook 이벤트가 들어온 Claude pane은 hook 상태를 우선 사용하므로 tmux scrollback/출력 재렌더가 `대기`/`작업중`으로 오인되는 일을 줄입니다.
+- 새 hook 자동 설치는 WSL workspace와 Claude Code 2.1.211 이상을 대상으로 하며, subdirectory/worktree가 공유하는 git main checkout 설정을 확인합니다. 이전 버전 또는 version을 확인할 수 없는 custom wrapper에서는 새 hook/event를 만들지 않고 launch cwd에 이미 존재하는 Simple Vibe IDE handler만 같은 event 안에서 절대경로/fail-open 형식으로 수선합니다. 기존 handler를 찾지 못하면 설정을 수정하지 않고 terminal 상태 판정만 사용합니다. 이런 repair-only 설치는 일부 event만 있을 수 있으므로 hook을 단독 기준으로 삼지 않고 terminal 판정을 계속 병행합니다.
+- Claude hook payload는 bridge 전송 전에 event/session/cwd/tool name/notification type/compact trigger/source 메타데이터만 남기고 prompt, tool input/output, assistant message 원문은 폐기합니다. Python 3로 안전하게 축약할 수 없으면 payload를 보내지 않고 Claude 실행만 계속합니다.
+- hook 파일에는 bridge port/token 값이 저장되지 않고, Claude 실행 시점의 임시 환경변수로만 전달됩니다. 앱 재시작 뒤 이미 살아 있던 tmux Claude는 새 bridge 환경을 상속할 수 없으므로 새 hook event가 확인되기 전에는 terminal title/output fallback을 사용합니다.
+- 현재 event 구성이 모두 검증된 Claude pane은 hook 상태를 우선 사용하므로 tmux scrollback/출력 재렌더가 `대기`/`작업중`으로 오인되는 일을 줄입니다. 마지막 hook event 뒤 5분 동안 새 event가 없으면 고장 난 hook이 상태를 영구 고정하지 않도록 terminal 판정을 다시 허용하며, 이후 hook event가 들어오면 hook 우선 상태가 복구됩니다.
+- 부모 Claude의 완료는 `Stop`, 세션 종료는 `SessionEnd`를 기준으로 합니다. `SubagentStop`, tool 실패, permission 거절, auto context compact는 부모 작업을 즉시 완료/오류로 바꾸지 않으며, 수동 `/compact` 완료는 idle로 돌아갑니다.
 
 Grok Build도 별도의 `Grok hooks` 옵션을 제공합니다.
 
@@ -308,6 +316,7 @@ Grok Build도 별도의 `Grok hooks` 옵션을 제공합니다.
 - `Open log`는 현재 메모리에 쌓인 로그를 보여주고, `Copy`로 전체 로그를 복사할 수 있습니다.
 - 로그는 터미널 렌더 watchdog, visible pane flush, agent 상태/source 변경, Claude hook bridge 이벤트, 알림 요청/성공/실패, memory saver sleep 같은 이벤트 메타데이터만 남깁니다.
 - Diagnostics가 켜져 있고 IDE가 띄운 tmux 기반 LLM pane이 보이는 상태라면 `tmux probe` 로그가 주기적으로 남습니다. 이 로그는 tmux pane의 dead/copy-mode/alternate-screen 상태, 현재 command/pid, 최근 capture/title/window의 checksum+byte 길이, IDE 쪽 data/refresh age와 write backlog만 기록해서 freeze가 tmux 내부 정지인지 IDE 렌더/PTY 전달 문제인지 가르는 데 씁니다.
+- tmux 내용은 바뀌는데 IDE data가 오래 멈춘 것으로 보이면 `autoReconnect=off` 경고가 남습니다. 이 판정은 휴리스틱이므로 앱은 기존 client를 보존하고, 재접속은 사용자가 `Tmux` 메뉴에서 명시적으로 수행합니다.
 - raw terminal 출력, clipboard 내용, 파일 본문, token/secret/env 값은 기록하지 않습니다.
 - IDE가 정상 종료되지 않았다고 보이면, 다음 실행 때 `previous session did not shut down cleanly` 항목과 마지막 heartbeat/event 시간이 남습니다.
 - 이전 세션 로그는 최근 일부만 브라우저 로컬 저장소에 보존되는 디버그용 breadcrumb입니다. 완전한 crash dump는 아니지만 강제 종료 직전 어느 영역이 마지막으로 기록됐는지 확인하는 데 쓸 수 있습니다.

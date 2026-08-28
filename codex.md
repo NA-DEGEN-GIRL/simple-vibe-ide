@@ -52,6 +52,192 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Patch Notes
 
+### 2026-08-28 - Extend OpenTUI redraw compatibility to OpenCode
+
+#### Changed (`src/main.ts`, terminal docs)
+- Confirmed that the reported OpenCode left-edge Korean/text fragments match the previously fixed
+  Grok/OpenTUI partial-redraw phenotype rather than a clipped terminal container or UTF-8 byte loss.
+  OpenCode had no compatibility detection, so a manually launched session stayed on the normal shell's
+  WebGL + Unicode 11 + `convertEol: true` path and missed the Grok redraw safeguards.
+- Generalized the Grok-only renderer/parser profile to a scoped OpenTUI profile. A direct `opencode`
+  command (including common package runners) or an OpenCode terminal title now selects DOM rendering,
+  Unicode 6 widths, PTY-owned EOL handling, bare-carriage-return erase-to-EOL cleanup, and throttled
+  post-write/scroll refresh. Codex, Claude, and ordinary shells retain their existing renderer path.
+- Manual OpenCode detection now disposes an already-promoted WebGL add-on before Enter reaches the PTY,
+  covering shells that were already displaying the `GL` badge. Saving `DOM compatibility` in Settings
+  also demotes existing live WebGL panes instead of requiring a new shell.
+- Kept OpenCode separate from launcher and agent-status metadata. No unverified Grok launch flags,
+  environment overrides, hooks, or tmux session behavior are applied to OpenCode.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- Isolated detection fixtures covered direct/path/quoted-path commands, inline assignments,
+  `sudo`/`env`, common package runners, OpenCode/`OC |` titles, and quoted false-positive cases.
+- Isolated OpenTUI output fixtures covered same-chunk and split CRLF/bare-CR boundaries, and
+  confirmed exactly one erase-to-EOL sequence is added only for bare carriage returns.
+- `git diff --check`
+- Real Windows/WebView2 OpenCode runtime smoke is still required; OpenCode is not installed in this
+  WSL validation environment.
+
+### 2026-08-21 - Isolate Windows builds from WSL npm dependencies
+
+#### Changed (`scripts/`, Windows build docs)
+- Confirmed that the Windows build cleanup failure was a mixed-platform install tree: WSL had
+  recreated Linux `.bin` symlinks and installed Linux esbuild, while older Windows command shims
+  remained in the same `node_modules`. Windows npm then failed while replacing those entries. This
+  is separate from tmux/Explorer and does not invalidate the Vite/nanoid security updates.
+- Added `windows-staged-runtime-smoke.ps1`. It copies current tracked working-tree source through a
+  Git manifest into a disposable Windows-local NTFS stage, performs a clean Windows `npm ci`, runs the
+  audit gate, and delegates to the existing Windows runtime smoke. Optional untracked source requires
+  an explicit switch and private-looking paths fail preflight. WSL and Windows no longer need to mutate
+  one shared dependency tree.
+- Windows runtime smoke now validates Windows npm shims/native packages and treats every native
+  nonzero status, including negative Windows errno values, as fatal. The dev and copy build wrappers
+  also reject a WSL-created/mixed dependency tree instead of trying to continue.
+- Updated the local Windows build launcher to use the staged gate and preserve its Windows-local Cargo
+  target cache. Local machine paths remain outside the public repository.
+
+#### Verification
+- `npm ci --ignore-scripts --no-audit --no-fund` restored a Linux-owned WSL dependency tree.
+- `npm audit --audit-level=low` (`found 0 vulnerabilities`)
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Windows staged runtime smoke still needs to be rerun from a Visual Studio developer environment.
+
+### 2026-08-21 - Clear Vite build-tool audit advisories
+
+#### Changed (`package.json`, `package-lock.json`)
+- Updated Vite within the existing major line from 7.3.5 to 7.3.6 and refreshed its compatible
+  transitive build tools: esbuild 0.28.2, PostCSS 8.5.26, and nanoid 3.3.18.
+- Used explicit patch/transitive updates rather than `npm audit fix --force`; application runtime
+  dependencies and the Tauri terminal lifecycle are unchanged.
+
+#### Verification
+- `npm install --ignore-scripts` (`found 0 vulnerabilities`)
+- `npm audit --audit-level=low` (`found 0 vulnerabilities`)
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+
+### 2026-08-21 - Stop destructive automatic tmux client reconnects
+
+#### Changed (`src/main.ts`, tmux docs)
+- Confirmed that visible button-launched WSL/SSH LLM panes could enter a heuristic stale-output
+  recovery path that cleared and killed the current PTY before a replacement tmux attach was proven.
+  Backend kill completion only queued the process reaper, while terminal spawn success did not prove
+  that `tmux attach-session` had succeeded, so a transient or false-positive recovery could leave the
+  IDE pane exited or detached even while the tmux process itself remained alive.
+- Kept the privacy-safe tmux freeze probe and warning, but removed its automatic PTY replacement.
+  A stale warning now records `autoReconnect=off`, preserves the current client/input path, and tells
+  the user to attach the same live session explicitly from the `Tmux` menu.
+- A fresh runtime report showed the v6 command followed only by tmux's opaque `[exited]` line. The
+  launcher now enables per-window `remain-on-exit` from inside the new pane before invoking the
+  agent. This retains the dead pane, last output, and exit status even if a user function calls
+  `exit` or `exec`. The typed marker is bumped to `__svi_launch_v=8`, making it clear whether the
+  running build contains the containment fixes.
+- Read-only persisted diagnostics confirmed repeated v6 `tmux stale-reconnect start`/`ok` events
+  with frontend terminal-data ages above the 15-second recovery threshold, including a recent
+  reproduction, while no renderer-watchdog recovery was recorded. A large visible Explorer can
+  amplify that false positive because its virtualized DOM still performs synchronous O(all expanded
+  rows) model/signature work; hiding Explorer gates its render/watch/prefetch paths. Explorer does
+  not directly kill a terminal or tmux session.
+- IDE-created sessions now set `destroy-unattached off` locally before the agent starts. This
+  protects the session from any IDE client-loss gap, including the separate renderer-watchdog path,
+  without changing the user's global tmux defaults. The server-wide `exit-unattached` option is not
+  modified.
+- Live read-only inspection found IDE-named tmux sessions detached with non-dead panes, consistent with
+  client loss rather than automatic `tmux kill-session`. Explicit menu `Kill`/`Kill all` remains the
+  only app path that invokes `tmux kill-session`.
+- Tmux target lookup normally accepts unique prefixes, so a missing `_1` could resolve to `_10` in
+  title/probe and explicit menu-kill helpers. Those backend targets now use tmux's leading `=` exact
+  form, preventing a stale menu item or poll from observing or killing a different numbered session.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- `cargo test --manifest-path src-tauri/Cargo.toml llm_tmux_target_tests --lib`
+- `git diff --check`
+- Isolated tmux/mock-agent fixtures returned nonzero statuses and confirmed that the session and
+  dead-pane status survived both an ordinary command return and a wrapper `exit`/`exec` path.
+- An isolated tmux client-detach fixture confirmed the normal `destroy-unattached=off` case preserves
+  the session, while `destroy-unattached=on` destroys the session when the last client disappears.
+- An isolated launcher fixture then enabled the global `destroy-unattached=on` default and confirmed
+  the v8 session-local override remained `off`; the detached session and status-23 dead pane both
+  survived.
+- An isolated `_1`-missing/`_10`-present fixture confirmed ordinary tmux targeting prefix-matches
+  `_10`, while the new `=_1` target correctly reports it missing.
+- Real packaged Windows WSL/SSH runtime smoke is still required.
+
+### 2026-08-02 - Make Codex and Claude buttons deterministic bypass launchers
+
+#### Changed (`src/main.ts`, launcher docs)
+- Codex and Claude buttons no longer inspect alias, function, or wrapper source to guess whether a
+  bypass flag is already present. Each button now appends exactly one canonical bypass flag, while
+  user wrappers remain responsible only for account and executable routing.
+- Removed Codex's unrelated `--enable goals`, the redundant Windows Codex config overrides, and
+  Claude's redundant Windows `--permission-mode` argument. The existing POSIX Claude root safety
+  gate remains, and Grok/Agy keep their compatibility-oriented best-effort flag detection.
+- The tmux launcher now passes the existing `printf %q` command directly to `bash -ic` instead of
+  adding another `eval` parsing layer. Bridge environment assignments and interactive Bash function
+  resolution are preserved.
+- Bumped the typed POSIX launcher marker to `__svi_launch_v=6`.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Isolated Bash/tmux fixture confirmed a route-only `codex()` function still receives exactly the
+  canonical bypass argument through `llm-usage`, while bridge-style environment values containing
+  spaces remain intact without the extra `eval` layer.
+- Real Windows app and affected SSH-profile button smoke were not run in this environment.
+
+### 2026-07-25 - Auto-migrate and harden Claude workspace status hooks
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src/types.ts`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)
+- Claude hook setup now detects Claude's local-settings behavior, uses the git main checkout on
+  2.1.211+, installs a versioned absolute-path hook, and automatically migrates legacy relative,
+  manually repaired or moved-repository stale absolute, partial, duplicate, and worktree-local
+  Simple Vibe IDE handlers.
+  Older or unverified wrappers only repair already-present IDE handlers in the launch cwd and never
+  create a new unsupported event schema.
+- Migration preserves unrelated settings and user handlers, leaves invalid JSON untouched, performs
+  a best-effort external-change check immediately before each atomic replace/create, re-reads the result
+  before enabling the bridge, and does not ask again for an already approved legacy installation.
+- Before changing hook files in a Git worktree, the IDE adds private local-settings, hook-script, and
+  migration-temp patterns to the repository-local exclude. A tracked target is never rewritten with an
+  absolute local path; setup falls back to terminal detection instead.
+- The command wrapper and generated script fail open when status telemetry setup is missing or
+  unavailable. Claude prompt/tool/assistant bodies are discarded before bridge transmission; only
+  bounded lifecycle metadata is staged in a private temporary file and removed with a trap.
+- Agent lifecycle mapping no longer treats subagent completion, a tool failure, permission denial, or
+  automatic context compaction as the end of the parent turn. Notification waiting state is limited to
+  actionable notification types, manual compaction returns to idle, a compact-triggered `SessionStart`
+  preserves that trigger-aware state, and `CwdChanged` updates only the agent-card metadata instead of
+  mutating the terminal pane's launch cwd.
+- Registering a fresh bridge route resets hook authority until an event arrives, so a restored tmux
+  process with stale bridge environment falls back to terminal detection instead of claiming a live hook.
+  Repair-only partial/old installations remain non-authoritative, and even a current hook yields to the
+  terminal fallback after five minutes without another event.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml` (29 passed)
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc`
+- Real Windows app runtime and live WSL Claude hook migration smoke were not run in this environment.
+
 ### 2026-07-17 - Bound unresponsive WSL clients during workspace switching
 
 #### Changed (`src/main.ts`, `src/api.ts`, `src-tauri/src/lib.rs`, `docs/USER_GUIDE.ko.md`)

@@ -138,6 +138,14 @@ export interface RegisterAgentBridgeSessionPayload {
   cwd: string;
 }
 
+export interface GitWorkspaceRoots {
+  launchCwd: string;
+  worktreeRoot: string;
+  mainCheckoutRoot: string;
+  settingsUseLaunchCwd: boolean;
+  claudeMainCheckoutSettingsSupported: boolean | null;
+}
+
 export interface AgentBridgeEvent {
   agentId: string;
   sessionId: string;

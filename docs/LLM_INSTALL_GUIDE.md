@@ -38,6 +38,7 @@ Expected:
 - MSVC Rust toolchain, commonly `stable-x86_64-pc-windows-msvc`
 - Visual Studio Build Tools C++ workload if Rust/Tauri asks for linker or C++
   build tools
+- Git for Windows for the WSL-checkout staged build helper
 
 Optional runtime tools:
 
@@ -79,36 +80,40 @@ Use this when the repo lives inside WSL but Windows Node/Rust/Tauri should build
 the desktop app. Do not rely on Linux `cargo` unless it is actually installed
 and the task is Linux-only frontend checking.
 
-Prefer `cmd pushd` so Windows gets a temporary drive mapping for the WSL UNC
-path, and keep Cargo output on a Windows-local temp directory:
+Do not run Windows npm over `node_modules` created by WSL. Linux bin symlinks and
+platform-specific packages cannot safely share one install tree with Windows.
+Use `cmd pushd` only to start the staged build helper; it copies current tracked
+working-tree source to Windows-local NTFS, runs a clean Windows `npm ci`, and
+keeps Cargo output Windows-local:
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-$env:CARGO_INCREMENTAL = "0"
-$env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
-cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && npm install && npm run check && npm run build && cd src-tauri && cargo check && cd .. && npm run tauri:dev'
+cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows-staged-runtime-smoke.ps1 -NoLaunch'
 ```
 
-Release build from a WSL checkout:
+To use a spacious Windows-local build drive:
 
 ```powershell
-$env:CARGO_INCREMENTAL = "0"
-$env:CARGO_TARGET_DIR = "$env:TEMP\simple-vibe-ide-target"
-cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && npm run tauri:build -- --no-bundle'
-```
-
-Then launch:
-
-```powershell
-cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && run-built.vbs'
+cmd /d /s /c 'pushd "\\wsl.localhost\[DISTRO]\home\[USER]\simple-vibe-ide" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\windows-staged-runtime-smoke.ps1 -StageRoot "D:\build-cache\simple-vibe-ide-win-src" -CargoTargetDir "D:\build-cache\simple-vibe-ide-target" -NoLaunch'
 ```
 
 Replace `[DISTRO]` and `[USER]` before running. Do not expose the real values in
 public reports.
 
+The stage is a disposable build snapshot, not an HMR workspace. Use a
+Windows-local clone/worktree for Windows `tauri:dev`; never alternate WSL and
+Windows npm installs in one checkout's `node_modules`.
+Tracked working-tree files are staged by default. Pass `-IncludeUntracked` only
+when new untracked source is required, after ensuring private local files are
+ignored; common untracked environment/private-key patterns are rejected.
+
 ## Verification Checklist
 
-At minimum, verify:
+The direct commands in this section are for a Windows-local checkout. For a
+WSL-hosted checkout, use the staged gate above; it runs the same checks and
+prints the Windows-local Cargo-target executable paths for manual launch.
+
+In a Windows-local checkout, at minimum verify:
 
 ```powershell
 npm run check

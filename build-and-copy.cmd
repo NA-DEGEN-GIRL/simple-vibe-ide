@@ -20,6 +20,14 @@ if not exist "node_modules" (
   call npm.cmd install || goto :fail
 )
 
+if not exist "node_modules\@esbuild\win32-x64\package.json" goto :wrong_node_modules
+if not exist "node_modules\@tauri-apps\cli-win32-x64-msvc\package.json" goto :wrong_node_modules
+if not exist "node_modules\.bin\vite.cmd" goto :wrong_node_modules
+if not exist "node_modules\.bin\tauri.cmd" goto :wrong_node_modules
+if exist "node_modules\.bin\esbuild\NUL" goto :wrong_node_modules
+if exist "node_modules\.bin\nanoid\NUL" goto :wrong_node_modules
+if exist "node_modules\.bin\vite\NUL" goto :wrong_node_modules
+
 echo ==^> TypeScript check
 call npm.cmd run check || goto :fail
 
@@ -47,6 +55,16 @@ echo     %APP_ROOT%\run-simple-vibe-ide.cmd
 echo     %APP_ROOT%\run-simple-vibe-terminal.cmd
 popd
 exit /b 0
+
+:wrong_node_modules
+echo node_modules is not a complete Windows dependency tree.
+echo Do not run Windows npm over dependencies created by WSL.
+echo Use scripts\windows-staged-runtime-smoke.ps1 for a WSL-hosted checkout,
+echo or install dependencies in a Windows-local checkout.
+echo.
+echo Build/copy failed with exit code 1.
+popd
+exit /b 1
 
 :copy_built_exe
 set "BINARY=%~1"
