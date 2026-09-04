@@ -155,6 +155,8 @@ public repo에 올릴 수 있는 프로젝트를 다룰 때는 실제 민감한 
 
 로컬 개발 서버가 감지되면 Browser 위젯에서 열 수 있습니다.
 
+- WSL/SSH 터미널의 정상적인 서버 시작 문구가 확인되면 Windows localhost 포워딩을 자동으로 준비합니다. Browser 패널을 강제로 열지는 않습니다.
+- 오류 로그, 문서 예시, 단독 URL처럼 서버 기동 여부가 불명확한 포트는 자동 연결하지 않고 수동 확인 항목으로 남깁니다.
 - URL을 직접 입력할 수 있습니다.
 - local port preview에 사용합니다.
 - page가 이상하면 새로고침하거나 서버 포트를 다시 확인합니다.
@@ -199,7 +201,7 @@ workspace는 현재 작업 맥락을 저장합니다.
 앱은 변경 이벤트와 별도로 약 30초마다 active workspace를 안전 저장하고, 앱이 백그라운드로 갈 때도 한 번 flush합니다.
 즉, 매번 `Save WS`를 다시 누르지 않아도 나중에 IDE를 다시 열었을 때 최근 배치에 가깝게 복원됩니다.
 
-앱을 닫거나 재빌드하면 실제 shell process는 종료될 수 있습니다. 대신 workspace를 다시 열면 UI와 작업 맥락을 빠르게 복원하는 방식입니다.
+앱을 닫거나 재빌드하면 일반 IDE-owned shell process는 종료될 수 있습니다. 대신 workspace를 다시 열면 UI와 작업 맥락을 빠르게 복원합니다. 명시적으로 분리된 tmux session은 예외이며 새 client pane으로 재접속합니다.
 
 ### Memory Saver
 
@@ -208,7 +210,7 @@ workspace는 현재 작업 맥락을 저장합니다.
 - workspace가 많아졌을 때 오래 안 쓴 inactive workspace의 shell/PTY를 정리해 RAM 사용량을 줄입니다.
 - `Balanced`는 10분 이상 inactive인 workspace를 대상으로 live workspace가 3개를 넘거나 live pane이 8개를 넘을 때 정리합니다. `Aggressive`는 2분, 1개 workspace, 4개 pane 기준입니다.
 - inactive 시간은 해당 workspace를 실제로 떠난 시점부터 계산합니다.
-- 해당 workspace tab과 layout snapshot은 유지되고, 다시 열면 shell이 새로 시작됩니다.
+- 해당 workspace tab과 layout snapshot은 유지되고, 다시 열면 일반 shell은 새로 시작됩니다. 분리된 tmux session은 새 client로 재접속합니다.
 - sleep된 workspace를 열면 tab에 `waking`이 표시되고, 저장된 split shell 복원이 끝난 뒤 해제됩니다. 복원이 실패하면 같은 workspace tab을 다시 눌러 재시도할 수 있습니다.
 - sleep된 workspace의 실행 중이던 shell process는 종료됩니다. 출력이 계속 나는 workspace는 idle로 보지 않지만, 장시간 서버/작업은 `Keep live`를 켜두는 것이 안전합니다.
 - dev server나 장시간 실행 작업을 유지해야 하는 workspace는 workspace tab 우클릭 메뉴에서 `Keep live`를 켜세요. 이미 sleep된 workspace에서 켠 경우에는 먼저 workspace를 열어 shell을 다시 시작해야 합니다.
@@ -248,15 +250,20 @@ workspace는 현재 작업 맥락을 저장합니다.
 
 ### LLM launcher tmux 재접속
 
-WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmux`가 설치된 경우 workspace+agent 단위 번호가 붙은 새 tmux session으로 실행합니다.
+WSL/SSH 같은 POSIX shell에서 LLM 버튼을 누르거나 Windows에서 Codex/Claude 버튼을 누르면, `tmux`가 설치된 경우 workspace+agent 단위 번호가 붙은 새 tmux session으로 실행합니다. Windows에서는 새 `powershell.exe -NoProfile`에서도 찾을 수 있는 표준 tmux 호환 executable/`.cmd`/`.ps1` 명령이 필요합니다.
+
+Windows용 shim은 인자 경계/순서와 exit code(특히 `-L simple-vibe-ide`와 literal `;` command queue)를 그대로 전달하고, `list-sessions -F`, exact `=name` 대상의 `has-session`/`attach-session`/`kill-session`, `new-session -d`, `set-option`/`show-options`, `@simple-vibe-ide-launch-owner`, `destroy-unattached`, `remain-on-exit`을 지원해야 합니다. `list-sessions`/`show-options`의 stdout에는 shim banner를 섞지 않아야 합니다. pane shell에서는 `powershell.exe`를 찾을 수 있어야 하며 detached server는 launcher/client가 종료된 뒤에도 살아 있어야 합니다. Windows 세션은 기존 default server의 process tree와 섞이지 않도록 전용 `simple-vibe-ide` server namespace를 쓰며 외부에서는 `tmux -L simple-vibe-ide ...`로 접근합니다. PowerShell profile에만 둔 alias/function은 지원하지 않습니다. tmux 명령을 찾았지만 session 생성이 실패하거나 모호하면 중복 agent를 막기 위해 direct 실행으로 fallback하지 않습니다.
 
 - 같은 workspace의 같은 agent 버튼을 여러 번 누르면 `codex #1`, `codex #2`처럼 별도 session/tab이 생깁니다.
 - LLM shell widget의 `+` 버튼도 plain shell이 아니라 같은 agent의 새 tmux session tab을 추가합니다.
 - LLM shell widget의 `Tmux` 버튼은 기존 tmux session 목록을 보여줍니다. session을 선택하면 현재 widget에 새 tab으로 attach합니다.
 - `Tmux` 목록의 `Kill`은 확인 후 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
 - stale-output probe는 현재 PTY를 자동으로 끊거나 재접속하지 않고 진단 경고만 남깁니다. 화면이 멈춘 경우 `Tmux` 메뉴에서 같은 session을 새 tab으로 직접 attach하세요.
-- IDE가 만든 session은 전역 tmux 설정은 바꾸지 않고 해당 session에만 `destroy-unattached off`를 적용합니다. IDE client가 끊겨도 session을 유지하고, agent command가 종료되면 `remain-on-exit` dead-pane에 실제 status와 마지막 출력을 남깁니다. 이 동작은 `__svi_launch_v=8`부터 적용됩니다.
-- `tmux`가 없거나 Windows profile에서는 기존처럼 직접 실행합니다.
+- IDE가 만든 session은 전역 tmux 설정은 바꾸지 않고 해당 session에만 `destroy-unattached off`를 적용합니다. IDE client가 끊겨도 session을 유지하고, agent command가 종료되면 `remain-on-exit` dead-pane에 실제 status와 마지막 출력을 남깁니다. 현재 launcher marker는 `__svi_launch_v=9`입니다.
+- Windows Codex/Claude session은 terminal PTY의 cleanup process tree 밖에서 먼저 만든 뒤 IDE terminal은 attach만 합니다. 따라서 tab의 `x`가 agent server를 직접 자식 process로 함께 종료하지 않습니다. 실제 생존 여부는 사용 중인 Windows tmux 구현도 detached server semantics를 지켜야 합니다.
+- backend가 session 생성을 확인한 뒤에는 workspace 전환이나 attach PTY 실패를 이유로 자동 Kill하지 않습니다. 생성된 session은 `Tmux` 메뉴의 명시적 `Kill`로만 종료합니다.
+- Windows Codex/Claude widget에서도 tmux 목록/attach/Kill 메뉴를 쓸 수 있습니다. POSIX 전용 title/stale-output probe는 Windows tmux에는 실행하지 않습니다.
+- 새 Windows Codex/Claude 버튼 실행에서 `tmux`가 없으면 기존처럼 직접 실행합니다. 단, 이미 v9 Windows tmux session으로 저장된 pane은 tmux 명령이 일시적으로 사라졌을 때 중복 direct agent를 띄우지 않고 복원을 보류합니다. Windows Grok/Agy 버튼은 이번 변경 대상이 아니므로 직접 실행합니다.
 - Codex와 Claude 버튼은 wrapper 내용을 판정하지 않고 각각 canonical bypass 인자 하나를 항상 추가합니다. 사용자 wrapper는 계정/실행 경로만 선택하고 bypass 인자를 자체 추가하지 않아야 합니다. Codex의 별도 `--enable goals`와 Windows 추가 override는 사용하지 않습니다.
 - Grok/Agy 호환성 인자에는 기존 best-effort 중복 판정이 유지됩니다. Claude는 bypass 인자를 거부하는 POSIX root 환경에서만 plain `claude`로 실행합니다.
 - Windows terminal에 표시되는 `[simple-vibe-ide] launching ...` 줄은 app이 실제로 더한 argv이므로 bypass 실행 여부를 확인할 때 사용합니다.

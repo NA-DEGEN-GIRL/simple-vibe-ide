@@ -118,6 +118,10 @@ interface TerminalPane {
   // used to re-launch the CLI (typed at the prompt) instead of restoring a plain shell.
   llmId?: string;
   llmTmuxSessionName?: string;
+  llmTmuxAttachOnly?: boolean;
+  // True only for a trusted v9 Windows tmux identity (created by the detached path or explicitly
+  // opened from the Tmux menu). Older snapshots stored speculative #1 names for direct launchers.
+  windowsLlmTmuxManaged?: boolean;
   // Runtime-only fallback for LLM sessions that were started manually or restored
   // from older snapshots without llmId metadata. This drives indicators/detection
   // but is not saved as launcher-owned state.
@@ -315,6 +319,15 @@ interface EditorPaneViewState {
   languageCompartment?: import('@codemirror/state').Compartment;
 }
 
+interface EditorTabRuntimeViewState {
+  // CodeMirror scroll effects are runtime-only and intentionally excluded from
+  // the JSON workspace snapshot. They are retained only while this app runs.
+  documentText: string;
+  renderSignature: string;
+  selection: import('@codemirror/state').EditorSelection;
+  scrollTo: ReturnType<CodeMirrorView['scrollSnapshot']>;
+}
+
 interface TerminalWidget {
   widgetId: string;
   workspaceId: string;
@@ -377,6 +390,13 @@ interface DetectedPortItem {
   profileId: string;
   port: number;
   url: string;
+}
+
+type BrowserForwardDisposition = 'active' | 'cached' | 'stopped';
+
+interface BrowserForwardStartResult {
+  forward: PortForwardResult;
+  disposition: BrowserForwardDisposition;
 }
 
 type TerminalPortStatus = 'detected' | 'starting' | 'active' | 'failed' | 'stopping' | 'direct';
@@ -1104,6 +1124,7 @@ interface EditorTabState {
   pendingRawMode?: boolean;
   pendingProfileId?: string;
   loading?: boolean;
+  runtimeViewState?: EditorTabRuntimeViewState;
 }
 
 interface ImageTabState {
@@ -1181,6 +1202,8 @@ interface WorkspaceTerminalSnapshot {
   command: string | null;
   llmId?: string;
   llmTmuxSessionName?: string;
+  llmTmuxAttachOnly?: boolean;
+  windowsLlmTmuxManaged?: boolean;
   backendId?: string;
   widgetId?: string;
   groupId?: string;
@@ -1341,6 +1364,7 @@ interface WorkspaceRuntimeCache {
   activeBrowserTabId: string;
   previewUrl: string;
   forwards: PortForwardResult[];
+  detectedPorts: DetectedPortItem[];
   previewProxies: PortForwardResult[];
   browserConsoleLogs: BrowserConsoleLog[];
 }
@@ -1531,6 +1555,8 @@ type CreateTerminalOptions = {
   pythonEnv?: TerminalPythonEnvSnapshot;
   llmId?: string;
   llmTmuxSessionName?: string;
+  llmTmuxAttachOnly?: boolean;
+  windowsLlmTmuxManaged?: boolean;
   shellHistoryId?: string;
   // Workspace restore prepares every xterm surface first, applies the saved split tree once,
   // then starts PTYs through a bounded queue. These flags are internal to that cold-restore path.
@@ -1872,6 +1898,7 @@ const WORKSPACE_LLM_TMUX_TITLE_INACTIVE_POLL_MS = 10_000;
 const WORKSPACE_LLM_HOOK_ACTIVE_MS = 30 * 60_000;
 const WORKSPACE_LLM_HOOK_AUTHORITY_LEASE_MS = 5 * 60_000;
 const LLM_TMUX_SESSION_MAX_LEN = 48;
+const WINDOWS_LLM_TMUX_SERVER_NAME = 'simple-vibe-ide';
 const LLM_TMUX_ENV_DANGEROUS_PATTERN = /(?:TOKEN|SECRET|PASSWORD|PASSWD|AUTH|COOKIE|KEY)/i;
 const CLAUDE_HOOK_DIR = '.claude';
 const CLAUDE_HOOK_SETTINGS_NAME = 'settings.local.json';
@@ -1883,7 +1910,7 @@ const GROK_HOOK_CONFIG_NAME = 'simple-vibe-ide.json';
 const GROK_HOOK_SCRIPT_NAME = 'simple-vibe-ide-hook.sh';
 const GROK_HOOK_COMMAND = `/bin/sh "$HOME/${GROK_HOOK_DIR}/${GROK_HOOK_SCRIPT_NAME}"`;
 const WORKSPACE_LLM_TMUX_TITLE_STALE_REPEAT_MS = 8000;
-const IDE_LLM_LAUNCHER_VERSION = 8;
+const IDE_LLM_LAUNCHER_VERSION = 9;
 const CLAUDE_HOOK_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
@@ -3774,7 +3801,7 @@ let workspaceOpenOperationId = '';
 let savedWorkspaceLoadInFlight = false;
 let storedActiveWorkspaceId = '';
 const layoutRatios = new WeakMap<HTMLElement, LayoutRatio>();
-const autoForwardingPorts = new Set<string>();
+const browserForwardStarts = new Map<string, Promise<BrowserForwardStartResult>>();
 const terminalPortEntries = new Map<string, TerminalPortEntry>();
 const ignoredTerminalPortKeys = new Set<string>();
 const terminalAutoForwardAttemptKeys = new Set<string>();
@@ -14399,9 +14426,12 @@ function cloneWorkspaceSnapshotForSavedLoad(saved: SavedWorkspaceEntry): Workspa
   snapshot.savedWorkspaceId = saved.id;
   snapshot.customLabel = saved.name;
   snapshot.updatedAt = new Date().toISOString();
-  snapshot.terminals = cloneTerminalSnapshotsForSavedWorkspace(source.terminals).map((terminal) => ({
+  snapshot.terminals = cloneTerminalSnapshotsForWorkspaceCopy(
+    cloneTerminalSnapshotsForSavedWorkspace(source.terminals),
+    snapshot.id,
+    source.profileId
+  ).map((terminal) => ({
     ...terminal,
-    shellHistoryId: crypto.randomUUID(),
     widgetId: terminal.widgetId || crypto.randomUUID()
   }));
   return snapshot;
@@ -17687,16 +17717,17 @@ async function copyWorkspaceTab(id: string) {
 
 function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnapshot {
   const copiedLabel = `${workspaceDisplayLabel(source)} copy`;
+  const workspaceId = crypto.randomUUID();
   return {
     ...source,
-    id: crypto.randomUUID(),
+    id: workspaceId,
     label: `${source.label} copy`,
     customLabel: copiedLabel,
     updatedAt: new Date().toISOString(),
     panels: cloneJson(source.panels),
     terminalSpawnRect: source.terminalSpawnRect ? { ...source.terminalSpawnRect } : undefined,
     terminalWidgetOpacity: cloneTerminalWidgetOpacityMap(source.terminalWidgetOpacity),
-    terminals: cloneTerminalSnapshotsForWorkspaceCopy(source.terminals),
+    terminals: cloneTerminalSnapshotsForWorkspaceCopy(source.terminals, workspaceId, source.profileId),
     terminalGroups: cloneTerminalGroupSnapshots(source.terminalGroups),
     editorTabs: cloneEditorTabSnapshots(source.editorTabs),
     editorPanes: cloneEditorPaneSnapshots(source.editorPanes),
@@ -17709,12 +17740,32 @@ function cloneWorkspaceSnapshotForCopy(source: WorkspaceSnapshot): WorkspaceSnap
   };
 }
 
-function cloneTerminalSnapshotsForWorkspaceCopy(terminals: WorkspaceTerminalSnapshot[]) {
+function cloneTerminalSnapshotsForWorkspaceCopy(
+  terminals: WorkspaceTerminalSnapshot[],
+  workspaceId: string,
+  defaultProfileId: string
+) {
   const cloned: WorkspaceTerminalSnapshot[] = [];
+  const llmSessionIndexes = new Map<string, number>();
   for (const terminal of terminals) {
+    const llmId = normalizeTerminalLlmId(terminal.llmId);
+    const profile = profileForIdWithWindowsFallback(terminal.profileId ?? defaultProfileId);
+    let llmTmuxSessionName: string | undefined;
+    if (llmId && profile?.kind !== 'windows') {
+      const key = `${profile?.id ?? terminal.profileId ?? defaultProfileId}\0${llmId}`;
+      const index = (llmSessionIndexes.get(key) ?? 0) + 1;
+      llmSessionIndexes.set(key, index);
+      llmTmuxSessionName = numberedWorkspaceTmuxSessionName(workspaceId, llmId, index);
+    }
     cloned.push({
       ...terminal,
       shellHistoryId: crypto.randomUUID(),
+      // A copied workspace must never attach to the source workspace's agent. POSIX panes get
+      // new, distinct identities now; Windows Codex/Claude panes are allocated during restore so
+      // their names become trusted only after the backend confirms a real detached session.
+      llmTmuxSessionName,
+      llmTmuxAttachOnly: undefined,
+      windowsLlmTmuxManaged: undefined,
       activePythonEnv: cloneTerminalPythonEnvSnapshot(terminal.activePythonEnv),
       rect: terminal.rect ? { ...terminal.rect } : undefined
     });
@@ -17861,6 +17912,25 @@ async function closeWorkspaceTab(id: string) {
       }
     }
     return;
+  }
+  // A port-forward request can finish while terminal shutdown is awaited.
+  // Refresh the runtime snapshot so removeWorkspaceRuntimeCache() also stops
+  // any forward adopted into the still-active workspace during that gap.
+  if (wasActive && state.activeWorkspaceId === id) {
+    saveActiveWorkspaceRuntimeCache();
+    const currentRuntime = workspaceRuntimeCache.get(id);
+    if (currentRuntime) {
+      currentRuntime.forwards = state.forwards.map((forward) => ({ ...forward }));
+      currentRuntime.detectedPorts = state.detectedPorts.map((port) => ({ ...port }));
+      currentRuntime.previewProxies = snapshotPreviewProxiesForRuntime();
+    } else {
+      const stopped = new Set<string>();
+      for (const forward of [...state.forwards, ...state.previewProxies]) {
+        if (stopped.has(forward.id)) continue;
+        stopped.add(forward.id);
+        void api.stopPortForward(forward.id).catch(() => undefined);
+      }
+    }
   }
   removeWorkspaceRuntimeCache(id);
   workspaceSnapshotSignatures.delete(id);
@@ -18407,7 +18477,7 @@ function terminalSnapshotsSignature(terminals: WorkspaceSnapshot['terminals']) {
 }
 
 function terminalSnapshotSignature(terminal: WorkspaceSnapshot['terminals'][number]) {
-  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.shellHistoryId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.llmTmuxSessionName ?? '')},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
+  return `${workspaceSignaturePart(terminal.snapshotPaneId ?? '')},${workspaceSignaturePart(terminal.shellHistoryId ?? '')},${workspaceSignaturePart(terminal.title)},${workspaceSignaturePart(terminal.customTitle ?? '')},${workspaceSignaturePart(terminal.command ?? '')},${workspaceSignaturePart(terminal.llmId ?? '')},${workspaceSignaturePart(terminal.llmTmuxSessionName ?? '')},${terminal.llmTmuxAttachOnly ? '1' : '0'},${terminal.windowsLlmTmuxManaged ? '1' : '0'},${workspaceSignaturePart(terminal.backendId ?? '')},${workspaceSignaturePart(terminal.widgetId ?? '')},${workspaceSignaturePart(terminal.groupId ?? '')},${workspaceSignaturePart(terminal.profileId)},${workspaceSignaturePart(terminal.cwd)},${terminalPythonEnvSignature(terminal.activePythonEnv)},${terminal.typingPadOpen ? '1' : '0'},${workspaceSignaturePart(terminal.defaultFocusTarget ?? DEFAULT_TERMINAL_FOCUS_TARGET)},${layoutRatioSignature(terminal.rect)}`;
 }
 
 function terminalPythonEnvSignature(env: TerminalPythonEnvSnapshot | null | undefined) {
@@ -18620,6 +18690,8 @@ function currentWorkspaceTerminalSnapshotState(workspaceId = state.activeWorkspa
           command: pane.command,
           llmId: pane.llmId,
           llmTmuxSessionName: pane.llmTmuxSessionName,
+          llmTmuxAttachOnly: pane.llmTmuxAttachOnly || undefined,
+          windowsLlmTmuxManaged: pane.windowsLlmTmuxManaged || undefined,
           widgetId: pane.widgetId,
           groupId: group.groupId,
           profileId: pane.profileId,
@@ -18670,9 +18742,13 @@ function activeWorkspaceSnapshot() {
 }
 
 function saveActiveWorkspaceRuntimeCache() {
-  if (restoringWorkspace || !state.activeWorkspaceId || !state.workspaceOpen) return;
+  if (!state.activeWorkspaceId || !state.workspaceOpen) return;
+  if (restoringWorkspace) {
+    syncActiveWorkspaceBrowserRuntimeCache();
+    return;
+  }
   const workspaceId = state.activeWorkspaceId;
-  syncActiveEditorTabFromView();
+  syncAllEditorPanesFromViews();
   workspaceRuntimeCache.set(workspaceId, {
     editorTabs: snapshotEditorTabsForRuntime(state.editorTabs),
     activeEditorTabId: state.activeEditorTabId,
@@ -18685,6 +18761,7 @@ function saveActiveWorkspaceRuntimeCache() {
     activeBrowserTabId: state.activeBrowserTabId,
     previewUrl: state.previewUrl,
     forwards: state.forwards.map((forward) => ({ ...forward })),
+    detectedPorts: state.detectedPorts.map((port) => ({ ...port })),
     previewProxies: snapshotPreviewProxiesForRuntime(),
     browserConsoleLogs: snapshotBrowserConsoleLogsForRuntime()
   });
@@ -18698,6 +18775,16 @@ function saveActiveWorkspaceRuntimeCache() {
     setEdgePreviewVisible(false);
   }
   hideNativeBrowserWebview({ all: true });
+}
+
+function syncActiveWorkspaceBrowserRuntimeCache() {
+  const scope = currentBrowserForwardScope();
+  if (!scope || !browserForwardScopeIsActive(scope)) return;
+  // During a partial restore, live Browser arrays may still be empty while the
+  // existing runtime cache owns active forward IDs. Do not overwrite it here.
+  // Forward/detected mutations mirror into the cache at their mutation sites;
+  // this call only guarantees a browser-only cache exists for a fresh restore.
+  ensureCachedBrowserForwardScope(scope);
 }
 
 function closeNativeBrowserWebviewsForWorkspace(workspaceId: string, tabs = state.browserTabs) {
@@ -19632,11 +19719,29 @@ async function restoreWorkspaceTerminalsInner(
     const createdPaneIds: string[] = [];
     const preparedPlans: PreparedWorkspaceTerminalRestore[] = [];
     const windowsCwdResolutions = new Map<string, Promise<string>>();
+    const windowsRestoreLlmSessionIndexes = new Map<string, Set<number>>();
     const sshRestoreScopes = new Map<string, WorkspaceTerminalRestoreSshScope>();
     const wslReadyPaneIds = new Set<string>();
     let queuedExplorerLoadAfterReady = false;
     let restoreCompleted = false;
     const activeSnapshotIndex = clamp(snapshot.activeTerminalIndex || 0, 0, terminalSnapshots.length - 1);
+
+    for (const terminal of terminalSnapshots) {
+      const llmId = terminal.llmId;
+      const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
+      if (
+        !llmId
+        || terminalProfile.kind !== 'windows'
+        || !windowsLlmButtonUsesTmux(llmId)
+        || terminal.windowsLlmTmuxManaged !== true
+      ) continue;
+      const index = llmTmuxSessionIndex(terminal.llmTmuxSessionName);
+      if (!index) continue;
+      const key = `${terminalProfile.id}\0${llmId}`;
+      const used = windowsRestoreLlmSessionIndexes.get(key) ?? new Set<number>();
+      used.add(index);
+      windowsRestoreLlmSessionIndexes.set(key, used);
+    }
 
     try {
       // Paint the saved widget frames first. PTYs are intentionally not started until every xterm
@@ -19673,13 +19778,35 @@ async function restoreWorkspaceTerminalsInner(
         const terminalProfile = profileForId(terminal.profileId ?? '') ?? profile;
         const terminalCwd = terminal.cwd || workspaceShellCwd();
         const defaultFocusTarget = terminalDefaultFocusTargetFromSnapshot(terminal, snapshot.terminalGroups);
-        const terminalTitle = terminal.title || 'shell';
+        const savedTerminalTitle = terminal.title || 'shell';
         // LLM launchers get a fresh define command after their bridge preparation completes. The
         // foreground call is still typed only after the recreated shell reports ready.
         const llmId = terminal.llmId;
-        const llmTmuxSessionName = llmId
-          ? safeLlmTmuxSessionName(terminal.llmTmuxSessionName) ?? workspaceTmuxSessionName(snapshot.id, llmId)
+        const savedLlmTmuxSessionName = llmId
+          ? safeLlmTmuxSessionName(terminal.llmTmuxSessionName) ?? undefined
           : undefined;
+        let llmTmuxSessionName: string | undefined = terminalProfile.kind === 'windows'
+          ? (terminal.windowsLlmTmuxManaged === true ? savedLlmTmuxSessionName : undefined)
+          : savedLlmTmuxSessionName;
+        if (llmId && !llmTmuxSessionName) {
+          if (terminalProfile.kind === 'windows' && windowsLlmButtonUsesTmux(llmId)) {
+            // Pre-v9 Windows snapshots may contain the same speculative #1 name even though they
+            // launched directly. Ignore that untrusted identity and assign each pane a stable,
+            // unreserved number so distinct legacy panes do not collapse onto one agent.
+            const legacyKey = `${terminalProfile.id}\0${llmId}`;
+            const used = windowsRestoreLlmSessionIndexes.get(legacyKey) ?? new Set<number>();
+            let legacyIndex = 1;
+            while (used.has(legacyIndex)) legacyIndex += 1;
+            used.add(legacyIndex);
+            windowsRestoreLlmSessionIndexes.set(legacyKey, used);
+            llmTmuxSessionName = numberedWorkspaceTmuxSessionName(snapshot.id, llmId, legacyIndex);
+          } else if (terminalProfile.kind !== 'windows') {
+            llmTmuxSessionName = workspaceTmuxSessionName(snapshot.id, llmId);
+          }
+        }
+        const terminalTitle = llmId && llmTmuxSessionName && typeof terminal.customTitle !== 'string'
+          ? llmTmuxTabTitle(llmId, llmTmuxSessionName)
+          : savedTerminalTitle;
         const terminalOptions: CreateTerminalOptions = {
           focus: false,
           profile: terminalProfile,
@@ -19691,6 +19818,9 @@ async function restoreWorkspaceTerminalsInner(
           pythonEnv: terminal.activePythonEnv,
           llmId,
           llmTmuxSessionName,
+          llmTmuxAttachOnly: terminal.llmTmuxAttachOnly === true,
+          windowsLlmTmuxManaged: terminalProfile.kind === 'windows'
+            && terminal.windowsLlmTmuxManaged === true,
           deferBackendStart: true,
           deferLayoutRender: true,
           skipInitialFitSettle: true
@@ -19724,7 +19854,8 @@ async function restoreWorkspaceTerminalsInner(
           options: terminalOptions,
           llmId,
           llmTmuxSessionName,
-          agentBridgePromise: llmId === 'claude' || llmId === 'grok'
+          agentBridgePromise: terminal.llmTmuxAttachOnly !== true
+            && (llmId === 'claude' || llmId === 'grok')
             ? prepareAgentBridgeForLlmLaunch(llmId, terminalProfile, terminalCwd, { allowPrompt: false })
             : null
         });
@@ -19826,7 +19957,7 @@ async function restoreWorkspaceTerminalsInner(
       };
       const startPreparedPlan = async (plan: PreparedWorkspaceTerminalRestore, reserveSpawnSlot = false) => {
         let agentBridge: AgentBridgeLaunchContext | null = null;
-        let llmParts: ReturnType<typeof llmLauncherParts> | null = null;
+        let llmParts: PreparedLlmLauncherParts | null = null;
         let sshRestoreLease: WorkspaceTerminalRestoreSshLease | null = null;
         let sshReadyConfirmed = false;
         let releaseSpawnSlot: (() => void) | undefined;
@@ -19839,21 +19970,6 @@ async function restoreWorkspaceTerminalsInner(
             ? await plan.agentBridgePromise.catch(() => null)
             : null;
           if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
-          llmParts = plan.llmId
-            ? llmLauncherParts(
-                plan.llmId,
-                plan.terminalProfile.kind,
-                snapshot.id,
-                plan.llmTmuxSessionName,
-                { agentBridge }
-              )
-            : null;
-          const terminalCommand = llmParts ? llmParts.define : plan.terminal.command;
-          if (!reserveSpawnSlot) {
-            sshRestoreLease = await acquireSshRestoreLease(plan);
-            releaseSpawnSlot = await acquireTerminalRestoreSpawnSlot();
-          }
-          if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
           if (plan.terminalProfile.kind === 'windows') {
             const spawnCwd = await resolveWindowsCwd(plan);
             if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
@@ -19862,6 +19978,48 @@ async function restoreWorkspaceTerminalsInner(
               updateTerminalWidgetTitle(plan.widget);
             }
           }
+          llmParts = plan.llmId
+            ? await prepareLlmLauncherParts(
+                plan.llmId,
+                plan.terminalProfile,
+                plan.pane.cwd,
+                snapshot.id,
+                plan.llmTmuxSessionName,
+                {
+                  agentBridge,
+                  attachExistingOnly: plan.options.llmTmuxAttachOnly === true,
+                  // A v9 managed identity proves this pane previously used Windows tmux. If the
+                  // command is temporarily missing, fail the restore instead of silently starting
+                  // a second direct Codex/Claude process outside that still-live session.
+                  requireWindowsTmux: plan.terminalProfile.kind === 'windows'
+                    && plan.options.windowsLlmTmuxManaged === true
+                }
+              )
+            : null;
+          if (llmParts) {
+            const previousSessionName = plan.llmTmuxSessionName;
+            plan.llmTmuxSessionName = llmParts.tmuxSessionName;
+            plan.pane.llmTmuxSessionName = llmParts.tmuxSessionName;
+            plan.options.llmTmuxSessionName = llmParts.tmuxSessionName;
+            plan.pane.llmTmuxAttachOnly = plan.options.llmTmuxAttachOnly === true;
+            plan.pane.windowsLlmTmuxManaged = llmParts.windowsLlmTmuxManaged;
+            plan.options.windowsLlmTmuxManaged = llmParts.windowsLlmTmuxManaged;
+            if (
+              plan.llmId
+              && previousSessionName !== llmParts.tmuxSessionName
+              && !plan.pane.customTitle
+            ) {
+              plan.title = llmTmuxTabTitle(plan.llmId, llmParts.tmuxSessionName);
+              plan.pane.title = plan.title;
+              updateTerminalWidgetTitle(plan.widget);
+            }
+          }
+          const terminalCommand = llmParts ? llmParts.define : plan.terminal.command;
+          if (!reserveSpawnSlot) {
+            sshRestoreLease = await acquireSshRestoreLease(plan);
+            releaseSpawnSlot = await acquireTerminalRestoreSpawnSlot();
+          }
+          if (!isWorkspaceTerminalRestoreCurrent(snapshot.id, options.token) || !isTerminalPaneAlive(plan.pane)) return;
           await startTerminalPaneBackend(
             plan.pane,
             plan.widget,
@@ -19905,6 +20063,7 @@ async function restoreWorkspaceTerminalsInner(
         if (llmParts && plan.pane.backendId && plan.llmId) {
           plan.pane.llmId = plan.llmId;
           plan.pane.llmTmuxSessionName = plan.llmTmuxSessionName;
+          plan.pane.windowsLlmTmuxManaged = llmParts.windowsLlmTmuxManaged;
           await registerAgentBridgeForPane(plan.pane, agentBridge).catch((error) => {
             console.warn(`Failed to register ${plan.llmId} bridge for restored pane`, error);
           });
@@ -22473,9 +22632,12 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
   const runtime = restoreWorkspaceRuntimeCache(snapshot.id);
   const browserVisible = !isBrowserPanelHidden();
   const browserConsoleVisible = Boolean(snapshot.browserConsoleVisible);
-  state.forwards = runtime?.forwards.map((forward) => ({ ...forward })) ?? [];
+  state.forwards = restoredBrowserForwards(runtime?.forwards ?? [], state.forwards);
   clearForwardLookup();
   for (const forward of state.forwards) rememberForward(forward);
+  state.detectedPorts = restoredDetectedPorts(runtime?.detectedPorts ?? [], state.detectedPorts, state.forwards);
+  clearDetectedPortLookup();
+  for (const port of state.detectedPorts) rememberDetectedPort(port);
   state.browserTabs = restoredBrowserTabs(snapshot, runtime);
   state.browserHistory = restoredBrowserHistory(snapshot, runtime);
   rebuildBrowserTabLookup();
@@ -22511,6 +22673,39 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
     renderBrowserTabs();
     if (state.browserConsoleVisible) renderBrowserConsole();
   }
+}
+
+function restoredBrowserForwards(cached: PortForwardResult[], startedDuringRestore: PortForwardResult[]) {
+  const restored: PortForwardResult[] = [];
+  const ids = new Set<string>();
+  const remotePorts = new Set<number>();
+  for (const forward of [...cached, ...startedDuringRestore]) {
+    if (ids.has(forward.id)) continue;
+    if (remotePorts.has(forward.remotePort)) {
+      void api.stopPortForward(forward.id).catch(() => undefined);
+      continue;
+    }
+    ids.add(forward.id);
+    remotePorts.add(forward.remotePort);
+    restored.push({ ...forward });
+  }
+  return restored;
+}
+
+function restoredDetectedPorts(
+  cached: DetectedPortItem[],
+  detectedDuringRestore: DetectedPortItem[],
+  forwards: PortForwardResult[]
+) {
+  const restored: DetectedPortItem[] = [];
+  const ids = new Set<string>();
+  const forwardedPorts = new Set(forwards.map((forward) => forward.remotePort));
+  for (const port of [...cached, ...detectedDuringRestore]) {
+    if (ids.has(port.id) || forwardedPorts.has(port.port)) continue;
+    ids.add(port.id);
+    restored.push({ ...port });
+  }
+  return restored;
 }
 
 function restoredBrowserTabs(snapshot: WorkspaceSnapshot, runtime: WorkspaceRuntimeCache | null | undefined) {
@@ -24601,23 +24796,54 @@ async function startLlmLauncher(id: string) {
   // command, which node-launched CLIs (e.g. codex via nvm) need to enter bypass/YOLO.
   const profile = state.activeProfile;
   if (!profile) return;
+  const workspaceId = state.activeWorkspaceId;
   const cwd = workspaceShellCwd();
-  const tmuxSessionName = await nextLlmTmuxSessionName(profile, cwd, state.activeWorkspaceId, id);
   const agentBridge = await prepareAgentBridgeForLlmLaunch(id, profile, cwd);
-  const { define, call } = llmLauncherParts(id, profile.kind, state.activeWorkspaceId, tmuxSessionName, { agentBridge });
-  const widget = await createTerminal(define, llmTmuxTabTitle(id, tmuxSessionName), {
-    initialHeight: 420,
-    profile,
-    cwd,
-    llmId: id,
-    llmTmuxSessionName: tmuxSessionName
-  });
-  if (!widget) return;
+  if (!llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)) return;
+  let prepared: PreparedLlmLauncherParts;
+  try {
+    prepared = await prepareLlmLauncherParts(id, profile, cwd, workspaceId, undefined, { agentBridge });
+  } catch (error) {
+    setStatus(`Failed to prepare ${id} launcher: ${String(error)}`, true);
+    return;
+  }
+  if (!llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)) {
+    return;
+  }
+  const { define, call, tmuxSessionName, windowsLlmTmuxManaged } = prepared;
+  let widget: TerminalWidget | null;
+  try {
+    widget = await createTerminal(define, llmTmuxTabTitle(id, tmuxSessionName), {
+      initialHeight: 420,
+      profile,
+      cwd,
+      llmId: id,
+      llmTmuxSessionName: tmuxSessionName,
+      windowsLlmTmuxManaged
+    });
+  } catch (error) {
+    setStatus(`Failed to create ${id} terminal: ${String(error)}`, true);
+    return;
+  }
+  if (!widget) {
+    return;
+  }
   const pane = activePaneForWidget(widget);
-  if (!pane?.backendId) return;
+  if (!pane?.backendId) {
+    return;
+  }
+  if (!llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)) {
+    await closeTerminalPane(pane.paneId, {
+      backgroundKill: true,
+      saveSnapshot: false,
+      renderShellTabs: false
+    });
+    return;
+  }
   // Remember this is an LLM launcher so a workspace restore re-runs the CLI, not a plain shell.
   pane.llmId = id;
   pane.llmTmuxSessionName = tmuxSessionName;
+  pane.windowsLlmTmuxManaged = windowsLlmTmuxManaged;
   await registerAgentBridgeForPane(pane, agentBridge);
   markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
   scheduleWorkspaceLlmTmuxTitlePoll(pane, 1000);
@@ -24635,8 +24861,9 @@ async function startLlmLauncher(id: string) {
 // `define` is sourced silently in the shell rcfile (no echo) to compute fixed button args and
 // transient env; `call` is typed at the prompt. The tmux path starts a fresh interactive bash so
 // the user's alias/function routing (for example an account selector) still resolves there. The
-// executable is not hidden in another shell function. On Windows we type the whole command as-is
-// (no separate define). Root-unsafe launchers also re-check uid in the typed command.
+// executable is not hidden in another shell function. Direct Windows launchers type the whole
+// command as-is (no separate define); Windows Codex/Claude tmux launches type an attach-only call.
+// Root-unsafe POSIX launchers also re-check uid in the typed command.
 function llmLauncherParts(
   id: string,
   profileKind: string | undefined = state.activeProfile?.kind,
@@ -24655,6 +24882,95 @@ function llmLauncherParts(
       envPassthrough: options.envPassthrough ?? safeLlmEnvPassthroughNames(state.ideSettings.llmTmuxEnvPassthrough)
     }
   );
+}
+
+type PreparedLlmLauncherParts = {
+  define: string | null;
+  call: string;
+  tmuxSessionName?: string;
+  windowsLlmTmuxManaged?: boolean;
+};
+
+function windowsLlmButtonUsesTmux(id: string) {
+  return id === 'codex' || id === 'claude';
+}
+
+async function prepareLlmLauncherParts(
+  id: string,
+  profile: ConnectionProfile,
+  cwd: string,
+  workspaceId: string,
+  requestedSessionName?: string | null,
+  options: {
+    agentBridge?: AgentBridgeLaunchContext | null;
+    envPassthrough?: string[];
+    attachExistingOnly?: boolean;
+    requireWindowsTmux?: boolean;
+  } = {}
+): Promise<PreparedLlmLauncherParts> {
+  const requested = safeLlmTmuxSessionName(requestedSessionName);
+  if (options.attachExistingOnly) {
+    if (!requested) throw new Error('An existing tmux session name is required');
+    if (profile.kind === 'windows' && !windowsLlmButtonUsesTmux(id)) {
+      throw new Error('Windows tmux attach is supported only for Codex and Claude buttons');
+    }
+    return {
+      define: null,
+      call: profile.kind === 'windows'
+        ? powershellLlmTmuxAttachCommand(requested)
+        : bashLlmTmuxAttachCommand(requested),
+      tmuxSessionName: requested,
+      windowsLlmTmuxManaged: profile.kind === 'windows' ? true : undefined
+    };
+  }
+  if (profile.kind === 'windows') {
+    const direct = llmLauncherParts(id, profile.kind, workspaceId, undefined, options);
+    if (!windowsLlmButtonUsesTmux(id)) return { ...direct, tmuxSessionName: undefined };
+    const result = await api.prepareWindowsLlmTmuxSession(
+      profile.id,
+      cwd,
+      workspaceId,
+      id,
+      requested
+    );
+    if (!result.available) {
+      if (options.requireWindowsTmux) {
+        throw new Error(result.message || 'The saved Windows tmux session is temporarily unavailable');
+      }
+      return { ...direct, tmuxSessionName: undefined };
+    }
+    const tmuxSessionName = safeLlmTmuxSessionName(result.sessionName);
+    if (!tmuxSessionName) throw new Error('Windows tmux returned an invalid session name');
+    // A successfully created tmux session is durable user state. Never auto-kill it merely
+    // because the renderer changes workspace or its attach PTY fails: another IDE/external client
+    // may already be attached, and the Tmux menu is the explicit lifecycle control.
+    invalidateLlmTmuxSessionMenuCache(profile.id, cwd, workspaceId, id);
+    return {
+      define: null,
+      call: powershellLlmTmuxAttachCommand(tmuxSessionName),
+      tmuxSessionName,
+      windowsLlmTmuxManaged: true
+    };
+  }
+  const tmuxSessionName = requested
+    ?? await nextLlmTmuxSessionName(profile, cwd, workspaceId, id);
+  const parts = llmLauncherParts(id, profile.kind, workspaceId, tmuxSessionName, options);
+  return { ...parts, tmuxSessionName };
+}
+
+function llmLaunchWorkspaceScopeIsCurrent(profile: ConnectionProfile, workspaceId: string) {
+  return !appShutdownStarted
+    && state.activeWorkspaceId === workspaceId
+    && state.activeProfile?.id === profile.id;
+}
+
+function bashLlmTmuxAttachCommand(sessionName: string) {
+  const target = exactShellTmuxTarget(sessionName);
+  return `if command -v tmux >/dev/null 2>&1; then tmux attach-session -t ${bashQuote(target)}; else printf '%s\n' 'tmux is not installed' >&2; false; fi`;
+}
+
+function exactShellTmuxTarget(sessionName: string) {
+  return `=${sessionName}`;
 }
 
 function bashLlmLauncherParts(
@@ -24814,6 +25130,20 @@ function powershellLlmLauncherCommand(launcher: LlmLauncherConfig) {
     `$sviDisplayArgs = @(${powershellQuote(executable)}) + $sviArgs`,
     'Write-Host ("[simple-vibe-ide] launching " + ($sviDisplayArgs -join " "))',
     `& ${powershellQuote(executable)} @sviArgs`
+  ].join('; ');
+}
+
+function powershellLlmTmuxAttachCommand(sessionName: string) {
+  const target = `=${sessionName}`;
+  return [
+    `$__svi_launch_v = ${IDE_LLM_LAUNCHER_VERSION}`,
+    "$__sviTmux = Get-Command 'tmux' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1",
+    "if (-not $__sviTmux -or -not $__sviTmux.Path) { throw 'tmux disappeared before attach' }",
+    `$__sviTmuxArgs = @('-L', ${powershellQuote(WINDOWS_LLM_TMUX_SERVER_NAME)}, 'attach-session', '-t', ${powershellQuote(target)})`,
+    '$__sviPowerShell = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName',
+    "$global:LASTEXITCODE = 0",
+    "if ($__sviTmux.CommandType -eq 'ExternalScript') { & $__sviPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $__sviTmux.Path @__sviTmuxArgs; $__sviTmuxOk = $?; $__sviTmuxExit = $LASTEXITCODE } else { & $__sviTmux.Path @__sviTmuxArgs; $__sviTmuxOk = $?; $__sviTmuxExit = $LASTEXITCODE }",
+    "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) { throw 'tmux attach failed' }"
   ].join('; ');
 }
 
@@ -25860,7 +26190,7 @@ function setPanelVisible(id: FloatingPanelId, visible: boolean, options: { skipS
   } else {
     if (widgetOpacityPopoverTarget?.element === panel) hideWidgetOpacityPopover({ persist: true });
     if (id === 'editor' && !wasHidden) {
-      syncActiveEditorTabFromView();
+      syncAllEditorPanesFromViews();
       destroyCodeEditorView();
     }
     if (id === 'browser' && !wasHidden && !restoringWorkspace) {
@@ -31475,6 +31805,7 @@ function refreshEditorTabIndexLookup(startIndex = 0) {
 function setEditorTabFile(tab: EditorTabState, file: OpenFileState | null) {
   const previousPath = tab.file?.path ?? tab.pendingPath;
   if (previousPath && editorTabByPath.get(previousPath) === tab) editorTabByPath.delete(previousPath);
+  if (tab.file !== file) tab.runtimeViewState = undefined;
   tab.file = file;
   if (file) {
     tab.pendingPath = undefined;
@@ -31540,7 +31871,7 @@ function createEditorTab(file: OpenFileState | null, activate = true, id: string
 }
 
 function activateEditorTab(id: string) {
-  syncActiveEditorTabFromView();
+  syncAllEditorPanesFromViews();
   const previousActiveId = state.activeEditorTabId;
   const tab = editorTabForId(id);
   if (!tab) return;
@@ -31763,8 +32094,15 @@ function syncEditorPaneFromView(paneId: string) {
   if (!tab?.file || tab.file.masked && !tab.file.rawMode) return;
   const viewState = editorPaneViewState.get(paneId);
   if (viewState?.view && viewState.file === tab.file) {
-    tab.file.draftContent = viewState.view.state.doc.toString();
+    const documentText = viewState.view.state.doc.toString();
+    tab.file.draftContent = documentText;
     tab.file.dirty = !sameEditorContent(tab.file.draftContent, tab.file.content);
+    tab.runtimeViewState = {
+      documentText,
+      renderSignature: viewState.renderSignature,
+      selection: viewState.view.state.selection,
+      scrollTo: viewState.view.scrollSnapshot()
+    };
   }
 }
 
@@ -32623,12 +32961,21 @@ async function mountCodeEditor(
   const viewState = editorPaneViewState.get(paneId);
   if (viewState && viewState.renderToken !== renderToken) return;
   const languageCompartment = new runtime.Compartment();
+  const documentText = editorDocumentText(file);
+  const savedViewState = tab.runtimeViewState;
+  const restoreViewState = savedViewState?.documentText === documentText
+    && savedViewState.renderSignature === viewSignature
+    ? savedViewState
+    : undefined;
+  if (savedViewState && !restoreViewState) tab.runtimeViewState = undefined;
 
   const view = new runtime.EditorView({
     state: runtime.EditorState.create({
-      doc: editorDocumentText(file),
+      doc: documentText,
+      selection: restoreViewState?.selection,
       extensions: editorExtensions(file.path, runtime, file, languageCompartment)
     }),
+    scrollTo: restoreViewState?.scrollTo,
     parent: mount
   });
   editorPaneViewState.set(paneId, { view, file, renderSignature: viewSignature, renderToken, languageCompartment });
@@ -34431,6 +34778,8 @@ async function createTerminalTab(
     llmId: terminalLlmId,
     openTuiCompatibility: terminalOpenTuiCompatibility,
     llmTmuxSessionName: safeLlmTmuxSessionName(options.llmTmuxSessionName) ?? undefined,
+    llmTmuxAttachOnly: options.llmTmuxAttachOnly === true,
+    windowsLlmTmuxManaged: options.windowsLlmTmuxManaged === true,
     profileId: terminalProfile.id,
     cwd: terminalCwd,
     shellHistoryId: normalizedTerminalShellHistoryId(options.shellHistoryId),
@@ -35432,7 +35781,11 @@ function terminalWidgetLauncherLlmId(widget: TerminalWidget | null | undefined) 
 function syncTerminalLlmSessionControls(widget: TerminalWidget) {
   const llmId = terminalWidgetLauncherLlmId(widget);
   const profile = profileForTerminalWidget(widget);
-  const visible = Boolean(llmId && profile?.kind !== 'windows');
+  const visible = Boolean(
+    llmId
+    && profile
+    && (profile.kind !== 'windows' || windowsLlmButtonUsesTmux(llmId))
+  );
   toggleClassIfChanged(widget.llmSessionsButton, 'hidden', !visible);
   widget.llmSessionsButton.disabled = !visible;
   widget.llmSessionsButton.title = llmId
@@ -35501,27 +35854,74 @@ async function createNewTabInWidget(widget: TerminalWidget) {
 async function createLlmTmuxTabInWidget(
   widget: TerminalWidget,
   llmId: string,
-  options: { sessionName?: string; title?: string } = {}
+  options: { sessionName?: string; title?: string; attachExistingOnly?: boolean } = {}
 ) {
   const profile = profileForTerminalWidget(widget) ?? state.activeProfile;
   if (!profile) return null;
+  const workspaceId = widget.workspaceId;
   const active = activePaneForWidget(widget);
   const cwd = active?.cwd ?? workspaceShellCwd();
   const requestedSessionName = safeLlmTmuxSessionName(options.sessionName);
-  const tmuxSessionName = requestedSessionName
-    ?? await nextLlmTmuxSessionName(profile, cwd, widget.workspaceId, llmId);
-  if (!requestedSessionName) invalidateLlmTmuxSessionMenuCache(profile.id, cwd, widget.workspaceId, llmId);
-  const agentBridge = await prepareAgentBridgeForLlmLaunch(llmId, profile, cwd);
-  const { define, call } = llmLauncherParts(llmId, profile.kind, widget.workspaceId, tmuxSessionName, { agentBridge });
+  const agentBridge = options.attachExistingOnly
+    ? null
+    : await prepareAgentBridgeForLlmLaunch(llmId, profile, cwd);
+  if (
+    terminalWidgetById.get(widget.widgetId) !== widget
+    || !widget.element.isConnected
+    || !llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)
+  ) return null;
+  let prepared: PreparedLlmLauncherParts;
+  try {
+    prepared = await prepareLlmLauncherParts(
+      llmId,
+      profile,
+      cwd,
+      workspaceId,
+      requestedSessionName,
+      { agentBridge, attachExistingOnly: options.attachExistingOnly }
+    );
+  } catch (error) {
+    setStatus(`Failed to prepare ${llmId} launcher: ${String(error)}`, true);
+    return null;
+  }
+  if (
+    terminalWidgetById.get(widget.widgetId) !== widget
+    || !widget.element.isConnected
+    || !llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)
+  ) {
+    return null;
+  }
+  const { define, call, tmuxSessionName, windowsLlmTmuxManaged } = prepared;
+  if (!requestedSessionName) invalidateLlmTmuxSessionMenuCache(profile.id, cwd, workspaceId, llmId);
   const title = options.title ?? llmTmuxTabTitle(llmId, tmuxSessionName);
-  const pane = await createTerminalTab(widget, define, title, {
-    profile,
-    cwd,
-    pythonEnv: active?.activePythonEnv,
-    llmId,
-    llmTmuxSessionName: tmuxSessionName
-  });
-  if (!pane?.backendId) return pane;
+  let pane: TerminalPane | null;
+  try {
+    pane = await createTerminalTab(widget, define, title, {
+      profile,
+      cwd,
+      pythonEnv: active?.activePythonEnv,
+      llmId,
+      llmTmuxSessionName: tmuxSessionName,
+      llmTmuxAttachOnly: options.attachExistingOnly === true,
+      windowsLlmTmuxManaged
+    });
+  } catch (error) {
+    setStatus(`Failed to create ${llmId} terminal tab: ${String(error)}`, true);
+    return null;
+  }
+  if (!pane?.backendId) {
+    return pane;
+  }
+  if (!llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId) || !isTerminalPaneAlive(pane)) {
+    if (isTerminalPaneAlive(pane)) {
+      await closeTerminalPane(pane.paneId, {
+        backgroundKill: true,
+        saveSnapshot: false,
+        renderShellTabs: false
+      });
+    }
+    return null;
+  }
   await registerAgentBridgeForPane(pane, agentBridge);
   markWorkspaceLlmActivityForPane(pane, WORKSPACE_LLM_START_ACTIVE_MS);
   scheduleWorkspaceLlmTmuxTitlePoll(pane, 1000);
@@ -35540,7 +35940,7 @@ async function createLlmTmuxTabInWidget(
 async function showLlmTmuxSessionMenu(widget: TerminalWidget, anchor: HTMLElement) {
   const llmId = terminalWidgetLauncherLlmId(widget);
   const profile = profileForTerminalWidget(widget);
-  if (!llmId || !profile || profile.kind === 'windows') return;
+  if (!llmId || !profile || (profile.kind === 'windows' && !windowsLlmButtonUsesTmux(llmId))) return;
   const active = activePaneForWidget(widget);
   const cwd = active?.cwd ?? workspaceShellCwd();
   const agent = agentAlertAgentLabel(llmId);
@@ -35654,7 +36054,8 @@ function llmTmuxSessionMenuItemsFromResult(
       action: () => {
         void createLlmTmuxTabInWidget(widget, llmId, {
           sessionName: session.name,
-          title: llmTmuxTabTitle(llmId, session.name)
+          title: llmTmuxTabTitle(llmId, session.name),
+          attachExistingOnly: true
         });
       }
     });
@@ -35735,23 +36136,64 @@ async function splitTerminalPane(pane: TerminalPane, direction: TerminalSplitDir
   if (!widget) return;
   const profile = profileForIdWithWindowsFallback(pane.profileId) ?? state.activeProfile;
   if (!profile) return;
-  const tmuxSessionName = pane.llmId
-    ? await nextLlmTmuxSessionName(profile, pane.cwd, pane.workspaceId, pane.llmId)
-    : undefined;
+  const workspaceId = pane.workspaceId;
   const agentBridge = pane.llmId ? await prepareAgentBridgeForLlmLaunch(pane.llmId, profile, pane.cwd) : null;
-  const llmParts = pane.llmId ? llmLauncherParts(pane.llmId, profile.kind, pane.workspaceId, tmuxSessionName, { agentBridge }) : null;
+  if (!isTerminalPaneAlive(pane) || !llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)) return;
+  let llmParts: PreparedLlmLauncherParts | null = null;
+  if (pane.llmId) {
+    try {
+      llmParts = await prepareLlmLauncherParts(
+        pane.llmId,
+        profile,
+        pane.cwd,
+        workspaceId,
+        undefined,
+        { agentBridge }
+      );
+    } catch (error) {
+      setStatus(`Failed to prepare ${pane.llmId} launcher: ${String(error)}`, true);
+      return;
+    }
+  }
+  if (!isTerminalPaneAlive(pane) || !llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)) {
+    return;
+  }
+  const tmuxSessionName = llmParts?.tmuxSessionName;
+  const windowsLlmTmuxManaged = llmParts?.windowsLlmTmuxManaged;
   const command = llmParts ? llmParts.define : pane.command;
   const title = pane.llmId ? llmTmuxTabTitle(pane.llmId, tmuxSessionName) : (pane.title.replace(/\s+\(exited\)$/i, '') || 'shell');
-  const newPane = await createTerminalTab(widget, command, title, {
-    profile,
-    cwd: pane.cwd,
-    splitTargetPaneId: pane.paneId,
-    splitDirection: direction,
-    pythonEnv: pane.activePythonEnv,
-    llmId: pane.llmId,
-    llmTmuxSessionName: tmuxSessionName
-  });
-  if (!newPane) return;
+  let newPane: TerminalPane | null;
+  try {
+    newPane = await createTerminalTab(widget, command, title, {
+      profile,
+      cwd: pane.cwd,
+      splitTargetPaneId: pane.paneId,
+      splitDirection: direction,
+      pythonEnv: pane.activePythonEnv,
+      llmId: pane.llmId,
+      llmTmuxSessionName: tmuxSessionName,
+      windowsLlmTmuxManaged
+    });
+  } catch (error) {
+    setStatus(`Failed to create terminal split: ${String(error)}`, true);
+    return;
+  }
+  if (!newPane) {
+    return;
+  }
+  if (!newPane.backendId && pane.llmId) {
+    return;
+  }
+  if (!isTerminalPaneAlive(newPane) || !llmLaunchWorkspaceScopeIsCurrent(profile, workspaceId)) {
+    if (isTerminalPaneAlive(newPane)) {
+      await closeTerminalPane(newPane.paneId, {
+        backgroundKill: true,
+        saveSnapshot: false,
+        renderShellTabs: false
+      });
+    }
+    return;
+  }
   if (llmParts && newPane.backendId) {
     await registerAgentBridgeForPane(newPane, agentBridge);
     markWorkspaceLlmActivityForPane(newPane, WORKSPACE_LLM_START_ACTIVE_MS);
@@ -38080,6 +38522,10 @@ function currentBrowserForwardScope(profile = state.activeProfile): BrowserForwa
   };
 }
 
+function browserForwardStartKey(scope: BrowserForwardScope, port: number) {
+  return JSON.stringify([scope.workspaceId, scope.profileId, scope.root, port]);
+}
+
 function browserForwardScopeIsActive(scope: BrowserForwardScope) {
   return state.activeWorkspaceId === scope.workspaceId
     && state.activeProfile?.id === scope.profileId
@@ -38092,12 +38538,42 @@ function cachedBrowserForwardScope(scope: BrowserForwardScope) {
   return snapshot?.profileId === scope.profileId && snapshot.root === scope.root ? runtime ?? null : null;
 }
 
+function ensureCachedBrowserForwardScope(scope: BrowserForwardScope) {
+  const cached = cachedBrowserForwardScope(scope);
+  if (cached) return cached;
+  if (!browserForwardScopeIsActive(scope)) return null;
+  const snapshot = workspaceSnapshotForId(scope.workspaceId);
+  if (snapshot?.profileId !== scope.profileId || snapshot.root !== scope.root) return null;
+  const runtime: WorkspaceRuntimeCache = {
+    // A browser-only cache may be created while a workspace restore is partial.
+    // Empty editor/explorer fields deliberately fall back to the persisted snapshot.
+    editorTabs: [],
+    activeEditorTabId: '',
+    editorPanes: [],
+    activeEditorPaneId: '',
+    editorSplitLayout: null,
+    browserTabs: snapshotBrowserTabsForRuntime(),
+    browserHistory: currentBrowserHistorySnapshot(),
+    activeBrowserTabId: state.activeBrowserTabId,
+    previewUrl: state.previewUrl,
+    forwards: state.forwards.map((forward) => ({ ...forward })),
+    detectedPorts: state.detectedPorts.map((port) => ({ ...port })),
+    previewProxies: snapshotPreviewProxiesForRuntime(),
+    browserConsoleLogs: snapshotBrowserConsoleLogsForRuntime()
+  };
+  workspaceRuntimeCache.set(scope.workspaceId, runtime);
+  return runtime;
+}
+
 function adoptBrowserForward(scope: BrowserForwardScope, forward: PortForwardResult) {
+  const runtime = ensureCachedBrowserForwardScope(scope);
   if (browserForwardScopeIsActive(scope)) {
     addForward(forward);
+    if (runtime && !runtime.forwards.some((candidate) => candidate.id === forward.id)) {
+      runtime.forwards.push({ ...forward });
+    }
     return 'active' as const;
   }
-  const runtime = cachedBrowserForwardScope(scope);
   if (runtime) {
     if (!runtime.forwards.some((candidate) => candidate.id === forward.id)) {
       runtime.forwards.push({ ...forward });
@@ -38108,11 +38584,55 @@ function adoptBrowserForward(scope: BrowserForwardScope, forward: PortForwardRes
   return 'stopped' as const;
 }
 
-function forgetBrowserForwardForScope(scope: BrowserForwardScope, id: string) {
+function startBrowserForwardForScope(
+  scope: BrowserForwardScope,
+  profileKind: ConnectionProfile['kind'],
+  remotePort: number,
+  localPort?: number
+): Promise<BrowserForwardStartResult> {
+  const key = browserForwardStartKey(scope, remotePort);
+  const pending = browserForwardStarts.get(key);
+  if (pending) return pending;
+
   if (browserForwardScopeIsActive(scope)) {
+    let existing = forwardForRemotePort(remotePort);
+    if (!existing && restoringWorkspace) {
+      existing = cachedBrowserForwardScope(scope)?.forwards.find((forward) => (
+        forward.remotePort === remotePort
+      )) ?? null;
+      if (existing) {
+        existing = { ...existing };
+        addForward(existing);
+      }
+    }
+    if (existing) {
+      removeDetectedPortForScope(scope, remotePort);
+      return Promise.resolve({ forward: existing, disposition: 'active' });
+    }
+  }
+
+  const request = localPort === undefined
+    ? startForwardForProfile(scope.profileId, profileKind, remotePort)
+    : api.startPortForward(scope.profileId, remotePort, localPort);
+  let started!: Promise<BrowserForwardStartResult>;
+  started = request
+    .then((forward) => {
+      const disposition = adoptBrowserForward(scope, forward);
+      if (disposition !== 'stopped') removeDetectedPortForScope(scope, remotePort);
+      return { forward, disposition };
+    })
+    .finally(() => {
+      if (browserForwardStarts.get(key) === started) browserForwardStarts.delete(key);
+    });
+  browserForwardStarts.set(key, started);
+  return started;
+}
+
+function forgetBrowserForwardForScope(scope: BrowserForwardScope, id: string) {
+  const active = browserForwardScopeIsActive(scope);
+  if (active) {
     removeForwardById(id);
     renderForwards();
-    return;
   }
   const runtime = cachedBrowserForwardScope(scope);
   if (!runtime) return;
@@ -38145,6 +38665,11 @@ function detectedPortForId(id: string) {
 function addDetectedPort(port: DetectedPortItem) {
   state.detectedPorts.push(port);
   rememberDetectedPort(port);
+  const scope = currentBrowserForwardScope();
+  const runtime = scope?.profileId === port.profileId ? ensureCachedBrowserForwardScope(scope) : null;
+  if (runtime && !runtime.detectedPorts.some((candidate) => candidate.id === port.id)) {
+    runtime.detectedPorts.push({ ...port });
+  }
 }
 
 function removeDetectedPortById(id: string) {
@@ -38155,12 +38680,28 @@ function removeDetectedPortById(id: string) {
   const removed = state.detectedPorts[index];
   forgetDetectedPort(removed);
   state.detectedPorts.splice(index, 1);
+  const scope = currentBrowserForwardScope();
+  const runtime = scope?.profileId === removed.profileId ? cachedBrowserForwardScope(scope) : null;
+  const cachedIndex = runtime?.detectedPorts.findIndex((candidate) => candidate.id === removed.id) ?? -1;
+  if (runtime && cachedIndex >= 0) runtime.detectedPorts.splice(cachedIndex, 1);
   return removed;
 }
 
+function removeDetectedPortForScope(scope: BrowserForwardScope, port: number) {
+  const id = detectedPortId(scope.profileId, port);
+  const activeRemoved = browserForwardScopeIsActive(scope) ? removeDetectedPortById(id) : null;
+  const runtime = cachedBrowserForwardScope(scope);
+  if (!runtime) return activeRemoved;
+  const index = runtime.detectedPorts.findIndex((candidate) => candidate.id === id);
+  if (index < 0) return activeRemoved;
+  const cachedRemoved = runtime.detectedPorts.splice(index, 1)[0] ?? null;
+  return activeRemoved ?? cachedRemoved;
+}
+
 async function startForward() {
-  if (!state.activeProfile) return;
-  const scope = currentBrowserForwardScope();
+  const profile = state.activeProfile;
+  if (!profile) return;
+  const scope = currentBrowserForwardScope(profile);
   if (!scope) return;
   const profileId = scope.profileId;
   const remotePort = Number(el.remotePort.value);
@@ -38170,8 +38711,13 @@ async function startForward() {
     return;
   }
   try {
-    const forward = await api.startPortForward(profileId, remotePort, localPort);
-    if (adoptBrowserForward(scope, forward) !== 'active') return;
+    const { forward, disposition } = await startBrowserForwardForScope(
+      scope,
+      profile.kind,
+      remotePort,
+      localPort
+    );
+    if (disposition !== 'active' || !browserForwardScopeIsActive(scope)) return;
     removeDetectedPortById(detectedPortId(profileId, remotePort));
     renderForwards();
     await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
@@ -38226,18 +38772,16 @@ async function openLocalPreviewUrl(url: URL) {
     return;
   }
 
-  let forward: PortForwardResult;
   try {
-    forward = await startForwardForProfile(scope.profileId, profile.kind, port);
+    const { forward, disposition } = await startBrowserForwardForScope(scope, profile.kind, port);
+    if (disposition !== 'active' || !browserForwardScopeIsActive(scope)) return;
+    removeDetectedPortById(detectedPortId(scope.profileId, port));
+    renderForwards();
+    await openLocalBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
+    setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
   } catch (error) {
     if (browserForwardScopeIsActive(scope)) setStatus(String(error), true);
-    return;
   }
-  if (adoptBrowserForward(scope, forward) !== 'active') return;
-  removeDetectedPortById(detectedPortId(scope.profileId, port));
-  renderForwards();
-  await openLocalBrowserTab(`${forward.url}${suffix}`, browserTabLabel(url.toString()));
-  setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
 }
 
 async function canUseDirectLocalPreview(url: string) {
@@ -38690,7 +39234,7 @@ function runTerminalPortScan(pane: TerminalPane) {
   if (!terminalOutputMayContainPreviewPortHint(cleanOutput)) return;
   const found = detectNewLocalServerPorts(cleanOutput, pane.seenPorts, (port, autoForward) => {
     queueDetectedPort(port, pane, autoForward);
-  }, !IS_TERMINAL_APP);
+  }, false);
   if (found) pane.outputBuffer = '';
 }
 
@@ -39168,17 +39712,21 @@ function flushTerminalCwdSnapshotSave() {
   saveActiveWorkspaceSnapshot({ immediate: true });
 }
 
-async function openPort(port: number, source: 'manual' | 'auto') {
+async function openPort(
+  port: number,
+  source: 'manual' | 'auto',
+  options: { openBrowser?: boolean } = {}
+) {
   if (!state.activeProfile || !isPreviewPort(port)) return;
   const profile = state.activeProfile;
   const scope = currentBrowserForwardScope(profile);
   if (!scope) return;
-  const key = `${scope.workspaceId}:${profile.id}:${port}`;
+  const openBrowser = options.openBrowser !== false;
   const existing = forwardForRemotePort(port);
   if (existing) {
     removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
-    await openLocalBrowserTab(existing.url, portTabLabel(existing.localPort));
+    if (openBrowser) await openLocalBrowserTab(existing.url, portTabLabel(existing.localPort));
     if (source === 'auto') setStatus(`Detected port ${port}; using ${existing.url}`);
     return;
   }
@@ -39187,19 +39735,17 @@ async function openPort(port: number, source: 'manual' | 'auto') {
     const url = `http://127.0.0.1:${port}`;
     removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
-    await openLocalBrowserTab(url, portTabLabel(port));
+    if (openBrowser) await openLocalBrowserTab(url, portTabLabel(port));
     setStatus(source === 'auto' ? `Detected local server on ${url}` : `Previewing ${url}`);
     return;
   }
 
-  if (autoForwardingPorts.has(key)) return;
-  autoForwardingPorts.add(key);
   try {
-    const forward = await startForwardForProfile(scope.profileId, profile.kind, port);
-    if (adoptBrowserForward(scope, forward) !== 'active') return;
+    const { forward, disposition } = await startBrowserForwardForScope(scope, profile.kind, port);
+    if (disposition !== 'active' || !browserForwardScopeIsActive(scope)) return;
     removeDetectedPortById(detectedPortId(profile.id, port));
     renderForwards();
-    await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
+    if (openBrowser) await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
     setStatus(source === 'auto'
       ? `Detected port ${port}; forwarding ${forward.url}`
       : `Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
@@ -39210,8 +39756,6 @@ async function openPort(port: number, source: 'manual' | 'auto') {
     } else {
       setStatus(`Detected port ${port}, but auto forward failed: ${String(error)}`, true);
     }
-  } finally {
-    autoForwardingPorts.delete(key);
   }
 }
 
@@ -39227,12 +39771,26 @@ function queueDetectedPort(port: number, pane?: TerminalPane, autoForward = fals
   }
   const id = detectedPortId(profile.id, port);
   const url = `http://127.0.0.1:${port}`;
-  if (detectedPortForId(id)) return;
-  if (browserTabForUrl(url)) return;
+  const shouldAutoForward = autoForward && profile.kind !== 'windows';
+  if (detectedPortForId(id)) {
+    if (shouldAutoForward) {
+      setStatus(`Detected local server on :${port}; auto-forwarding`);
+      void openPort(port, 'auto', { openBrowser: false });
+    }
+    return;
+  }
+  // A persisted Browser tab can outlive its runtime-only forward. A confirmed
+  // server must be allowed to recreate that forward after an app/workspace restore.
+  if (browserTabForUrl(url) && !shouldAutoForward) return;
 
   addDetectedPort({ id, profileId: profile.id, port, url });
   renderForwards();
   logBrowserConsole('info', `Detected local server on ${url}`);
+  if (shouldAutoForward) {
+    setStatus(`Detected local server on :${port}; auto-forwarding`);
+    void openPort(port, 'auto', { openBrowser: false });
+    return;
+  }
   setStatus(isBrowserPanelHidden()
     ? `Detected local server on :${port}; open Browser to preview`
     : `Detected local server on :${port}`);
@@ -39857,6 +40415,13 @@ function updateForwardRowElement(
       const id = row.dataset.forwardId ?? '';
       if (!id) return;
       if (row.dataset.forwardKind === 'detected') {
+        const detected = detectedPortForId(id);
+        if (detected) {
+          for (const pane of state.terminals) {
+            if (pane.workspaceId !== state.activeWorkspaceId || pane.profileId !== detected.profileId) continue;
+            pane.seenPorts.add(detected.port);
+          }
+        }
         removeDetectedPortById(id);
         renderForwards();
         return;
@@ -42644,12 +43209,11 @@ function maybeAutoForwardBrowserLocalUrl(message: string) {
     if (!isPreviewPort(port)) continue;
     if (isPreviewProxyLocalPort(port)) continue;
     if (forwardForRemotePort(port)) continue;
-    const key = `browser-dep:${scope.workspaceId}:${profileId}:${port}`;
-    if (autoForwardingPorts.has(key)) continue;
-    autoForwardingPorts.add(key);
-    void startForwardForProfile(scope.profileId, profile.kind, port)
-      .then((forward) => {
-        if (adoptBrowserForward(scope, forward) !== 'active') return;
+    if (browserForwardStarts.has(browserForwardStartKey(scope, port))) continue;
+    void startBrowserForwardForScope(scope, profile.kind, port)
+      .then(({ forward, disposition }) => {
+        if (disposition !== 'active' || !browserForwardScopeIsActive(scope)) return;
+        removeDetectedPortById(detectedPortId(profileId, port));
         renderForwards();
         logBrowserConsole('info', `Auto forwarded browser dependency port ${port}`);
       })
@@ -42657,8 +43221,7 @@ function maybeAutoForwardBrowserLocalUrl(message: string) {
         if (browserForwardScopeIsActive(scope)) {
           logBrowserConsole('warn', `Auto forward for browser dependency port ${port} failed: ${String(error)}`);
         }
-      })
-      .finally(() => autoForwardingPorts.delete(key));
+      });
   }
 }
 

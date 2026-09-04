@@ -175,6 +175,13 @@ export interface LlmTmuxSessionListResult {
   message?: string | null;
 }
 
+export interface WindowsLlmTmuxPrepareResult {
+  available: boolean;
+  sessionName?: string | null;
+  created: boolean;
+  message?: string | null;
+}
+
 export interface LlmTmuxPaneTitleResult {
   available: boolean;
   sessionName: string;

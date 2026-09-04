@@ -211,7 +211,9 @@ Codex와 Claude 버튼은 alias/function/wrapper 내용을 해석하지 않고 �
 
 ### tmux 재접속
 
-WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmux`가 설치된 경우 workspace+agent 단위 session으로 실행합니다.
+WSL/SSH 같은 POSIX shell에서 LLM 버튼을 누르거나 Windows에서 Codex/Claude 버튼을 누르면, `tmux`가 설치된 경우 workspace+agent 단위 session으로 실행합니다. Windows에서는 새 `powershell.exe -NoProfile`에서도 찾을 수 있는 표준 tmux 호환 executable/`.cmd`/`.ps1` 명령이 필요합니다.
+
+Windows용 shim은 인자 경계/순서와 exit code(특히 `-L simple-vibe-ide`와 literal `;` command queue)를 그대로 전달하고, `list-sessions -F`, exact `=name` 대상의 `has-session`/`attach-session`/`kill-session`, `new-session -d`, `set-option`/`show-options`, `@simple-vibe-ide-launch-owner`, `destroy-unattached`, `remain-on-exit`을 지원해야 합니다. `list-sessions`/`show-options`의 stdout에는 shim banner를 섞지 않아야 합니다. pane shell에서는 `powershell.exe`를 찾을 수 있어야 하며 detached server는 launcher/client 종료 후에도 살아 있어야 합니다. Windows 세션은 기존 default server가 IDE cleanup Job 아래에서 만들어진 경우까지 분리하기 위해 전용 `simple-vibe-ide` server namespace를 씁니다. 외부 client에서는 `tmux -L simple-vibe-ide ...`로 접근합니다. PowerShell profile에만 둔 alias/function은 대상이 아닙니다. 명령을 찾았지만 이 계약대로 session을 만들지 못하면 중복 agent를 막기 위해 direct 실행으로 fallback하지 않고 오류로 중단합니다.
 
 - 같은 workspace의 같은 agent를 여러 번 누르면 `codex #1`, `codex #2`처럼 별도 session/tab이 생깁니다.
 - LLM widget의 `+` 버튼은 plain shell 대신 같은 agent의 새 tmux session tab을 추가합니다.
@@ -220,8 +222,11 @@ WSL/SSH 같은 POSIX shell에서 Codex/Claude/Grok/Agy 버튼을 누르면, `tmu
 - `Kill`은 해당 tmux session 자체를 종료합니다. tab의 `x`는 IDE tab/PTY만 닫고 tmux session은 죽이지 않습니다.
 - `Kill all`은 현재 목록에 보이는 해당 LLM session만 확인 후 종료합니다.
 - stale-output probe는 진단 경고만 남기며 기존 PTY를 자동 종료/재접속하지 않습니다. 화면이 멈춘 경우 `Tmux` 메뉴에서 같은 session을 새 tab으로 직접 attach하세요.
-- IDE가 만든 session은 전역 tmux 설정을 바꾸지 않고 `destroy-unattached off`를 session 단위로 강제합니다. IDE client가 끊겨도 session을 유지하고, agent command가 종료되면 `remain-on-exit` dead-pane에 실제 status와 마지막 출력을 남깁니다. 새 launcher marker는 `__svi_launch_v=8`입니다.
-- `tmux`가 없거나 Windows profile이면 기존처럼 직접 실행합니다.
+- IDE가 만든 session은 전역 tmux 설정을 바꾸지 않고 `destroy-unattached off`를 session 단위로 강제합니다. IDE client가 끊겨도 session을 유지하고, agent command가 종료되면 `remain-on-exit` dead-pane에 실제 status와 마지막 출력을 남깁니다. 새 launcher marker는 `__svi_launch_v=9`입니다.
+- Windows Codex/Claude session은 terminal PTY의 cleanup process tree 밖에서 먼저 만든 뒤 IDE terminal은 attach만 합니다. 실제 생존 여부는 사용 중인 Windows tmux 구현도 detached server semantics를 지켜야 합니다.
+- backend가 session 생성을 확인한 뒤에는 workspace 전환이나 attach PTY 실패를 이유로 자동 Kill하지 않습니다. 생성된 session의 종료는 `Tmux` 메뉴의 명시적 `Kill`로만 수행합니다.
+- Windows Codex/Claude widget에서도 tmux 목록/attach/Kill 메뉴를 사용할 수 있습니다. POSIX 전용 title/stale-output probe는 Windows tmux에서 실행하지 않습니다.
+- 새 Windows Codex/Claude 버튼 실행에서 `tmux`가 없으면 기존처럼 직접 실행합니다. 단, 이미 v9 Windows tmux session으로 저장된 pane을 복원할 때 명령이 일시적으로 사라졌다면 살아 있는 agent와 중복되지 않도록 direct 실행하지 않고 복원을 보류합니다. Windows Grok/Agy 버튼은 이번 변경 대상이 아니므로 직접 실행합니다.
 
 ### Agent bridge와 알림
 
@@ -371,7 +376,7 @@ When asking an LLM or coding agent to install, build, or verify the app, provide
 - Workspace restore respects the last saved state. If the last state had no terminal widgets, no fallback `shell` is created.
 - `Use This Folder` changes the IDE workspace root without auto-spawning a shell. Use `+shell`, `Win`, or an LLM launcher when you need one.
 - While the app is running, switching workspace tabs keeps live shell/LLM processes alive.
-- After app close, rebuild, or memory-saver sleep, OS processes are not snapshotted. The UI/context is restored and shells start fresh when needed.
+- After app close, rebuild, or memory-saver sleep, ordinary IDE-owned OS processes are not snapshotted. The UI/context is restored and shells start fresh when needed; explicitly detached tmux sessions are the exception and reconnect through a fresh client.
 - Terminal responsiveness is the primary product constraint. Fast direct PTY I/O takes priority over restart persistence.
 
 ## Highlights
@@ -542,7 +547,9 @@ The Codex and Claude buttons do not inspect alias, function, or wrapper source. 
 
 ### tmux Attach/Reconnect
 
-On POSIX profiles such as WSL/SSH, LLM launchers use `tmux` when it is installed.
+On POSIX profiles such as WSL/SSH, LLM launchers use `tmux` when it is installed. The Windows Codex and Claude buttons do the same when a standard tmux-compatible executable, `.cmd`, or `.ps1` is discoverable from a fresh `powershell.exe -NoProfile` process.
+
+A Windows shim must preserve argument boundaries/order and exit status (including `-L simple-vibe-ide` and the literal `;` command queue), and support `list-sessions -F`, exact `=name` targets for `has-session`/`attach-session`/`kill-session`, `new-session -d`, `set-option`/`show-options`, `@simple-vibe-ide-launch-owner`, `destroy-unattached`, and `remain-on-exit`. It must not mix shim banners into the machine-readable stdout of `list-sessions` or `show-options`. Its pane shell must resolve `powershell.exe`, and its detached server must outlive the launcher/client. Windows sessions use the dedicated `simple-vibe-ide` server namespace so a pre-existing default server cannot inherit the IDE terminal cleanup lifetime; external clients should use `tmux -L simple-vibe-ide ...`. A profile-only alias or function is not supported. If tmux is discovered but cannot create a session under this contract, the launcher stops with an error instead of falling back to a duplicate direct agent.
 
 - Repeated launches for the same agent/workspace create numbered sessions such as `codex #1`, `codex #2`.
 - The `+` button in an LLM widget creates another session tab for the same agent instead of a plain shell.
@@ -551,8 +558,11 @@ On POSIX profiles such as WSL/SSH, LLM launchers use `tmux` when it is installed
 - `Kill` terminates the tmux session. Closing the IDE tab only closes the local PTY/tab.
 - `Kill all` terminates only the currently listed sessions for that LLM after confirmation.
 - Stale-output probes only report diagnostics; they do not automatically terminate or reconnect the current PTY. If a pane appears frozen, attach the same session in a new tab from `Tmux`.
-- IDE-created sessions override `destroy-unattached off` for that session without changing the user's global tmux defaults. A lost IDE client therefore leaves the session alive, while `remain-on-exit` retains an agent-exited pane with its last output and real status. The new launcher marker is `__svi_launch_v=8`.
-- If `tmux` is missing or the profile is Windows, launchers run directly.
+- IDE-created sessions override `destroy-unattached off` for that session without changing the user's global tmux defaults. A lost IDE client therefore leaves the session alive, while `remain-on-exit` retains an agent-exited pane with its last output and real status. The new launcher marker is `__svi_launch_v=9`.
+- Windows Codex/Claude sessions are created before the terminal PTY, outside its cleanup process tree; the IDE terminal then performs attach only. The Windows tmux implementation must still provide normal detached-server semantics for the session to survive.
+- After the backend confirms creation, workspace changes and attach-PTY failures do not auto-kill the durable session. Session termination remains an explicit `Kill` action in the `Tmux` menu.
+- The tmux list/attach/Kill menu is available in Windows Codex/Claude widgets. POSIX-only title and stale-output probes remain disabled for Windows tmux.
+- A fresh Windows Codex/Claude button launch runs directly if `tmux` is missing. A pane already saved as a v9 Windows tmux session instead defers restore while tmux is unavailable, avoiding a duplicate direct agent beside a potentially live session. Windows Grok/Agy buttons remain direct and are outside this change.
 
 ### Agent Bridge And Alerts
 
@@ -660,7 +670,7 @@ The built-in preview is for quick validation. Use a normal browser when extensio
 - WSL UNC checkouts may need polling file watching, `pushd`/mapped-drive command execution, and a Windows-local Cargo target directory for reliable Windows dev builds.
 - SSH file operations assume a POSIX remote with common tools such as `sh`, `find`, `cat`, `base64`, and `tar`.
 - Large remote image previews pass through the Tauri command channel, so they may feel slower than local Windows/WSL previews.
-- Workspace restore saves UI/work context, but long-running shell processes are recreated rather than resumed from process snapshots.
+- Workspace restore saves UI/work context, but ordinary long-running shell processes are recreated rather than resumed from process snapshots. Explicitly detached tmux sessions are reattached instead of process-snapshotted.
 - Drag out depends on WebView2 accepting `DownloadURL`/`file://` drag data. Use `Open` as the fallback when needed.
 - Capture protection depends on Windows and the capture backend used by the streaming or screen-sharing tool.
 - There is no signed installer or stable release channel yet.

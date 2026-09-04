@@ -43,14 +43,104 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 - Most recent relevant commit before this handoff: `b34fcaf Restore`.
 - Runtime keep-alive and pty-host reattach were removed because they harmed the
   primary product goal: a very responsive shell-first IDE.
-- Workspace snapshots still restore UI/work context, but shell processes are
-  recreated after app close/rebuild rather than reattached.
+- Workspace snapshots still restore UI/work context. Ordinary shell processes are recreated after
+  app close/rebuild; explicitly detached tmux sessions are the reattach exception.
 - Keep browser preview fixes general. The active path is a scoped Tauri child
   WebView when capture protection is off, with iframe fallback for capture-safe
   workspaces. Edge CDP preview remains disabled because earlier attempts caused
   startup freeze/endpoint readiness issues.
 
 ## Patch Notes
+
+### 2026-09-05 - Use Windows tmux for the Codex and Claude launcher buttons
+
+#### Changed (`src/main.ts`, `src/api.ts`, `src/types.ts`, `src-tauri/`, terminal docs)
+- Scoped Windows tmux support to the Codex and Claude buttons. If a standard tmux-compatible
+  executable, `.cmd`, or `.ps1` is visible to a fresh no-profile PowerShell, the backend creates a
+  numbered detached session before the IDE terminal starts and the terminal types an attach-only
+  command. Missing tmux keeps the existing direct launcher for a fresh button/legacy pane;
+  restoring an already-managed v9 identity fails closed instead. Grok/Agy remain direct on Windows.
+- The detached create control process is kept outside the app child-cleanup Job and does not expose
+  Rust capture pipes. Session creation, `destroy-unattached off`, `remain-on-exit`, and a final
+  ownership/completion marker are submitted in one tmux command queue with exact session/pane
+  targets. Until that marker is verified, cancel/timeout performs tree cleanup; after an exact-owner
+  recovery it unregisters the controller and kills only that stuck controller PID so the detached
+  session is not mistaken for an IDE-owned process tree.
+- Windows invocations use the dedicated `-L simple-vibe-ide` server namespace. This prevents a
+  default tmux server that was previously born under an IDE terminal Job from lending that doomed
+  process lifetime to new button sessions.
+- `.ps1` tmux shims run in a nested PowerShell process for list/create/attach/Kill and in-pane setup.
+  A wrapper ending in `exit $LASTEXITCODE` therefore cannot terminate the IDE terminal's root
+  PowerShell or skip the actual Codex/Claude launch.
+- A discovered tmux that cannot safely confirm creation now fails closed rather than falling back to
+  a second direct agent. Cross-process name collisions are retried only when an ownership marker
+  proves that another launch claimed the name; ambiguous partial creation stops without fan-out.
+- Once creation is confirmed, the session is durable user state and is never auto-killed because a
+  workspace changed or an attach PTY failed. The Windows Codex/Claude `Tmux` menu is the explicit
+  list/reattach/Kill control. A persisted Windows-managed marker distinguishes real v9 tmux
+  identities from older speculative `#1` metadata; legacy panes receive stable per-pane numbered
+  names so panes within one restored layout do not collapse onto one agent. Launcher marker is v9.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- Host and `x86_64-pc-windows-msvc` `cargo check`
+- `git diff --check`
+- Real Windows runtime validation with the user's custom tmux command remains required, especially
+  `.ps1` wrapper exit isolation, two numbered button launches, tab/app-close survival, and reattach.
+
+### 2026-09-04 - Restore IDE automatic port forwarding
+
+#### Changed (`src/main.ts`, Browser docs)
+- Confirmed the forwarding backend was healthy because manual Browser forwarding and automatic
+  forwarding share the same API. The IDE terminal scanner already classified high-confidence server
+  output, but its Browser branch discarded that decision and always left a pending manual row.
+- High-confidence WSL/SSH server output now starts a workspace/profile/root-scoped forward automatically.
+  This only prepares the Windows localhost endpoint; it does not open the hidden Browser panel or create
+  a preview WebView, preserving the existing terminal-output performance boundary.
+- Low-confidence matches remain pending and can later upgrade when the terminal prints a confirmed
+  startup line. A restored Browser tab no longer suppresses recreation of its runtime-only forward.
+- Browser Advanced, address-bar preview, detected-port, and Browser-console starts now share one
+  in-flight request per workspace/profile/root/port. Pending rows and completed forwards are mirrored
+  into the browser runtime cache so a workspace switch or partial restore cannot lose or leak them.
+- Windows-profile ports remain direct localhost entries and ambiguous/error-like output still requires
+  explicit user confirmation.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- Isolated detection/integration fixtures covered Vite, Uvicorn, Python HTTP server, bare URLs,
+  error/refused output, low-confidence-to-confirmed upgrades, and the no-auto-open Browser guard.
+- Real Windows/WebView2 WSL/SSH forwarding smoke remains to be run.
+
+### 2026-08-28 - Preserve editor position across workspace switches
+
+#### Changed (`src/main.ts`)
+- Confirmed the editor jump was IDE-side: switching workspaces cached each open document but destroyed
+  its CodeMirror view without retaining the selection or viewport, so returning created a new view at
+  the start of the file.
+- Added a transient per-tab CodeMirror view snapshot using the editor's supported `scrollSnapshot()`
+  restore path. Workspace and editor-tab switches now retain the exact vertical/horizontal viewport
+  and selection when the document and render mode still match.
+- Workspace switching captures every visible editor split pane before teardown. The view snapshot stays
+  in the in-memory workspace cache only and is not written to the persistent JSON workspace store.
+- Replacing a tab's file clears the transient snapshot so an unrelated or externally refreshed document
+  cannot inherit stale editor coordinates.
+
+#### Verification
+- `npm run check`
+- `npm run build`
+- `npm run build:terminal`
+- `git diff --check`
+- An isolated headless Chromium CodeMirror recreation fixture preserved a manually scrolled viewport
+  (`scrollTop=6400`, `scrollLeft=160`) while the cursor remained near the start of the document.
+- Real Windows/WebView2 switching should still be manually smoked with a long file, including a viewport
+  that is far from the cursor and (if used) separate positions in split editor panes.
 
 ### 2026-08-28 - Extend OpenTUI redraw compatibility to OpenCode
 

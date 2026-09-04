@@ -122,8 +122,48 @@ The script runs:
 - Confirm both CLIs enter their bypass/no-approval mode and do not ask for an
   approval on a harmless read-only action. Do not use a destructive action for
   this smoke.
+- Put a standard tmux-compatible executable, `.cmd`, or `.ps1` on the app's
+  inherited Windows `PATH` (not only in a PowerShell profile), then launch the
+  Windows Codex and Claude buttons twice, including rapid repeated clicks.
+  Confirm `#1` and `#2` are separate, `Tmux` lists them, exact-session
+  attach/Kill works, and each bypass flag still appears exactly once. Repeat
+  from a workspace path containing spaces and an apostrophe.
+- Confirm every Windows tmux client invocation begins with
+  `-L simple-vibe-ide` (the compound command queue carries it once before
+  `new-session`). Start an unrelated default tmux server first, then verify the
+  button sessions use only the dedicated namespace and survive independently.
+  From an external client, confirm `tmux -L simple-vibe-ide list-sessions` sees
+  the IDE sessions.
+- Confirm the shim writes no banner/debug text to stdout for `list-sessions`
+  and `show-options`; those outputs are parsed as machine-readable data.
+- For the `.ps1` form, test a wrapper that ends with `exit $LASTEXITCODE`.
+  Confirm list/create/attach/Kill still work, detaching returns to the existing
+  IDE PowerShell instead of exiting the terminal tab, and the agent command
+  actually starts inside the pane.
+- Close a Windows tmux-backed tab and attach its same session again. Then close
+  and relaunch the app and repeat the attach. Confirm the detached tmux server
+  and agent survived both cleanup paths, and inspect the process tree to verify
+  the server is not a descendant of the closed IDE terminal PowerShell.
+- Set the tmux server default `destroy-unattached` to `on`, then repeat create,
+  tab-close, app-close, and attach. Confirm the IDE session itself reports
+  `destroy-unattached off` and survives without changing the global default.
+- Switch workspaces immediately after a button launch and simulate one terminal
+  attach/start failure. Confirm the already-created session remains available in
+  `Tmux` and is not auto-killed; terminate it only with the explicit Kill action.
+- Temporarily remove the Windows tmux command from `PATH`. Confirm the Codex and
+  Claude buttons use their unchanged direct launcher instead. Make tmux session
+  creation fail after discovery and confirm the IDE reports the error without
+  also launching a second direct agent.
+- With a v9 managed session saved, hide the shim from `PATH` and relaunch.
+  Confirm restore starts no direct Codex/Claude process; restore again after the
+  shim returns and confirm it reattaches. Also kill a cached menu session outside
+  the IDE, choose that menu entry, and confirm attach fails without recreating it
+  or launching direct.
+- Restore a pre-v9 layout containing multiple speculative Windows `#1` panes.
+  Confirm they migrate to distinct stable numbers instead of sharing one agent;
+  confirm a current v9 layout keeps its already-managed session names.
 - In WSL and one SSH profile with tmux installed, confirm the typed launcher line
-  starts with `__svi_launch_v=8` and Codex/Claude remains usable for a normal turn.
+  starts with `__svi_launch_v=9` and Codex/Claude remains usable for a normal turn.
 - From another client attached to the IDE-created session, confirm
   `tmux show-options -v -t "$TMUX_PANE" destroy-unattached` reports `off` without
   changing the server-wide default.
@@ -152,8 +192,9 @@ The script runs:
 - Switch workspaces while terminals are alive; confirm hidden/restored terminal
   widgets behave correctly.
 - Close/relaunch after saving a workspace; confirm UI/work context restores but
-  shell processes start fresh. Runtime keep-alive/reattach is intentionally not
-  part of the current product.
+  ordinary shell processes start fresh. Runtime keep-alive is intentionally not
+  part of the current product; externally detached tmux sessions are the explicit
+  exception and should reattach through their recreated client panes.
 
 ### 4. Browser widget used/unused states
 

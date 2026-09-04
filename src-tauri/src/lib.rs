@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child as ProcessChild, Command, Output, Stdio};
+use std::process::{Child as ProcessChild, Command, ExitStatus, Output, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -33,6 +33,9 @@ use windows::Win32::System::DataExchange::{
 
 #[cfg(windows)]
 use windows::Win32::System::Ole::CF_HDROP;
+
+#[cfg(windows)]
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 
 #[cfg(windows)]
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
@@ -190,6 +193,16 @@ const SNIPPETS_STORE_FILE: &str = "snippets.v1.json";
 const SNIPPETS_STORE_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_SNIPPETS_STORE: &str = r#"{"version":1,"activeTabId":"general","tabs":[{"id":"general","title":"General","items":[]}]}"#;
 const LLM_TMUX_SESSION_MAX_LEN: usize = 48;
+const WINDOWS_LLM_TMUX_LAUNCHER_VERSION: u32 = 9;
+const WINDOWS_LLM_TMUX_ALLOCATION_ATTEMPTS: usize = 8;
+const WINDOWS_LLM_TMUX_PREPARE_MISSING_EXIT_CODE: i32 = 80;
+const WINDOWS_LLM_TMUX_PREPARE_EXISTS_EXIT_CODE: i32 = 81;
+const WINDOWS_LLM_TMUX_PREPARE_CREATED_EXIT_CODE: i32 = 82;
+const WINDOWS_LLM_TMUX_PREPARE_FAILED_EXIT_CODE: i32 = 83;
+const WINDOWS_LLM_TMUX_PREPARE_AMBIGUOUS_EXIT_CODE: i32 = 84;
+const WINDOWS_LLM_TMUX_OWNER_OPTION: &str = "@simple-vibe-ide-launch-owner";
+const WINDOWS_LLM_TMUX_SERVER_NAME: &str = "simple-vibe-ide";
+const WINDOWS_LLM_TMUX_OWNER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 type EdgeSessionStore = Arc<Mutex<HashMap<String, EdgeDevtoolsSessionState>>>;
 
@@ -204,6 +217,7 @@ static WSL_HELPER_GATES: OnceLock<Mutex<HashMap<String, Arc<WslHelperGate>>>> = 
 static PROCESS_REAPER_QUEUE: OnceLock<Arc<ProcessReaperQueue>> = OnceLock::new();
 static PROCESS_REAPER_ACTIVE_ITEMS: AtomicU32 = AtomicU32::new(0);
 static PROCESS_REAPER_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static WINDOWS_LLM_TMUX_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(windows)]
 static WINDOWS_SSH_AGENT_STATUS_CACHE: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
 
@@ -926,6 +940,28 @@ fn windows_spawn_cwd() -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+fn windows_powershell_executable() -> PathBuf {
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if length > 0 && length < buffer.len() {
+        let system_dir = PathBuf::from(String::from_utf16_lossy(&buffer[..length]));
+        let candidate = system_dir
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+#[cfg(not(windows))]
+fn windows_powershell_executable() -> PathBuf {
+    PathBuf::from("powershell.exe")
+}
+
 fn windows_shell_cwd() -> PathBuf {
     let app_dir = "simple-vibe-ide-shell";
     let mut candidates = Vec::new();
@@ -1613,7 +1649,7 @@ fn ssh_agent_executable() -> PathBuf {
 
 #[cfg(windows)]
 fn query_windows_ssh_agent_service_running() -> bool {
-    let mut command = Command::new("powershell.exe");
+    let mut command = Command::new(windows_powershell_executable());
     command
         .arg("-NoLogo")
         .arg("-NoProfile")
@@ -1993,6 +2029,15 @@ struct LlmTmuxSessionListResult {
     available: bool,
     base_name: String,
     sessions: Vec<LlmTmuxSession>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsLlmTmuxPrepareResult {
+    available: bool,
+    session_name: Option<String>,
+    created: bool,
     message: Option<String>,
 }
 
@@ -2730,6 +2775,32 @@ async fn next_llm_tmux_session(
 }
 
 #[tauri::command]
+async fn prepare_windows_llm_tmux_session(
+    profile_id: String,
+    cwd: String,
+    workspace_id: String,
+    agent_id: String,
+    session_name: Option<String>,
+    operation_id: String,
+    renderer_runtime_epoch: u64,
+) -> Result<WindowsLlmTmuxPrepareResult, String> {
+    run_blocking_command("prepare windows llm tmux session", move || {
+        let operation = begin_runtime_operation(&operation_id, renderer_runtime_epoch)?;
+        let profile = profile_from_id(&profile_id);
+        let cwd = normalize_profile_path(&profile, &cwd);
+        prepare_windows_llm_tmux_session_direct(
+            &profile,
+            &cwd,
+            &workspace_id,
+            &agent_id,
+            session_name.as_deref(),
+            Some(operation.process_scope()),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 async fn kill_llm_tmux_session(
     profile_id: String,
     cwd: String,
@@ -2780,27 +2851,419 @@ async fn llm_tmux_pane_probe(
     .await
 }
 
+fn windows_powershell_command(script: &str, cwd: &str) -> Command {
+    let requested_cwd = PathBuf::from(cwd);
+    let spawn_cwd = if requested_cwd.is_dir() {
+        requested_cwd
+    } else {
+        windows_spawn_cwd()
+    };
+    let mut command = Command::new(windows_powershell_executable());
+    command
+        .current_dir(spawn_cwd)
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-OutputFormat")
+        .arg("Text")
+        .arg("-EncodedCommand")
+        .arg(powershell_encoded_command(script));
+    command
+}
+
+fn run_windows_powershell_with_timeout(
+    script: &str,
+    cwd: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut command = windows_powershell_command(script, cwd);
+    let output = command_output_with_timeout(&mut command, timeout)?;
+    if !output.status.success() {
+        return Err(command_output_error_message(&output));
+    }
+    Ok(decode_wsl_text(&output.stdout).into_bytes())
+}
+
+fn run_windows_powershell_status_preserving_detached_descendants(
+    script: &str,
+    cwd: &str,
+    timeout: Duration,
+    session_name: &str,
+    owner_token: &str,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<WindowsLlmTmuxPrepareControlStatus, String> {
+    let mut command = windows_powershell_command(script, cwd);
+    command_status_with_timeout_preserving_detached_descendants(
+        &mut command,
+        timeout,
+        cwd,
+        session_name,
+        owner_token,
+        runtime_scope,
+    )
+}
+
+#[derive(Debug)]
+enum WindowsLlmTmuxPrepareControlStatus {
+    Exited(ExitStatus),
+    RecoveredCreated,
+}
+
+fn windows_tmux_command_lookup() -> &'static str {
+    "Get-Command 'tmux' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1"
+}
+
+fn windows_tmux_command_setup_script() -> String {
+    format!(
+        "$__sviTmux = {}; $__sviPowerShell = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName; ",
+        windows_tmux_command_lookup()
+    )
+}
+
+fn windows_tmux_invoke_script(args_variable: &str) -> String {
+    format!(
+        concat!(
+            "$global:LASTEXITCODE = 0; ",
+            "if ($__sviTmux.CommandType -eq 'ExternalScript') {{ ",
+            "  & $__sviPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $__sviTmux.Path @{args}; ",
+            "  $__sviTmuxOk = $?; $__sviTmuxExit = $LASTEXITCODE ",
+            "}} else {{ ",
+            "  & $__sviTmux.Path @{args}; $__sviTmuxOk = $?; $__sviTmuxExit = $LASTEXITCODE ",
+            "}}; "
+        ),
+        args = args_variable,
+    )
+}
+
+fn windows_tmux_capture_invoke_script(args_variable: &str, output_variable: &str) -> String {
+    format!(
+        concat!(
+            "$global:LASTEXITCODE = 0; ",
+            "if ($__sviTmux.CommandType -eq 'ExternalScript') {{ ",
+            "  [string]${output} = (& $__sviPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $__sviTmux.Path @{args} | Out-String); ",
+            "  $__sviTmuxOk = $?; $__sviTmuxExit = $LASTEXITCODE ",
+            "}} else {{ ",
+            "  [string]${output} = (& $__sviTmux.Path @{args} | Out-String); $__sviTmuxOk = $?; $__sviTmuxExit = $LASTEXITCODE ",
+            "}}; ${output} = ${output}.Trim(); "
+        ),
+        args = args_variable,
+        output = output_variable,
+    )
+}
+
+fn windows_tmux_list_script() -> String {
+    format!(
+        concat!(
+            "{tmux_setup}",
+            "if (-not $__sviTmux -or -not $__sviTmux.Path) {{ Write-Output '__SVI_TMUX_MISSING__'; exit 0 }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'list-sessions', '-F', \"#{{session_name}}`t#{{session_attached}}`t#{{session_windows}}`t#{{session_created}}`t#{{session_activity}}\"); ",
+            "{tmux_invoke}",
+            "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ exit 0 }}"
+        ),
+        tmux_setup = windows_tmux_command_setup_script(),
+        tmux_invoke = windows_tmux_invoke_script("__sviTmuxArgs"),
+        server = powershell_single_quote(WINDOWS_LLM_TMUX_SERVER_NAME),
+    )
+}
+
+fn windows_llm_launcher_spec(agent_id: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match agent_id {
+        "codex" => Some(("codex", &["--dangerously-bypass-approvals-and-sandbox"])),
+        "claude" => Some(("claude", &["--dangerously-skip-permissions"])),
+        _ => None,
+    }
+}
+
+fn windows_llm_tmux_inner_script(
+    session_name: &str,
+    cwd: &str,
+    executable: &str,
+    args: &[&str],
+) -> String {
+    let pane_target = exact_llm_tmux_pane_target(session_name);
+    let quoted_args = args
+        .iter()
+        .map(|value| powershell_single_quote(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        concat!(
+            "$ErrorActionPreference = 'Stop'; ",
+            "$__svi_launch_v = {version}; ",
+            "Set-Location -LiteralPath {cwd}; ",
+            "{tmux_setup}",
+            "if (-not $__sviTmux -or -not $__sviTmux.Path) {{ throw 'tmux disappeared before the LLM launcher started' }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'set-option', '-t', {pane_target}, 'destroy-unattached', 'off'); ",
+            "{tmux_invoke}",
+            "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ if ($__sviTmuxExit -ne 0) {{ exit $__sviTmuxExit }}; exit 1 }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'set-option', '-w', '-t', {pane_target}, 'remain-on-exit', 'on'); ",
+            "{tmux_invoke}",
+            "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ if ($__sviTmuxExit -ne 0) {{ exit $__sviTmuxExit }}; exit 1 }}; ",
+            "$__sviArgs = @({args}); ",
+            "$__sviDisplayArgs = @({executable}) + $__sviArgs; ",
+            "Write-Host ('[simple-vibe-ide] launching ' + ($__sviDisplayArgs -join ' ')); ",
+            "$global:LASTEXITCODE = 0; & {executable} @__sviArgs; ",
+            "$__sviAgentOk = $?; $__sviAgentExit = $LASTEXITCODE; ",
+            "if (-not $__sviAgentOk -or $__sviAgentExit -ne 0) {{ if ($__sviAgentExit -ne 0) {{ exit $__sviAgentExit }}; exit 1 }}"
+        ),
+        version = WINDOWS_LLM_TMUX_LAUNCHER_VERSION,
+        cwd = powershell_single_quote(cwd),
+        tmux_setup = windows_tmux_command_setup_script(),
+        tmux_invoke = windows_tmux_invoke_script("__sviTmuxArgs"),
+        server = powershell_single_quote(WINDOWS_LLM_TMUX_SERVER_NAME),
+        pane_target = powershell_single_quote(&pane_target),
+        args = quoted_args,
+        executable = powershell_single_quote(executable),
+    )
+}
+
+fn windows_llm_tmux_prepare_script(
+    session_name: &str,
+    encoded_inner: &str,
+    owner_token: &str,
+) -> String {
+    let session_target = exact_llm_tmux_session_target(session_name);
+    let pane_target = exact_llm_tmux_pane_target(session_name);
+    // Keep this command name-based instead of embedding a C:\ path. Some Windows tmux shims
+    // delegate the pane command to MSYS/WSL, where `powershell.exe` is interop-resolvable but a
+    // quoted native absolute path is not. The control process starts tmux from a trusted system
+    // directory, and the encoded inner script changes to the requested workspace before launch.
+    let inner_command = format!(
+        "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded_inner}"
+    );
+    format!(
+        concat!(
+            "{tmux_setup}",
+            "if (-not $__sviTmux -or -not $__sviTmux.Path) {{ exit {missing} }}; ",
+            "$__sviSession = {session}; $__sviTarget = {target}; $__sviPaneTarget = {pane_target}; $__sviOwner = {owner}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'has-session', '-t', $__sviTarget); ",
+            "{tmux_invoke}",
+            "if ($__sviTmuxOk -and $__sviTmuxExit -eq 0) {{ exit {exists} }}; ",
+            "$__sviInner = {inner}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'new-session', '-d', '-s', $__sviSession, $__sviInner, ';', 'set-option', '-t', $__sviPaneTarget, 'destroy-unattached', 'off', ';', 'set-option', '-w', '-t', $__sviPaneTarget, 'remain-on-exit', 'on', ';', 'set-option', '-t', $__sviPaneTarget, {owner_option}, $__sviOwner); ",
+            "{tmux_invoke}",
+            "if ($__sviTmuxOk -and $__sviTmuxExit -eq 0) {{ exit {created} }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'has-session', '-t', $__sviTarget); ",
+            "{tmux_invoke}",
+            "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ exit {failed} }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'show-options', '-qv', '-t', $__sviPaneTarget, {owner_option}); ",
+            "{tmux_capture}",
+            "if ($__sviObservedOwner -eq $__sviOwner) {{ exit {created} }}; ",
+            "if ([string]::IsNullOrEmpty($__sviObservedOwner)) {{ exit {ambiguous} }}; ",
+            "if ($__sviObservedOwner -match '^[0-9a-f]{{32}}$') {{ exit {exists} }}; ",
+            "exit {ambiguous}"
+        ),
+        tmux_setup = windows_tmux_command_setup_script(),
+        tmux_invoke = windows_tmux_invoke_script("__sviTmuxArgs"),
+        tmux_capture = windows_tmux_capture_invoke_script(
+            "__sviTmuxArgs",
+            "__sviObservedOwner"
+        ),
+        missing = WINDOWS_LLM_TMUX_PREPARE_MISSING_EXIT_CODE,
+        exists = WINDOWS_LLM_TMUX_PREPARE_EXISTS_EXIT_CODE,
+        created = WINDOWS_LLM_TMUX_PREPARE_CREATED_EXIT_CODE,
+        failed = WINDOWS_LLM_TMUX_PREPARE_FAILED_EXIT_CODE,
+        ambiguous = WINDOWS_LLM_TMUX_PREPARE_AMBIGUOUS_EXIT_CODE,
+        session = powershell_single_quote(session_name),
+        target = powershell_single_quote(&session_target),
+        pane_target = powershell_single_quote(&pane_target),
+        owner = powershell_single_quote(owner_token),
+        owner_option = powershell_single_quote(WINDOWS_LLM_TMUX_OWNER_OPTION),
+        server = powershell_single_quote(WINDOWS_LLM_TMUX_SERVER_NAME),
+        inner = powershell_single_quote(&inner_command),
+    )
+}
+
+fn windows_llm_tmux_owner_probe_script(session_name: &str, owner_token: &str) -> String {
+    let session_target = exact_llm_tmux_session_target(session_name);
+    let pane_target = exact_llm_tmux_pane_target(session_name);
+    format!(
+        concat!(
+            "{tmux_setup}",
+            "if (-not $__sviTmux -or -not $__sviTmux.Path) {{ exit 127 }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'has-session', '-t', {session_target}); ",
+            "{tmux_invoke}",
+            "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ exit 1 }}; ",
+            "$__sviTmuxArgs = @('-L', {server}, 'show-options', '-qv', '-t', {pane_target}, {owner_option}); ",
+            "{tmux_capture}",
+            "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ exit 1 }}; ",
+            "if ($__sviObservedOwner -ceq {owner}) {{ exit 0 }}; exit 1"
+        ),
+        tmux_setup = windows_tmux_command_setup_script(),
+        tmux_invoke = windows_tmux_invoke_script("__sviTmuxArgs"),
+        tmux_capture = windows_tmux_capture_invoke_script("__sviTmuxArgs", "__sviObservedOwner"),
+        session_target = powershell_single_quote(&session_target),
+        pane_target = powershell_single_quote(&pane_target),
+        owner_option = powershell_single_quote(WINDOWS_LLM_TMUX_OWNER_OPTION),
+        owner = powershell_single_quote(owner_token),
+        server = powershell_single_quote(WINDOWS_LLM_TMUX_SERVER_NAME),
+    )
+}
+
+fn windows_llm_tmux_session_has_owner(cwd: &str, session_name: &str, owner_token: &str) -> bool {
+    let mut command = windows_powershell_command(
+        &windows_llm_tmux_owner_probe_script(session_name, owner_token),
+        cwd,
+    );
+    command_status_with_timeout_already_guarded(&mut command, WINDOWS_LLM_TMUX_OWNER_PROBE_TIMEOUT)
+        .is_ok_and(|status| status.success())
+}
+
+fn prepare_windows_llm_tmux_session_direct(
+    profile: &ConnectionProfile,
+    cwd: &str,
+    workspace_id: &str,
+    agent_id: &str,
+    requested_session_name: Option<&str>,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<WindowsLlmTmuxPrepareResult, String> {
+    check_runtime_process_scope(runtime_scope)?;
+    if profile.kind != "windows" {
+        return Err("Windows tmux preparation requires a Windows profile".to_string());
+    }
+    let Some((executable, args)) = windows_llm_launcher_spec(agent_id) else {
+        return Err(
+            "Windows tmux launch is supported only for Codex and Claude buttons".to_string(),
+        );
+    };
+    let _prepare_guard = WINDOWS_LLM_TMUX_PREPARE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    check_runtime_process_scope(runtime_scope)?;
+    let mut list = list_llm_tmux_sessions_direct(profile, cwd, workspace_id, agent_id)?;
+    check_runtime_process_scope(runtime_scope)?;
+    if !list.available {
+        return Ok(WindowsLlmTmuxPrepareResult {
+            available: false,
+            session_name: None,
+            created: false,
+            message: list.message,
+        });
+    }
+    let requested_session_name = if let Some(requested) = requested_session_name {
+        if !is_safe_llm_tmux_session_name(requested)
+            || !is_llm_tmux_session_for_base(requested, &list.base_name)
+        {
+            return Err("invalid Windows tmux session name".to_string());
+        }
+        Some(requested.to_string())
+    } else {
+        None
+    };
+    for _ in 0..WINDOWS_LLM_TMUX_ALLOCATION_ATTEMPTS {
+        check_runtime_process_scope(runtime_scope)?;
+        let session_name = requested_session_name
+            .clone()
+            .unwrap_or_else(|| next_llm_tmux_session_name_from_list(&list));
+        let inner = windows_llm_tmux_inner_script(&session_name, cwd, executable, args);
+        let owner_token = Uuid::new_v4().simple().to_string();
+        let script = windows_llm_tmux_prepare_script(
+            &session_name,
+            &powershell_encoded_command(&inner),
+            &owner_token,
+        );
+        let control_cwd = windows_spawn_cwd();
+        let status = run_windows_powershell_status_preserving_detached_descendants(
+            &script,
+            control_cwd.to_string_lossy().as_ref(),
+            LLM_TMUX_COMMAND_TIMEOUT,
+            &session_name,
+            &owner_token,
+            runtime_scope,
+        )?;
+        let status_code = match status {
+            WindowsLlmTmuxPrepareControlStatus::Exited(status) => status.code(),
+            WindowsLlmTmuxPrepareControlStatus::RecoveredCreated => {
+                Some(WINDOWS_LLM_TMUX_PREPARE_CREATED_EXIT_CODE)
+            }
+        };
+        match status_code {
+            Some(WINDOWS_LLM_TMUX_PREPARE_MISSING_EXIT_CODE) => {
+                return Ok(WindowsLlmTmuxPrepareResult {
+                    available: false,
+                    session_name: None,
+                    created: false,
+                    message: Some("tmux is not installed on this Windows profile".to_string()),
+                });
+            }
+            Some(WINDOWS_LLM_TMUX_PREPARE_CREATED_EXIT_CODE) => {
+                // Creation is the ownership boundary: this detached session is durable user
+                // state. Do not tear it down merely because the renderer/app starts closing now.
+                return Ok(WindowsLlmTmuxPrepareResult {
+                    available: true,
+                    session_name: Some(session_name),
+                    created: true,
+                    message: None,
+                });
+            }
+            Some(WINDOWS_LLM_TMUX_PREPARE_EXISTS_EXIT_CODE) if requested_session_name.is_some() => {
+                check_runtime_process_scope(runtime_scope)?;
+                return Ok(WindowsLlmTmuxPrepareResult {
+                    available: true,
+                    session_name: Some(session_name),
+                    created: false,
+                    message: None,
+                });
+            }
+            Some(WINDOWS_LLM_TMUX_PREPARE_EXISTS_EXIT_CODE) => {
+                // Another app instance claimed the numbered name after our list. Relist and
+                // reserve another number rather than attaching a fresh click to its pane.
+                list = list_llm_tmux_sessions_direct(profile, cwd, workspace_id, agent_id)?;
+                check_runtime_process_scope(runtime_scope)?;
+                if !list.available {
+                    return Ok(WindowsLlmTmuxPrepareResult {
+                        available: false,
+                        session_name: None,
+                        created: false,
+                        message: list.message,
+                    });
+                }
+                continue;
+            }
+            Some(WINDOWS_LLM_TMUX_PREPARE_FAILED_EXIT_CODE) => {
+                return Err("tmux failed to create the Windows LLM session".to_string());
+            }
+            Some(WINDOWS_LLM_TMUX_PREPARE_AMBIGUOUS_EXIT_CODE) => {
+                return Err(
+                    "tmux may have created the Windows LLM session but did not preserve its ownership marker; refusing to launch another session"
+                        .to_string(),
+                );
+            }
+            Some(code) => {
+                return Err(format!(
+                    "Windows tmux preparation exited with unexpected status {code}"
+                ));
+            }
+            None => return Err("Windows tmux preparation ended without an exit status".to_string()),
+        }
+    }
+    Err("tmux session numbers changed repeatedly; retry the Windows LLM button".to_string())
+}
+
 fn list_llm_tmux_sessions_direct(
     profile: &ConnectionProfile,
-    _cwd: &str,
+    cwd: &str,
     workspace_id: &str,
     agent_id: &str,
 ) -> Result<LlmTmuxSessionListResult, String> {
     let base_name = llm_tmux_session_base_name(workspace_id, agent_id);
-    if profile.kind == "windows" {
-        return Ok(LlmTmuxSessionListResult {
-            available: false,
-            base_name,
-            sessions: Vec::new(),
-            message: Some("tmux is only used for WSL/SSH profiles".to_string()),
-        });
-    }
-    let output = run_profile_shell_with_timeout(
-        profile,
-        "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; tmux list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{session_activity}' 2>/dev/null || true",
-        None,
-        LLM_TMUX_COMMAND_TIMEOUT,
-    )?;
+    let output = if profile.kind == "windows" {
+        run_windows_powershell_with_timeout(
+            &windows_tmux_list_script(),
+            cwd,
+            LLM_TMUX_COMMAND_TIMEOUT,
+        )?
+    } else {
+        run_profile_shell_with_timeout(
+            profile,
+            "if ! command -v tmux >/dev/null 2>&1; then printf '__SVI_TMUX_MISSING__\\n'; exit 0; fi; tmux list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{session_activity}' 2>/dev/null || true",
+            None,
+            LLM_TMUX_COMMAND_TIMEOUT,
+        )?
+    };
     let text = String::from_utf8_lossy(&output);
     if text
         .lines()
@@ -2866,7 +3329,11 @@ fn next_llm_tmux_session_direct(
     agent_id: &str,
 ) -> Result<String, String> {
     let list = list_llm_tmux_sessions_direct(profile, cwd, workspace_id, agent_id)?;
-    let base = list.base_name;
+    Ok(next_llm_tmux_session_name_from_list(&list))
+}
+
+fn next_llm_tmux_session_name_from_list(list: &LlmTmuxSessionListResult) -> String {
+    let base = &list.base_name;
     let used = list
         .sessions
         .iter()
@@ -2874,21 +3341,35 @@ fn next_llm_tmux_session_direct(
         .collect::<HashSet<_>>();
     for index in 1..1000 {
         if !used.contains(&index) {
-            return Ok(numbered_llm_tmux_session_name(&base, index));
+            return numbered_llm_tmux_session_name(&base, index);
         }
     }
-    Ok(numbered_llm_tmux_session_name(&base, 1000))
+    numbered_llm_tmux_session_name(&base, 1000)
 }
 
 fn kill_llm_tmux_session_direct(
     profile: &ConnectionProfile,
-    _cwd: &str,
+    cwd: &str,
     session_name: &str,
 ) -> Result<(), String> {
-    if profile.kind == "windows" {
-        return Err("tmux is only used for WSL/SSH profiles".to_string());
-    }
     let target = exact_llm_tmux_session_target(session_name);
+    if profile.kind == "windows" {
+        let script = format!(
+            concat!(
+                "{}",
+                "if (-not $__sviTmux -or -not $__sviTmux.Path) {{ Write-Error 'tmux is not installed'; exit 127 }}; ",
+                "$__sviTmuxArgs = @('-L', {}, 'kill-session', '-t', {}); ",
+                "{}",
+                "if (-not $__sviTmuxOk -or $__sviTmuxExit -ne 0) {{ if ($__sviTmuxExit -ne 0) {{ exit $__sviTmuxExit }}; exit 1 }}"
+            ),
+            windows_tmux_command_setup_script(),
+            powershell_single_quote(WINDOWS_LLM_TMUX_SERVER_NAME),
+            powershell_single_quote(&target),
+            windows_tmux_invoke_script("__sviTmuxArgs"),
+        );
+        return run_windows_powershell_with_timeout(&script, cwd, LLM_TMUX_COMMAND_TIMEOUT)
+            .map(|_| ());
+    }
     let script = format!(
         "if ! command -v tmux >/dev/null 2>&1; then echo 'tmux is not installed' >&2; exit 127; fi; tmux kill-session -t {}",
         shell_quote(&target)
@@ -3212,6 +3693,149 @@ mod llm_tmux_target_tests {
         assert_eq!(
             exact_llm_tmux_pane_target("svi_demo_codex_1"),
             "=svi_demo_codex_1:"
+        );
+    }
+}
+
+#[cfg(test)]
+mod windows_llm_tmux_launcher_tests {
+    use super::*;
+
+    #[test]
+    fn only_codex_and_claude_have_windows_tmux_launcher_specs() {
+        assert_eq!(
+            windows_llm_launcher_spec("codex"),
+            Some(("codex", &["--dangerously-bypass-approvals-and-sandbox"][..]))
+        );
+        assert_eq!(
+            windows_llm_launcher_spec("claude"),
+            Some(("claude", &["--dangerously-skip-permissions"][..]))
+        );
+        assert_eq!(windows_llm_launcher_spec("grok"), None);
+        assert_eq!(windows_llm_launcher_spec("antigravity"), None);
+    }
+
+    #[test]
+    fn inner_launcher_sets_session_options_before_the_fixed_agent_command() {
+        let script = windows_llm_tmux_inner_script(
+            "svi_demo_codex_1",
+            r"C:\Work O'Brien\repo",
+            "codex",
+            &["--dangerously-bypass-approvals-and-sandbox"],
+        );
+        let destroy = script
+            .find("@('-L', 'simple-vibe-ide', 'set-option', '-t', '=svi_demo_codex_1:', 'destroy-unattached', 'off')")
+            .expect("session keepalive option");
+        let remain = script
+            .find("@('-L', 'simple-vibe-ide', 'set-option', '-w', '-t', '=svi_demo_codex_1:', 'remain-on-exit', 'on')")
+            .expect("dead pane retention option");
+        let launch = script
+            .find("& 'codex' @__sviArgs")
+            .expect("fixed Codex launch");
+
+        assert!(destroy < remain && remain < launch);
+        assert!(script.contains("$__svi_launch_v = 9"));
+        assert!(script.contains("Set-Location -LiteralPath 'C:\\Work O''Brien\\repo'"));
+        assert!(script.contains("$__sviTmux.CommandType -eq 'ExternalScript'"));
+        assert!(script.contains("-File $__sviTmux.Path @__sviTmuxArgs"));
+        assert_eq!(
+            script
+                .matches("'--dangerously-bypass-approvals-and-sandbox'")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn detached_prepare_uses_exact_targets_and_an_encoded_inner_command() {
+        let script =
+            windows_llm_tmux_prepare_script("svi_demo_claude_10", "QQBBAEEAPQAxAA==", "owner123");
+
+        let create = script
+            .find(
+                "@('-L', 'simple-vibe-ide', 'new-session', '-d', '-s', $__sviSession, $__sviInner",
+            )
+            .expect("detached create command");
+        let destroy = script[create..]
+            .find("'destroy-unattached', 'off'")
+            .map(|offset| create + offset)
+            .expect("session keepalive option");
+        let remain = script[create..]
+            .find("'remain-on-exit', 'on'")
+            .map(|offset| create + offset)
+            .expect("dead pane retention option");
+        let owner = script[create..]
+            .find("'@simple-vibe-ide-launch-owner', $__sviOwner")
+            .map(|offset| create + offset)
+            .expect("final completion marker");
+
+        assert!(create < destroy && destroy < remain && remain < owner);
+        assert_eq!(script.matches("'new-session'").count(), 1);
+        assert_eq!(script.matches("';'").count(), 3);
+        assert!(script.contains("$__sviTarget = '=svi_demo_claude_10'"));
+        assert!(script.contains("$__sviPaneTarget = '=svi_demo_claude_10:'"));
+        assert!(script.contains("powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass"));
+        assert!(!script.contains(r"C:\Windows"));
+        assert!(script.contains("$__sviOwner = 'owner123'"));
+        assert!(script.contains("if ($__sviObservedOwner -eq $__sviOwner) { exit 82 }"));
+        assert!(script.contains("if ([string]::IsNullOrEmpty($__sviObservedOwner)) { exit 84 }"));
+        assert!(script.contains("if ($__sviObservedOwner -match '^[0-9a-f]{32}$') { exit 81 }"));
+        assert!(script.contains("$__sviTmux.CommandType -eq 'ExternalScript'"));
+        assert!(!script.contains("kill-session"));
+        assert!(!script.contains(">$null"));
+        assert!(script.contains("-EncodedCommand QQBBAEEAPQAxAA=="));
+        assert!(!script.contains("claude --dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn interrupted_prepare_probe_reads_only_the_exact_completion_marker() {
+        let script = windows_llm_tmux_owner_probe_script(
+            "svi_demo_codex_2",
+            "0123456789abcdef0123456789abcdef",
+        );
+
+        assert!(
+            script.contains("@('-L', 'simple-vibe-ide', 'has-session', '-t', '=svi_demo_codex_2')")
+        );
+        assert!(script.contains(
+            "@('-L', 'simple-vibe-ide', 'show-options', '-qv', '-t', '=svi_demo_codex_2:', '@simple-vibe-ide-launch-owner')"
+        ));
+        assert!(script.contains(
+            "if ($__sviObservedOwner -ceq '0123456789abcdef0123456789abcdef') { exit 0 }"
+        ));
+        assert!(script.contains("$__sviTmux.CommandType -eq 'ExternalScript'"));
+        assert!(!script.contains("kill-session"));
+    }
+
+    #[test]
+    fn numbered_allocator_skips_only_sessions_in_the_filtered_list() {
+        let list = LlmTmuxSessionListResult {
+            available: true,
+            base_name: "svi_demo_codex".to_string(),
+            sessions: vec![
+                LlmTmuxSession {
+                    name: "svi_demo_codex_1".to_string(),
+                    attached: false,
+                    windows: 1,
+                    created_at: None,
+                    activity_at: None,
+                    legacy: false,
+                },
+                LlmTmuxSession {
+                    name: "svi_demo_codex_10".to_string(),
+                    attached: false,
+                    windows: 1,
+                    created_at: None,
+                    activity_at: None,
+                    legacy: false,
+                },
+            ],
+            message: None,
+        };
+
+        assert_eq!(
+            next_llm_tmux_session_name_from_list(&list),
+            "svi_demo_codex_2"
         );
     }
 }
@@ -10390,7 +11014,7 @@ fn run_profile_shell_once(
         command.stdin(Stdio::null());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (child, _process_registration) = {
+    let (mut pending_child, _process_registration) = {
         let _runtime_guard = runtime_lifecycle_read();
         if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
             return Err("app shutdown is already in progress".to_string());
@@ -10399,14 +11023,17 @@ fn run_profile_shell_once(
         let child = hide_command_window(&mut command)
             .spawn()
             .map_err(|err| format!("failed to run remote shell: {err}"))?;
-        let mut pending_child = PendingProcessChild::new(child);
+        let pending_child = PendingProcessChild::new(child);
         let pid = pending_child.child().id();
         assign_child_to_cleanup_job(pid);
         let registration = TransientProcessRegistration::new(pid);
-        check_runtime_process_scope(runtime_scope)?;
-        (pending_child.take(), registration)
+        (pending_child, registration)
     };
-    let mut pending_child = PendingProcessChild::new(child);
+    if let Err(error) = check_runtime_process_scope(runtime_scope) {
+        terminate_pending_process_child_with_wsl_permit(&mut pending_child, &mut wsl_permit);
+        drop(_process_registration);
+        return Err(error);
+    }
     let stdout = pending_child.child_mut().stdout.take();
     let stderr = pending_child.child_mut().stderr.take();
     let stdout_reader = stdout.map(spawn_process_output_reader);
@@ -10737,7 +11364,174 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
     command_output_with_timeout_scoped(command, timeout, None, None, false)
 }
 
+fn command_status_with_timeout_preserving_detached_descendants(
+    command: &mut Command,
+    timeout: Duration,
+    cwd: &str,
+    session_name: &str,
+    owner_token: &str,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
+) -> Result<WindowsLlmTmuxPrepareControlStatus, String> {
+    check_runtime_process_scope(runtime_scope)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Keep renderer/app cleanup from snapshotting the unconfirmed controller PID between the
+    // final owner probe and registry removal. Cancellation is still observed every 50 ms; the
+    // bounded owner probe below deliberately uses an already-guarded spawn path.
+    let _runtime_guard = runtime_lifecycle_read();
+    let (mut pending_child, process_registration) = {
+        if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+            return Err("app shutdown is already in progress".to_string());
+        }
+        check_runtime_process_scope(runtime_scope)?;
+        let child = hide_command_window(command)
+            .spawn()
+            .map_err(|err| format!("failed to start process: {err}"))?;
+        // Do not assign this short control process to the app cleanup Job: a native tmux server
+        // spawned beneath it must be able to detach and outlive both the terminal PTY and app.
+        // Until the final owner marker proves that the full create/options queue completed, keep
+        // the controller in the transient registry so cancellation cannot leave a ghost launcher.
+        let pid = child.id();
+        (
+            PendingProcessChild::new(child),
+            TransientProcessRegistration::new(pid),
+        )
+    };
+    if let Err(error) = check_runtime_process_scope(runtime_scope) {
+        return finish_interrupted_windows_llm_tmux_control(
+            pending_child,
+            process_registration,
+            cwd,
+            session_name,
+            owner_token,
+            error,
+        );
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match pending_child.child_mut().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if let Err(error) = check_runtime_process_scope(runtime_scope) {
+                    return finish_interrupted_windows_llm_tmux_control(
+                        pending_child,
+                        process_registration,
+                        cwd,
+                        session_name,
+                        owner_token,
+                        error,
+                    );
+                }
+                if Instant::now() >= deadline {
+                    return finish_interrupted_windows_llm_tmux_control(
+                        pending_child,
+                        process_registration,
+                        cwd,
+                        session_name,
+                        owner_token,
+                        format!("process timed out after {}s", timeout.as_secs()),
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return finish_interrupted_windows_llm_tmux_control(
+                    pending_child,
+                    process_registration,
+                    cwd,
+                    session_name,
+                    owner_token,
+                    format!("failed to wait for process: {error}"),
+                );
+            }
+        }
+    };
+    let completed_child = pending_child.take();
+    drop(process_registration);
+    drop(completed_child);
+    Ok(WindowsLlmTmuxPrepareControlStatus::Exited(status))
+}
+
+fn terminate_detached_control_process(child: &mut ProcessChild) {
+    // The completion marker is already visible, so terminate only the stuck PowerShell controller.
+    // A compatible tmux server has detached by this ownership boundary and remains durable state.
+    if child.kill().is_ok() {
+        let _ = child.wait();
+    } else {
+        let _ = child.try_wait();
+    }
+}
+
+fn command_status_with_timeout_already_guarded(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = hide_command_window(command)
+        .spawn()
+        .map_err(|error| format!("failed to start process: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                terminate_process_child(&mut child);
+                return Err(format!("process timed out after {}s", timeout.as_secs()));
+            }
+            Err(error) => {
+                terminate_process_child(&mut child);
+                return Err(format!("failed to wait for process: {error}"));
+            }
+        }
+    }
+}
+
+fn finish_interrupted_windows_llm_tmux_control(
+    mut pending_child: PendingProcessChild,
+    process_registration: TransientProcessRegistration,
+    cwd: &str,
+    session_name: &str,
+    owner_token: &str,
+    error: String,
+) -> Result<WindowsLlmTmuxPrepareControlStatus, String> {
+    if windows_llm_tmux_session_has_owner(cwd, session_name, owner_token) {
+        let mut control_child = pending_child.take();
+        drop(process_registration);
+        terminate_detached_control_process(&mut control_child);
+        return Ok(WindowsLlmTmuxPrepareControlStatus::RecoveredCreated);
+    }
+
+    // Before the final marker, fail closed and tear down this controller tree. This prevents a
+    // canceled/failed button click from completing later and launching an untracked second agent.
+    let mut no_wsl_permit = None;
+    terminate_pending_process_child_with_wsl_permit(&mut pending_child, &mut no_wsl_permit);
+    drop(process_registration);
+    Err(error)
+}
+
 fn command_output_with_timeout_scoped(
+    command: &mut Command,
+    timeout: Duration,
+    runtime_scope: Option<RuntimeProcessScope<'_>>,
+    wsl_gate_key: Option<&str>,
+    wait_for_wsl_cooldown: bool,
+) -> Result<Output, String> {
+    command_output_with_timeout_scoped_inner(
+        command,
+        timeout,
+        runtime_scope,
+        wsl_gate_key,
+        wait_for_wsl_cooldown,
+    )
+}
+
+fn command_output_with_timeout_scoped_inner(
     command: &mut Command,
     timeout: Duration,
     runtime_scope: Option<RuntimeProcessScope<'_>>,
@@ -10757,7 +11551,7 @@ fn command_output_with_timeout_scoped(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (child, _process_registration) = {
+    let (mut pending_child, _process_registration) = {
         let _runtime_guard = runtime_lifecycle_read();
         if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
             return Err("app shutdown is already in progress".to_string());
@@ -10769,10 +11563,13 @@ fn command_output_with_timeout_scoped(
         let pid = child.id();
         assign_child_to_cleanup_job(pid);
         let registration = TransientProcessRegistration::new(pid);
-        check_runtime_process_scope(runtime_scope)?;
-        (child, registration)
+        (PendingProcessChild::new(child), registration)
     };
-    let mut pending_child = PendingProcessChild::new(child);
+    if let Err(error) = check_runtime_process_scope(runtime_scope) {
+        terminate_pending_process_child_with_wsl_permit(&mut pending_child, &mut wsl_permit);
+        drop(_process_registration);
+        return Err(error);
+    }
     let stdout = pending_child.child_mut().stdout.take();
     let stderr = pending_child.child_mut().stderr.take();
     let stdout_reader = stdout.map(spawn_process_output_reader);
@@ -12934,6 +13731,7 @@ pub fn run() {
             register_agent_bridge_session,
             list_llm_tmux_sessions,
             next_llm_tmux_session,
+            prepare_windows_llm_tmux_session,
             kill_llm_tmux_session,
             llm_tmux_pane_title,
             llm_tmux_pane_probe,

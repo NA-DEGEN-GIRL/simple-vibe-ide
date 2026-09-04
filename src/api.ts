@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, GitWorkspaceRoots, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse } from './types';
+import type { AgentAlertPayload, AgentAlertResult, AgentBridgeInfo, AttachmentResult, ConnectionProfile, DeletedPathItem, DirectoryListingResult, DirectorySignatureResult, EdgeDevtoolsPage, EdgeDevtoolsSession, ExportStartResult, FileEntry, GitWorkspaceRoots, LlmTmuxPaneProbeResult, LlmTmuxPaneTitleResult, LlmTmuxSessionListResult, PortForwardResult, PreviewProxyResult, RegisterAgentBridgeSessionPayload, RendererHeartbeatResponse, WindowsLlmTmuxPrepareResult } from './types';
 
 // Each WebView generation receives a backend-issued token during init. Keeping
 // it inside this module means every persistent runtime start is automatically
@@ -34,6 +34,22 @@ export const api = {
     invoke<LlmTmuxSessionListResult>('list_llm_tmux_sessions', { profileId, cwd, workspaceId, agentId }),
   nextLlmTmuxSession: (profileId: string, cwd: string, workspaceId: string, agentId: string) =>
     invoke<string>('next_llm_tmux_session', { profileId, cwd, workspaceId, agentId }),
+  prepareWindowsLlmTmuxSession: (
+    profileId: string,
+    cwd: string,
+    workspaceId: string,
+    agentId: string,
+    sessionName?: string | null,
+    operationId: string = crypto.randomUUID()
+  ) => invoke<WindowsLlmTmuxPrepareResult>('prepare_windows_llm_tmux_session', {
+    profileId,
+    cwd,
+    workspaceId,
+    agentId,
+    sessionName: sessionName ?? null,
+    operationId,
+    rendererRuntimeEpoch
+  }),
   killLlmTmuxSession: (profileId: string, cwd: string, sessionName: string) =>
     invoke<void>('kill_llm_tmux_session', { profileId, cwd, sessionName }),
   llmTmuxPaneTitle: (profileId: string, cwd: string, sessionName: string) =>
