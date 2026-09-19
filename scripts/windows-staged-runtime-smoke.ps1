@@ -52,32 +52,7 @@ function Test-NonLocalWindowsPath {
   return [bool]($drive -and $drive.DisplayRoot)
 }
 
-function Test-PrivateLookingUntrackedPath {
-  param([Parameter(Mandatory = $true)][string]$RelativePath)
-
-  $normalized = $RelativePath.Replace("\", "/").ToLowerInvariant()
-  $leaf = [System.IO.Path]::GetFileName($normalized)
-  $environmentPrefix = "." + "env"
-  $blockedLeafNames = @(
-    ("." + "npm" + "rc"),
-    ("." + "net" + "rc"),
-    ("." + "git-" + "credentials"),
-    ("id_" + "dsa"),
-    ("id_" + "ecdsa"),
-    ("id_" + "ed25519"),
-    ("id_" + "rsa")
-  )
-  if ($leaf -eq $environmentPrefix -or
-      ($leaf.StartsWith("$environmentPrefix.") -and -not $leaf.EndsWith(".example"))) {
-    return $true
-  }
-  if ($blockedLeafNames -contains $leaf) { return $true }
-  if ($normalized -match "(^|/)(\.ssh|\.aws|\.azure|\.gnupg)/") { return $true }
-  return [bool]($leaf -match "\.(pem|key|p12|pfx)$")
-}
-
 $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
-$gitSafeSourceRoot = $sourceRoot.Replace("\", "/")
 if (-not $StageRoot) {
   $StageRoot = Join-Path $env:TEMP "simple-vibe-ide-win-src"
 }
@@ -109,7 +84,30 @@ if (Test-NonLocalWindowsPath $cargoFullPath) {
 $git = Get-Command git.exe -ErrorAction SilentlyContinue
 if (-not $git) { $git = Get-Command git -ErrorAction SilentlyContinue }
 if (-not $git) {
-  throw "Git for Windows is required to create the tracked source manifest."
+  throw "Git for Windows is required to create the source manifest."
+}
+
+$node = Get-Command node.exe -ErrorAction SilentlyContinue
+if (-not $node) { $node = Get-Command node -ErrorAction SilentlyContinue }
+if (-not $node) { throw "Node.js is required to validate and build the Windows stage." }
+
+# Validate the complete working-tree manifest BEFORE removing the previous stage.
+# Default includes only allowlisted nonignored new code, not arbitrary local data.
+$manifestArgs = @(
+  (Join-Path $sourceRoot "scripts\windows-stage-manifest.mjs"),
+  "--source-root", $sourceRoot,
+  "--git", $git.Source
+)
+if ($IncludeUntracked) { $manifestArgs += "--include-untracked" }
+$global:LASTEXITCODE = 0
+$manifestJson = @(& $node.Source @manifestArgs)
+if ($global:LASTEXITCODE -ne 0) {
+  throw "Windows source manifest validation failed. The existing stage was not changed."
+}
+$manifest = ($manifestJson -join "`n") | ConvertFrom-Json
+$sourceFiles = @($manifest.files)
+if ($manifest.version -ne 1 -or $sourceFiles.Count -eq 0) {
+  throw "The Windows source manifest is invalid. The existing stage was not changed."
 }
 
 $markerName = ".simple-vibe-windows-stage"
@@ -137,34 +135,12 @@ if (Test-Path $stageFullPath) {
 New-Item -ItemType Directory -Path $stageFullPath -Force | Out-Null
 Set-Content -LiteralPath $markerPath -Value $markerValue -Encoding Ascii
 
-$global:LASTEXITCODE = 0
-$trackedFiles = @(& $git.Source -c "safe.directory=$gitSafeSourceRoot" -C $sourceRoot ls-files --cached)
-if ($global:LASTEXITCODE -ne 0) {
-  throw "Could not enumerate tracked source files with Git."
-}
-
-$untrackedFiles = @()
-if ($IncludeUntracked) {
-  $global:LASTEXITCODE = 0
-  $untrackedFiles = @(& $git.Source -c "safe.directory=$gitSafeSourceRoot" -C $sourceRoot ls-files --others --exclude-standard)
-  if ($global:LASTEXITCODE -ne 0) {
-    throw "Could not enumerate untracked source files with Git."
-  }
-  $privateUntrackedFiles = @($untrackedFiles | Where-Object { Test-PrivateLookingUntrackedPath $_ })
-  if ($privateUntrackedFiles.Count -gt 0) {
-    throw "Refusing to stage private-looking untracked files. Add private local files to .gitignore and retry."
-  }
-}
-$sourceFiles = @($trackedFiles + $untrackedFiles | Sort-Object -Unique)
-if ($sourceFiles.Count -eq 0) {
-  throw "Git returned an empty source manifest."
-}
-
 Write-Host "Simple Vibe IDE Windows-local staged smoke"
 Write-Host "Source: $(Format-DisplayPath $sourceRoot)"
 Write-Host "Stage: $(Format-DisplayPath $stageFullPath)"
 Write-Host "Cargo target: $(Format-DisplayPath $cargoFullPath)"
 Write-Host "Source manifest entries: $($sourceFiles.Count)"
+Write-Host "New build source files included automatically: $($manifest.automaticUntrackedCount)"
 
 foreach ($relativePath in $sourceFiles) {
   if (-not $relativePath) { continue }

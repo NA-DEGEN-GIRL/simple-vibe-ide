@@ -5,10 +5,9 @@ Dim fso
 Dim env
 Dim scriptDir
 Dim tempDir
-Dim appRoot
-Dim appDir
-Dim sourceExe
-Dim appExe
+Dim launchScript
+Dim launchCommand
+Dim launchExitCode
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -16,27 +15,30 @@ Set env = shell.Environment("PROCESS")
 
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 tempDir = shell.ExpandEnvironmentStrings("%TEMP%")
-appRoot = fso.BuildPath(tempDir, "simple-vibe-ide-target")
-appDir = fso.BuildPath(appRoot, "release")
-appExe = fso.BuildPath(appDir, "simple-vibe-ide.exe")
-sourceExe = fso.BuildPath(scriptDir, "src-tauri\target\release\simple-vibe-ide.exe")
+launchScript = fso.BuildPath(scriptDir, "scripts\run-temp-release.ps1")
 
-If Not fso.FileExists(sourceExe) Then
-  sourceExe = appExe
-End If
-
-If Not fso.FileExists(sourceExe) Then
-  MsgBox "Built app not found." & vbCrLf & vbCrLf & sourceExe & vbCrLf & vbCrLf & _
-    "Build it first with: npm run tauri -- build --no-bundle", vbExclamation, "Simple Vibe IDE"
+If Not fso.FileExists(launchScript) Then
+  MsgBox "Launch helper not found: scripts\run-temp-release.ps1", vbExclamation, "Simple Vibe IDE"
   WScript.Quit 1
 End If
 
-If Not fso.FolderExists(appRoot) Then fso.CreateFolder appRoot
-If Not fso.FolderExists(appDir) Then fso.CreateFolder appDir
-
-If LCase(sourceExe) <> LCase(appExe) Then
-  fso.CopyFile sourceExe, appExe, True
-End If
 env("SIMPLE_VIBE_IDE_ROOT") = scriptDir
+launchCommand = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " & _
+  "-WindowStyle Hidden -File " & Chr(34) & launchScript & Chr(34) & " -SkipTerminal"
+
+' Wait only for the copy/launcher helper, not for the application lifetime.
+On Error Resume Next
 shell.CurrentDirectory = tempDir
-shell.Run Chr(34) & appExe & Chr(34), 1, False
+launchExitCode = shell.Run(launchCommand, 0, True)
+If Err.Number <> 0 Then
+  Err.Clear
+  On Error GoTo 0
+  MsgBox "Could not start the app. Run run-built.cmd to see diagnostics.", vbExclamation, "Simple Vibe IDE"
+  WScript.Quit 1
+End If
+On Error GoTo 0
+
+If launchExitCode <> 0 Then
+  MsgBox "App launch failed. Run run-built.cmd to see diagnostics.", vbExclamation, "Simple Vibe IDE"
+  WScript.Quit launchExitCode
+End If

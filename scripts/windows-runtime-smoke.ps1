@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "windows-build-artifacts.ps1")
 
 function Format-DisplayPath {
   param([string]$Path)
@@ -84,7 +85,7 @@ function Find-BuiltExe {
 
   if ($env:CARGO_TARGET_DIR) {
     $candidate = Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"
-    $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
+    $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
     if ($resolved) { return $resolved.Path }
     return $null
   }
@@ -95,9 +96,9 @@ function Find-BuiltExe {
 
   $seen = @{}
   foreach ($candidate in $candidates) {
-    $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
+    $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
     if (-not $resolved) { continue }
-    $item = Get-Item $resolved.Path -ErrorAction SilentlyContinue
+    $item = Get-Item -LiteralPath $resolved.Path -ErrorAction SilentlyContinue
     if (-not $item) { continue }
     $key = $item.FullName.ToLowerInvariant()
     if ($seen.ContainsKey($key)) { continue }
@@ -118,16 +119,17 @@ function Remove-StaleBuiltExe {
   param([string]$BinaryName = "simple-vibe-ide")
 
   if (-not $env:CARGO_TARGET_DIR) { return }
+  # Only Cargo's mutable output needs freshness cleanup. Runtime snapshots may be
+  # running (or used by their SSH askpass children) and must never be replaced.
   $paths = @(
-    (Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"),
-    (Join-Path $env:CARGO_TARGET_DIR "simple-vibe-build-sources\$BinaryName.exe")
+    (Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe")
   )
   foreach ($path in $paths) {
-    if (-not (Test-Path $path)) { continue }
+    if (-not (Test-Path -LiteralPath $path)) { continue }
     try {
       Remove-Item -LiteralPath $path -Force
     } catch {
-      throw "Could not remove stale $BinaryName build artifact before rebuild: $(Format-DisplayPath $path). Close running apps that use it. $(Format-DisplayPath $_.Exception.Message)"
+      throw "Could not refresh raw Cargo output: $(Format-DisplayPath $path). If this raw release exe was launched directly, close that instance once and use the timestamped runtime exe or run-built launcher instead. Other running snapshots can stay open. $(Format-DisplayPath $_.Exception.Message)"
     }
   }
 }
@@ -138,13 +140,9 @@ function Save-BuiltExeSnapshot {
     [Parameter(Mandatory = $true)][string]$BinaryName
   )
 
-  if (-not $env:CARGO_TARGET_DIR) { return $SourceExe }
+  if (-not $env:CARGO_TARGET_DIR) { throw "CARGO_TARGET_DIR is required to publish a runtime snapshot." }
   $snapshotDir = Join-Path $env:CARGO_TARGET_DIR "simple-vibe-build-sources"
-  New-Item -ItemType Directory -Force $snapshotDir | Out-Null
-  $snapshotExe = Join-Path $snapshotDir "$BinaryName.exe"
-  Copy-Item -LiteralPath $SourceExe -Destination $snapshotExe -Force
-  (Get-Item -LiteralPath $snapshotExe).LastWriteTime = Get-Date
-  return $snapshotExe
+  return Save-VersionedBuiltExe -SourceExe $SourceExe -BinaryName $BinaryName -SnapshotDir $snapshotDir
 }
 
 function Assert-ExeProductName {
@@ -213,6 +211,8 @@ if (-not $SkipNpmInstall) {
 }
 
 Invoke-Step "Windows npm dependency preflight" { Assert-WindowsNodeModules }
+Invoke-Step "Versioned build artifact regression" { & (Join-Path $PSScriptRoot "windows-build-artifacts-smoke.ps1") }
+Invoke-Step "Build artifact routing regression" { & (Join-Path $PSScriptRoot "windows-build-routing-smoke.ps1") }
 Invoke-Step "npm audit" { npm.cmd audit --audit-level=low }
 
 Invoke-Step "TypeScript check" { npm.cmd run check }
@@ -225,8 +225,8 @@ $ideExe = Find-BuiltExe "simple-vibe-ide"
 if (-not $ideExe) {
   throw "Could not find built simple-vibe-ide.exe after Tauri build."
 }
-$ideExe = Save-BuiltExeSnapshot -SourceExe $ideExe -BinaryName "simple-vibe-ide"
 Assert-ExeProductName -ExePath $ideExe -ExpectedName "Simple Vibe IDE"
+$ideExe = Save-BuiltExeSnapshot -SourceExe $ideExe -BinaryName "simple-vibe-ide"
 
 Remove-StaleBuiltExe "simple-vibe-terminal"
 Invoke-Step "Tauri Terminal release no-bundle build" { npm.cmd run tauri:terminal:build }
@@ -234,8 +234,8 @@ $terminalExe = Find-BuiltExe "simple-vibe-terminal"
 if (-not $terminalExe) {
   throw "Could not find built simple-vibe-terminal.exe after Tauri terminal build."
 }
-$terminalExe = Save-BuiltExeSnapshot -SourceExe $terminalExe -BinaryName "simple-vibe-terminal"
 Assert-ExeProductName -ExePath $terminalExe -ExpectedName "Simple Vibe Terminal"
+$terminalExe = Save-BuiltExeSnapshot -SourceExe $terminalExe -BinaryName "simple-vibe-terminal"
 
 Write-Host ""
 Write-Host "Built IDE exe: $(Format-DisplayPath $ideExe)" -ForegroundColor Green
@@ -243,7 +243,8 @@ Write-Host "Built Terminal exe: $(Format-DisplayPath $terminalExe)" -ForegroundC
 
 if (-not $NoLaunch) {
   Invoke-Step "Launch built app" {
-    Start-Process -FilePath $ideExe -WorkingDirectory $repoRoot
+    # Do not keep the disposable staged source directory open for the app lifetime.
+    Start-Process -FilePath $ideExe -WorkingDirectory (Split-Path -Parent $ideExe)
   }
 }
 

@@ -9,6 +9,11 @@
 
 Simple Vibe IDE is a Windows-first Tauri v2 desktop app for fast LLM coding sessions across Windows, WSL, and SSH workspaces. It is a local, pre-1.0 tool focused on terminal responsiveness, workspace memory, and practical multi-agent coding loops.
 
+**다른 시스템에서 개발 재개 / Developer onboarding:**
+[문서 지도](docs/README.md) → [현재 구현·이관](docs/DEVELOPMENT_HANDOFF.md) →
+[OS별 개발 환경](docs/DEVELOPMENT_ENVIRONMENTS.md) → [아키텍처](docs/ARCHITECTURE.md) →
+[검증 절차](docs/TESTING.md). Coding agents start with [AGENTS.md](AGENTS.md).
+
 ![Simple Vibe IDE Glass theme demo screenshot](docs/simple-vibe-ide-glass-demo.png)
 
 _Glass theme screenshot._
@@ -70,6 +75,7 @@ LLM이나 coding agent에게 설치/빌드/검증을 맡길 때는 [LLM / Agent 
 - Workspace별 Calculator와 history
 - Capture protection toggle
 - 자동 포트 연결과 compact `Ports` 팝오버를 포함한 Simple Vibe Terminal 별도 exe
+- IDE 상단 `Ports`에서 워크스페이스별 포트 등록·중지·재시도 관리. 새 버전에서 감지/등록한 포트는 재실행 후 해당 워크스페이스 진입 시 복원되며 브라우저는 자동으로 열지 않습니다.
 
 ## 설치 요구사항
 
@@ -130,8 +136,10 @@ Windows-local drive를 쓰려면 `-StageRoot`와 `-CargoTargetDir`를 전달하�
 
 Windows HMR 개발이 필요하면 Windows-local clone/worktree를 사용하세요. 같은 WSL checkout의
 `node_modules`에서 WSL `npm install`과 Windows `npm install`을 번갈아 실행하지 마세요.
-staged helper는 기본적으로 tracked working-tree file만 복사합니다. 새 untracked source까지
-필요할 때만 `-IncludeUntracked`를 쓰고, private local file은 먼저 ignore 처리하세요.
+staged helper는 tracked working-tree 파일과, 지정된 소스 경로의 새 Rust/프런트엔드 코드·
+빌드 스크립트를 기본 복사합니다. 새 모듈 때문에 먼저 commit하거나 옵션을 추가할 필요는 없습니다.
+그 외 미추적 asset/docs 파일까지 필요할 때만 `-IncludeUntracked`를 쓰고, private local file은
+먼저 ignore 처리하세요. 파일 목록·개인 파일 패턴·Windows 경로 검증은 기존 stage 삭제 전에 수행합니다.
 
 ## 빌드와 실행
 
@@ -149,7 +157,7 @@ Simple Vibe Terminal만 빌드:
 npm run tauri:terminal:build
 ```
 
-IDE와 Terminal을 한 번에 빌드하고 `%TEMP%\simple-vibe-ide-target\release`로 복사:
+IDE와 Terminal을 한 번에 빌드하고 `%TEMP%\simple-vibe-ide-target\simple-vibe-build-sources`로 복사:
 
 ```powershell
 .\build-and-copy.cmd
@@ -163,7 +171,10 @@ IDE와 Terminal을 한 번에 빌드하고 `%TEMP%\simple-vibe-ide-target\releas
 
 - `run-built.vbs`: 추가 console 창 없이 조용히 실행하는 일반 launcher
 - `run-built.cmd`: 디버깅용으로 console 창을 보면서 실행하는 launcher
-- `build-and-copy.cmd`: `simple-vibe-ide.exe`, `simple-vibe-terminal.exe`, 실행 helper를 temp release 폴더에 복사
+- `build-and-copy.cmd`: 날짜·시간(UTC)과 GUID를 붙인 IDE/Terminal EXE 및 실행 helper를 생성
+- 실행 파일은 Cargo 출력과 분리된 복사본이므로 이전 앱을 종료하지 않고 재빌드할 수 있습니다.
+  이전 복사본은 자동 삭제하지 않습니다. Cargo `release` EXE를 직접 실행 중이었다면 한 번 종료한 뒤
+  새 launcher를 사용하세요. [빌드 중 실행 유지](docs/WINDOWS_RUNTIME_SMOKE.md#rebuild-while-an-earlier-app-is-running)
 
 ## 첫 사용 흐름
 
@@ -215,6 +226,7 @@ WSL/SSH 같은 POSIX shell에서 LLM 버튼을 누르거나 Windows에서 Codex/
 
 Windows용 shim은 인자 경계/순서와 exit code(특히 `-L simple-vibe-ide`와 literal `;` command queue)를 그대로 전달하고, `list-sessions -F`, exact `=name` 대상의 `has-session`/`attach-session`/`kill-session`, `new-session -d`, `set-option`/`show-options`, `@simple-vibe-ide-launch-owner`, `destroy-unattached`, `remain-on-exit`을 지원해야 합니다. `list-sessions`/`show-options`의 stdout에는 shim banner를 섞지 않아야 합니다. pane shell에서는 `powershell.exe`를 찾을 수 있어야 하며 detached server는 launcher/client 종료 후에도 살아 있어야 합니다. Windows 세션은 기존 default server가 IDE cleanup Job 아래에서 만들어진 경우까지 분리하기 위해 전용 `simple-vibe-ide` server namespace를 씁니다. 외부 client에서는 `tmux -L simple-vibe-ide ...`로 접근합니다. PowerShell profile에만 둔 alias/function은 대상이 아닙니다. 명령을 찾았지만 이 계약대로 session을 만들지 못하면 중복 agent를 막기 위해 direct 실행으로 fallback하지 않고 오류로 중단합니다.
 
+- Windows LLM pane(v10)과 새 대화형 shell은 Windows PowerShell 5.1 프로필을 읽습니다. `codex`/`claude` 함수와 계정 선택 래퍼를 이름으로 호출하며 `.exe`로 우회하지 않습니다. 새 session의 기본 셸/명령만 지정하며 기존 session이나 전역 `.tmux.conf`는 바꾸지 않습니다. shim은 `set-option -F`의 `#{l:}` 빈 문자열 확장도 지원해야 합니다. 위의 profile-only alias/function 제한은 LLM이 아니라 **tmux 명령 검색**에만 해당합니다.
 - 같은 workspace의 같은 agent를 여러 번 누르면 `codex #1`, `codex #2`처럼 별도 session/tab이 생깁니다.
 - LLM widget의 `+` 버튼은 plain shell 대신 같은 agent의 새 tmux session tab을 추가합니다.
 - `Tmux` 버튼은 메뉴를 즉시 열고, 기존 session 목록을 비동기로 불러옵니다. 최근 목록은 cache되어 반복 열기가 빠릅니다.
@@ -403,6 +415,7 @@ When asking an LLM or coding agent to install, build, or verify the app, provide
 - Workspace Calculator with history
 - Workspace capture protection toggle
 - Separate Simple Vibe Terminal executable with automatic port connections and a compact `Ports` popover
+- IDE toolbar `Ports` manages workspace forwards, stop and retry. Ports detected/registered in this version restore on workspace activation after restart, without opening a browser.
 
 ## Requirements
 
@@ -465,9 +478,10 @@ and `-CargoTargetDir` to use another spacious Windows-local drive.
 For Windows HMR development, use a Windows-local clone/worktree. Never alternate
 WSL `npm install` and Windows `npm install` in the same WSL checkout's
 `node_modules` directory.
-The staged helper copies tracked working-tree files by default. Use
-`-IncludeUntracked` only when new untracked source is required, after ensuring
-all private local files are ignored.
+The staged helper copies tracked working-tree files plus allowlisted nonignored new
+Rust/frontend code and build scripts by default, without requiring a commit first.
+Use `-IncludeUntracked` for other new assets/docs only after ensuring private local
+files are ignored. Manifest/privacy/Windows path validation precedes old-stage deletion.
 
 ## Build And Launch
 
@@ -485,7 +499,7 @@ Build only Simple Vibe Terminal:
 npm run tauri:terminal:build
 ```
 
-Build both IDE and Terminal, then copy both exes to `%TEMP%\simple-vibe-ide-target\release`:
+Build both IDE and Terminal, then copy both exes to `%TEMP%\simple-vibe-ide-target\simple-vibe-build-sources`:
 
 ```powershell
 .\build-and-copy.cmd
@@ -499,7 +513,10 @@ After building:
 
 - `run-built.vbs`: quiet launcher without an extra console window
 - `run-built.cmd`: debug launcher with a visible console window
-- `build-and-copy.cmd`: builds/copies both exes and writes helper launchers
+- `build-and-copy.cmd`: publishes UTC timestamp/GUID-named executable copies and writes helper launchers
+- Runtime copies are separate from Cargo output, so older apps can stay open during rebuilds.
+  Old copies are not automatically deleted. A directly launched raw Cargo `release` EXE needs a
+  one-time close before switching to these launchers. [Rebuild while running](docs/WINDOWS_RUNTIME_SMOKE.md#rebuild-while-an-earlier-app-is-running)
 
 ## First Run
 
@@ -552,6 +569,7 @@ On POSIX profiles such as WSL/SSH, LLM launchers use `tmux` when it is installed
 A Windows shim must preserve argument boundaries/order and exit status (including `-L simple-vibe-ide` and the literal `;` command queue), and support `list-sessions -F`, exact `=name` targets for `has-session`/`attach-session`/`kill-session`, `new-session -d`, `set-option`/`show-options`, `@simple-vibe-ide-launch-owner`, `destroy-unattached`, and `remain-on-exit`. It must not mix shim banners into the machine-readable stdout of `list-sessions` or `show-options`. Its pane shell must resolve `powershell.exe`, and its detached server must outlive the launcher/client. Windows sessions use the dedicated `simple-vibe-ide` server namespace so a pre-existing default server cannot inherit the IDE terminal cleanup lifetime; external clients should use `tmux -L simple-vibe-ide ...`. A profile-only alias or function is not supported. If tmux is discovered but cannot create a session under this contract, the launcher stops with an error instead of falling back to a duplicate direct agent.
 
 - Repeated launches for the same agent/workspace create numbered sessions such as `codex #1`, `codex #2`.
+- Windows LLM panes (v10) and new interactive shells load Windows PowerShell 5.1 profiles, resolving `codex`/`claude` functions and account wrappers by name rather than bypassing them with an `.exe` path. Only new session shell defaults are set; existing sessions and global user configuration stay untouched. Shims must support `set-option -F` with the empty literal format `#{l:}`. The profile-only alias/function restriction above applies to **tmux discovery**, not LLM commands.
 - The `+` button in an LLM widget creates another session tab for the same agent instead of a plain shell.
 - The `Tmux` button opens immediately and loads existing sessions asynchronously. Recent results are cached for faster repeat opens.
 - Selecting a session attaches it as a new tab in the current widget.

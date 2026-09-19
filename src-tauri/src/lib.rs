@@ -1,11 +1,12 @@
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, ExitStatus, Output, Stdio};
 #[cfg(windows)]
@@ -22,6 +23,9 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
+
+mod preview_body;
+use preview_body::{capture_preview_body, PreviewBodyCapture, PreviewBodyFraming};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -147,10 +151,16 @@ const LOCAL_DIRECTORY_BATCH_PARALLELISM: usize = 4;
 const WSL_DIRECTORY_BATCH_PARALLELISM: usize = 2;
 const TERMINAL_DIRECT_OUTPUT_EVENT_BATCH_MS: u64 = 4;
 const TERMINAL_OUTPUT_EVENT_FORCE_CHARS: usize = 16 * 1024;
+const TERMINAL_OUTPUT_MAX_IN_FLIGHT_BYTES: usize = 128 * 1024;
+const TERMINAL_OUTPUT_MAX_IN_FLIGHT_BATCHES: usize = 64;
 const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 256;
 const TERMINAL_INPUT_BARRIER_TIMEOUT: Duration = Duration::from_millis(1_200);
 const TERMINAL_DSR_CURSOR_QUERY: &str = "\x1b[6n";
+const FORWARD_PROXY_MAX_CONNECTIONS: usize = 128;
+const FORWARD_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BROWSER_NATIVE_WEBVIEW_LABEL_PREFIX: &str = "browser-preview-webview";
+const PREVIEW_HTML_CAPTURE_LIMIT: usize = 2 * 1024 * 1024;
+const PREVIEW_HTML_CAPTURE_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const WSL_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(8);
 const WSL_FAST_HOME_DETECT_TIMEOUT: Duration = Duration::from_secs(4);
 const WSL_WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -193,7 +203,7 @@ const SNIPPETS_STORE_FILE: &str = "snippets.v1.json";
 const SNIPPETS_STORE_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_SNIPPETS_STORE: &str = r#"{"version":1,"activeTabId":"general","tabs":[{"id":"general","title":"General","items":[]}]}"#;
 const LLM_TMUX_SESSION_MAX_LEN: usize = 48;
-const WINDOWS_LLM_TMUX_LAUNCHER_VERSION: u32 = 9;
+const WINDOWS_LLM_TMUX_LAUNCHER_VERSION: u32 = 10;
 const WINDOWS_LLM_TMUX_ALLOCATION_ATTEMPTS: usize = 8;
 const WINDOWS_LLM_TMUX_PREPARE_MISSING_EXIT_CODE: i32 = 80;
 const WINDOWS_LLM_TMUX_PREPARE_EXISTS_EXIT_CODE: i32 = 81;
@@ -367,6 +377,7 @@ impl Default for IdeState {
 
 struct TerminalSession {
     input_tx: SyncSender<TerminalInputMessage>,
+    output_batcher: Arc<AppOutputBatcher>,
     child: Box<dyn portable_pty::Child + Send>,
     master: Box<dyn MasterPty + Send>,
     rows: u16,
@@ -377,6 +388,7 @@ struct TerminalSession {
 struct PendingTerminalChild {
     child: Option<Box<dyn portable_pty::Child + Send>>,
     wsl_permit: Option<WslHelperPermit>,
+    output_batcher: Option<Arc<AppOutputBatcher>>,
 }
 
 impl PendingTerminalChild {
@@ -387,6 +399,7 @@ impl PendingTerminalChild {
         Self {
             child: Some(child),
             wsl_permit,
+            output_batcher: None,
         }
     }
 
@@ -406,6 +419,9 @@ impl PendingTerminalChild {
 impl Drop for PendingTerminalChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.take() {
+            if let Some(batcher) = self.output_batcher.take() {
+                batcher.stop();
+            }
             schedule_terminal_child_termination_with_wsl_permit(child, self.wsl_permit.take());
         }
     }
@@ -417,9 +433,94 @@ enum TerminalInputMessage {
 }
 
 struct ForwardSession {
-    stop: Option<Arc<AtomicBool>>,
+    stop: Option<Arc<ForwardProxyControl>>,
     child: Option<ProcessChild>,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct ForwardProxyControl {
+    stopped: AtomicBool,
+    next_connection_id: AtomicU64,
+    connections: Mutex<HashMap<u64, Vec<TcpStream>>>,
+}
+
+struct ForwardProxyConnection {
+    id: u64,
+    control: Arc<ForwardProxyControl>,
+}
+
+impl ForwardProxyControl {
+    fn register(self: &Arc<Self>, incoming: &TcpStream) -> std::io::Result<ForwardProxyConnection> {
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "port forward was stopped",
+            ));
+        }
+        if connections.len() >= FORWARD_PROXY_MAX_CONNECTIONS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "port forward connection limit reached",
+            ));
+        }
+        let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        connections.insert(id, vec![incoming.try_clone()?]);
+        Ok(ForwardProxyConnection {
+            id,
+            control: self.clone(),
+        })
+    }
+
+    fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let connections = std::mem::take(
+            &mut *self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for streams in connections.into_values() {
+            for stream in streams {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+impl ForwardProxyConnection {
+    fn track_remote(&self, remote: &TcpStream) -> std::io::Result<()> {
+        let mut connections = self
+            .control
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let streams = connections.get_mut(&self.id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "port forward was stopped")
+        })?;
+        streams.push(remote.try_clone()?);
+        Ok(())
+    }
+}
+
+impl Drop for ForwardProxyConnection {
+    fn drop(&mut self) {
+        let streams = self
+            .control
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+        if let Some(streams) = streams {
+            for stream in streams {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
 }
 
 struct PendingProcessChild {
@@ -704,6 +805,96 @@ struct AppOutputBatchShared {
     app: tauri::AppHandle,
     state: Mutex<AppOutputBatchState>,
     ready: Condvar,
+    flow: TerminalOutputFlow,
+}
+
+#[derive(Default)]
+struct TerminalOutputFlowState {
+    pending: VecDeque<(u64, usize)>,
+    pending_bytes: usize,
+    last_sequence: u64,
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct TerminalOutputFlow {
+    state: Mutex<TerminalOutputFlowState>,
+    ready: Condvar,
+}
+
+impl TerminalOutputFlow {
+    fn reserve(&self, sequence: u64, bytes: usize) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.stopped
+            && (state.pending.len() >= TERMINAL_OUTPUT_MAX_IN_FLIGHT_BATCHES
+                || (!state.pending.is_empty()
+                    && state.pending_bytes.saturating_add(bytes)
+                        > TERMINAL_OUTPUT_MAX_IN_FLIGHT_BYTES))
+        {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if state.stopped {
+            return false;
+        }
+        state.pending.push_back((sequence, bytes));
+        state.pending_bytes += bytes;
+        state.last_sequence = sequence;
+        true
+    }
+
+    fn acknowledge(&self, sequence: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sequence > state.last_sequence {
+            return;
+        }
+        while state
+            .pending
+            .front()
+            .is_some_and(|(pending, _)| *pending <= sequence)
+        {
+            if let Some((_, bytes)) = state.pending.pop_front() {
+                state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+            }
+        }
+        self.ready.notify_all();
+    }
+
+    fn discard_failed_emission(&self, sequence: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|(pending, _)| *pending == sequence)
+        {
+            if let Some((_, bytes)) = state.pending.remove(index) {
+                state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+            }
+        }
+        self.ready.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stopped = true;
+        state.pending.clear();
+        state.pending_bytes = 0;
+        self.ready.notify_all();
+    }
 }
 
 /// One sleeping worker per live terminal replaces the old thread-per-timer
@@ -729,6 +920,7 @@ impl AppOutputBatcher {
                 worker_stopped: false,
             }),
             ready: Condvar::new(),
+            flow: TerminalOutputFlow::default(),
         });
         let worker_shared = shared.clone();
         let worker = thread::Builder::new()
@@ -789,20 +981,23 @@ impl AppOutputBatcher {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
+
+    fn stop(&self) {
+        self.shared.flow.stop();
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stopping = true;
+        state.force_flush = true;
+        self.shared.ready.notify_all();
+    }
 }
 
 impl Drop for AppOutputBatcher {
     fn drop(&mut self) {
-        {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.stopping = true;
-            state.force_flush = true;
-            self.shared.ready.notify_one();
-        }
+        self.stop();
         let worker = self
             .worker
             .get_mut()
@@ -861,13 +1056,30 @@ fn run_app_output_batcher(shared: Arc<AppOutputBatchShared>) {
             }
         };
 
-        let _ = shared.app.emit(
+        // Tauri event delivery queues work in WebView2; returning from emit is
+        // not evidence that xterm consumed it. Bound that queue with renderer
+        // acknowledgements without blocking the global terminal/lifecycle locks.
+        if !shared.flow.reserve(sequence, data.len()) {
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.buffer.clear();
+            state.worker_stopped = true;
+            shared.ready.notify_all();
+            return;
+        }
+        let emitted = shared.app.emit(
             "terminal-data",
             TerminalDataEvent {
                 id: shared.id.clone(),
                 data,
+                sequence,
             },
         );
+        if emitted.is_err() {
+            shared.flow.discard_failed_emission(sequence);
+        }
         let mut state = shared
             .state
             .lock()
@@ -1029,6 +1241,41 @@ fn normalize_profile_path(profile: &ConnectionProfile, path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+fn resolve_windows_profile_path(path: &str) -> Result<String, String> {
+    let requested = if path.trim().is_empty() {
+        default_windows_root()
+    } else {
+        path.trim().to_string()
+    };
+    let bytes = requested.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if has_drive && (bytes.len() == 2 || !matches!(bytes[2], b'\\' | b'/')) {
+        // D:folder is relative to that drive's current directory, NOT D:\folder.
+        // Never silently guess a project location or apply this path again in the child shell.
+        return Err(
+            r"Use an absolute Windows project folder, for example D:\Projects\Example (not D:Projects\Example). Add the slash after the drive letter."
+                .to_string(),
+        );
+    }
+    if has_drive || requested.starts_with(r"\\") {
+        return Ok(requested);
+    }
+    let requested = PathBuf::from(requested);
+    // Resolve once, before the directory probe and PTY creation. PowerShell then receives
+    // the same absolute path instead of resolving a relative suffix for a second time.
+    let resolved = if requested.is_absolute() {
+        requested
+    } else {
+        std::env::current_dir()
+            .map_err(|_| {
+                "Could not resolve the Windows project folder. Choose an absolute folder."
+                    .to_string()
+            })?
+            .join(requested)
+    };
+    Ok(resolved.to_string_lossy().into_owned())
 }
 
 fn wsl_posix_path_to_windows_path(profile: &ConnectionProfile, path: &str) -> Option<PathBuf> {
@@ -1779,9 +2026,9 @@ if ($agentStatus -eq 1) {{
   if (-not $addedIdentity) {{
     & $sshAdd
   }}
-}} elseif ($agentStatus -ne 0) {{
-  Write-Host '[simple-vibe-ide] Windows OpenSSH agent is unavailable; using the IDE SSH askpass prompt instead.'
 }}
+# An agent is optional: IDE askpass is already configured. Let ssh report real
+# authentication failures instead of printing a fallback notice on every tab.
 $sshArgs = @({common_options})
 # Keep the native argv quote escape as a defensive layer, but the terminal bootstrap is
 # primarily passed as a quote-free base64 loader now. Windows PowerShell 5.1 -> ssh.exe
@@ -1891,6 +2138,7 @@ struct DirectorySignatureEntry {
 struct TerminalDataEvent {
     id: String,
     data: String,
+    sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3030,8 +3278,15 @@ fn windows_llm_tmux_prepare_script(
     // delegate the pane command to MSYS/WSL, where `powershell.exe` is interop-resolvable but a
     // quoted native absolute path is not. The control process starts tmux from a trusted system
     // directory, and the encoded inner script changes to the requested workspace before launch.
+    // This is the actual LLM pane, not the noninteractive tmux control helper.
+    // Load the user's PS5.1 profiles so `& 'codex'` / `& 'claude'` resolve their
+    // functions/account wrappers instead of bypassing them via a native CLI shim.
+    // PS5.1 drops an empty native argv item (also across .ps1 wrappers). Expand a
+    // nonempty literal format inside tmux instead, to clear default-command safely.
+    // set-option resolves pane-style targets even for session options: use the
+    // exact '=session:' target, not '=session', and never alter global defaults.
     let inner_command = format!(
-        "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded_inner}"
+        "powershell.exe -Version 5.1 -NoLogo -ExecutionPolicy Bypass -EncodedCommand {encoded_inner}"
     );
     format!(
         concat!(
@@ -3042,7 +3297,7 @@ fn windows_llm_tmux_prepare_script(
             "{tmux_invoke}",
             "if ($__sviTmuxOk -and $__sviTmuxExit -eq 0) {{ exit {exists} }}; ",
             "$__sviInner = {inner}; ",
-            "$__sviTmuxArgs = @('-L', {server}, 'new-session', '-d', '-s', $__sviSession, $__sviInner, ';', 'set-option', '-t', $__sviPaneTarget, 'destroy-unattached', 'off', ';', 'set-option', '-w', '-t', $__sviPaneTarget, 'remain-on-exit', 'on', ';', 'set-option', '-t', $__sviPaneTarget, {owner_option}, $__sviOwner); ",
+            "$__sviTmuxArgs = @('-L', {server}, 'new-session', '-d', '-s', $__sviSession, $__sviInner, ';', 'set-option', '-t', $__sviPaneTarget, 'default-shell', $__sviPowerShell, ';', 'set-option', '-F', '-t', $__sviPaneTarget, 'default-command', '#{{l:}}', ';', 'set-option', '-t', $__sviPaneTarget, 'destroy-unattached', 'off', ';', 'set-option', '-w', '-t', $__sviPaneTarget, 'remain-on-exit', 'on', ';', 'set-option', '-t', $__sviPaneTarget, {owner_option}, $__sviOwner); ",
             "{tmux_invoke}",
             "if ($__sviTmuxOk -and $__sviTmuxExit -eq 0) {{ exit {created} }}; ",
             "$__sviTmuxArgs = @('-L', {server}, 'has-session', '-t', $__sviTarget); ",
@@ -3734,7 +3989,7 @@ mod windows_llm_tmux_launcher_tests {
             .expect("fixed Codex launch");
 
         assert!(destroy < remain && remain < launch);
-        assert!(script.contains("$__svi_launch_v = 9"));
+        assert!(script.contains("$__svi_launch_v = 10"));
         assert!(script.contains("Set-Location -LiteralPath 'C:\\Work O''Brien\\repo'"));
         assert!(script.contains("$__sviTmux.CommandType -eq 'ExternalScript'"));
         assert!(script.contains("-File $__sviTmux.Path @__sviTmuxArgs"));
@@ -3771,10 +4026,18 @@ mod windows_llm_tmux_launcher_tests {
 
         assert!(create < destroy && destroy < remain && remain < owner);
         assert_eq!(script.matches("'new-session'").count(), 1);
-        assert_eq!(script.matches("';'").count(), 3);
+        assert_eq!(script.matches("';'").count(), 5);
         assert!(script.contains("$__sviTarget = '=svi_demo_claude_10'"));
         assert!(script.contains("$__sviPaneTarget = '=svi_demo_claude_10:'"));
-        assert!(script.contains("powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass"));
+        assert!(script.contains("powershell.exe -Version 5.1 -NoLogo -ExecutionPolicy Bypass"));
+        assert!(!script.contains("powershell.exe -NoLogo -NoProfile"));
+        assert!(script
+            .contains("'set-option', '-t', $__sviPaneTarget, 'default-shell', $__sviPowerShell"));
+        assert!(script
+            .contains("'set-option', '-F', '-t', $__sviPaneTarget, 'default-command', '#{l:}'"));
+        assert!(!script.contains("'-g'"));
+        assert!(!script.contains("'-f'"));
+        assert!(!script.contains("cmd.exe"));
         assert!(!script.contains(r"C:\Windows"));
         assert!(script.contains("$__sviOwner = 'owner123'"));
         assert!(script.contains("if ($__sviObservedOwner -eq $__sviOwner) { exit 82 }"));
@@ -3785,6 +4048,49 @@ mod windows_llm_tmux_launcher_tests {
         assert!(!script.contains(">$null"));
         assert!(script.contains("-EncodedCommand QQBBAEEAPQAxAA=="));
         assert!(!script.contains("claude --dangerously-skip-permissions"));
+    }
+
+    #[test]
+    #[ignore = "exports an opt-in isolated Windows runtime smoke fixture; never starts a real LLM"]
+    fn export_windows_tmux_profile_smoke_fixture() {
+        let directory = std::env::var("SVI_TMUX_SMOKE_FIXTURE_DIR")
+            .expect("set SVI_TMUX_SMOKE_FIXTURE_DIR to an empty temporary directory");
+        let server = format!("svi_profile_smoke_{}", Uuid::new_v4().simple());
+        let session = "svi_profile_smoke_codex_1";
+        let inner = windows_llm_tmux_inner_script(
+            session,
+            r"C:\",
+            "codex",
+            &["--dangerously-bypass-approvals-and-sandbox"],
+        )
+        .replace(WINDOWS_LLM_TMUX_SERVER_NAME, &server);
+        // Check the real profile's resolution, then shadow Codex with a harmless
+        // test function. No account selector, LLM process or network request runs.
+        let probe = concat!(
+            "$c = Get-Command codex -ErrorAction SilentlyContinue; ",
+            "Write-Output ('SVI_PROFILE_TYPE=' + $c.CommandType); ",
+            "Write-Output ('SVI_PS_VERSION=' + $PSVersionTable.PSVersion.Major + '.' + $PSVersionTable.PSVersion.Minor); ",
+            "function codex { Write-Output ('SVI_FUNCTION_' + 'ROUTED'); }; "
+        );
+        let prepare = windows_llm_tmux_prepare_script(
+            session,
+            &powershell_encoded_command(&format!("{probe}{inner}")),
+            &Uuid::new_v4().simple().to_string(),
+        )
+        .replace(WINDOWS_LLM_TMUX_SERVER_NAME, &server);
+        let invoke = windows_tmux_invoke_script("__sviTmuxArgs");
+        let prepare = prepare.replace(&invoke, &format!(
+            "{invoke} Write-Output ('SVI_CTRL_' + $__sviTmuxArgs[2] + '_EXIT=' + $__sviTmuxExit + '_OK=' + $__sviTmuxOk); "
+        ));
+        std::fs::create_dir_all(&directory).expect("fixture directory");
+        std::fs::write(
+            PathBuf::from(directory).join("windows-tmux-profile-fixture.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "server": server, "session": session, "prepareScript": prepare,
+            }))
+            .unwrap(),
+        )
+        .expect("write isolated fixture");
     }
 
     #[test]
@@ -4958,8 +5264,8 @@ fn resolve_profile_path_blocking_with_scope(
             ));
         }
     }
-    if profile.kind == "windows" && trimmed.is_empty() {
-        return Ok(default_windows_root());
+    if profile.kind == "windows" {
+        return resolve_windows_profile_path(trimmed);
     }
     if profile.kind == "ssh" && trimmed.is_empty() {
         return Ok(".".to_string());
@@ -5211,13 +5517,13 @@ fn read_text_file_blocking(profile_id: String, path: String) -> Result<String, S
             } else {
                 let script = format!("cat -- {}", shell_quote(&path));
                 let bytes = run_profile_shell(&profile, &script, None)?;
-                Ok(String::from_utf8_lossy(&bytes).to_string())
+                Ok(remote_text_from_bytes(bytes))
             }
         }
         "ssh" => {
             let script = format!("cat -- {}", shell_quote(&path));
             let bytes = run_profile_shell(&profile, &script, None)?;
-            Ok(String::from_utf8_lossy(&bytes).to_string())
+            Ok(remote_text_from_bytes(bytes))
         }
         _ => Err(format!("unsupported profile kind: {}", profile.kind)),
     }
@@ -5306,8 +5612,22 @@ fn read_file_data_url_blocking(profile_id: String, path: String) -> Result<Strin
         _ => return Err(format!("unsupported profile kind: {}", profile.kind)),
     };
     let mime = mime_type_for_path(&path);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{mime};base64,{encoded}"))
+    Ok(file_data_url(&mime, &bytes))
+}
+
+fn remote_text_from_bytes(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
+fn file_data_url(mime: &str, bytes: &[u8]) -> String {
+    let encoded_len = base64::encoded_len(bytes.len(), true).unwrap_or(0);
+    let mut output = String::with_capacity(mime.len() + 13 + encoded_len);
+    output.push_str("data:");
+    output.push_str(mime);
+    output.push_str(";base64,");
+    base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut output);
+    output
 }
 
 #[tauri::command]
@@ -6110,26 +6430,12 @@ fn save_attachment_blocking(
                 fs::write(&target, data).map_err(|err| err.to_string())?;
             } else {
                 let target = join_posix(&current_dir, &relative);
-                let dir = parent_posix(&target);
-                let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-                let script = format!(
-                    "mkdir -p {} && base64 -d > {}",
-                    shell_quote(&dir),
-                    shell_quote(&target)
-                );
-                run_profile_shell(&profile, &script, Some(encoded.into_bytes()))?;
+                write_remote_file(&profile, &target, data)?;
             }
         }
         "ssh" => {
             let target = join_posix(&current_dir, &relative);
-            let dir = parent_posix(&target);
-            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-            let script = format!(
-                "mkdir -p {} && base64 -d > {}",
-                shell_quote(&dir),
-                shell_quote(&target)
-            );
-            run_profile_shell(&profile, &script, Some(encoded.into_bytes()))?;
+            write_remote_file(&profile, &target, data)?;
         }
         _ => return Err(format!("unsupported profile kind: {}", profile.kind)),
     }
@@ -6164,7 +6470,11 @@ fn spawn_terminal_direct(
         return Err("renderer runtime was replaced while the terminal was launching".to_string());
     }
     let profile = profile_from_id(&profile_id);
-    let cwd = normalize_profile_path(&profile, &cwd);
+    let cwd = if profile.kind == "windows" {
+        resolve_windows_profile_path(&cwd)?
+    } else {
+        normalize_profile_path(&profile, &cwd)
+    };
     warm_wsl_profile_with_scope(&profile, operation_scope)?;
     check_runtime_process_scope(operation_scope)?;
     if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
@@ -6221,6 +6531,7 @@ fn spawn_terminal_direct(
         .spawn_command(cmd)
         .map_err(|err| err.to_string())?;
     let mut pending_child = PendingTerminalChild::new(child, terminal_wsl_permit);
+    pending_child.output_batcher = Some(read_batcher.clone());
     if let Some(pid) = pending_child.child().process_id() {
         assign_child_to_cleanup_job(pid);
     }
@@ -6251,22 +6562,25 @@ fn spawn_terminal_direct(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    leftover.extend_from_slice(&buf[..n]);
-                    let mut data = drain_complete_utf8(&mut leftover);
+                    let mut data = decode_terminal_read(&buf[..n], &mut leftover);
                     if !dsr_leftover.is_empty() {
-                        data.insert_str(0, &dsr_leftover);
-                        dsr_leftover.clear();
+                        dsr_leftover.push_str(&data);
+                        data = Cow::Owned(std::mem::take(&mut dsr_leftover));
                     }
                     let trailing_dsr_prefix_len = trailing_terminal_dsr_prefix_len(&data);
+                    let keep_at = data.len() - trailing_dsr_prefix_len;
                     if trailing_dsr_prefix_len > 0 {
-                        let keep_at = data.len() - trailing_dsr_prefix_len;
-                        dsr_leftover = data[keep_at..].to_string();
-                        data.truncate(keep_at);
+                        dsr_leftover.push_str(&data[keep_at..]);
                     }
-                    if data.is_empty() {
+                    if keep_at == 0 {
                         continue;
                     }
-                    push_terminal_output_without_dsr_queries(&read_batcher, &app, &read_id, &data);
+                    push_terminal_output_without_dsr_queries(
+                        &read_batcher,
+                        &app,
+                        &read_id,
+                        &data[..keep_at],
+                    );
                 }
                 Err(_) => break,
             }
@@ -6305,6 +6619,10 @@ fn spawn_terminal_direct(
         terminal_id.clone(),
         TerminalSession {
             input_tx,
+            output_batcher: pending_child
+                .output_batcher
+                .take()
+                .expect("terminal output batcher"),
             child: pending_child.take(),
             master: pair.master,
             rows,
@@ -6331,7 +6649,7 @@ fn spawn_terminal_direct(
 
 fn write_terminal_host(state: &IdeState, id: String, data: String) -> Result<(), String> {
     let input_tx = terminal_input_sender(state, &id)?;
-    write_terminal_bytes(&input_tx, data.as_bytes())
+    write_terminal_bytes(&input_tx, data.into_bytes())
 }
 
 fn terminal_input_sender(
@@ -6350,12 +6668,12 @@ fn terminal_input_sender(
 
 fn write_terminal_bytes(
     input_tx: &SyncSender<TerminalInputMessage>,
-    data: &[u8],
+    data: Vec<u8>,
 ) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
     }
-    match input_tx.try_send(TerminalInputMessage::Data(data.to_vec())) {
+    match input_tx.try_send(TerminalInputMessage::Data(data)) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => Err("terminal input queue is full; try again".to_string()),
         Err(TrySendError::Disconnected(_)) => Err("terminal input writer is closed".to_string()),
@@ -6768,6 +7086,7 @@ fn terminate_pending_process_child_with_wsl_permit(
 }
 
 fn terminate_terminal_session(session: TerminalSession) {
+    session.output_batcher.stop();
     schedule_terminal_child_termination_with_wsl_context(session.child, None, session.wsl_gate_key);
 }
 
@@ -6785,7 +7104,7 @@ impl RuntimeCleanupTask {
             Self::Terminal(session) => terminate_terminal_session(session),
             Self::Forward(mut forward) => {
                 if let Some(stop) = forward.stop.take() {
-                    stop.store(true, Ordering::SeqCst);
+                    stop.shutdown();
                 }
                 if let Some(child) = forward.child.take() {
                     schedule_process_child_termination(child);
@@ -7329,17 +7648,20 @@ fn start_port_forward_host(
     listener
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(ForwardProxyControl::default());
     let thread_stop = stop.clone();
     let thread_target = target_host.clone();
 
     let worker = thread::spawn(move || {
-        while !thread_stop.load(Ordering::Relaxed) {
+        while !thread_stop.stopped.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((incoming, _)) => {
+                    let Ok(connection) = thread_stop.register(&incoming) else {
+                        continue;
+                    };
                     let target = thread_target.clone();
                     thread::spawn(move || {
-                        let _ = proxy_stream(incoming, target, remote_port);
+                        let _ = proxy_stream(incoming, target, remote_port, &connection);
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -7353,7 +7675,7 @@ fn start_port_forward_host(
     let mut forwards = match state.forwards.lock() {
         Ok(forwards) => forwards,
         Err(_) => {
-            stop.store(true, Ordering::SeqCst);
+            stop.shutdown();
             let _ = worker.join();
             return Err("forward state poisoned".to_string());
         }
@@ -7392,18 +7714,21 @@ fn start_preview_proxy_host(
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
     let id = Uuid::new_v4().to_string();
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(ForwardProxyControl::default());
     let thread_stop = stop.clone();
     let thread_host = target.host.clone();
     let thread_port = target.port;
 
     let worker = thread::spawn(move || {
-        while !thread_stop.load(Ordering::Relaxed) {
+        while !thread_stop.stopped.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((incoming, _)) => {
+                    let Ok(connection) = thread_stop.register(&incoming) else {
+                        continue;
+                    };
                     let host = thread_host.clone();
                     thread::spawn(move || {
-                        let _ = proxy_http_preview(incoming, host, thread_port);
+                        let _ = proxy_http_preview(incoming, host, thread_port, &connection);
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -7417,7 +7742,7 @@ fn start_preview_proxy_host(
     let mut forwards = match state.forwards.lock() {
         Ok(forwards) => forwards,
         Err(_) => {
-            stop.store(true, Ordering::SeqCst);
+            stop.shutdown();
             let _ = worker.join();
             return Err("forward state poisoned".to_string());
         }
@@ -7455,13 +7780,14 @@ fn probe_local_http_url_blocking(target_url: String) -> Result<bool, String> {
 }
 
 fn stop_port_forward_host(state: &IdeState, id: String) -> Result<(), String> {
-    let mut forwards = state
+    let forward = state
         .forwards
         .lock()
-        .map_err(|_| "forward state poisoned".to_string())?;
-    if let Some(mut forward) = forwards.remove(&id) {
+        .map_err(|_| "forward state poisoned".to_string())?
+        .remove(&id);
+    if let Some(mut forward) = forward {
         if let Some(stop) = forward.stop.take() {
-            stop.store(true, Ordering::Relaxed);
+            stop.shutdown();
         }
         if let Some(child) = forward.child.take() {
             schedule_process_child_termination(child);
@@ -7511,6 +7837,28 @@ async fn spawn_terminal(
 #[tauri::command]
 fn write_terminal(state: State<'_, IdeState>, id: String, data: String) -> Result<(), String> {
     write_terminal_host(&state, id, data)
+}
+
+#[tauri::command]
+fn acknowledge_terminal_output(
+    state: State<'_, IdeState>,
+    id: String,
+    sequence: u64,
+    renderer_runtime_epoch: u64,
+) -> Result<(), String> {
+    if !renderer_runtime_epoch_is_current(renderer_runtime_epoch) {
+        return Ok(());
+    }
+    let batcher = state
+        .terminals
+        .lock()
+        .map_err(|_| "terminal state poisoned".to_string())?
+        .get(&id)
+        .map(|session| session.output_batcher.clone());
+    if let Some(batcher) = batcher {
+        batcher.shared.flow.acknowledge(sequence);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -8693,14 +9041,16 @@ fn terminal_command(
         }
         _ => {
             let bootstrap = powershell_terminal_bootstrap_script(
+                cwd,
                 shell_history_id,
                 command.as_deref().filter(|value| !value.trim().is_empty()),
             );
             (
-                "powershell.exe".to_string(),
+                windows_powershell_executable()
+                    .to_string_lossy()
+                    .into_owned(),
                 vec![
                     "-NoLogo".to_string(),
-                    "-NoProfile".to_string(),
                     "-NoExit".to_string(),
                     "-EncodedCommand".to_string(),
                     powershell_encoded_command(&bootstrap),
@@ -8717,7 +9067,11 @@ fn normalized_terminal_shell_history_id(value: Option<&str>, fallback: &str) -> 
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn powershell_terminal_bootstrap_script(shell_history_id: &str, command: Option<&str>) -> String {
+fn powershell_terminal_bootstrap_script(
+    cwd: &str,
+    shell_history_id: &str,
+    command: Option<&str>,
+) -> String {
     // Changing only HistorySavePath can leave default shared entries in PSReadLine memory, and
     // re-enabling SaveIncrementally can persist them. Disable saving and clear first; if private
     // storage setup fails, keep PSReadLine session-only instead of falling back to its shared file.
@@ -8747,6 +9101,15 @@ try {{\n\
 Remove-Variable -Name '__sviHistoryRoot','__sviHistoryDir','__sviHistoryPath','__sviPsReadLineLoaded' -ErrorAction SilentlyContinue",
         shell_history_id
     );
+    if !cwd.is_empty() {
+        // The process cwd and PowerShell's provider location are separate. Reassert the
+        // requested folder after module setup, before any launcher/user command. LiteralPath
+        // preserves UNC, Unicode, brackets and quotes; fail closed rather than run elsewhere.
+        script.push_str(&format!(
+            "\ntry {{\n  Microsoft.PowerShell.Management\\Set-Location -LiteralPath {} -ErrorAction Stop\n}} catch {{\n  throw 'The requested shell folder is unavailable. Reopen the project folder and try again.'\n}}",
+            powershell_single_quote(cwd)
+        ));
+    }
     if let Some(command) = command {
         script.push('\n');
         script.push_str(command);
@@ -9020,11 +9383,20 @@ fn local_directory_signature(path: &Path, include_sizes: bool) -> Result<String,
             size,
         });
     }
-    entries.sort_by(|left, right| {
-        directory_kind_order(left.kind)
-            .cmp(&directory_kind_order(right.kind))
-            .then_with(|| compare_entry_names(&left.name, &right.name))
-    });
+    if entries.iter().any(|entry| !entry.name.is_ascii()) {
+        entries.sort_by_cached_key(|entry| {
+            (
+                directory_kind_order(entry.kind),
+                entry_sort_name_key(&entry.name),
+            )
+        });
+    } else {
+        entries.sort_by(|left, right| {
+            directory_kind_order(left.kind)
+                .cmp(&directory_kind_order(right.kind))
+                .then_with(|| compare_entry_names(&left.name, &right.name))
+        });
+    }
     Ok(directory_signature_from_signature_entries(&entries))
 }
 
@@ -9694,11 +10066,22 @@ fn directory_kind_order(kind: &str) -> u8 {
 }
 
 fn sort_entries(mut entries: Vec<FileEntry>) -> Result<Vec<FileEntry>, String> {
-    entries.sort_by(|left, right| {
-        directory_kind_order(left.kind)
-            .cmp(&directory_kind_order(right.kind))
-            .then_with(|| compare_entry_names(&left.name, &right.name))
-    });
+    // Preserve the allocation-free ASCII comparator. Mixed/Unicode listings would
+    // otherwise allocate lowercase Strings on every O(n log n) comparison.
+    if entries.iter().any(|entry| !entry.name.is_ascii()) {
+        entries.sort_by_cached_key(|entry| {
+            (
+                directory_kind_order(entry.kind),
+                entry_sort_name_key(&entry.name),
+            )
+        });
+    } else {
+        entries.sort_by(|left, right| {
+            directory_kind_order(left.kind)
+                .cmp(&directory_kind_order(right.kind))
+                .then_with(|| compare_entry_names(&left.name, &right.name))
+        });
+    }
     Ok(entries)
 }
 
@@ -10100,6 +10483,7 @@ fn run_export_job(
     );
 
     if let Some(source) = info.direct_windows_path.as_deref() {
+        let mut progress_throttle = ExportProgressThrottle::default();
         if info.kind == "dir" {
             let total = directory_total_size(source, &cancel)?;
             copy_local_path_recursive_with_progress(
@@ -10108,7 +10492,9 @@ fn run_export_job(
                 &cancel,
                 total,
                 &mut |done, total| {
-                    emit_export_progress(app, id, &output_name, done, total, directory);
+                    if progress_throttle.should_emit(Instant::now()) {
+                        emit_export_progress(app, id, &output_name, done, total, directory);
+                    }
                 },
             )?;
         } else {
@@ -10118,7 +10504,9 @@ fn run_export_job(
                 &cancel,
                 info.size.unwrap_or(0),
                 &mut |done, total| {
-                    emit_export_progress(app, id, &output_name, done, total, false);
+                    if progress_throttle.should_emit(Instant::now()) {
+                        emit_export_progress(app, id, &output_name, done, total, false);
+                    }
                 },
             )?;
         }
@@ -10183,6 +10571,24 @@ fn export_root() -> Result<PathBuf, String> {
     let root = std::env::temp_dir().join("simple-vibe-ide-exports");
     fs::create_dir_all(&root).map_err(|err| err.to_string())?;
     Ok(root)
+}
+
+#[derive(Default)]
+struct ExportProgressThrottle {
+    last_emit: Option<Instant>,
+}
+
+impl ExportProgressThrottle {
+    fn should_emit(&mut self, now: Instant) -> bool {
+        if self
+            .last_emit
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+        {
+            return false;
+        }
+        self.last_emit = Some(now);
+        true
+    }
 }
 
 fn emit_export_progress(
@@ -10408,13 +10814,16 @@ fn stream_profile_shell_to_file(
         .take()
         .ok_or_else(|| "failed to capture export stream".to_string())?;
     let mut output = fs::File::create(output_path).map_err(|err| err.to_string())?;
+    let mut progress_throttle = ExportProgressThrottle::default();
     let copy_result = copy_reader_to_writer(
         &mut stdout,
         &mut output,
         cancel,
         total,
         &mut |done, total| {
-            emit_export_progress(app, id, name, done, total, false);
+            if progress_throttle.should_emit(Instant::now()) {
+                emit_export_progress(app, id, name, done, total, false);
+            }
         },
     );
     copy_result?;
@@ -10920,6 +11329,9 @@ fn run_profile_shell_with_timeout_scoped(
     timeout: Duration,
     runtime_scope: Option<RuntimeProcessScope<'_>>,
 ) -> Result<Vec<u8>, String> {
+    // Retries and the writer share immutable bytes rather than cloning a full
+    // attachment/file buffer, including for single-attempt SSH operations.
+    let stdin_data = stdin_data.map(Arc::new);
     let attempts = if profile.kind == "wsl" {
         WSL_TRANSIENT_RETRY_ATTEMPTS
     } else {
@@ -10960,7 +11372,7 @@ fn run_profile_shell_with_timeout_scoped(
 fn run_profile_shell_once(
     profile: &ConnectionProfile,
     script: &str,
-    stdin_data: Option<Vec<u8>>,
+    stdin_data: Option<Arc<Vec<u8>>>,
     timeout: Duration,
     runtime_scope: Option<RuntimeProcessScope<'_>>,
     wait_for_wsl_cooldown: bool,
@@ -11649,14 +12061,14 @@ where
     receiver
 }
 
-fn spawn_process_stdin_writer<W>(mut writer: W, data: Vec<u8>) -> Receiver<Result<(), String>>
+fn spawn_process_stdin_writer<W>(mut writer: W, data: Arc<Vec<u8>>) -> Receiver<Result<(), String>>
 where
     W: Write + Send + 'static,
 {
     let (sender, receiver) = sync_channel(1);
     thread::spawn(move || {
         let result = writer
-            .write_all(&data)
+            .write_all(data.as_slice())
             .and_then(|_| writer.flush())
             .map_err(|err| err.to_string());
         let _ = sender.send(result);
@@ -11689,25 +12101,66 @@ fn join_stdin_writer(receiver: Option<Receiver<Result<(), String>>>) -> Result<(
 }
 
 fn proxy_stream(
-    mut incoming: TcpStream,
+    incoming: TcpStream,
     target_host: String,
     target_port: u16,
+    connection: &ForwardProxyConnection,
 ) -> std::io::Result<()> {
-    let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
+    let remote = connect_forward_proxy_target(&target_host, target_port, connection)?;
+    relay_proxy_streams(incoming, remote)
+}
+
+fn connect_forward_proxy_target(
+    target_host: &str,
+    target_port: u16,
+    connection: &ForwardProxyConnection,
+) -> std::io::Result<TcpStream> {
+    let address = SocketAddr::new(
+        target_host.parse().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid proxy target address",
+            )
+        })?,
+        target_port,
+    );
+    let remote = TcpStream::connect_timeout(&address, FORWARD_PROXY_CONNECT_TIMEOUT)?;
+    connection.track_remote(&remote)?;
+    remote.set_nodelay(true)?;
+    Ok(remote)
+}
+
+fn relay_proxy_streams(mut incoming: TcpStream, mut remote: TcpStream) -> std::io::Result<()> {
+    incoming.set_nodelay(true)?;
     let mut incoming_to_remote = incoming.try_clone()?;
     let mut remote_from_incoming = remote.try_clone()?;
     let writer = thread::spawn(move || {
-        let _ = std::io::copy(&mut incoming_to_remote, &mut remote_from_incoming);
+        let result = std::io::copy(&mut incoming_to_remote, &mut remote_from_incoming);
+        // Forward a client FIN so targets that read through EOF can respond.
+        let _ = remote_from_incoming.shutdown(Shutdown::Write);
+        if result.is_err() {
+            let _ = remote_from_incoming.shutdown(Shutdown::Both);
+            let _ = incoming_to_remote.shutdown(Shutdown::Both);
+        }
     });
-    let _ = std::io::copy(&mut remote, &mut incoming);
+    let result = std::io::copy(&mut remote, &mut incoming);
+    // A target FIN ends only its response direction: it may still be receiving
+    // an upload. Forward that FIN before joining, and preserve the other half.
+    // Errors or explicit ForwardProxyControl shutdown close both directions.
+    let _ = incoming.shutdown(Shutdown::Write);
+    if result.is_err() {
+        let _ = remote.shutdown(Shutdown::Both);
+        let _ = incoming.shutdown(Shutdown::Both);
+    }
     let _ = writer.join();
-    Ok(())
+    result.map(|_| ())
 }
 
 fn proxy_http_preview(
     mut incoming: TcpStream,
     target_host: String,
     target_port: u16,
+    connection: &ForwardProxyConnection,
 ) -> std::io::Result<()> {
     incoming.set_nodelay(true)?;
     incoming.set_read_timeout(Some(Duration::from_secs(15)))?;
@@ -11729,13 +12182,13 @@ fn proxy_http_preview(
             &request_text,
             request_body,
             &proxy_origin,
+            connection,
         );
     }
     let rewritten_request =
         rewrite_preview_request_headers(&request_text, &target_host, target_port, &proxy_origin);
 
-    let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
-    remote.set_nodelay(true)?;
+    let mut remote = connect_forward_proxy_target(&target_host, target_port, connection)?;
     remote.set_read_timeout(Some(Duration::from_secs(75)))?;
     remote.write_all(rewritten_request.as_bytes())?;
     if !request_body.is_empty() {
@@ -11756,18 +12209,58 @@ fn proxy_http_preview(
     let (response_headers, response_body) = response.split_at(response_header_end + 4);
     let response_text = String::from_utf8_lossy(response_headers);
     let target_origin = format!("http://{target_host}:{target_port}");
-    if should_inject_preview_console_bridge(&response_text) {
-        let body = read_http_response_body(&mut remote, response_body, &response_text)?;
-        let injected = inject_preview_console_bridge(&body, &target_host, target_port);
-        let rewritten_response = rewrite_preview_response_headers(
+    if preview_response_has_no_body(&request_text, &response_text) {
+        let rewritten = rewrite_preview_response_headers(
             &response_text,
-            Some(injected.len()),
+            None,
             &target_origin,
             &proxy_origin,
             &target_host,
         );
-        incoming.write_all(rewritten_response.as_bytes())?;
-        incoming.write_all(&injected)?;
+        incoming.write_all(rewritten.as_bytes())?;
+        return Ok(());
+    }
+    if should_inject_preview_console_bridge(&response_text) {
+        remote.set_read_timeout(Some(PREVIEW_HTML_CAPTURE_READ_TIMEOUT))?;
+        let framing = if http_header_value(&response_text, "transfer-encoding").is_some() {
+            PreviewBodyFraming::Chunked // eligibility accepts only a single chunked coding
+        } else if let Some(length) = http_content_length(&response_text) {
+            PreviewBodyFraming::Length(length)
+        } else {
+            PreviewBodyFraming::CloseDelimited
+        };
+        match capture_preview_body(
+            &mut remote,
+            response_body,
+            framing,
+            PREVIEW_HTML_CAPTURE_LIMIT,
+        )? {
+            PreviewBodyCapture::Complete(body) => {
+                let injected = inject_preview_console_bridge(&body, &target_host, target_port);
+                let rewritten_response = rewrite_preview_response_headers(
+                    &response_text,
+                    Some(injected.len()),
+                    &target_origin,
+                    &proxy_origin,
+                    &target_host,
+                );
+                incoming.write_all(rewritten_response.as_bytes())?;
+                incoming.write_all(&injected)?;
+            }
+            PreviewBodyCapture::Passthrough(prefix) => {
+                // Keep the original wire framing and page bytes on size/time fallback.
+                let rewritten_response = rewrite_preview_response_headers(
+                    &response_text,
+                    None,
+                    &target_origin,
+                    &proxy_origin,
+                    &target_host,
+                );
+                remote.set_read_timeout(None)?;
+                incoming.write_all(rewritten_response.as_bytes())?;
+                relay_preview_response_body(&mut remote, &mut incoming, &prefix, &response_text)?;
+            }
+        }
     } else {
         let rewritten_response = rewrite_preview_response_headers(
             &response_text,
@@ -11778,26 +12271,23 @@ fn proxy_http_preview(
         );
         remote.set_read_timeout(None)?;
         incoming.write_all(rewritten_response.as_bytes())?;
-        if !response_body.is_empty() {
-            incoming.write_all(response_body)?;
-        }
-        std::io::copy(&mut remote, &mut incoming)?;
+        relay_preview_response_body(&mut remote, &mut incoming, response_body, &response_text)?;
     }
     Ok(())
 }
 
 fn proxy_websocket_upgrade(
-    mut incoming: TcpStream,
+    incoming: TcpStream,
     target_host: String,
     target_port: u16,
     request_headers: &str,
     request_body: &[u8],
     proxy_origin: &str,
+    connection: &ForwardProxyConnection,
 ) -> std::io::Result<()> {
     let rewritten_request =
         rewrite_preview_upgrade_headers(request_headers, &target_host, target_port, proxy_origin);
-    let mut remote = TcpStream::connect((target_host.as_str(), target_port))?;
-    remote.set_nodelay(true)?;
+    let mut remote = connect_forward_proxy_target(&target_host, target_port, connection)?;
     incoming.set_nodelay(true)?;
     incoming.set_read_timeout(None)?;
     incoming.set_write_timeout(None)?;
@@ -11807,14 +12297,7 @@ fn proxy_websocket_upgrade(
     if !request_body.is_empty() {
         remote.write_all(request_body)?;
     }
-    let mut incoming_to_remote = incoming.try_clone()?;
-    let mut remote_from_incoming = remote.try_clone()?;
-    let writer = thread::spawn(move || {
-        let _ = std::io::copy(&mut incoming_to_remote, &mut remote_from_incoming);
-    });
-    let _ = std::io::copy(&mut remote, &mut incoming);
-    let _ = writer.join();
-    Ok(())
+    relay_proxy_streams(incoming, remote)
 }
 
 fn parse_http_preview_target(target_url: &str) -> Result<HttpTarget, String> {
@@ -11849,7 +12332,7 @@ fn parse_http_preview_target(target_url: &str) -> Result<HttpTarget, String> {
     })
 }
 
-fn read_http_headers(stream: &mut TcpStream, limit: usize) -> std::io::Result<Vec<u8>> {
+fn read_http_headers(stream: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
@@ -11857,11 +12340,18 @@ fn read_http_headers(stream: &mut TcpStream, limit: usize) -> std::io::Result<Ve
         if read == 0 {
             break;
         }
+        let scan_start = buffer.len().saturating_sub(3);
         buffer.extend_from_slice(&chunk[..read]);
-        if find_http_header_end(&buffer).is_some() {
-            break;
+        if let Some(end) = find_http_header_end(&buffer[scan_start..]) {
+            if scan_start + end + 4 <= limit {
+                break;
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers too large",
+            ));
         }
-        if buffer.len() > limit {
+        if buffer.len() >= limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "HTTP headers too large",
@@ -12117,6 +12607,7 @@ fn rewrite_preview_response_headers(
     proxy_origin: &str,
     target_host: &str,
 ) -> String {
+    let transfer_encoded = http_header_value(headers, "transfer-encoding").is_some();
     let mut lines = headers.lines();
     let status_line = lines
         .next()
@@ -12162,8 +12653,16 @@ fn rewrite_preview_response_headers(
             continue;
         }
         if content_length.is_some()
-            && header_name_in(name_trimmed, &["content-length", "transfer-encoding"])
+            && header_name_in(
+                name_trimmed,
+                &["content-length", "transfer-encoding", "trailer"],
+            )
         {
+            continue;
+        }
+        // Transfer-Encoding defines wire framing; never forward a conflicting
+        // Content-Length on an untouched chunked/transfer-coded response.
+        if transfer_encoded && header_name_is(name_trimmed, "content-length") {
             continue;
         }
         if header_name_is(name_trimmed, "location") {
@@ -12272,6 +12771,160 @@ fn cookie_attribute_is(attribute: &str, expected_name: &str, expected_value: &st
     };
     name.trim().eq_ignore_ascii_case(expected_name)
         && value.trim().eq_ignore_ascii_case(expected_value)
+}
+
+#[cfg(test)]
+mod file_io_performance_tests {
+    use super::*;
+
+    #[test]
+    fn remote_text_reuses_valid_bytes_and_preserves_lossy_fallback() {
+        for value in ["ASCII", "한글 🦀"] {
+            let bytes = value.as_bytes().to_vec();
+            let allocation = bytes.as_ptr();
+            let text = remote_text_from_bytes(bytes);
+            assert_eq!(text.as_ptr(), allocation);
+            assert_eq!(text, value);
+        }
+        for value in [b"".as_slice(), b"\xff\xea\xb0\x80\xf0\x9f", b"\xed\xa0\x80"] {
+            assert_eq!(
+                remote_text_from_bytes(value.to_vec()),
+                String::from_utf8_lossy(value)
+            );
+        }
+    }
+
+    #[test]
+    fn data_url_encodes_directly_with_identical_padding_and_binary_bytes() {
+        for length in 0..100 {
+            let bytes: Vec<u8> = (0..length).map(|index| (index * 47) as u8).collect();
+            let expected = format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            assert_eq!(file_data_url("image/png", &bytes), expected);
+        }
+    }
+
+    #[test]
+    fn cached_unicode_sort_preserves_comparator_order_and_stable_ties() {
+        for names in [
+            vec!["a", "A", "b", ".x", "Z", "z"],
+            vec![
+                "한글", "가", "a", "A", "Ä", "ä", "İ", "i\u{307}", "🦀", "Σ", "σ", "ς",
+            ],
+        ] {
+            let mut expected = Vec::new();
+            for (index, name) in names.iter().cycle().take(names.len() * 3).enumerate() {
+                expected.push(FileEntry {
+                    name: name.to_string(),
+                    path: format!("/fixture/{index}"),
+                    kind: if index % 3 == 0 { "dir" } else { "file" },
+                    size: index as u64,
+                    hidden: name.starts_with('.'),
+                });
+            }
+            let actual = sort_entries(
+                expected
+                    .iter()
+                    .map(|entry| FileEntry {
+                        name: entry.name.clone(),
+                        path: entry.path.clone(),
+                        kind: entry.kind,
+                        size: entry.size,
+                        hidden: entry.hidden,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            expected.sort_by(|left, right| {
+                directory_kind_order(left.kind)
+                    .cmp(&directory_kind_order(right.kind))
+                    .then_with(|| compare_entry_names(&left.name, &right.name))
+            });
+            assert_eq!(
+                actual.iter().map(|entry| &entry.path).collect::<Vec<_>>(),
+                expected.iter().map(|entry| &entry.path).collect::<Vec<_>>()
+            );
+            let signature_entries: Vec<_> = actual
+                .iter()
+                .map(|entry| DirectorySignatureEntry {
+                    name: entry.name.clone(),
+                    kind: entry.kind,
+                    size: entry.size,
+                    hidden: entry.hidden,
+                })
+                .collect();
+            assert_eq!(
+                directory_signature_from_signature_entries(&signature_entries),
+                directory_signature_from_entries(&expected)
+            );
+        }
+    }
+
+    struct FragmentedReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        chunk_size: usize,
+    }
+
+    impl Read for FragmentedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let length = (self.bytes.len() - self.offset)
+                .min(self.chunk_size)
+                .min(buffer.len());
+            buffer[..length].copy_from_slice(&self.bytes[self.offset..self.offset + length]);
+            self.offset += length;
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn incremental_http_scan_handles_fragmented_delimiters_and_body_overread() {
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+        for chunk_size in 1..=headers.len() + 4 {
+            let mut reader = FragmentedReader {
+                bytes: [headers.as_slice(), b"body"].concat(),
+                offset: 0,
+                chunk_size,
+            };
+            let mut received = read_http_headers(&mut reader, headers.len()).unwrap();
+            assert_eq!(find_http_header_end(&received), Some(headers.len() - 4));
+            reader.read_to_end(&mut received).unwrap();
+            assert_eq!(received, [headers.as_slice(), b"body"].concat());
+        }
+        let body = vec![b'x'; 8192];
+        let mut reader = std::io::Cursor::new([headers.as_slice(), &body].concat());
+        let received = read_http_headers(&mut reader, headers.len()).unwrap();
+        assert_eq!(received.len(), 8192);
+        assert_eq!(&received[..headers.len()], headers);
+    }
+
+    #[test]
+    fn http_header_limit_counts_headers_not_body_and_rejects_oversized_terminator() {
+        for (bytes, limit) in [(b"abcd\r\n\r\n".as_slice(), 7), (b"abcdefgh", 8)] {
+            let error = read_http_headers(&mut std::io::Cursor::new(bytes), limit).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        let partial = b"HTTP/1.1 200 OK\r\n";
+        assert_eq!(
+            read_http_headers(&mut std::io::Cursor::new(partial), 100).unwrap(),
+            partial
+        );
+    }
+
+    #[test]
+    fn export_progress_is_time_bounded_and_independent_per_job() {
+        let start = Instant::now();
+        let mut throttle = ExportProgressThrottle::default();
+        let mut count = 0;
+        for millis in 0..1000 {
+            count += usize::from(throttle.should_emit(start + Duration::from_millis(millis)));
+        }
+        assert_eq!(count, 10);
+        assert!(ExportProgressThrottle::default().should_emit(start));
+        assert!(throttle.should_emit(start + Duration::from_millis(1000)));
+    }
 }
 
 #[cfg(test)]
@@ -12521,6 +13174,69 @@ mod renderer_watchdog_tests {
 }
 
 #[cfg(test)]
+mod terminal_directory_tests {
+    use super::*;
+
+    #[test]
+    fn windows_drive_relative_project_paths_are_rejected_with_actionable_help() {
+        for path in [r"D:#Projects\Example", r"d:relative", "D:", r" D:child "] {
+            let error = resolve_windows_profile_path(path).expect_err("ambiguous drive path");
+            assert!(error.contains(r"D:\Projects\Example"));
+            assert!(error.contains("slash after the drive"));
+            assert!(resolve_profile_path_blocking("windows-local".into(), path.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn windows_absolute_hash_and_unc_paths_remain_literal() {
+        for path in [
+            r"D:\#Projects\Example",
+            "D:/#Projects/Example",
+            r"D:\한글 [test]\O'Brien",
+            r"\\server\share\#Projects\Example",
+            r"\\?\D:\#Projects\Example",
+        ] {
+            assert_eq!(resolve_windows_profile_path(path).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn relative_project_suffix_is_anchored_once_before_child_start() {
+        let resolved = resolve_windows_profile_path("#project-fixture").unwrap();
+        assert!(Path::new(&resolved).is_absolute());
+        assert_eq!(resolve_windows_profile_path(&resolved).unwrap(), resolved);
+        assert_eq!(
+            PathBuf::from(&resolved),
+            std::env::current_dir().unwrap().join("#project-fixture")
+        );
+    }
+
+    #[test]
+    fn posix_profile_paths_are_not_reinterpreted_as_windows_drives() {
+        for profile in ["wsl:FixtureDistro", "ssh:fixture"] {
+            assert_eq!(
+                resolve_profile_path_blocking(profile.into(), "D:notes".into()).unwrap(),
+                "D:notes"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_optional_agent_absence_is_quiet_without_changing_authentication_flow() {
+        let script = ssh_terminal_bootstrap_script("fixture", "printf ok");
+        assert!(!script.contains("Windows OpenSSH agent is unavailable"));
+        assert!(script.contains("& $sshAdd -l *> $null"));
+        assert!(script.contains("if ($agentStatus -eq 1)"));
+        assert!(script.contains("& $sshAdd -- $expandedIdentity"));
+        assert!(script.contains("& $ssh @sshArgs\nexit $LASTEXITCODE"));
+        let profile = profile_from_id("wsl:FixtureDistro");
+        let (program, args) = terminal_command(&profile, "/project", None, "fixture");
+        assert_eq!(program, "wsl.exe");
+        assert!(!args.join(" ").contains("sshAdd"));
+    }
+}
+
+#[cfg(test)]
 mod terminal_history_tests {
     use super::*;
 
@@ -12577,7 +13293,8 @@ mod terminal_history_tests {
     #[test]
     fn powershell_bootstrap_clears_shared_state_before_enabling_pane_history() {
         let command = "Write-Output 'ready'";
-        let script = powershell_terminal_bootstrap_script(HISTORY_ID, Some(command));
+        let script =
+            powershell_terminal_bootstrap_script(r"C:\Projects\Example", HISTORY_ID, Some(command));
         let disable = script
             .find("-HistorySaveStyle SaveNothing -ErrorAction Stop")
             .expect("disable default history");
@@ -12595,6 +13312,142 @@ mod terminal_history_tests {
         assert!(disable < clear && clear < enable && enable < launch);
         assert!(script.contains("Remove-Module PSReadLine -Force"));
         assert!(!script.contains("ConsoleHost_history"));
+    }
+
+    #[test]
+    fn powershell_bootstrap_sets_literal_cwd_after_setup_before_launch() {
+        for (cwd, quoted) in [
+            (r"D:\#Projects\Example", r"'D:\#Projects\Example'"),
+            (r"D:\Projects\한글 [demo]", r"'D:\Projects\한글 [demo]'"),
+            (
+                r"\\server\share\O'Brien $demo; (test)",
+                r"'\\server\share\O''Brien $demo; (test)'",
+            ),
+            (
+                r"\\wsl.localhost\TestDistro\workspace\repo",
+                r"'\\wsl.localhost\TestDistro\workspace\repo'",
+            ),
+        ] {
+            let command = "Write-Output 'launcher'";
+            let script = powershell_terminal_bootstrap_script(cwd, HISTORY_ID, Some(command));
+            let history = script
+                .rfind("Remove-Variable -Name")
+                .expect("history cleanup");
+            let location = script
+                .find(&format!(
+                    "Microsoft.PowerShell.Management\\Set-Location -LiteralPath {quoted} -ErrorAction Stop"
+                ))
+                .expect("quoted literal cwd");
+            let failure = script
+                .find("throw 'The requested shell folder is unavailable.")
+                .expect("failed cwd must terminate the script, not run the launcher elsewhere");
+            let launch = script.rfind(command).expect("launcher after successful cd");
+            assert!(history < location && location < failure && failure < launch);
+            assert!(script.ends_with(command));
+        }
+    }
+
+    #[test]
+    fn windows_terminal_command_encodes_requested_project_cwd() {
+        let profile = profile_from_id("windows-local");
+        let cwd = r"D:\Projects\한글 O'Brien [demo]";
+        for command in [None, Some("Write-Output 'launcher'".to_string())] {
+            let (program, args) = terminal_command(&profile, cwd, command.clone(), HISTORY_ID);
+            assert_eq!(program, windows_powershell_executable().to_string_lossy());
+            assert_eq!(&args[..3], ["-NoLogo", "-NoExit", "-EncodedCommand"]);
+            assert!(!args.iter().any(|arg| arg == "-NoProfile"));
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&args[3])
+                .expect("encoded bootstrap");
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            let script = String::from_utf16(&units).expect("Unicode bootstrap");
+            assert_eq!(
+                script,
+                powershell_terminal_bootstrap_script(cwd, HISTORY_ID, command.as_deref())
+            );
+            assert!(script.contains(r"-LiteralPath 'D:\Projects\한글 O''Brien [demo]'"));
+        }
+    }
+
+    #[test]
+    fn empty_powershell_cwd_does_not_invent_a_project_path() {
+        let script = powershell_terminal_bootstrap_script("", HISTORY_ID, None);
+        assert!(!script.contains("Set-Location"));
+        assert!(script.contains(&format!("'{HISTORY_ID}.txt'")));
+    }
+}
+
+#[cfg(test)]
+mod terminal_decode_tests {
+    use super::*;
+
+    #[test]
+    fn valid_terminal_reads_borrow_the_original_allocation() {
+        for text in [
+            "ordinary ASCII output\r\n",
+            "한글과 emoji 🦀\r\n",
+            "\x1b[6n",
+        ] {
+            let mut leftover = Vec::new();
+            let decoded = decode_terminal_read(text.as_bytes(), &mut leftover);
+            assert!(matches!(decoded, Cow::Borrowed(_)));
+            assert_eq!(decoded.as_ptr(), text.as_ptr());
+            assert!(leftover.is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_utf8_stream_matches_lossy_decode_at_every_boundary() {
+        let fixtures: &[&[u8]] = &[
+            "ASCII 한글 🦀\x1b[6n 끝".as_bytes(),
+            b"\xff\xea\xb0\x80\xf0\x9f\xa6\x80\xfe",
+            b"\xe0\x80\xff\xf0\x9f\x80",
+            b"\xed\xa0\x80\xc0\xaf\xf5\x80\x80\x80",
+        ];
+        for bytes in fixtures {
+            for split in 0..=bytes.len() {
+                let mut leftover = Vec::new();
+                let mut output = decode_terminal_read(&bytes[..split], &mut leftover).into_owned();
+                assert!(leftover.len() <= 3);
+                output.push_str(&decode_terminal_read(&bytes[split..], &mut leftover));
+                output.push_str(&String::from_utf8_lossy(&leftover));
+                assert_eq!(output, String::from_utf8_lossy(bytes), "split={split}");
+            }
+            let mut leftover = Vec::new();
+            let mut output = String::new();
+            for byte in *bytes {
+                output.push_str(&decode_terminal_read(
+                    std::slice::from_ref(byte),
+                    &mut leftover,
+                ));
+                assert!(leftover.len() <= 3);
+            }
+            output.push_str(&String::from_utf8_lossy(&leftover));
+            assert_eq!(output, String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn invalid_prefix_preserves_an_incomplete_hangul_tail() {
+        let mut leftover = Vec::new();
+        assert_eq!(decode_terminal_read(b"\xff\xea", &mut leftover), "\u{fffd}");
+        assert_eq!(leftover, b"\xea");
+        assert_eq!(decode_terminal_read(b"\xb0\x80", &mut leftover), "가");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn dsr_prefix_retention_never_splits_utf8_or_a_complete_query() {
+        for prefix_len in 1..TERMINAL_DSR_CURSOR_QUERY.len() {
+            let text = format!("한글{}", &TERMINAL_DSR_CURSOR_QUERY[..prefix_len]);
+            assert_eq!(trailing_terminal_dsr_prefix_len(&text), prefix_len);
+            assert_eq!(&text[..text.len() - prefix_len], "한글");
+        }
+        assert_eq!(trailing_terminal_dsr_prefix_len("한글\x1b[6n"), 0);
+        assert_eq!(trailing_terminal_dsr_prefix_len("한글"), 0);
     }
 }
 
@@ -12617,6 +13470,37 @@ mod terminal_input_tests {
     }
 
     #[test]
+    fn input_queue_takes_ownership_without_copying_the_ipc_string() {
+        let (input_tx, input_rx) = sync_channel(1);
+        let data = "한글 paste".to_string();
+        let original = data.as_ptr();
+        write_terminal_bytes(&input_tx, data.into_bytes()).unwrap();
+        let TerminalInputMessage::Data(queued) = input_rx.recv().unwrap() else {
+            panic!("expected input bytes");
+        };
+        assert_eq!(queued.as_ptr(), original);
+        assert_eq!(queued, "한글 paste".as_bytes());
+    }
+
+    #[test]
+    fn remote_stdin_retries_share_binary_input_without_cloning_the_buffer() {
+        let bytes = b"\x00\xff\r\n\xea\xb0\x80".to_vec();
+        let allocation = bytes.as_ptr();
+        let data = Arc::new(bytes);
+        for _ in 0..2 {
+            let shared = Arc::clone(&data);
+            assert_eq!(shared.as_ptr(), allocation);
+            let output = SharedWriter::default();
+            let observed = Arc::clone(&output.0);
+            spawn_process_stdin_writer(output, shared)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(*observed.lock().unwrap(), *data);
+        }
+    }
+
+    #[test]
     fn input_flush_barrier_confirms_prior_data_reached_the_writer() {
         let output = SharedWriter::default();
         let observed = output.0.clone();
@@ -12626,7 +13510,7 @@ mod terminal_input_tests {
             run_terminal_input_writer(&mut output, input_rx);
         });
 
-        write_terminal_bytes(&input_tx, b"before-barrier").expect("queue terminal data");
+        write_terminal_bytes(&input_tx, b"before-barrier".to_vec()).expect("queue terminal data");
         flush_terminal_input_sender(&input_tx, Duration::from_millis(250))
             .expect("confirm terminal input flush");
 
@@ -12641,7 +13525,7 @@ mod terminal_input_tests {
     #[test]
     fn input_flush_barrier_times_out_when_the_queue_cannot_accept_it() {
         let (input_tx, _input_rx) = sync_channel(1);
-        write_terminal_bytes(&input_tx, b"queued").expect("fill terminal input queue");
+        write_terminal_bytes(&input_tx, b"queued".to_vec()).expect("fill terminal input queue");
 
         let error = flush_terminal_input_sender(&input_tx, Duration::from_millis(10))
             .expect_err("full queue should time out");
@@ -12815,9 +13699,355 @@ mod wsl_recovery_tests {
 }
 
 #[cfg(test)]
+mod terminal_output_flow_tests {
+    use super::*;
+
+    #[test]
+    fn output_credit_counts_bytes_and_ignores_duplicate_or_future_acknowledgements() {
+        let flow = TerminalOutputFlow::default();
+        assert!(flow.reserve(4, 8192));
+        assert!(flow.reserve(8, 16384));
+        flow.acknowledge(99);
+        assert_eq!(flow.state.lock().unwrap().pending_bytes, 24576);
+        flow.acknowledge(4);
+        flow.acknowledge(4);
+        flow.acknowledge(3);
+        assert_eq!(flow.state.lock().unwrap().pending_bytes, 16384);
+        flow.acknowledge(8);
+        assert_eq!(flow.state.lock().unwrap().pending_bytes, 0);
+        assert!(flow.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn output_credit_blocks_at_batch_limit_until_renderer_acknowledges() {
+        let flow = Arc::new(TerminalOutputFlow::default());
+        for sequence in 1..=TERMINAL_OUTPUT_MAX_IN_FLIGHT_BATCHES as u64 {
+            assert!(flow.reserve(sequence, 1));
+        }
+        let writer_flow = flow.clone();
+        let (done_tx, done_rx) = sync_channel(1);
+        let writer = thread::spawn(move || {
+            done_tx.send(writer_flow.reserve(65, 1)).unwrap();
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            flow.state.lock().unwrap().pending.len(),
+            TERMINAL_OUTPUT_MAX_IN_FLIGHT_BATCHES
+        );
+        flow.acknowledge(1);
+        assert!(done_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn output_credit_stop_unblocks_a_byte_limited_worker_without_renderer_ack() {
+        let flow = Arc::new(TerminalOutputFlow::default());
+        assert!(flow.reserve(1, TERMINAL_OUTPUT_MAX_IN_FLIGHT_BYTES));
+        let writer_flow = flow.clone();
+        let (done_tx, done_rx) = sync_channel(1);
+        let writer = thread::spawn(move || {
+            done_tx.send(writer_flow.reserve(2, 1)).unwrap();
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            flow.state.lock().unwrap().pending_bytes,
+            TERMINAL_OUTPUT_MAX_IN_FLIGHT_BYTES
+        );
+        flow.stop();
+        assert!(!done_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        writer.join().unwrap();
+        assert_eq!(flow.state.lock().unwrap().pending_bytes, 0);
+        assert!(!flow.reserve(3, 1));
+    }
+}
+
+#[cfg(test)]
 mod preview_proxy_tests {
     use super::*;
     use std::sync::mpsc;
+
+    fn preview_roundtrip(request: &[u8], response: Vec<u8>) -> Vec<u8> {
+        let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (release_tx, release_rx) = mpsc::channel();
+        let target_closed = Arc::new(AtomicBool::new(false));
+        let observed_close = Arc::clone(&target_closed);
+        let target_worker = thread::spawn(move || {
+            let (mut stream, _) = target.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            read_http_headers(&mut stream, 128 * 1024).unwrap();
+            stream.write_all(&response).unwrap();
+            // A framed response must finish without waiting for the target's FIN.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            observed_close.store(true, Ordering::SeqCst);
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        let (incoming, _) = listener.accept().unwrap();
+        let control = Arc::new(ForwardProxyControl::default());
+        let connection = control.register(&incoming).unwrap();
+        let proxy_worker = thread::spawn(move || {
+            proxy_http_preview(incoming, "127.0.0.1".into(), port, &connection)
+        });
+        client.write_all(request).unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        assert!(
+            !target_closed.load(Ordering::SeqCst),
+            "proxy waited for target EOF despite complete HTTP framing"
+        );
+        release_tx.send(()).unwrap();
+        proxy_worker.join().unwrap().unwrap();
+        target_worker.join().unwrap();
+        assert!(control.connections.lock().unwrap().is_empty());
+        received
+    }
+
+    #[test]
+    fn html_head_and_no_body_statuses_return_without_reading_a_body() {
+        for (method, status, length) in [
+            ("HEAD", "200 OK", 12345),
+            ("GET", "204 No Content", 0),
+            ("GET", "304 Not Modified", 12345),
+        ] {
+            let received = preview_roundtrip(
+                format!("{method} / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(),
+                format!("HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {length}\r\n\r\n").into_bytes(),
+            );
+            let end = find_http_header_end(&received).unwrap() + 4;
+            assert_eq!(received.len(), end);
+            assert_eq!(
+                http_content_length(&String::from_utf8_lossy(&received)),
+                Some(length)
+            );
+        }
+        assert!(!preview_response_has_no_body(
+            "HEAD / HTTP/1.1",
+            "HTTP/1.1 103 Early Hints\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn small_chunked_html_injects_and_completes_at_trailers_without_target_eof() {
+        let received = preview_roundtrip(
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nTrailer: X-Test\r\n\r\nf\r\n<html>ok</html>\r\n0\r\nX-Test: end\r\n\r\n".to_vec(),
+        );
+        let end = find_http_header_end(&received).unwrap() + 4;
+        let headers = String::from_utf8_lossy(&received[..end]);
+        assert!(http_header_value(&headers, "transfer-encoding").is_none());
+        assert!(http_header_value(&headers, "trailer").is_none());
+        assert_eq!(http_content_length(&headers), Some(received.len() - end));
+        let body = String::from_utf8_lossy(&received[end..]);
+        assert!(body.contains("__simpleVibeConsoleBridge"));
+        assert!(body.ends_with("<html>ok</html>"));
+    }
+
+    #[test]
+    fn oversized_html_is_relayed_byte_exact_without_injection_or_eof_wait() {
+        let body = vec![b'x'; PREVIEW_HTML_CAPTURE_LIMIT + 1];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let received = preview_roundtrip(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", response);
+        let end = find_http_header_end(&received).unwrap() + 4;
+        assert_eq!(&received[end..], body);
+    }
+
+    #[test]
+    fn injection_skips_unsupported_transfer_codings_and_bodyless_statuses() {
+        for extra in [
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: chunked, chunked\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Content-Encoding: gzip\r\n",
+        ] {
+            assert!(!should_inject_preview_console_bridge(&format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{extra}\r\n"
+            )));
+        }
+        for status in [204, 205, 206, 304, 103] {
+            assert!(!should_inject_preview_console_bridge(&format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: text/html\r\n\r\n"
+            )));
+        }
+        assert!(should_inject_preview_console_bridge(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: Chunked\r\n\r\n"
+        ));
+        let passthrough = rewrite_preview_response_headers(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 999\r\nTrailer: X-Test\r\n\r\n",
+            None, "http://127.0.0.1:4000", "http://127.0.0.1:5000", "127.0.0.1",
+        );
+        assert!(http_header_value(&passthrough, "transfer-encoding").is_some());
+        assert!(http_header_value(&passthrough, "trailer").is_some());
+        assert!(http_header_value(&passthrough, "content-length").is_none());
+    }
+
+    #[test]
+    fn fixed_length_relay_preserves_prefix_and_reports_truncated_bodies() {
+        let headers = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+        let mut reader = std::io::Cursor::new(b"dyunused");
+        let mut output = Vec::new();
+        relay_preview_response_body(&mut reader, &mut output, b"bo", headers).unwrap();
+        assert_eq!(output, b"body");
+        assert_eq!(reader.position(), 2);
+        let error =
+            relay_preview_response_body(&mut std::io::empty(), &mut Vec::new(), b"bo", headers)
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn tcp_proxy_forwards_client_eof_and_finishes_after_the_response() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).expect("target listener");
+        let target_port = target.local_addr().unwrap().port();
+        let target_worker = thread::spawn(move || {
+            let (mut stream, _) = target.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"request until EOF");
+            stream.write_all(b"response after EOF").unwrap();
+        });
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(proxy.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (incoming, _) = proxy.accept().unwrap();
+        let control = Arc::new(ForwardProxyControl::default());
+        let connection = control.register(&incoming).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let proxy_worker = thread::spawn(move || {
+            let result = proxy_stream(incoming, "127.0.0.1".into(), target_port, &connection);
+            drop(connection);
+            done_tx.send(result).unwrap();
+        });
+        client.write_all(b"request until EOF").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response after EOF");
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        proxy_worker.join().unwrap();
+        target_worker.join().unwrap();
+        assert!(control.connections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tcp_proxy_target_half_close_preserves_the_client_upload() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let target_worker = thread::spawn(move || {
+            let (mut stream, _) = target.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(b"target finished").unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut upload = Vec::new();
+            stream.read_to_end(&mut upload).unwrap();
+            assert_eq!(upload, b"upload after target FIN");
+        });
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(proxy.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (incoming, _) = proxy.accept().unwrap();
+        let control = Arc::new(ForwardProxyControl::default());
+        let connection = control.register(&incoming).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let proxy_worker = thread::spawn(move || {
+            let result = proxy_stream(incoming, "127.0.0.1".into(), target_port, &connection);
+            drop(connection);
+            done_tx.send(result).unwrap();
+        });
+        // A target can send FIN and still receive data. The client must observe
+        // response EOF before it uploads, and that upload must not be truncated.
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"target finished");
+        client.write_all(b"upload after target FIN").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        proxy_worker.join().unwrap();
+        target_worker.join().unwrap();
+        assert!(control.connections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopping_forward_releases_idle_proxy_connections() {
+        for preview in [false, true] {
+            let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let target_port = target.local_addr().unwrap().port();
+            let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut client = TcpStream::connect(proxy.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let (incoming, _) = proxy.accept().unwrap();
+            let control = Arc::new(ForwardProxyControl::default());
+            let connection = control.register(&incoming).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                if preview {
+                    let _ =
+                        proxy_http_preview(incoming, "127.0.0.1".into(), target_port, &connection);
+                } else {
+                    let _ = proxy_stream(incoming, "127.0.0.1".into(), target_port, &connection);
+                }
+                drop(connection);
+                done_tx.send(()).unwrap();
+            });
+            // Exercise an already connected tunnel as well as an HTTP worker still
+            // waiting for its first header; neither peer has to close for stop to work.
+            let _remote = if preview {
+                None
+            } else {
+                Some(target.accept().unwrap().0)
+            };
+            control.shutdown();
+            done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("stopped proxy worker");
+            worker.join().unwrap();
+            let mut byte = [0];
+            match client.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => panic!("stopped proxy socket was not closed: {result:?}"),
+            }
+            assert!(control.connections.lock().unwrap().is_empty());
+            assert!(control.register(&client).is_err());
+        }
+    }
 
     fn spawn_one_request_target() -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("target listener");
@@ -12840,7 +14070,11 @@ mod preview_proxy_tests {
         let port = listener.local_addr().expect("proxy addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("proxy accept");
-            match proxy_http_preview(stream, "127.0.0.1".to_string(), target_port) {
+            let control = Arc::new(ForwardProxyControl::default());
+            let connection = control
+                .register(&stream)
+                .expect("register proxy connection");
+            match proxy_http_preview(stream, "127.0.0.1".to_string(), target_port, &connection) {
                 Ok(()) => {}
                 Err(err)
                     if matches!(
@@ -12957,9 +14191,10 @@ fn should_inject_preview_console_bridge(headers: &str) -> bool {
     let mut encoded = false;
     let mut cacheable_success = false;
     let mut partial = false;
+    let mut transfer_codings = 0;
     if let Some(status) = headers.lines().next() {
         let code = status.split_whitespace().nth(1).unwrap_or_default();
-        cacheable_success = code.starts_with('2') && code != "206";
+        cacheable_success = code.starts_with('2') && !matches!(code, "204" | "205" | "206");
     }
     for line in headers.lines() {
         let Some((name, value)) = line.split_once(':') else {
@@ -12978,75 +14213,46 @@ fn should_inject_preview_console_bridge(headers: &str) -> bool {
         if name.trim().eq_ignore_ascii_case("content-range") {
             partial = true;
         }
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            for coding in value.split(',') {
+                transfer_codings += 1;
+                if !coding.trim().eq_ignore_ascii_case("chunked") || transfer_codings > 1 {
+                    encoded = true;
+                }
+            }
+        }
     }
     cacheable_success && html && !encoded && !partial
 }
 
-fn read_http_response_body(
-    remote: &mut TcpStream,
-    first_body: &[u8],
+fn preview_response_has_no_body(request: &str, response: &str) -> bool {
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    // Interim 1xx headers must keep relaying their final response, even for HEAD.
+    matches!(status, 204 | 304)
+        || (status >= 200 && request.split_whitespace().next() == Some("HEAD"))
+}
+
+fn relay_preview_response_body(
+    remote: &mut impl Read,
+    incoming: &mut impl Write,
+    prefix: &[u8],
     headers: &str,
-) -> std::io::Result<Vec<u8>> {
-    let mut body = first_body.to_vec();
-    if is_chunked_response(headers) {
-        remote.read_to_end(&mut body)?;
-        return decode_chunked_body(&body);
-    }
-    if let Some(length) = http_content_length(headers) {
-        if body.len() < length {
-            let mut rest = vec![0_u8; length - body.len()];
-            remote.read_exact(&mut rest)?;
-            body.extend(rest);
+) -> std::io::Result<()> {
+    if http_header_value(headers, "transfer-encoding").is_none() {
+        if let Some(length) = http_content_length(headers) {
+            let first_length = prefix.len().min(length);
+            incoming.write_all(&prefix[..first_length])?;
+            return copy_exact_bytes(remote, incoming, length - first_length);
         }
-        body.truncate(length);
-        return Ok(body);
     }
-    remote.read_to_end(&mut body)?;
-    Ok(body)
-}
-
-fn is_chunked_response(headers: &str) -> bool {
-    headers.lines().any(|line| {
-        let Some((name, value)) = line.split_once(':') else {
-            return false;
-        };
-        name.trim().eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .split(',')
-                .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
-    })
-}
-
-fn decode_chunked_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut index = 0;
-    let mut decoded = Vec::new();
-    while index < body.len() {
-        let Some(line_end) = find_crlf(&body[index..]) else {
-            break;
-        };
-        let size_line = String::from_utf8_lossy(&body[index..index + line_end]);
-        let size_text = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size")
-        })?;
-        index += line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if index + size > body.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "truncated chunked response",
-            ));
-        }
-        decoded.extend_from_slice(&body[index..index + size]);
-        index += size + 2;
-    }
-    Ok(decoded)
-}
-
-fn find_crlf(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(2).position(|window| window == b"\r\n")
+    incoming.write_all(prefix)?;
+    std::io::copy(remote, incoming)?;
+    Ok(())
 }
 
 fn inject_preview_console_bridge(body: &[u8], target_host: &str, target_port: u16) -> Vec<u8> {
@@ -13107,17 +14313,20 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
       }
     } catch (_) {}
   });
+  function clip(value, limit) {
+    return value.length > limit ? value.slice(0, limit - 1) + '…' : value;
+  }
   function compact(value) {
-    if (typeof value === 'string') return value;
+    if (typeof value === 'string') return clip(value, 2048);
     if (value == null) return String(value);
-    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return clip(String(value), 2048);
     if (Array.isArray(value)) return '[Array(' + value.length + ')]';
     if (typeof value === 'object') {
       try {
         var keys = [];
         for (var key in value) {
           if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-          keys.push(key);
+          keys.push(clip(key, 80));
           if (keys.length >= 6) break;
         }
         return keys.length ? '{' + keys.join(',') + '}' : '{}';
@@ -13125,19 +14334,45 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
         return '[Object]';
       }
     }
-    return String(value);
+    return clip(String(value), 2048);
+  }
+  function structured(value, depth, seen, budget) {
+    if (value == null) return String(value);
+    if (typeof value === 'string') return clip(JSON.stringify(clip(value, 1024)), 2048);
+    if (typeof value !== 'object') return compact(value);
+    if (depth >= 2 || budget.reads >= 64) return compact(value);
+    if (seen.indexOf(value) >= 0) return '[Circular]';
+    seen.push(value);
+    var array = Array.isArray(value);
+    var text = array ? '[' : '{';
+    var count = 0;
+    try {
+      for (var key in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        if (count >= (array ? 16 : 12) || budget.reads >= 64 || text.length >= 2048) {
+          text += ',…';
+          break;
+        }
+        if (count++) text += ',';
+        if (!array) text += JSON.stringify(clip(key, 80)) + ':';
+        budget.reads++;
+        try { text += structured(value[key], depth + 1, seen, budget); }
+        catch (_) { text += '[Unavailable]'; }
+      }
+    } finally { seen.pop(); }
+    return clip(text + (array ? ']' : '}'), 4096);
   }
   function format(value, compactMode) {
     try {
-      if (typeof value === 'string') return value;
+      if (typeof value === 'string') return clip(value, 2048);
       if (value instanceof Error) {
-        if (compactMode || !window.__simpleVibeConsoleDetailed) return value.message || String(value);
-        return value.stack || value.message || String(value);
+        if (compactMode || !window.__simpleVibeConsoleDetailed) return clip(value.message || String(value), 2048);
+        return clip(value.stack || value.message || String(value), 4096);
       }
       if (compactMode || !window.__simpleVibeConsoleDetailed) return compact(value);
-      return JSON.stringify(value) || String(value);
+      return structured(value, 0, [], { reads: 0 });
     } catch (_) {
-      return String(value);
+      return '[Unserializable]';
     }
   }
   var consoleQueue = [];
@@ -13489,8 +14724,8 @@ fn preview_console_bridge_script(target_host: &str, target_port: u16) -> String 
 }
 
 fn copy_exact_bytes(
-    reader: &mut TcpStream,
-    writer: &mut TcpStream,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
     mut remaining: usize,
 ) -> std::io::Result<()> {
     let mut buffer = [0_u8; 8192];
@@ -13498,7 +14733,10 @@ fn copy_exact_bytes(
         let chunk_len = remaining.min(buffer.len());
         let read = reader.read(&mut buffer[..chunk_len])?;
         if read == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated HTTP body",
+            ));
         }
         writer.write_all(&buffer[..read])?;
         remaining -= read;
@@ -13513,20 +14751,42 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn decode_terminal_read<'a>(bytes: &'a [u8], leftover: &mut Vec<u8>) -> Cow<'a, str> {
+    // Normal PTY reads need only validation, not a Vec copy and a temporary String.
+    if leftover.is_empty() {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return Cow::Borrowed(text);
+        }
+    }
+    leftover.extend_from_slice(bytes);
+    Cow::Owned(drain_complete_utf8(leftover))
+}
+
 fn drain_complete_utf8(buffer: &mut Vec<u8>) -> String {
-    if buffer.is_empty() {
-        return String::new();
+    let mut decoded = String::with_capacity(buffer.len());
+    let mut consumed = 0;
+    while consumed < buffer.len() {
+        match std::str::from_utf8(&buffer[consumed..]) {
+            Ok(text) => {
+                decoded.push_str(text);
+                consumed = buffer.len();
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                if valid_end > consumed {
+                    // This prefix was just validated; stay with safe Rust in the rare fallback.
+                    decoded.push_str(std::str::from_utf8(&buffer[consumed..valid_end]).unwrap());
+                }
+                consumed = valid_end;
+                let Some(invalid_len) = error.error_len() else {
+                    break;
+                };
+                decoded.push('\u{fffd}');
+                consumed += invalid_len;
+            }
+        }
     }
-    let split = match std::str::from_utf8(buffer) {
-        Ok(_) => buffer.len(),
-        Err(err) if err.error_len().is_none() => err.valid_up_to(),
-        Err(_) => buffer.len(),
-    };
-    if split == 0 {
-        return String::new();
-    }
-    let decoded = String::from_utf8_lossy(&buffer[..split]).to_string();
-    buffer.drain(..split);
+    buffer.drain(..consumed);
     decoded
 }
 
@@ -13772,6 +15032,7 @@ pub fn run() {
             save_attachment,
             spawn_terminal,
             write_terminal,
+            acknowledge_terminal_output,
             flush_terminal_input,
             resize_terminal,
             kill_terminal,

@@ -15,7 +15,8 @@
     "tauri:build": "tauri build",
     "tauri:terminal:dev": "tauri dev --config src-tauri/tauri.terminal.conf.json",
     "tauri:terminal:build": "tauri build --config src-tauri/tauri.terminal.conf.json --no-bundle",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "check:regressions": "node scripts/terminal-performance-smoke.mjs && node scripts/terminal-output-flow-smoke.mjs && node scripts/workspace-async-smoke.mjs && node scripts/terminal-ime-smoke.mjs && node scripts/explorer-interaction-smoke.mjs && node scripts/editor-performance-smoke.mjs && node scripts/storage-browser-smoke.mjs && node scripts/browser-lifecycle-smoke.mjs && node scripts/browser-console-smoke.mjs && node scripts/browser-proxy-scope-smoke.mjs && node scripts/windows-stage-manifest-smoke.mjs && node scripts/windows-shell-cwd-smoke.mjs && node scripts/workspace-ports-smoke.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.0",

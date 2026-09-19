@@ -3,6 +3,10 @@
 This guide is written for coding agents and LLM assistants that need to help a
 user install, build, run, or verify Simple Vibe IDE.
 
+For continuing development on a different system, first read the
+[portable handoff](DEVELOPMENT_HANDOFF.md), [OS environment guide](DEVELOPMENT_ENVIRONMENTS.md)
+and [test map](TESTING.md). This install guide is not the full architecture reference.
+
 Simple Vibe IDE is a Windows-only Tauri v2 desktop app. The frontend is
 TypeScript/Vite and the backend is Rust/Tauri. WSL, SSH, and Windows shells are
 runtime targets, but the desktop app itself should be built and verified with
@@ -44,7 +48,7 @@ Optional runtime tools:
 
 - WSL distro for WSL workspaces
 - Windows OpenSSH client for SSH workspaces
-- Microsoft Edge or Chrome for the Browser widget's hidden DevTools/CDP preview
+- Microsoft WebView2 Runtime for the native Browser preview (Edge CDP preview is disabled)
 - LLM CLIs if the launcher buttons should work: `codex`, `claude`, `grok`,
   `antigravity`
 
@@ -103,9 +107,11 @@ public reports.
 The stage is a disposable build snapshot, not an HMR workspace. Use a
 Windows-local clone/worktree for Windows `tauri:dev`; never alternate WSL and
 Windows npm installs in one checkout's `node_modules`.
-Tracked working-tree files are staged by default. Pass `-IncludeUntracked` only
-when new untracked source is required, after ensuring private local files are
-ignored; common untracked environment/private-key patterns are rejected.
+Tracked working-tree files and allowlisted nonignored new Rust/frontend code, build
+scripts and capability JSON are staged by default. New modules do not require a
+commit or `-IncludeUntracked`. Use that flag only for other untracked assets/docs,
+after ensuring private local files are ignored. Selected untracked private-file
+patterns, symlinks and Windows-incompatible paths are rejected before old-stage deletion.
 
 ## Verification Checklist
 
@@ -151,10 +157,10 @@ Smoke test in the app:
 - Image files open in Image Preview, not as UTF-8 text.
 - Clipboard image paste saves an attachment and optionally pastes an `@...` tag
   into the active shell.
-- Browser tabs can open a local port or full URL through the hidden Edge
-  DevTools/CDP canvas preview, with the iframe preview proxy left as fallback.
-- Browser console shows page console/log/network failure events where CDP
-  exposes them.
+- Browser tabs use native child WebViews normally, with capture-safe iframe/proxy
+  fallback. Edge DevTools/CDP canvas preview is not the active default.
+- Browser console uses the page bridge where supported; large/slow/unsupported
+  fallback HTML may bypass injection and therefore lack bridge-dependent features.
 - Notes, Calculator, and Browser keyboard zoom controls affect the focused
   widget content, not the whole widget frame.
 

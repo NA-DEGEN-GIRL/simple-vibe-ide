@@ -174,6 +174,8 @@ export const api = {
       rendererRuntimeEpoch
     }),
   writeTerminal: (id: string, data: string) => invoke<void>('write_terminal', { id, data }),
+  acknowledgeTerminalOutput: (id: string, sequence: number) =>
+    invoke<void>('acknowledge_terminal_output', { id, sequence, rendererRuntimeEpoch }),
   flushTerminalInput: (id: string) => invoke<void>('flush_terminal_input', { id }),
   resizeTerminal: (id: string, rows: number, cols: number) =>
     invoke<void>('resize_terminal', { id, rows, cols }),

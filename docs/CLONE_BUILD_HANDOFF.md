@@ -1,8 +1,11 @@
 # Clone Build Handoff
 
 This note is for an LLM or developer starting from a fresh GitHub clone.
-Read `AGENTS.md` and `codex.md` first, then use this file as a compact build
-and runtime checklist.
+Start with [AGENTS.md](../AGENTS.md) and the current
+[portable development handoff](DEVELOPMENT_HANDOFF.md). Detailed
+[OS setup](DEVELOPMENT_ENVIRONMENTS.md), [architecture](ARCHITECTURE.md), and
+[testing](TESTING.md) are self-contained for a new machine. This older compact
+checklist remains as a quick reference; `codex.md` is historical context.
 
 ## Project Shape
 
@@ -16,8 +19,11 @@ and runtime checklist.
 ```powershell
 npm install
 npm run check
+npm run check:regressions
 npm run build
+npm run build:terminal
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
 ```
 
@@ -57,8 +63,10 @@ Windows-local paths such as `D:\build-cache\simple-vibe-ide-win-src` and
 - Do not reintroduce the old pty-host keep-alive/background terminal host.
 - Direct in-process PTY I/O was kept for responsiveness.
 - Keep xterm writes chunked.
-- TUI cursor-position queries (`ESC[6n`) should be answered using current
-  frontend cursor coordinates after pending terminal writes drain.
+- Rust filters TUI cursor-position queries (`ESC[6n`), flushes preceding output
+  and emits a dedicated event. The frontend drains pending writes, calculates
+  current xterm coordinates and queues CPR through the input sequencer. Never
+  forward the raw query to xterm as well.
 - Normal shell semantics must remain: selected text + `Ctrl+C` copies; no
   selection + `Ctrl+C` interrupts; `Ctrl+V` pastes.
 - SSH/WSL startup injections must wait for the shell-ready OSC7 marker. Do not
@@ -110,7 +118,11 @@ For a proper distributable artifact, prefer:
 npm run tauri -- build
 ```
 
-Then use the installer under `src-tauri\target\release\bundle\`.
+Then use the installer under the selected Cargo target's `release\bundle\`
+(normally `src-tauri\target\release\bundle\` without a target override).
+For local builds, use the timestamped executable published by the Windows smoke
+helpers instead of running mutable Cargo output. Building with `-NoLaunch` keeps
+existing apps running; restarting the app, not compiling alone, ends its PTYs.
 
 ## Privacy / Public Repo Safety
 

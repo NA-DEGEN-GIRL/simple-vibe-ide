@@ -74,6 +74,7 @@ export interface BrowserWebviewPageLoadEvent {
 export interface TerminalDataEvent {
   id: string;
   data: string;
+  sequence: number;
 }
 
 export interface TerminalCursorQueryEvent {

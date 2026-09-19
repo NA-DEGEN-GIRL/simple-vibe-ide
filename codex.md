@@ -36,6 +36,10 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
 
 ## Current Handoff Focus
 
+- Portable development entry point (2026-09-19): `docs/DEVELOPMENT_HANDOFF.md`,
+  `docs/DEVELOPMENT_ENVIRONMENTS.md`, `docs/ARCHITECTURE.md`, `docs/TESTING.md`.
+  These supersede stale current-focus details below; local handoffs are optional.
+
 - Latest snapshot: `.handoff/latest.md`.
 - Current priority: verify the direct in-process PTY runtime in the real
   Windows app, especially WSL/SSH shell startup, fast typing, paste, Ctrl+C,
@@ -51,6 +55,341 @@ The local `.handoff/` directory is shared by Codex, Claude, and Grok. Any of the
   startup freeze/endpoint readiness issues.
 
 ## Patch Notes
+
+### 2026-09-19 - Portable development handoff and Astra instructions
+
+- Added a public documentation index, implementation/lifecycle map, OS environment
+  guide, test map and migration checklist. New machines need no private chat/history,
+  local handoff skill, build wrapper or worklog hook to develop the repo.
+- Reorganized AGENTS.md around explicit outcomes, scoped source reads, independent
+  ownership, verification and privacy. It is agent guidance, not a model selector.
+- Corrected stale no-tests/CDP assumptions and documented actual DSR ownership:
+  Rust filters/flushes queries; frontend drains xterm and sequences CPR responses.
+- Current source checks re-run: TypeScript, all 13 Node scripts, both frontend
+  builds, Rust fmt, 73 lib tests (1 opt-in ignored), Windows-target cargo check pass.
+  Vite large-chunk/GNU cross-target advisories remain. Native Windows release/tmux
+  smoke results are explicitly dated 2026-09-09, not re-run for documentation.
+- Reviewed all 46 candidate public files for private identifiers/paths/URLs and
+  credentials; final staged gitleaks and identifier scans found no matches. New
+  documentation links resolve to published files rather than ignored local notes.
+  Ignored handoffs, personal artifacts and worklog refs remain outside the branch push.
+
+### 2026-09-09 - Windows tmux creation loads PowerShell profiles
+
+- Audited creation, not attach: detached new-session explicitly used PowerShell with
+  -NoProfile. On the tested native tmux 3.6a-win32 install, profile-enabled PS5.1 resolves
+  Codex as a Function, while -NoProfile resolves codex.ps1. The IDE already invokes
+  `& 'codex'`, not codex.exe; restoring profile loading preserves user llm-usage routing
+  without hardcoding a possibly different `llm-usage run` convention.
+- Windows inner launcher v10 loads PS5.1 profiles. New IDE sessions alone receive the
+  trusted Windows PS5.1 default-shell and empty default-command, so commandless windows
+  and splits are interactive profile-loaded shells. Use exact pane-style '=session:'
+  targets even for session options. Expand '#{l:}' with set-option -F to carry an empty
+  value safely through PS5 native argv; never use global setters or bypass .tmux.conf.
+- Interactive local Windows shells also load profiles and use the trusted system PS5.1
+  executable. SSH/control helper -NoProfile and attach ExternalScript handling are unchanged.
+  Existing-session reuse returns before setters; old running panes are not restarted.
+- Native isolated-server smoke passes actual new-session, commandless new-window/split-window,
+  profile Function lookup, harmless function-name dispatch, and preservation of an existing
+  test session's settings. The isolated server inherited the user's global PS5.1 setting.
+  The production named server was absent during read-only audit; no production sessions,
+  global options, user config/profile files or external tmux checkout were changed.
+- Added opt-in Rust fixture exporter and windows-tmux-profile-smoke.ps1. It substitutes a
+  harmless Codex function, never executes a real LLM, and kills only its UUID-named test
+  server. Rust formatting, 73 regular tests, Windows MSVC-target check, TypeScript and all
+  13 Node regression scripts pass. Windows staged -NoLaunch smoke also passes: both
+  native release builds and executable metadata, artifact/routing tests, frontend builds,
+  and npm audit (zero vulnerabilities). Timestamped executables published without
+  launching/stopping apps. Existing Vite large-chunk advisory remains; full GUI smoke
+  and other tmux script wrappers were not tested.
+
+### 2026-09-09 - Workspace Ports menu and restart restoration
+
+- Added an IDE toolbar Ports menu; Browser's Ports button opens the same manager.
+  Forward/list/Stop are independent of Browser visibility. Saved disconnected rules
+  expose Retry, Enable, Disable and Forget. Forward/restoration never opens a browser.
+- Store up to 32 validated remote/local/enabled rules per workspace profile/root, not
+  runtime process IDs. Signature invalidation and normal snapshot capture preserve them.
+  Activate a workspace to restore enabled rules serially; reuse existing tunnels and
+  retain their actual local port. Failed fixed-port restores stay visible for Retry.
+- Stop disables restoration. A disabled pending request keeps its tombstone until the
+  late tunnel is stopped; Forget then frees the rule slot. Shutdown rejects late starts.
+  Existing backend runtime cleanup already drains IDE-owned tunnels/processes. Native
+  WSL localhost exposure and independently running servers are not owned or stopped by IDE.
+- Fixed split-output detection with a 256-character carry, added standalone local URL
+  recognition, and retain up to 32 numeric discoveries per inactive pane for activation.
+  Background discoveries queue rules rather than starting another workspace's SSH IPC.
+  Scan buffers drain per batch; no scrollback scan, persistent host or listener polling.
+- Existing installations have no historical forwarding rules to migrate: a port must be
+  detected/registered once with this version. Arbitrary servers that never print a local
+  URL/listener hint still need initial manual registration. Server processes are not restarted.
+- Added workspace-ports-smoke to regression commands. Typecheck, all 13 Node scripts and
+  both frontend builds pass; an independent read-only lifecycle review informed race fixes.
+- Windows interop is working again. The staged VS/Git-for-Windows `-NoLaunch` smoke passes:
+  Windows dependency/artifact/routing checks, audit (0 vulnerabilities), Rust check and
+  both native release executables with metadata verification. Windows Node also passes the
+  Ports helper fixtures. Actual GUI/SSH-server behavior still needs manual smoke; Vite's
+  existing large-chunk advisory remains. Running apps were not stopped or launched.
+
+### 2026-09-08 - Manual forwarding does not open the Browser
+
+- The Browser port panel's Forward button now only establishes the tunnel and updates
+  the list/status. Removed the automatic browser-tab open; clicking the forwarded port
+  or using an explicit Open/address action still opens the preview. Auto-forward is unchanged.
+- Added helper regression coverage for successful forwarding, stale workspace completion
+  and errors without opening a browser. Real Windows runtime remains a manual smoke check.
+
+### 2026-09-08 - Confirmed recovery for Windows paths missing the drive slash
+
+- Rejection alone left existing Windows workspace snapshots unusable. Open / Connect,
+  new shell startup and cold shell restore now propose the drive-root form for `D:folder`.
+  A bounded directory probe must succeed, then the user must confirm before repair.
+- Approval updates matching workspace root, Root input, unstarted pane cwd and snapshot
+  paths; Explorer reloads asynchronously and resumes polling. Live/in-flight shells and
+  file contents are not relocated. Open / Connect retains its normal workspace-open behavior.
+- Concurrent identical requests share a probe/dialog. Cancel, missing folders, failed
+  probes and workspace changes cannot apply stale repairs or silently fall back to home.
+  Backend strict validation stays intact; POSIX paths and ordinary shell cd are unchanged.
+- Added six helper regression groups (20 Windows cwd groups total). Typecheck, all twelve
+  Node regression scripts and both frontend builds pass. Vite's existing large-chunk
+  advisory remains. Actual Windows WebView/PowerShell runtime is not verified here.
+
+### 2026-09-08 - Reject ambiguous Windows drive paths and quiet optional SSH agent notice
+
+- The reported hash-folder startup failure matches a drive-relative path being applied
+  twice: `D:folder` is not `D:\folder`. The previous cwd fix left nonempty Windows paths
+  unresolved, so PTY creation anchored the suffix under app cwd and PowerShell applied
+  it again. Literal `#` is safe in the existing quoted Set-Location -LiteralPath bootstrap.
+- Project resolution and the backend spawn boundary now reject drive-relative input with
+  actionable absolute-path guidance. Other relative Windows paths are anchored once before
+  probing/spawning. Frontend validation rejects ambiguous drive input before IPC or restore
+  fallback; ordinary POSIX colon filenames and user-entered shell cd semantics are unchanged.
+  Do not automatically move/delete folders created under an unintended old project root.
+- Removed the per-SSH-tab optional Windows-agent fallback notice. IDE askpass was already
+  enabled; key loading, actual SSH authentication/errors and exit propagation stay intact.
+  This notice came from Windows-side SSH bootstrap, not the local WSL launch path. No
+  service auto-start, key-store change or authentication timeout was introduced.
+- Windows-path and SSH-auth reviewers independently checked the two reports. Added two
+  frontend regression groups (14 cwd groups total), five Rust tests and hash quoting coverage.
+  Typecheck, twelve Node regression scripts, both frontend builds, Rust formatting, 73 Rust
+  tests and host/Windows MSVC-target checks pass. Real Windows runtime remains unverified
+  because installed cmd.exe still fails WSL interop. Existing build advisories remain.
+- Follow-up candidates: show the resolved project path before opening, expose authentication
+  mode in a connection-status panel, and bound/coalesce noninteractive agent probes without
+  timing out actual passphrase entry. These are proposals, not changes made in this patch.
+
+### 2026-09-06 - Rebuild without replacing running runtime executables
+
+- The reported build failure came from deleting the fixed-name executable under
+  `simple-vibe-build-sources` before every rebuild. Runtime snapshots are no longer
+  deleted/overwritten. Each publication is a regular byte copy named with UTC date/time,
+  milliseconds and a GUID, atomically renamed from its own exclusive partial file.
+  Cargo target/cache stays shared; no running apps are terminated and old snapshots stay
+  available for their SSH askpass children.
+- Smoke checks metadata and preserves the IDE snapshot before the Terminal build renames
+  Cargo's shared output. It launches from the snapshot directory, not the disposable
+  staged source directory. The existing external staged build cmd needs no rewrite.
+- Updated runtime/source resolvers, build-and-copy and both run-built launchers to use
+  separate runtime copies. Latest snapshots are per binary; a newer raw Cargo output can
+  supersede one only with matching product metadata. Explicit fresh-build resolution never
+  falls back to an older snapshot. Explicit target and own-repository builds take priority
+  over the historical fallback cache. Partial files and reparse-point candidates are ignored.
+- Added two PowerShell regression scripts to the Windows smoke preflight. Verified with
+  an isolated official SHA256-checked PowerShell 7.6.5 Linux runtime: artifact/file-sharing
+  fixtures, metadata-selection fixtures, 35 routing assertions and parser checks pass.
+  Typecheck, existing Node regression scripts, source-manifest inclusion and diff checks
+  pass. No app/backend code changed this turn; earlier uncommitted patches are preserved.
+- Windows PowerShell 5.1, WSH/CMD, real Windows image locks and MSVC rebuild still need
+  Windows smoke; WSL interop remains unavailable. A legacy instance launched directly
+  from raw Cargo `release` output still needs a one-time close, then a versioned launcher.
+  The user's running fixed-name snapshot does NOT require that close. Old copies are not
+  automatically pruned; remove them manually only after their apps are closed.
+
+### 2026-09-06 - Preserve Windows project cwd when opening shells
+
+- `+ Shell` already selected the project root/profile, but Windows startup validation
+  could silently replace an unavailable requested directory with Explorer/home/app cwd.
+  Fresh launches now validate and spawn the same resolved path, and report a safe error
+  rather than switch folders. Only snapshot recovery opts into captured, same-profile
+  project/default fallbacks; async work never reads another workspace's live paths.
+- Windows PowerShell now explicitly sets its provider location after history/module
+  setup and before startup commands, in addition to the existing PTY process cwd.
+  LiteralPath and UTF-16 encoded commands preserve UNC, Hangul, brackets and apostrophes.
+  A failed location change aborts the startup script; `-NoExit` still permits an interactive
+  prompt. This hardens startup, not proof of the user's exact runtime trigger.
+- Fixed confirmed UNC prefix loss during cwd tracking/snapshot updates, share-root parent
+  traversal and UNC prompt/continuation recognition. Prompt matching keeps the share and
+  tail disjoint to avoid quadratic backtracking on long incomplete output.
+  The separate safe-temp `Win Shell` button and WSL/SSH launch profiles are unchanged.
+- Added Windows shell helper regressions and three Rust bootstrap/encoding tests.
+  Typecheck, both frontend builds, the twelve-script regression command, formatting,
+  68 Rust tests and host/Windows-target cargo checks pass. Existing build advisories remain.
+  Actual Windows PowerShell/WebView2 runtime remains unverified: WSL interop returns
+  Exec format error. Rebuild with the existing staged cmd and follow the new
+  [Windows cwd smoke checklist](docs/WINDOWS_RUNTIME_SMOKE.md#windows-project-shell-working-directory).
+
+### 2026-09-06 - Fix untracked source omission from default Windows builds
+
+- The Browser follow-up added untracked `src-tauri/src/preview_body.rs`, but the default
+  Windows stage still copied tracked files only. This caused E0583 despite a successful
+  Windows-target check of the original checkout. The default build path now includes
+  allowlisted nonignored new Rust/frontend code, build scripts and capability JSON.
+  No commit or additional flag is required for the new module, and the Git index is unchanged.
+- New `windows-stage-manifest.mjs` parses NUL-delimited Git UTF-8 filenames and emits
+  ASCII-safe JSON for Windows PowerShell. Unrelated local files remain excluded by default;
+  `-IncludeUntracked` remains explicit wider inclusion, with existing private-name guards.
+- Manifest validation now precedes old-stage deletion. Unsafe Windows filenames, case
+  collisions and source symlinks/junctions are rejected rather than copied ambiguously.
+- Added `windows-stage-manifest-smoke.mjs`: 13 real Git/filesystem tests, now part of the
+  eleven-script regression command. Tests cover the missing module, Unicode filenames,
+  ignored/private files, index preservation, collisions and links. Default manifest copying
+  to a fresh temporary source snapshot followed by Windows MSVC-target cargo check passed.
+- The user's existing external build cmd already invokes the repository staging helper,
+  so no launcher rewrite is required: rerun the same command. Actual Windows PowerShell/
+  release/link execution remains unverified here because WSL interop is unavailable.
+
+### 2026-09-06 - Browser navigation, proxy ownership and bounded HTML capture
+
+- Capture-safe iframe Reload/Hard refresh/Clear cache now use the actual fallback path.
+  Repeated activation no longer restarts the same pending iframe navigation; replacement
+  documents receive fresh Console detail mode, and errors/suspended frames remain retryable.
+- Identical native bounds updates are skipped while pending or already applied, preserving
+  explicit navigation, exact coordinates, hide/close invalidation and delayed-close recovery.
+- Preview proxy probes/starts are claimed before awaiting IPC and fenced by workspace,
+  profile/root, generation and promise identity. Obsolete created proxies are stopped;
+  old results/errors and asset retries cannot affect newly navigated/restored tabs.
+- Console no longer jumps to the bottom while reading older entries. Hidden batches retain
+  only the newest valid payloads before enqueueing. Deferred workspace suspension remains
+  cancellable after its timer fires, so stale idle work cannot bypass a new retention grace.
+- New isolated native body-capture module bounds optional HTML injection to 2 MiB with
+  best-effort time limits. Oversized/slow/unsupported pages relay original wire bytes, with
+  bridge-dependent integrations unavailable on those fallback pages. Small chunked bodies
+  validate incrementally and decode in place; complete framing no longer requires EOF.
+- Fixed HEAD/204/304 body handling, skipped unsupported transfer coding/205 injection,
+  stripped obsolete Trailer on injection and conflicting Content-Length on transfer-coded
+  passthrough. Fixed-length relay stops at its body boundary and reports truncation.
+- Added three Browser helper scripts and native parser/loopback tests. Typecheck, both
+  frontend builds, ten regression scripts, formatting, 65 Rust tests and host/Windows-target
+  checks pass. Real Windows/WebView2 runtime remains unverified (WSL interop unavailable).
+- Details, tradeoffs and remaining iframe-retention/80 ms listener-polling candidates:
+  [Browser performance](docs/BROWSER_PERFORMANCE.md). No hidden-tab state-loss policy,
+  background terminal host, dependency or unsafe process cleanup change was introduced.
+
+### 2026-09-06 - Whole-app allocation, scheduling and file I/O audit
+
+- Expanded the audit beyond the terminal to Editor/Notes, Explorer, Browser/proxy,
+  native file transfers, exports, persistence, process lifecycle, GPU and release settings.
+  See [coverage, measurements and remaining risks](docs/PERFORMANCE_AUDIT.md).
+- Editor caches the current immutable Text's string and avoids rebuilding tab chrome
+  on every dirty edit. Notes quota compaction now counts each JSON record once rather
+  than repeatedly serializing the entire retained list; the synthetic overflow fixture
+  drops from roughly 3.6 seconds to 6 ms (not Windows end-to-end timing).
+- Notes saves are serialized/coalesced per tab object; older saves cannot overwrite a
+  newer completed save. Captured scope/path and current-tab timer guards prevent old
+  workspace work from cancelling another workspace's autosave.
+- Explorer avoids full settings normalization in scroll guards; native mixed/Unicode
+  sort keys are computed once per entry while ASCII sorting and signature order remain.
+- Remote reads reuse valid UTF-8 buffers, retries share immutable stdin, attachment
+  uploads use existing raw binary stdin, and data URLs encode into their final allocation.
+- Browser drains deduplicate pending idle work and fence/cancel stale generations;
+  injected console messages are bounded before crossing postMessage. HTTP header scans
+  retain a three-byte overlap rather than rescanning the whole accumulated header.
+- Export running progress is throttled before allocation/emission, with lifecycle events
+  unchanged. Stalled export stderr/cancellation and permanent-delete/write races in Notes
+  remain explicit follow-up work; no unsafe cleanup shortcuts were introduced.
+- Added Editor/Notes/Browser regressions and seven native tests. Typecheck, both frontend
+  builds, seven regression scripts, formatting, 53 Rust tests and host/Windows-target
+  checks pass. Actual Windows runtime remains unverified because WSL interop cannot
+  execute installed Windows binaries; existing build advisories remain visible.
+
+### 2026-09-06 - Reduce PTY copies, protect pending IME commits, and fix Explorer interactions
+
+#### Changed
+- Normal complete UTF-8 PTY reads are borrowed directly from the read buffer instead of
+  copying through a carry Vec and temporary String. Split/invalid reads use a safe bounded
+  decoder; invalid bytes no longer consume an incomplete valid Hangul/emoji suffix. DSR
+  suffix retention and query/output ordering are unchanged.
+- Terminal input transfers the owned IPC String's bytes into the existing writer queue without
+  an extra allocation/copy. Queue limits, ordering, retries and flush barriers remain unchanged.
+- The IDE's IME blur guard now protects both live composition and the pending xterm commit
+  after compositionend. A generation-fenced task releases it after xterm's canonical textarea
+  read, retaining deferred blur across a newer composition and cancelling stale work on disposal.
+  No committed text is reconstructed, directly replayed, or deduplicated by the IDE.
+- Disabled IME diagnostics no longer read textarea/event properties or build strings. IME and
+  already-scheduled fit guards run before layout reads; hidden/inactive panes skip geometry reads.
+- Reopening an existing editor tab from Explorer now shows and raises Editor, like the new-file
+  path. Plain primary-click on empty Explorer space clears child/multi-selection and anchor,
+  so both New File and New Folder target currentDir. Loading rows, rename inputs, modified
+  clicks and drag trailing clicks retain their existing semantics.
+
+#### Important remaining IME limitation
+- Installed xterm 6.1.0-beta.191 also loses committed Hangul when multiple compositions and a
+  normal key arrive before its pending timers run. An actual-source synthetic replay reproduces
+  this independently of the IDE's blur bug; it is not a native Windows IME reproduction.
+- [Upstream issue #6089](https://github.com/xtermjs/xterm.js/issues/6089) describes this shared
+  pending-send cancellation; [PR #6090](https://github.com/xtermjs/xterm.js/pull/6090) was still
+  open when checked. Lower load reduces the trigger but is not a full correctness fix. Keep
+  Type pad available until a reviewed composition-queue change is validated on Windows.
+- No dependency bump, node_modules modification, private CompositionHelper replacement, or
+  compositionend.data direct-send workaround was introduced. A maintained xterm patch/fork
+  with per-composition ownership and Windows Korean event replay is the remaining root-fix path.
+
+#### Verification
+- Typecheck, both Vite builds, all five regression scripts, formatting, 46 Rust tests, and
+  host/Windows-target cargo checks. Regression fixtures include every byte split of valid and
+  malformed UTF-8, original-allocation ownership, actual installed xterm commit/blur handling,
+  Ctrl+C/Ctrl+V semantics and Explorer open/selection behavior.
+- `node scripts/terminal-ime-smoke.mjs --upstream-probe` additionally reports the known xterm
+  timer-backlog limitation; it is advisory, not a claim that the dependency bug was patched.
+- Optimized helper-only microbench, 100k reads plus DSR scan/sink: roughly 304 -> 97 ms ASCII,
+  746 -> 474 ms Korean, with temporary per-read Strings removed on the normal fast path.
+  These are not Windows PTY/IPC or end-to-end typing latency measurements.
+- Real Windows/WebView2 IME, long-output and Explorer z-order smoke remains required; this
+  environment still cannot execute Windows binaries through WSL interop.
+
+### 2026-09-05 - Bound long-session output and fix Explorer/runtime accumulation
+
+#### Changed (`src/`, `src-tauri/src/lib.rs`, regression scripts)
+- Terminal output now has renderer acknowledgements after xterm parsing, with at most
+  128 KiB / 64 unacknowledged IPC batches per pane. Close/cancel wakes blocked producers;
+  early startup events retain their sequence until the backend ID is bound. Stale ACKs
+  cannot credit another backend/renderer generation. Direct PTY I/O, DSR handling,
+  input sequencing, and the v9 tmux creation/reattach policy are unchanged.
+- Hidden panes coalesce the initial burst, then drain in small yielding tasks instead of
+  waiting 900 ms for each 8 KiB chunk. Only one idle-drain callback can be outstanding;
+  native idle deadlines still allow progress while another pane is continuously busy.
+- Hist is independent of visible xterm scrollback. Its saturated arrays now evict using
+  a head offset, its optional parser queue is capped at 128 Ki characters with a skipped-output
+  marker, and parsing yields every 32 Ki characters. Open history rendering is throttled
+  and reads only the displayed page, not a copy of all 20k/100k cached lines.
+- History correctly handles fragmented CRLF, ANSI, OSC and DCS terminators, retaining
+  only bounded escape-parser state, not arbitrarily long control-string payloads.
+- Explorer batch reads claim missing directories before awaiting existing reads and retain
+  the captured size mode throughout completion. This closes duplicate WSL/SSH helper and
+  wrong-cache-key races without removing timeout/cancellation deduplication.
+- Failed inactive editor restoration is attempted once per hydration pass so one missing
+  remote file cannot loop indefinitely or starve later tabs. Workspace changes clear stale
+  loading state; cached pending tabs resume hydration when shown again.
+- Explorer ignores stale asynchronous UI results, respects collapse while loading, and
+  fences file creation against workspace changes or same-scope resets. Immutable entry
+  weak-key width caching avoids remeasuring every row on trees larger than 2,000 entries.
+- Closing forwards/proxies shuts down accepted TCP/WebSocket sockets, not just the listener.
+  TCP FIN is relayed in each direction while preserving half-close uploads. Explicit stop
+  wakes both copy workers; connections are capped and connect waits bounded. Listener joins
+  no longer hold the shared forwards map lock.
+
+#### Verification and limits
+- `npm run check`, both Vite builds, and `npm run check:regressions`.
+- Rust formatting, all 41 Rust tests, host and Windows MSVC-target `cargo check`.
+- Helper fixtures reproduce the prior bugs. A synthetic 10,000-flush saturated deep-history
+  workload improved from about 79 ms to 7 ms; unchanged 3,000-row Explorer re-rendering
+  performs zero additional text measurements instead of 3,000. These are helper-level
+  measurements, not end-to-end Windows responsiveness or a RAM-soak result.
+- Existing Vite chunk-size and cross-target GNU-compiler advisories remain. No dependency
+  upgrades or warning suppression were added for this patch.
+- Real Windows/WebView2/WSL/SSH runtime smoke is still required. WSL interop/binfmt was
+  checked; invoking the installed Windows `cmd.exe` returns `Exec format error` here.
+  Use the staged Windows gate and the long-session checklist in `docs/WINDOWS_RUNTIME_SMOKE.md`.
 
 ### 2026-09-05 - Use Windows tmux for the Codex and Claude launcher buttons
 

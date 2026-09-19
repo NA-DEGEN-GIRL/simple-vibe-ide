@@ -143,11 +143,17 @@ interface TerminalPane {
   element: HTMLElement;
   host: HTMLElement;
   outputBuffer: string;
+  portHintTail?: string;
+  pendingDetectedPorts?: Map<number, boolean>;
   writeBuffer: string;
   historyCache?: TerminalHistoryCache;
   historyPendingBuffer?: string;
   historyFlushTimer?: number;
   backendOutputChars: number;
+  outputSequence?: number;
+  outputAcknowledgedSequence?: number;
+  outputAckInFlight?: Promise<void>;
+  outputAckRetryTimer?: number;
   cwdOutputBuffer: string;
   inputBuffer: string;
   inputWriteBuffer: string;
@@ -176,6 +182,10 @@ interface TerminalPane {
   typingPadPasteInFlight?: boolean;
   imeComposing?: boolean;
   imeDomComposing?: boolean;
+  imeCommitPending?: boolean;
+  imeCommitGeneration?: number;
+  imeCommitTimer?: number;
+  imeBlurReplayTimer?: number;
   imeCompositionStartedAt?: number;
   imeDeferredXtermBlur?: boolean;
   imeTraceSequence?: number;
@@ -244,6 +254,7 @@ interface TerminalPane {
   pendingFitStableFrames?: number;
   writeFrame?: number;
   writeTimer?: number;
+  writeIdleScheduled?: boolean;
   shellReadyFallbackTimer?: number;
   portScanTimer?: number;
   cwdScanTimer?: number;
@@ -261,9 +272,11 @@ interface PendingTerminalImeUiSwitch {
 
 interface TerminalHistoryCache {
   lines: string[];
+  head?: number;
   currentLine: string;
   charCount: number;
   escapeCarry: string;
+  pendingCarriageReturn?: boolean;
 }
 
 type TerminalSplitDirection = 'row' | 'column';
@@ -317,6 +330,8 @@ interface EditorPaneViewState {
   renderSignature: string;
   renderToken: number;
   languageCompartment?: import('@codemirror/state').Compartment;
+  lastDocument?: import('@codemirror/state').Text;
+  lastDocumentText?: string;
 }
 
 interface EditorTabRuntimeViewState {
@@ -1277,6 +1292,12 @@ interface NoteTabSnapshot {
   theme?: NoteThemeId;
 }
 
+interface WorkspacePortRule {
+  remotePort: number;
+  localPort: number;
+  enabled: boolean;
+}
+
 interface WorkspaceSnapshot {
   id: string;
   label: string;
@@ -1311,6 +1332,7 @@ interface WorkspaceSnapshot {
   noteOpacity?: number;
   browserTabs: BrowserTab[];
   browserHistory: string[];
+  portForwards?: WorkspacePortRule[];
   activeBrowserTabId: string;
   browserDeviceId: string;
   browserOrientation: BrowserOrientation;
@@ -1792,6 +1814,7 @@ const TERMINAL_PORT_SCAN_DEBOUNCE_MS = 220;
 const TERMINAL_CWD_SCAN_DEBOUNCE_MS = 140;
 const TERMINAL_INACTIVE_WRITE_BATCH_MS = 240;
 const TERMINAL_BACKGROUND_WRITE_BATCH_MS = 900;
+const TERMINAL_HIDDEN_WRITE_CONTINUATION_MS = 16;
 const TERMINAL_RENDER_WATCHDOG_MS = 420;
 const TERMINAL_RENDER_WATCHDOG_STALE_RAF_MS = 500;
 const TERMINAL_RENDER_REFRESH_MIN_MS = 260;
@@ -1846,6 +1869,9 @@ const TERMINAL_LLM_DETECTION_THROTTLE_MS = 180;
 const TERMINAL_LLM_DETECTION_BUFFER_CHARS = 6000;
 const TERMINAL_TITLE_ANALYSIS_BATCH_MS = 32;
 const TERMINAL_HISTORY_ANALYSIS_BATCH_MS = 50;
+const TERMINAL_HISTORY_PENDING_MAX_CHARS = 128 * 1024;
+const TERMINAL_HISTORY_PARSE_CHUNK_CHARS = 32 * 1024;
+const TERMINAL_HISTORY_CONTINUATION_MS = 16;
 const TERMINAL_HISTORY_CONTROL_SYNC_MIN_MS = 400;
 const TERMINAL_BACKGROUND_SCAN_BATCH_MS = 900;
 const TERMINAL_BACKGROUND_CWD_SAVE_DELAY_MS = 1200;
@@ -1969,9 +1995,9 @@ const TERMINAL_IME_RELEASE_DEFER_MS = 120;
 const TERMINAL_IME_COMPOSITION_FALLBACK_MS = 30_000;
 const TERMINAL_IME_COMPOSITION_HARD_LIMIT_MS = 120_000;
 const TERMINAL_FOCUS_RETRY_MS = 36;
-const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
-const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
-const TERMINAL_PROMPT_CONTINUATION_HINT_PATTERN = /(?:PS\s+[A-Za-z]:\\?|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|^[#$>]\s*$)/;
+const TERMINAL_PROMPT_SHORT_HINT_PATTERN = /(?:PS\s+(?:[A-Za-z]:\\?|\\\\)|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|[#$>]\s*$)/;
+const TERMINAL_PROMPT_CWD_HINT_PATTERN = /(?:PS\s+(?:[A-Za-z]:\\|\\\\)|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:|[#$>]\s*$)/;
+const TERMINAL_PROMPT_CONTINUATION_HINT_PATTERN = /(?:PS\s+(?:[A-Za-z]:\\?|\\\\)|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]*:?|^[#$>]\s*$)/;
 const TERMINAL_FILE_LINK_PATTERN = /(?:^|[\s([{"'`])(@?(?:(?:[A-Za-z]:[\\/]|\\\\|\/|~[\\/]|\.{1,2}[\\/])?(?:[A-Za-z0-9_@.+~()[\]-]+[\\/])*[A-Za-z0-9_@.+~()[\]-]*\.(?:png|jpe?g|gif|webp|bmp|svg|ico|txt|md|json|jsonc|yaml|yml|toml|env|ini|conf|config|log|ts|tsx|js|jsx|mjs|cjs|css|scss|html|htm|py|rs|go|java|c|cpp|h|hpp|cs|sh|bash|ps1|bat|cmd))(?:[:#]\d+(?::\d+)?)?)/gi;
 const TERMINAL_PREVIEW_PORT_HINT_PATTERN = /localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\b(?:listening|running|available|started|serving|server|port)\b|:\d{2,5}/i;
 const TERMINAL_OSC7_CWD_PATTERN = /\x1b]7;file:\/\/[^/\x07\x1b]*(\/[^\x07\x1b]*)(?:\x07|\x1b\\)/g;
@@ -1983,7 +2009,7 @@ const LOCAL_SERVER_NEGATIVE_CONTEXT_PATTERN = /\b(?:error|failed|failure|refused
 const TERMINAL_AUTO_FORWARD_LIMIT = 8;
 const TERMINAL_FORWARD_READY_TIMEOUT_MS = 10_000;
 const TERMINAL_FORWARD_READY_DELAY_MS = 250;
-const TERMINAL_POWERSHELL_PROMPT_CWD_PATTERN = /(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*)>\s*$/;
+const TERMINAL_POWERSHELL_PROMPT_CWD_PATTERN = /(?:^|\s)PS\s+([A-Za-z]:\\[^<>|?*\r\n]*|\\\\[^\\<>|?*\r\n]+\\[^\\<>|?*\r\n]+(?:\\[^<>|?*\r\n]*)?)>\s*$/;
 const TERMINAL_BASH_PROMPT_CWD_PATTERN = /(?:^|\s)[^@\s:]+@[^:\s]+:([^#$\r\n]+)[#$]\s*$/;
 const EXPLORER_TYPEAHEAD_TIMEOUT_MS = 900;
 const EXPLORER_WATCH_LOCAL_MS = 2500;
@@ -3817,9 +3843,11 @@ const profileById = new Map<string, ConnectionProfile>();
 const terminalPaneById = new Map<string, TerminalPane>();
 const terminalPaneByBackendId = new Map<string, TerminalPane>();
 const terminalBackendTerminationPromises = new Map<string, Promise<void>>();
+const windowsFolderRepairRequests = new Map<string, Promise<string>>();
 const terminalBackendTerminationRetryTimers = new Map<string, number>();
 const terminalBackendTerminationRetryAttempts = new Map<string, number>();
 const pendingTerminalDataByBackendId = new Map<string, string>();
+const pendingTerminalSequenceByBackendId = new Map<string, number>();
 const pendingTerminalCursorQueriesByBackendId = new Map<string, number>();
 const pendingTerminalExitByBackendId = new Map<string, TerminalExitEvent>();
 const terminalPanesByWidgetId = new Map<string, TerminalPane[]>();
@@ -3890,14 +3918,18 @@ let nativeBrowserWebviewNeedsBoundsRecovery = false;
 let nativeBrowserWebviewSuspendedForAddressSuggestions = false;
 let nativeBrowserWebviewSyncFrame = 0;
 let nativeBrowserWebviewRequestSeq = 0;
+let nativeBrowserWebviewAppliedKey = '';
+let nativeBrowserWebviewPendingKey = '';
 let nativeBrowserOverlayObserver: MutationObserver | null = null;
 let browserRestoreResumeToken = 0;
 const noteSaveTimers = new Map<string, number>();
+const noteSaveInFlightByTab = new WeakMap<NoteTabState, Promise<void>>();
 let noteMemoryRecords: NoteMemoryRecord[] = [];
 let noteMemoryPersistTimer = 0;
 let noteMemoryStoreDirty = false;
 const previewProxyProbeAt = new Map<string, number>();
 const previewProxyStarts = new Map<string, Promise<PortForwardResult>>();
+let previewProxyScopeGeneration = 0;
 const previewProxyByTargetOrigin = new Map<string, PortForwardResult>();
 const previewProxyByLocalPort = new Map<number, PortForwardResult>();
 const previewProxyLocalPortMisses = new Set<number>();
@@ -3964,7 +3996,7 @@ let explorerTitleOverflowGap = 0;
 let explorerSemanticContentWidth = 0;
 let explorerMeasureCanvas: HTMLCanvasElement | null = null;
 let explorerMeasureContext: CanvasRenderingContext2D | null = null;
-const explorerRowWidthMeasureCache = new Map<string, number>();
+const explorerRowWidthMeasureCache = new WeakMap<FileEntry, { signature: string; width: number }>();
 let explorerPathRowRenderSignature = '\0';
 let explorerFileSizeModeRenderSignature = '\0';
 let explorerOpenModeRenderSignature = '\0';
@@ -4018,8 +4050,12 @@ let browserConsoleLogSequence = 0;
 let browserConsoleLastTimeSecond = -1;
 let browserConsoleLastTimeText = '';
 let browserConsolePortScanTimer = 0;
+let browserConsolePortScanGeneration = 0;
+let browserConsolePortScanIdleScheduled = false;
 let browserConsolePortScanQueue: string[] = [];
 let browserConsoleHiddenPayloadTimer = 0;
+let browserConsoleHiddenPayloadGeneration = 0;
+let browserConsoleHiddenPayloadIdleScheduled = false;
 let browserConsoleHiddenPayloadQueue: unknown[] = [];
 let activeBrowserFrameId = '';
 let browserInactiveFrameSuspendTimer = 0;
@@ -4362,7 +4398,7 @@ app.innerHTML = `
         <button class="panel-toggle" data-toggle-panel="snippets" title="Toggle Snippets" aria-pressed="false">Snip</button>
         <button class="panel-toggle" data-toggle-panel="calculator" title="Toggle Calculator" aria-pressed="false">Calc</button>
         <button class="panel-toggle" data-toggle-panel="settings" title="Toggle IDE Settings" aria-pressed="false">Set</button>
-        <button id="terminal-ports-toggle" class="terminal-ports-toggle${IS_TERMINAL_APP ? '' : ' hidden'}" type="button" aria-haspopup="dialog" aria-controls="terminal-ports-popover" aria-expanded="false" title="Detected and forwarded local server ports">
+        <button id="terminal-ports-toggle" class="terminal-ports-toggle" type="button" aria-haspopup="dialog" aria-controls="terminal-ports-popover" aria-expanded="false" title="Workspace port forwarding">
           <span>Ports</span><span id="terminal-ports-count" class="terminal-ports-count" aria-live="polite">0</span>
         </button>
         <div class="workspace-status-slot"><div id="status" class="status">Ready</div></div>
@@ -4534,16 +4570,10 @@ app.innerHTML = `
             <div id="browser-console-log" class="browser-console-log"></div>
           </section>
         </div>
-        <details class="browser-advanced">
-          <summary>Advanced ports</summary>
-          <div class="port-form">
-            <input id="remote-port" type="number" min="1" max="65535" placeholder="remote port" />
-            <input id="local-port" type="number" min="0" max="65535" placeholder="local=remote" />
-            <button id="start-forward">Forward</button>
-            <button id="hard-refresh-preview" title="Reload with a cache-busting local URL">Hard reload</button>
-          </div>
-          <div id="forward-list" class="forward-list"></div>
-        </details>
+        <div class="port-form">
+          <button id="browser-ports">Ports</button>
+          <button id="hard-refresh-preview" title="Reload with a cache-busting local URL">Hard reload</button>
+        </div>
         <div class="console-note">Local and live URLs can open here. Some public sites block iframe embedding; open those in a full browser when their own policy rejects preview.</div>
       </section>
       <section class="panel calculator-panel floating-panel hidden" data-panel="calculator">
@@ -4677,8 +4707,17 @@ app.innerHTML = `
       <span class="spacer"></span>
       <button id="terminal-ports-close" type="button" aria-label="Close local server ports">Close</button>
     </div>
-    <div id="terminal-forward-list" class="forward-list terminal-forward-list"></div>
-    <div class="terminal-ports-note">High-confidence WSL/SSH server ports auto-forward. Open launches the Windows browser; Copy copies the local URL.</div>
+    <div id="terminal-forward-list" class="forward-list terminal-forward-list${IS_TERMINAL_APP ? '' : ' hidden'}"></div>
+    <div id="workspace-ports-manager" class="${IS_TERMINAL_APP ? 'hidden' : ''}">
+      <div class="port-form">
+        <input id="remote-port" type="number" min="1" max="65535" placeholder="remote port" aria-label="Remote port" />
+        <input id="local-port" type="number" min="0" max="65535" placeholder="local=remote" aria-label="Local port (0 = automatic)" />
+        <button id="start-forward">Forward</button>
+      </div>
+      <div id="forward-list" class="forward-list"></div>
+      <div id="workspace-port-rules" class="forward-list"></div>
+    </div>
+    <div class="terminal-ports-note">${IS_TERMINAL_APP ? 'High-confidence WSL/SSH server ports auto-forward. Open launches the Windows browser; Copy copies the local URL.' : 'Workspace forwards restore on return after restarting the IDE. Stop disables automatic restoration. Forward never opens a browser; click a forwarded port to open it.'}</div>
   </div>
   <div id="widget-opacity-popover" class="widget-opacity-popover hidden" data-no-window-drag role="dialog" aria-label="Widget opacity">
     <div class="widget-opacity-popover-header">
@@ -5227,10 +5266,10 @@ async function init() {
     listen<TerminalDataEvent>('terminal-data', (event) => {
       const pane = terminalPaneByBackendId.get(event.payload.id);
       if (!pane) {
-        bufferPendingTerminalData(event.payload.id, event.payload.data);
+        bufferPendingTerminalData(event.payload.id, event.payload.data, event.payload.sequence);
         return;
       }
-      handleTerminalData(pane, event.payload.data);
+      handleBackendTerminalData(pane, event.payload.data, event.payload.sequence);
     }),
     listen<TerminalCursorQueryEvent>('terminal-cursor-query', (event) => {
       const pane = terminalPaneByBackendId.get(event.payload.id);
@@ -18257,6 +18296,7 @@ function createCurrentWorkspaceSnapshot(
     noteOpacity,
     browserTabs: currentBrowserTabSnapshots(),
     browserHistory: currentBrowserHistorySnapshot(),
+    portForwards: workspacePortRules(currentBrowserForwardScope()),
     activeBrowserTabId: state.activeBrowserTabId,
     browserDeviceId: state.browserDeviceId,
     browserOrientation: state.browserOrientation,
@@ -18427,6 +18467,7 @@ function workspaceSnapshotSignature(snapshot: WorkspaceSnapshot) {
   signature += `|${String(snapshot.noteOpacity)}`;
   signature += `|${browserTabSnapshotsSignature(snapshot.browserTabs)}`;
   signature += `|${browserHistorySignature(snapshot.browserHistory)}`;
+  signature += `|${JSON.stringify(normalizedWorkspacePortRules(snapshot.portForwards))}`;
   signature += `|${workspaceSignaturePart(snapshot.activeBrowserTabId)}`;
   signature += `|${workspaceSignaturePart(snapshot.browserDeviceId)}`;
   signature += `|${workspaceSignaturePart(snapshot.browserOrientation)}`;
@@ -19906,7 +19947,11 @@ async function restoreWorkspaceTerminalsInner(
         const key = `${plan.terminalProfile.id}\0${plan.pane.cwd}`;
         let pending = windowsCwdResolutions.get(key);
         if (!pending) {
-          pending = usableTerminalCwd(plan.terminalProfile, plan.pane.cwd);
+          pending = usableTerminalCwd(plan.terminalProfile, plan.pane.cwd, [
+            ...(plan.terminalProfile.id === profile.id ? [snapshot.root, snapshot.currentDir] : []),
+            plan.terminalProfile.root,
+            ''
+          ], snapshot.id);
           windowsCwdResolutions.set(key, pending);
         }
         return pending;
@@ -20271,6 +20316,8 @@ async function restoreEditorTabs(snapshot: WorkspaceSnapshot) {
     state.openFile = activeEditorTab().file;
     if (isEditorPanelVisible()) {
       renderEditor();
+      void hydrateVisibleEditorTab();
+      scheduleInactiveEditorHydration();
     } else {
       destroyCodeEditorView();
     }
@@ -20418,12 +20465,16 @@ function scheduleInactiveEditorHydration() {
   runWhenUiIdle(() => hydrateInactiveEditorTabs(token), 900);
 }
 
-function hydrateInactiveEditorTabs(token = inactiveEditorHydrationToken) {
+function hydrateInactiveEditorTabs(token = inactiveEditorHydrationToken, attempted = new Set<string>()) {
   if (token !== inactiveEditorHydrationToken) return;
-  const tab = state.editorTabs.find((item) => item.id !== state.activeEditorTabId && item.pendingPath && !item.loading);
+  const tab = state.editorTabs.find((item) => item.id !== state.activeEditorTabId
+    && item.pendingPath && !item.loading && !attempted.has(item.id));
   if (!tab) return;
+  // A missing file or failed remote read stays manually retryable, but must not monopolize
+  // the idle queue and keep spawning helpers ahead of every other restored tab.
+  attempted.add(tab.id);
   void hydrateEditorTab(tab, false).finally(() => {
-    if (token === inactiveEditorHydrationToken) runWhenUiIdle(() => hydrateInactiveEditorTabs(token), 900);
+    if (token === inactiveEditorHydrationToken) runWhenUiIdle(() => hydrateInactiveEditorTabs(token, attempted), 900);
   });
 }
 
@@ -20465,6 +20516,9 @@ async function hydrateEditorTab(tab: EditorTabState, renderWhenDone: boolean) {
       liveTab.loading = false;
       if (!getPanel('editor').classList.contains('hidden')) renderEditor();
     }
+  } finally {
+    // Runtime snapshots retain this object even after switching workspaces.
+    tab.loading = false;
   }
 }
 
@@ -20676,15 +20730,18 @@ function compactNoteMemoryRecords() {
     .sort((left, right) => right.updatedAt - left.updatedAt);
   const seen = new Set<string>();
   const compacted: NoteMemoryRecord[] = [];
+  let serializedChars = '{"version":1,"notes":[]}'.length;
   for (const record of sorted) {
     const key = noteMemoryRecordScopeKey(record);
     if (seen.has(key)) continue;
     seen.add(key);
+    const addedChars = JSON.stringify(record).length + (compacted.length ? 1 : 0);
+    // Account for the exact JSON envelope, commas and escaping once per record,
+    // instead of serializing the entire shrinking store after each removed note.
+    if (compacted.length && serializedChars + addedChars > NOTES_MEMORY_STORE_MAX_CHARS) break;
     compacted.push(record);
+    serializedChars += addedChars;
     if (compacted.length >= NOTES_MEMORY_LIMIT) break;
-  }
-  while (compacted.length > 1 && JSON.stringify({ version: 1, notes: compacted }).length > NOTES_MEMORY_STORE_MAX_CHARS) {
-    compacted.pop();
   }
   noteMemoryRecords = compacted;
 }
@@ -21969,14 +22026,38 @@ async function saveAllDirtyNotes() {
 }
 
 async function saveNoteTabNow(tab: NoteTabState, requestedScope: NotePersistenceScope | null = currentNotePersistenceScope()) {
-  const timer = noteSaveTimers.get(tab.id);
-  if (timer) window.clearTimeout(timer);
-  noteSaveTimers.delete(tab.id);
+  // An old tab's queued save can finish after a workspace switch. IDs may be
+  // restored in another workspace; never cancel that new tab's autosave timer.
+  if (
+    requestedScope?.workspaceId === state.activeWorkspaceId
+    && requestedScope.profileId === state.activeProfile?.id
+    && noteTabForId(tab.id) === tab
+  ) {
+    const timer = noteSaveTimers.get(tab.id);
+    if (timer) window.clearTimeout(timer);
+    noteSaveTimers.delete(tab.id);
+  }
+  const previous = noteSaveInFlightByTab.get(tab);
+  if (previous) {
+    await previous;
+    if (tab.dirty) await saveNoteTabNow(tab, requestedScope);
+    return;
+  }
   if (tab.loading && !tab.dirty) return;
   if (!requestedScope || !tab.dirty) return;
-  const scope = requestedScope;
+  const pending = performNoteSave(tab, requestedScope);
+  noteSaveInFlightByTab.set(tab, pending);
+  try {
+    await pending;
+  } finally {
+    if (noteSaveInFlightByTab.get(tab) === pending) noteSaveInFlightByTab.delete(tab);
+  }
+}
+
+async function performNoteSave(tab: NoteTabState, scope: NotePersistenceScope) {
   const profileId = scope.profileId;
   const content = tab.content;
+  const path = tab.path;
   tab.saving = true;
   const scopeIsCurrent = () => (
     state.activeWorkspaceId === scope.workspaceId
@@ -21985,11 +22066,11 @@ async function saveNoteTabNow(tab: NoteTabState, requestedScope: NotePersistence
   );
   if (scopeIsCurrent()) renderNoteStatus();
   try {
-    await api.writeTextFile(profileId, tab.path, content);
-    invalidateExplorerParentDirectoryCache(profileId, tab.path, scope.workspaceId);
+    await api.writeTextFile(profileId, path, content);
+    invalidateExplorerParentDirectoryCache(profileId, path, scope.workspaceId);
     tab.saving = false;
     tab.lastSavedAt = Date.now();
-    if (tab.content === content) tab.dirty = false;
+    tab.dirty = tab.content !== content || tab.path !== path;
     queueNoteMemoryUpsert(tab, { scope });
     if (scopeIsCurrent()) {
       renderNoteTabs();
@@ -22491,17 +22572,17 @@ function yieldToUi() {
   });
 }
 
-function runWhenUiIdle(callback: () => void, timeout = 700) {
-  if (appShutdownStarted) return;
+function runWhenUiIdle(callback: () => void, timeout = 700, allowWhileBusy = false, cancelled?: () => boolean) {
+  if (appShutdownStarted || cancelled?.()) return;
   const idleWindow = window as Window & {
     requestIdleCallback?: (handler: IdleRequestCallback, options?: IdleRequestOptions) => number;
   };
   const run = () => {
-    if (appShutdownStarted) return;
-    const delay = uiBusyDelayMs();
+    if (appShutdownStarted || cancelled?.()) return;
+    const delay = allowWhileBusy ? 0 : uiBusyDelayMs();
     if (delay > 0) {
       window.setTimeout(() => {
-        if (!appShutdownStarted) runWhenUiIdle(callback, timeout);
+        if (!appShutdownStarted) runWhenUiIdle(callback, timeout, allowWhileBusy, cancelled);
       }, delay);
       return;
     }
@@ -22668,6 +22749,7 @@ function restoreBrowserState(snapshot: WorkspaceSnapshot) {
     setInputValueIfChanged(el.previewUrl, state.previewUrl);
   }
   hideBrowserAddressSuggestions();
+  void restoreWorkspacePortForwards();
   if (browserVisible) {
     renderForwards();
     renderBrowserTabs();
@@ -23021,6 +23103,7 @@ function bindEvents() {
   el.saveFile.addEventListener('click', saveOpenFile);
   el.toggleRaw.addEventListener('click', toggleRawMode);
   el.startForward.addEventListener('click', startForward);
+  document.querySelector('#browser-ports')!.addEventListener('click', showTerminalPortsPopover);
   el.terminalPortsToggle.addEventListener('click', toggleTerminalPortsPopover);
   el.terminalPortsClose.addEventListener('click', () => hideTerminalPortsPopover());
   el.loadPreview.addEventListener('click', () => void openPreviewValue(el.previewUrl.value.trim()));
@@ -23814,7 +23897,11 @@ async function toggleCurrentWindowMaximize() {
 async function resolveSelectedRoot(operationId: string) {
   if (!state.activeProfile) return '.';
   const profile = state.activeProfile;
-  const requested = el.rootInput.value.trim() || profile.root || '.';
+  const requested = await repairWindowsShellFolder(
+    profile,
+    el.rootInput.value.trim() || profile.root || '.',
+    state.activeWorkspaceId
+  );
   setStatus(`Resolving ${profile.label} root...`);
   const resolved = await withTimeout(
     api.resolveProfilePath(profile.id, requested, operationId),
@@ -26985,10 +27072,36 @@ function markTerminalWriteFinished(pane: TerminalPane) {
 
 function resolveTerminalWriteDrainIfReady(pane: TerminalPane) {
   if (!terminalWriteDrainReady(pane)) return;
+  acknowledgeTerminalOutputIfDrained(pane);
   const resolve = pane.writeDrainResolve;
   pane.writeDrainPromise = undefined;
   pane.writeDrainResolve = undefined;
   if (resolve) resolve();
+}
+
+function acknowledgeTerminalOutputIfDrained(pane: TerminalPane) {
+  const backendId = pane.backendId;
+  const sequence = pane.outputSequence ?? 0;
+  if (!backendId || !isTerminalPaneAlive(pane) || !terminalWriteDrainReady(pane)
+    || sequence <= (pane.outputAcknowledgedSequence ?? 0)
+    || pane.outputAckInFlight || pane.outputAckRetryTimer) return;
+  const request = api.acknowledgeTerminalOutput(backendId, sequence)
+    .then(() => {
+      if (pane.backendId === backendId) pane.outputAcknowledgedSequence = sequence;
+    })
+    .catch(() => {
+      if (pane.backendId !== backendId || !isTerminalPaneAlive(pane)) return;
+      pane.outputAckRetryTimer = window.setTimeout(() => {
+        pane.outputAckRetryTimer = undefined;
+        acknowledgeTerminalOutputIfDrained(pane);
+      }, 250);
+    })
+    .finally(() => {
+      if (pane.outputAckInFlight !== request) return;
+      pane.outputAckInFlight = undefined;
+      acknowledgeTerminalOutputIfDrained(pane);
+    });
+  pane.outputAckInFlight = request;
 }
 
 function scheduleOpenTuiTerminalViewportRefresh(pane: TerminalPane, reason: string) {
@@ -27429,7 +27542,9 @@ function failPendingTerminalInput(pane: TerminalPane, reason: string) {
 
 function prunePendingTerminalBackendEvents() {
   while (pendingTerminalDataByBackendId.size > TERMINAL_PENDING_BACKEND_EVENT_LIMIT) {
-    pendingTerminalDataByBackendId.delete(pendingTerminalDataByBackendId.keys().next().value as string);
+    const oldest = pendingTerminalDataByBackendId.keys().next().value as string;
+    pendingTerminalDataByBackendId.delete(oldest);
+    pendingTerminalSequenceByBackendId.delete(oldest);
   }
   while (pendingTerminalCursorQueriesByBackendId.size > TERMINAL_PENDING_BACKEND_EVENT_LIMIT) {
     pendingTerminalCursorQueriesByBackendId.delete(pendingTerminalCursorQueriesByBackendId.keys().next().value as string);
@@ -27439,8 +27554,11 @@ function prunePendingTerminalBackendEvents() {
   }
 }
 
-function bufferPendingTerminalData(backendId: string, data: string) {
+function bufferPendingTerminalData(backendId: string, data: string, sequence?: number) {
   if (!backendId || !data) return;
+  if (sequence !== undefined) {
+    pendingTerminalSequenceByBackendId.set(backendId, Math.max(sequence, pendingTerminalSequenceByBackendId.get(backendId) ?? 0));
+  }
   const previous = pendingTerminalDataByBackendId.get(backendId) ?? '';
   const merged = previous + data;
   pendingTerminalDataByBackendId.set(
@@ -27470,6 +27588,7 @@ function bufferPendingTerminalExit(payload: TerminalExitEvent) {
 function dropPendingTerminalBackendEvents(backendId: string | undefined) {
   if (!backendId) return;
   pendingTerminalDataByBackendId.delete(backendId);
+  pendingTerminalSequenceByBackendId.delete(backendId);
   pendingTerminalCursorQueriesByBackendId.delete(backendId);
   pendingTerminalExitByBackendId.delete(backendId);
 }
@@ -27478,7 +27597,9 @@ function flushPendingTerminalBackendEvents(pane: TerminalPane, backendId: string
   const data = pendingTerminalDataByBackendId.get(backendId);
   if (data) {
     pendingTerminalDataByBackendId.delete(backendId);
-    handleTerminalData(pane, data);
+    const sequence = pendingTerminalSequenceByBackendId.get(backendId);
+    pendingTerminalSequenceByBackendId.delete(backendId);
+    handleBackendTerminalData(pane, data, sequence);
   }
   const cursorQueries = pendingTerminalCursorQueriesByBackendId.get(backendId) ?? 0;
   if (cursorQueries) {
@@ -27517,6 +27638,11 @@ function setTerminalBackendId(pane: TerminalPane, backendId: string | undefined)
   clearTerminalPendingShellReadyActions(pane);
   pane.backendId = backendId;
   pane.backendOutputChars = 0;
+  pane.outputSequence = 0;
+  pane.outputAcknowledgedSequence = 0;
+  pane.outputAckInFlight = undefined;
+  if (pane.outputAckRetryTimer) window.clearTimeout(pane.outputAckRetryTimer);
+  pane.outputAckRetryTimer = undefined;
   pane.shellReadyAt = undefined;
   pane.shellReadyConfirmed = undefined;
   pane.shellReadyProbeBuffer = undefined;
@@ -27870,8 +27996,8 @@ function cachedFreshExplorerDirectoryByKey(key: string, profileId: string) {
   return cloneExplorerEntries(cached.entries);
 }
 
-function cacheExplorerDirectory(profileId: string, path: string, entries: FileEntry[], workspaceId = state.activeWorkspaceId) {
-  const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+function cacheExplorerDirectory(profileId: string, path: string, entries: FileEntry[], workspaceId = state.activeWorkspaceId, includeSizes = state.showFileSizes) {
+  const key = explorerDirectoryCacheKey(profileId, path, workspaceId, includeSizes);
   const signature = explorerDirectorySignature(entries);
   const cachedEntries = cloneExplorerEntries(entries);
   explorerDirectorySignatureCache.set(cachedEntries, signature);
@@ -27938,11 +28064,11 @@ async function readExplorerDirectoryCached(profileId: string, path: string, work
   return fetchExplorerDirectory(profileId, path, workspaceId);
 }
 
-async function fetchExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId, force = false) {
+async function fetchExplorerDirectory(profileId: string, path: string, workspaceId = state.activeWorkspaceId, force = false, includeSizes = state.showFileSizes) {
   if (shouldDeferRemoteDirectoryRead(profileId, workspaceId)) {
     throw new Error(remoteDirectoryReadWaitMessage(profileId));
   }
-  const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+  const key = explorerDirectoryCacheKey(profileId, path, workspaceId, includeSizes);
   if (!force) {
     const cached = cachedFreshExplorerDirectoryByKey(key, profileId);
     if (cached) return cached;
@@ -27953,7 +28079,7 @@ async function fetchExplorerDirectory(profileId: string, path: string, workspace
   const operationId = crypto.randomUUID();
   const backendRead = trackExplorerRuntimeOperation(
     operationId,
-    api.listDirectory(profileId, path, state.showFileSizes, operationId)
+    api.listDirectory(profileId, path, includeSizes, operationId)
   );
   let read: Promise<FileEntry[]>;
   read = withExplorerDirectoryTimeout(
@@ -27963,7 +28089,7 @@ async function fetchExplorerDirectory(profileId: string, path: string, workspace
     operationId
   )
     .then((entries) => {
-      cacheExplorerDirectory(profileId, path, entries, workspaceId);
+      cacheExplorerDirectory(profileId, path, entries, workspaceId, includeSizes);
       return cloneExplorerEntries(entries);
     });
   const releaseRead = () => {
@@ -27982,6 +28108,7 @@ async function fetchExplorerDirectories(
   workspaceId = state.activeWorkspaceId,
   force = false
 ) {
+  const includeSizes = state.showFileSizes;
   const results = new Map<string, DirectoryListingResult>();
   if (shouldDeferRemoteDirectoryRead(profileId, workspaceId)) {
     const message = remoteDirectoryReadWaitMessage(profileId);
@@ -27996,7 +28123,7 @@ async function fetchExplorerDirectories(
 
   for (const path of paths) {
     const resultKey = explorerPathKey(path);
-    const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId);
+    const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId, includeSizes);
     if (!force) {
       const cached = cachedFreshExplorerDirectoryByKey(cacheKey, profileId);
       if (cached) {
@@ -28021,7 +28148,8 @@ async function fetchExplorerDirectories(
     }
   }
 
-  if (pendingReads.length) await Promise.all(pendingReads);
+  // Claim misses before the first await, otherwise another caller can start
+  // the same WSL/SSH read while unrelated pending directories are loading.
   if (misses.length) {
     const batchReads = new Map<string, ReturnType<typeof createExplorerDirectoryPendingRead>>();
     let backendRead: Promise<DirectoryListingResult[]> | null = null;
@@ -28033,7 +28161,7 @@ async function fetchExplorerDirectories(
       }
     };
     for (const path of misses) {
-      const key = explorerDirectoryCacheKey(profileId, path, workspaceId);
+      const key = explorerDirectoryCacheKey(profileId, path, workspaceId, includeSizes);
       if (explorerDirectoryReads.has(key)) continue;
       const pending = createExplorerDirectoryPendingRead();
       explorerDirectoryReads.set(key, pending.promise);
@@ -28043,7 +28171,7 @@ async function fetchExplorerDirectories(
       const operationId = crypto.randomUUID();
       backendRead = trackExplorerRuntimeOperation(
         operationId,
-        api.listDirectories(profileId, misses, state.showFileSizes, operationId)
+        api.listDirectories(profileId, misses, includeSizes, operationId)
       );
       backendRead.then(
         () => {
@@ -28064,7 +28192,7 @@ async function fetchExplorerDirectories(
       const completedKeys = new Set<string>();
       for (const listing of listings) {
         const key = explorerPathKey(listing.path);
-        const cacheKey = explorerDirectoryCacheKey(profileId, listing.path, workspaceId);
+        const cacheKey = explorerDirectoryCacheKey(profileId, listing.path, workspaceId, includeSizes);
         completedKeys.add(cacheKey);
         const pending = batchReads.get(cacheKey);
         if (listing.error) {
@@ -28072,7 +28200,7 @@ async function fetchExplorerDirectories(
           pending?.reject(new Error(listing.error));
         } else {
           const entries = cloneExplorerEntries(listing.entries);
-          cacheExplorerDirectory(profileId, listing.path, entries, workspaceId);
+          cacheExplorerDirectory(profileId, listing.path, entries, workspaceId, includeSizes);
           results.set(key, { path: listing.path, entries, error: null });
           pending?.resolve(cloneExplorerEntries(entries));
         }
@@ -28085,17 +28213,17 @@ async function fetchExplorerDirectories(
       const profile = profileForIdWithWindowsFallback(profileId) ?? state.activeProfile;
       if (profile?.kind === 'wsl' || profile?.kind === 'ssh') {
         for (const path of misses) {
-          const pending = batchReads.get(explorerDirectoryCacheKey(profileId, path, workspaceId));
+          const pending = batchReads.get(explorerDirectoryCacheKey(profileId, path, workspaceId, includeSizes));
           results.set(explorerPathKey(path), { path, entries: [], error: String(error) });
           pending?.reject(error);
         }
       } else {
         releaseBatchReads();
         await Promise.all(misses.map(async (path) => {
-          const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId);
+          const cacheKey = explorerDirectoryCacheKey(profileId, path, workspaceId, includeSizes);
           const pending = batchReads.get(cacheKey);
           try {
-            const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force);
+            const entries = await fetchExplorerDirectory(profileId, path, workspaceId, force, includeSizes);
             results.set(explorerPathKey(path), { path, entries, error: null });
             pending?.resolve(cloneExplorerEntries(entries));
           } catch (readError) {
@@ -28110,6 +28238,7 @@ async function fetchExplorerDirectories(
     }
   }
 
+  if (pendingReads.length) await Promise.all(pendingReads);
   return results;
 }
 
@@ -28909,28 +29038,18 @@ function explorerMeasurementFont() {
   ].join(' ');
 }
 
-function pruneExplorerRowWidthMeasureCache() {
-  if (explorerRowWidthMeasureCache.size <= 2000) return;
-  const excess = explorerRowWidthMeasureCache.size - 1600;
-  let removed = 0;
-  for (const key of explorerRowWidthMeasureCache.keys()) {
-    explorerRowWidthMeasureCache.delete(key);
-    removed += 1;
-    if (removed >= excess) break;
-  }
-}
-
 function measureExplorerRowContentWidth(rowInfo: ExplorerVisibleRow, hideSizes: boolean, font: string) {
-  const cacheKey = `${hideSizes ? 'h' : 's'}\t${font}\t${rowInfo.staticSignature}`;
-  const cached = explorerRowWidthMeasureCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  const signature = `${hideSizes ? 'h' : 's'}\t${font}\t${rowInfo.depth}\t${rowInfo.sizeText}`;
+  const cached = rowInfo.entry ? explorerRowWidthMeasureCache.get(rowInfo.entry) : undefined;
+  if (cached?.signature === signature) return cached.width;
 
   // Virtualization must not force layout once per row before its first paint. Canvas text metrics
   // plus the known grid/padding geometry are deterministic and intentionally include a small
   // safety margin for font hinting, including long Korean names.
   const width = calculateExplorerSemanticRowWidthFallback(rowInfo, hideSizes, font);
-  explorerRowWidthMeasureCache.set(cacheKey, width);
-  pruneExplorerRowWidthMeasureCache();
+  // Entries are immutable snapshots. Weak keys avoid retaining discarded trees,
+  // without a small global LRU that thrashes on every render of a large Explorer.
+  if (rowInfo.entry) explorerRowWidthMeasureCache.set(rowInfo.entry, { signature, width });
   return width;
 }
 
@@ -29067,17 +29186,15 @@ function explorerHasHorizontalOverflow(contentWidth: number, clientWidth: number
 }
 
 function explorerRowsGlassActiveForScrollGuard() {
-  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
   return appGlassEnabled()
-    && glass.explorerRows === true
+    && state.ideSettings.appGlass?.explorerRows !== false
     && !getPanel('explorer').classList.contains('hidden');
 }
 
 function explorerGlassActiveForHorizontalScroll() {
   const panel = getPanel('explorer');
-  const glass = normalizeAppGlassSettings(state.ideSettings.appGlass);
   return appGlassEnabled()
-    && (panel.classList.contains('app-glass-active-shell') || glass.explorerRows === true)
+    && (panel.classList.contains('app-glass-active-shell') || state.ideSettings.appGlass?.explorerRows !== false)
     && !panel.classList.contains('hidden');
 }
 
@@ -29442,7 +29559,17 @@ function handleExplorerClick(event: MouseEvent) {
   // flag can never leak into a later, unrelated click).
   if (Date.now() - explorerDragEndAt < EXPLORER_CLICK_SUPPRESS_MS) return;
   const entry = explorerEntryFromEvent(event);
-  if (!entry) return;
+  if (!entry) {
+    const target = event.target;
+    if (event.button !== 0 || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey
+      || !(target instanceof Element) || !el.fileList.contains(target)
+      || target.closest('.file-row, input, textarea, button, select, a, [contenteditable]')) return;
+    clearExplorerModifierPointer();
+    clearExplorerTextSelection();
+    // No child selection means New File / New Folder targets the displayed root.
+    setExplorerSelection([], '', '', false);
+    return;
+  }
   if (event.shiftKey || event.ctrlKey || event.metaKey) {
     event.preventDefault();
     clearExplorerTextSelection();
@@ -30270,6 +30397,12 @@ async function toggleExplorerDirectory(entry: FileEntry) {
 
   const profileId = state.activeProfile.id;
   const workspaceId = state.activeWorkspaceId;
+  const root = state.currentDir;
+  const loading = state.explorerLoading;
+  const expanded = state.explorerExpanded;
+  const isCurrent = () => state.activeProfile?.id === profileId
+    && state.activeWorkspaceId === workspaceId && state.currentDir === root
+    && state.explorerLoading === loading && state.explorerExpanded === expanded;
   const cached = state.explorerChildren.get(entry.path) ?? cachedExplorerDirectory(profileId, entry.path, workspaceId);
   if (cached) {
     state.explorerChildren.set(entry.path, cached);
@@ -30289,20 +30422,24 @@ async function toggleExplorerDirectory(entry: FileEntry) {
 
   try {
     const children = await fetchExplorerDirectory(profileId, entry.path, workspaceId);
-    if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId) return;
+    if (!isCurrent()) return;
     state.explorerChildren.set(entry.path, children);
     markExplorerEntryLookupDirty();
     state.explorerSignatures.set(entry.path, explorerDirectorySignature(children));
-    state.explorerExpanded.add(entry.path);
-    queueVisibleExplorerDirectoryPrefetch(700);
-    setStatus(`Expanded ${entry.name}`);
+    if (expanded.has(entry.path)) {
+      queueVisibleExplorerDirectoryPrefetch(700);
+      setStatus(`Expanded ${entry.name}`);
+    }
   } catch (error) {
-    state.explorerExpanded.delete(entry.path);
+    if (!isCurrent()) return;
+    expanded.delete(entry.path);
     setStatus(String(error), true);
   } finally {
-    state.explorerLoading.delete(entry.path);
-    renderExplorer();
-    saveActiveWorkspaceSnapshot();
+    loading.delete(entry.path);
+    if (isCurrent()) {
+      renderExplorer();
+      saveActiveWorkspaceSnapshot();
+    }
   }
 }
 
@@ -30344,22 +30481,33 @@ function canRunPowerShellScriptAsAdmin() {
 
 async function createExplorerItem(kind: 'file' | 'dir') {
   if (!state.activeProfile || !state.currentDir) return;
-  const targetDir = await explorerCreateTargetDirectory();
-  const siblings = await ensureExplorerDirectoryChildren(targetDir);
-  const name = uniqueExplorerName(kind === 'file' ? 'new-file.txt' : 'New Folder', siblings);
-  const path = joinExplorerPath(targetDir, name);
-
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  const root = state.currentDir;
+  const childrenMap = state.explorerChildren;
+  const activationGeneration = workspaceActivationGeneration;
+  const isCurrent = () => state.activeProfile?.id === profileId
+    && state.activeWorkspaceId === workspaceId && state.currentDir === root
+    && state.explorerChildren === childrenMap && workspaceActivationGeneration === activationGeneration;
   try {
-    if (kind === 'file') await api.createFile(state.activeProfile.id, path);
-    else await api.createDirectory(state.activeProfile.id, path);
-    if (kind === 'file') invalidateTextFileCache(state.activeProfile.id, path);
-    invalidateExplorerDirectoryCache(state.activeProfile.id, targetDir);
+    const targetDir = await explorerCreateTargetDirectory();
+    if (!isCurrent()) return;
+    const siblings = await ensureExplorerDirectoryChildren(targetDir);
+    if (!isCurrent()) return;
+    const name = uniqueExplorerName(kind === 'file' ? 'new-file.txt' : 'New Folder', siblings);
+    const path = joinExplorerPath(targetDir, name);
+    if (kind === 'file') await api.createFile(profileId, path);
+    else await api.createDirectory(profileId, path);
+    if (kind === 'file') invalidateTextFileCache(profileId, path);
+    invalidateExplorerDirectoryCache(profileId, targetDir, workspaceId);
+    if (!isCurrent()) return;
     await reloadExplorerDirectory(targetDir);
+    if (!isCurrent()) return;
     selectExplorerEntry(path);
     startInlineExplorerRename(path, { created: true });
     setStatus(`${kind === 'file' ? 'Created file' : 'Created folder'} - name it in Explorer`);
   } catch (error) {
-    setStatus(String(error), true);
+    if (isCurrent()) setStatus(String(error), true);
   }
 }
 
@@ -30529,7 +30677,13 @@ async function ensureExplorerDirectoryChildren(path: string) {
   if (path === state.currentDir) return state.entries;
   const cached = state.explorerChildren.get(path);
   if (cached) return cached;
-  const children = await readExplorerDirectoryCached(state.activeProfile.id, path);
+  const profileId = state.activeProfile.id;
+  const workspaceId = state.activeWorkspaceId;
+  const root = state.currentDir;
+  const childrenMap = state.explorerChildren;
+  const children = await readExplorerDirectoryCached(profileId, path, workspaceId);
+  if (state.activeProfile?.id !== profileId || state.activeWorkspaceId !== workspaceId
+    || state.currentDir !== root || state.explorerChildren !== childrenMap) return children;
   state.explorerChildren.set(path, children);
   markExplorerEntryLookupDirty();
   state.explorerExpanded.add(path);
@@ -32087,6 +32241,17 @@ function syncAllEditorPanesFromViews() {
   syncCodeViewReference();
 }
 
+function editorViewDocumentText(viewState: EditorPaneViewState) {
+  const document = viewState.view!.state.doc;
+  // CodeMirror Text is immutable. Keep one current flatten per view, not every
+  // undo version, and continue capturing selection/scroll on every snapshot.
+  if (viewState.lastDocument !== document) {
+    viewState.lastDocumentText = document.toString();
+    viewState.lastDocument = document;
+  }
+  return viewState.lastDocumentText!;
+}
+
 function syncEditorPaneFromView(paneId: string) {
   const pane = editorPaneForId(paneId);
   if (!pane) return;
@@ -32094,7 +32259,7 @@ function syncEditorPaneFromView(paneId: string) {
   if (!tab?.file || tab.file.masked && !tab.file.rawMode) return;
   const viewState = editorPaneViewState.get(paneId);
   if (viewState?.view && viewState.file === tab.file) {
-    const documentText = viewState.view.state.doc.toString();
+    const documentText = editorViewDocumentText(viewState);
     tab.file.draftContent = documentText;
     tab.file.dirty = !sameEditorContent(tab.file.draftContent, tab.file.content);
     tab.runtimeViewState = {
@@ -32119,6 +32284,7 @@ async function openFile(path: string): Promise<boolean> {
     const existing = editorTabForPath(path);
     if (existing) {
       activateEditorTab(existing.id);
+      setPanelVisible('editor', true);
       setStatus('File opened');
       // Already-open files bypass the read path below, so an external edit would otherwise
       // keep showing stale content. Refresh non-dirty plain-text tabs from disk in the
@@ -33375,10 +33541,13 @@ function markDirty() {
 
 function markOpenFileDirtyFromEditorEdit(file: OpenFileState = state.openFile!) {
   if (!file) return;
+  const wasDirty = file.dirty;
   file.dirty = true;
   file.draftContent = undefined;
-  if (file === state.openFile) updateEditorLabel();
-  renderEditorTabs();
+  if (!wasDirty) {
+    if (file === state.openFile) updateEditorLabel();
+    renderEditorTabs();
+  }
   if (file === state.openFile) el.saveFile.disabled = false;
 }
 
@@ -33498,7 +33667,7 @@ async function saveOpenFile() {
 function currentEditorContentForFile(file: OpenFileState) {
   if (file.masked && !file.rawMode) return serializeSecretLines(file.lines);
   for (const viewState of editorPaneViewState.values()) {
-    if (viewState.file === file && viewState.view) return viewState.view.state.doc.toString();
+    if (viewState.file === file && viewState.view) return editorViewDocumentText(viewState);
   }
   return file.draftContent ?? file.content;
 }
@@ -34214,8 +34383,20 @@ function appendTerminalHistoryCache(pane: TerminalPane, data: string) {
 }
 
 function scheduleTerminalHistoryCacheAppend(pane: TerminalPane, data: string) {
-  if (!data || !terminalHistoryCacheLimits().enabled) return;
-  pane.historyPendingBuffer = `${pane.historyPendingBuffer ?? ''}${data}`;
+  if (!data || pane.closed || !terminalHistoryCacheLimits().enabled) return;
+  const pending = `${pane.historyPendingBuffer ?? ''}${data}`;
+  if (pending.length > TERMINAL_HISTORY_PENDING_MAX_CHARS) {
+    // This optional plain-text cache must not retain a second unbounded copy of a TUI flood.
+    // xterm delivery has its own queue; trimming this cache never trims the live terminal.
+    const marker = '\r\n[History cache skipped older pending output]\r\n';
+    pane.historyPendingBuffer = marker + pending.slice(-(TERMINAL_HISTORY_PENDING_MAX_CHARS - marker.length));
+    if (pane.historyCache) {
+      pane.historyCache.escapeCarry = '';
+      pane.historyCache.pendingCarriageReturn = false;
+    }
+  } else {
+    pane.historyPendingBuffer = pending;
+  }
   if (pane.historyFlushTimer) return;
   pane.historyFlushTimer = window.setTimeout(() => {
     pane.historyFlushTimer = undefined;
@@ -34224,42 +34405,52 @@ function scheduleTerminalHistoryCacheAppend(pane: TerminalPane, data: string) {
 }
 
 function flushTerminalHistoryCacheAppend(pane: TerminalPane) {
+  if (pane.closed) return;
+  if (pane.historyFlushTimer) window.clearTimeout(pane.historyFlushTimer);
+  pane.historyFlushTimer = undefined;
   const pending = pane.historyPendingBuffer ?? '';
-  pane.historyPendingBuffer = '';
-  if (pending) appendTerminalHistoryCache(pane, pending);
+  const end = surrogateSafeChunkEnd(pending, Math.min(pending.length, TERMINAL_HISTORY_PARSE_CHUNK_CHARS));
+  pane.historyPendingBuffer = pending.slice(end);
+  if (end) appendTerminalHistoryCache(pane, pending.slice(0, end));
+  if (pane.historyPendingBuffer) {
+    pane.historyFlushTimer = window.setTimeout(() => {
+      pane.historyFlushTimer = undefined;
+      flushTerminalHistoryCacheAppend(pane);
+    }, TERMINAL_HISTORY_CONTINUATION_MS);
+  }
 }
 
 function terminalHistoryCompletePlainChunk(cache: TerminalHistoryCache, data: string) {
-  const combined = cache.escapeCarry ? `${cache.escapeCarry}${data}` : data;
-  cache.escapeCarry = '';
-  const escapeIndex = combined.lastIndexOf('\x1b');
-  if (escapeIndex >= 0) {
-    const tail = combined.slice(escapeIndex);
-    if (terminalHistoryEscapeLooksIncomplete(tail)) {
-      cache.escapeCarry = tail.slice(0, 512);
-      return stripTerminalHistoryControlSequences(combined.slice(0, escapeIndex));
+  // Keep only parser state, never OSC/DCS payload. A title/image control string can
+  // span arbitrarily many PTY chunks, including a split ESC-backslash terminator.
+  let escape = cache.escapeCarry;
+  let plainStart = 0;
+  let plain = '';
+  for (let index = 0; index < data.length; index += 1) {
+    const char = data[index];
+    if (!escape) {
+      if (char !== '\x1b') continue;
+      plain += data.slice(plainStart, index);
+      escape = '\x1b';
+    } else if (escape === '\x1b') {
+      if (char === '[' || char === ']' || 'PX^_'.includes(char)) escape += char;
+      else if (char >= ' ' && char <= '/') escape = '\x1b ';
+      else if (char !== '\x1b') escape = '';
+    } else if (escape === '\x1b[' || escape === '\x1b ') {
+      if (char === '\x1b') escape = '\x1b';
+      else if ((char >= (escape === '\x1b[' ? '@' : '0') && char <= '~')
+        || char === '\x18' || char === '\x1a') escape = '';
+    } else {
+      const afterEscape = escape.endsWith('\x1b');
+      const kind = escape[1];
+      if ((afterEscape && char === '\\') || (kind === ']' && char === '\x07')
+        || char === '\x18' || char === '\x1a' || char === '\x9c') escape = '';
+      else escape = `\x1b${kind}${char === '\x1b' ? '\x1b' : ''}`;
     }
+    plainStart = index + 1;
   }
-  return stripTerminalHistoryControlSequences(combined);
-}
-
-function terminalHistoryEscapeLooksIncomplete(tail: string) {
-  if (!tail.startsWith('\x1b')) return false;
-  if (tail.length === 1) return true;
-  const kind = tail[1];
-  if (kind === ']' || kind === 'P' || kind === '_' || kind === '^') {
-    return !(tail.includes('\x07') || tail.includes('\x1b\\'));
-  }
-  if (kind === '[') return !/\x1b\[[0-?]*[ -/]*[@-~]/.test(tail);
-  return tail.length < 2;
-}
-
-function stripTerminalHistoryControlSequences(data: string) {
-  return data
-    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
-    .replace(/\x1b[PX^_][\s\S]*?\x1b\\/g, '')
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-    .replace(/\x1b[ -/]*[@-~]/g, '');
+  cache.escapeCarry = escape;
+  return plain + data.slice(plainStart);
 }
 
 function appendTerminalHistoryPlainText(cache: TerminalHistoryCache, text: string) {
@@ -34269,16 +34460,21 @@ function appendTerminalHistoryPlainText(cache: TerminalHistoryCache, text: strin
   };
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
-    if (char === '\r') {
-      appendPlainSegment(index);
-      if (text[index + 1] === '\n') {
+    if (cache.pendingCarriageReturn) {
+      cache.pendingCarriageReturn = false;
+      if (char === '\n') {
         pushTerminalHistoryLine(cache, cache.currentLine);
         cache.currentLine = '';
-        segmentStart = index + 2;
-        index += 1;
+        segmentStart = index + 1;
         continue;
       }
       cache.currentLine = '';
+    }
+    if (char === '\r') {
+      appendPlainSegment(index);
+      // CRLF is often split across PTY or history-parser chunks. Delay the overwrite until
+      // the next character distinguishes CRLF from a progress-line carriage return.
+      cache.pendingCarriageReturn = true;
       segmentStart = index + 1;
       continue;
     }
@@ -34322,30 +34518,47 @@ function trimTerminalHistoryCache(pane: TerminalPane) {
     syncTerminalHistoryControlsForPane(pane);
     return;
   }
-  let removeCount = 0;
-  let removeChars = 0;
+  let head = cache.head ?? 0;
   while (
-    removeCount < cache.lines.length
-    && (cache.lines.length - removeCount > limits.maxLines || cache.charCount - removeChars > limits.maxChars)
+    head < cache.lines.length
+    && (cache.lines.length - head + (cache.currentLine ? 1 : 0) > limits.maxLines
+      || cache.charCount + cache.currentLine.length > limits.maxChars)
   ) {
-    removeChars += cache.lines[removeCount].length + 1;
-    removeCount += 1;
+    cache.charCount -= cache.lines[head].length + 1;
+    cache.lines[head] = ''; // Release the old string immediately, without shifting every live line.
+    head += 1;
   }
-  if (removeCount) {
-    cache.lines.splice(0, removeCount);
-    cache.charCount = Math.max(0, cache.charCount - removeChars);
+  cache.head = head;
+  if (head >= 1024 && head * 2 >= cache.lines.length) {
+    cache.lines = cache.lines.slice(head);
+    cache.head = 0;
   }
 }
 
-function terminalHistoryLines(pane: TerminalPane) {
+function terminalHistoryCachedLineCount(cache: TerminalHistoryCache) {
+  return cache.lines.length - (cache.head ?? 0);
+}
+
+function terminalHistoryLineAt(cache: TerminalHistoryCache, index: number) {
+  const stored = terminalHistoryCachedLineCount(cache);
+  return index < stored ? cache.lines[(cache.head ?? 0) + index] : cache.currentLine;
+}
+
+function terminalHistoryLineRange(pane: TerminalPane, start: number, end: number) {
   const cache = pane.historyCache;
   if (!cache) return [];
-  return cache.currentLine ? [...cache.lines, cache.currentLine] : cache.lines;
+  const lines: string[] = [];
+  for (let index = start; index < end; index += 1) lines.push(terminalHistoryLineAt(cache, index));
+  return lines;
+}
+
+function terminalHistoryLines(pane: TerminalPane) {
+  return terminalHistoryLineRange(pane, 0, terminalHistoryLineCount(pane));
 }
 
 function terminalHistoryLineCount(pane: TerminalPane | null | undefined) {
   const cache = pane?.historyCache;
-  return cache ? cache.lines.length + (cache.currentLine ? 1 : 0) : 0;
+  return cache ? terminalHistoryCachedLineCount(cache) + (cache.currentLine ? 1 : 0) : 0;
 }
 
 function terminalHasCachedHistory(pane: TerminalPane | null | undefined) {
@@ -34357,14 +34570,13 @@ function syncTerminalHistoryControlsForPane(pane: TerminalPane) {
   if (!widget) return;
   const activePane = activePaneForWidget(widget);
   if (activePane?.paneId !== pane.paneId && widget.historyOverlayPaneId !== pane.paneId) return;
-  const lineCount = terminalHistoryLineCount(pane);
   const now = performance.now();
   const overlayOpen = widget.historyOverlayPaneId === pane.paneId;
   const shouldSyncNow = widget.historyButton.disabled
-    || overlayOpen
-    || lineCount % 500 === 0
     || now - (pane.historyControlsLastSyncAt ?? 0) >= TERMINAL_HISTORY_CONTROL_SYNC_MIN_MS;
   if (shouldSyncNow) {
+    if (pane.historyControlsSyncTimer) window.clearTimeout(pane.historyControlsSyncTimer);
+    pane.historyControlsSyncTimer = undefined;
     pane.historyControlsLastSyncAt = now;
     syncTerminalHistoryControls(widget);
     if (overlayOpen) renderTerminalHistoryOverlay(widget);
@@ -34373,6 +34585,7 @@ function syncTerminalHistoryControlsForPane(pane: TerminalPane) {
   if (!pane.historyControlsSyncTimer) {
     pane.historyControlsSyncTimer = window.setTimeout(() => {
       pane.historyControlsSyncTimer = undefined;
+      if (pane.closed) return;
       pane.historyControlsLastSyncAt = performance.now();
       syncTerminalHistoryControls(widget);
       if (widget.historyOverlayPaneId === pane.paneId) renderTerminalHistoryOverlay(widget);
@@ -34417,16 +34630,16 @@ function openTerminalHistoryOverlay(
   }
   const widget = terminalWidgetForPane(pane);
   if (!widget) return;
-  const lines = terminalHistoryLines(pane);
-  let endLine = lines.length;
+  const lineCount = terminalHistoryLineCount(pane);
+  let endLine = lineCount;
   if (options.source === 'top-scroll') {
     const xtermLines = pane.term.buffer.normal.length || pane.term.buffer.active.length || 0;
     endLine = clamp(
-      lines.length - Math.max(0, xtermLines - TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES),
+      lineCount - Math.max(0, xtermLines - TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES),
       0,
-      lines.length
+      lineCount
     );
-    if (endLine <= 0) endLine = Math.min(lines.length, TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
+    if (endLine <= 0) endLine = Math.min(lineCount, TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
   }
   widget.historyOverlayPaneId = pane.paneId;
   widget.historyOverlayEndLine = endLine;
@@ -34456,43 +34669,43 @@ function renderTerminalHistoryOverlay(widget: TerminalWidget) {
     closeTerminalHistoryOverlay(widget);
     return;
   }
-  const lines = terminalHistoryLines(pane);
-  const end = clamp(widget.historyOverlayEndLine ?? lines.length, 0, lines.length);
+  const lineCount = terminalHistoryLineCount(pane);
+  const end = clamp(widget.historyOverlayEndLine ?? lineCount, 0, lineCount);
   let start = Math.max(0, end - TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
   let chars = 0;
   for (let index = end - 1; index >= start; index -= 1) {
-    chars += lines[index].length + 1;
+    chars += terminalHistoryLineAt(pane.historyCache!, index).length + 1;
     if (chars > TERMINAL_HISTORY_VISIBLE_PAGE_CHARS) {
       start = index + 1;
       break;
     }
   }
-  const visible = lines.slice(start, end).join('\n');
+  const visible = terminalHistoryLineRange(pane, start, end).join('\n');
   widget.historyOverlayPageStart = start;
   widget.historyOverlayPageEnd = end;
   if (widget.historyContent.value !== visible) widget.historyContent.value = visible;
-  const range = lines.length ? `${start + 1}-${end}` : '0';
+  const range = lineCount ? `${start + 1}-${end}` : '0';
   setTextContentIfChanged(
     widget.historyMeta,
-    `History ${range} / ${lines.length.toLocaleString()} lines · plain text · session-only`
+    `History ${range} / ${lineCount.toLocaleString()} lines · plain text · session-only`
   );
   setDisabledIfChanged(widget.historyOlder, start <= 0);
-  setDisabledIfChanged(widget.historyNewer, end >= lines.length);
+  setDisabledIfChanged(widget.historyNewer, end >= lineCount);
   setDisabledIfChanged(widget.historyCopyVisible, !visible);
-  setDisabledIfChanged(widget.historyCopyAll, !lines.length);
-  setDisabledIfChanged(widget.historyClear, !lines.length);
+  setDisabledIfChanged(widget.historyCopyAll, !lineCount);
+  setDisabledIfChanged(widget.historyClear, !lineCount);
 }
 
 function pageTerminalHistoryOverlay(widget: TerminalWidget, direction: -1 | 1) {
   const pane = widget.historyOverlayPaneId ? terminalPaneById.get(widget.historyOverlayPaneId) : null;
   if (!pane) return;
-  const lines = terminalHistoryLines(pane);
-  if (!lines.length) return;
+  const lineCount = terminalHistoryLineCount(pane);
+  if (!lineCount) return;
   const start = widget.historyOverlayPageStart ?? 0;
-  const end = widget.historyOverlayPageEnd ?? lines.length;
+  const end = widget.historyOverlayPageEnd ?? lineCount;
   widget.historyOverlayEndLine = direction < 0
     ? Math.max(0, start)
-    : Math.min(lines.length, end + TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
+    : Math.min(lineCount, end + TERMINAL_HISTORY_VISIBLE_PAGE_LINES);
   renderTerminalHistoryOverlay(widget);
   window.requestAnimationFrame(() => {
     widget.historyContent.scrollTop = direction < 0 ? widget.historyContent.scrollHeight : 0;
@@ -34541,9 +34754,8 @@ function handleTerminalHistoryWheel(event: WheelEvent, pane: TerminalPane) {
   if (pane.term.buffer.active.type === 'alternate') return;
   if (pane.term.buffer.active.viewportY > 0) return;
   if (!terminalHasCachedHistory(pane)) return;
-  const lines = terminalHistoryLines(pane);
   const xtermLines = pane.term.buffer.normal.length || pane.term.buffer.active.length || 0;
-  if (lines.length <= xtermLines + TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES) return;
+  if (terminalHistoryLineCount(pane) <= xtermLines + TERMINAL_HISTORY_TOP_SCROLL_OVERLAP_LINES) return;
   event.preventDefault();
   event.stopPropagation();
   openTerminalHistoryOverlay(pane, { source: 'top-scroll' });
@@ -34879,7 +35091,7 @@ async function startTerminalPaneBackend(
     if (initiallyVisible && !options.skipInitialFitSettle) await settleTerminalInitialFit(pane);
     if (!isTerminalPaneAlive(pane)) return pane;
     if (terminalProfile.kind === 'windows' && !options.skipCwdValidation) {
-      const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd);
+      const spawnCwd = await usableTerminalCwd(terminalProfile, pane.cwd, [], pane.workspaceId);
       if (!isTerminalPaneAlive(pane)) return pane;
       if (spawnCwd !== pane.cwd) {
         pane.cwd = spawnCwd;
@@ -36267,22 +36479,130 @@ function updateTerminalWidgetRendererBadge(widget: TerminalWidget, pane = active
   if (widget.rendererBadge.title !== renderer.title) widget.rendererBadge.title = renderer.title;
 }
 
-async function usableTerminalCwd(profile: ConnectionProfile, requestedCwd: string) {
-  const candidates = new Set([
-    requestedCwd,
-    state.currentDir,
-    state.workspaceRoot,
-    profile.root,
-    profile.kind === 'windows' ? '' : '~'
-  ].filter((candidate): candidate is string => candidate !== undefined && candidate !== null));
+async function usableTerminalCwd(
+  profile: ConnectionProfile,
+  requestedCwd: string,
+  fallbackCwds: string[] = [],
+  workspaceId?: string
+) {
+  if (profile.kind === 'windows' && /^[A-Za-z]:(?![\\/])/.test(requestedCwd.trim())) {
+    if (workspaceId === undefined) {
+      throw new Error('Use an absolute Windows project folder, for example D:\\Projects\\Example (not D:Projects\\Example). Add the slash after the drive letter.');
+    }
+    requestedCwd = await repairWindowsShellFolder(profile, requestedCwd, workspaceId);
+    // Confirmation authorizes this folder, not a restore fallback elsewhere.
+    fallbackCwds = [];
+  }
+  // A new shell must not silently move into another project/home on a failed probe.
+  // Only snapshot restoration opts into recovery, using its captured workspace paths.
+  const candidates = new Set([requestedCwd, ...fallbackCwds]);
   for (const candidate of candidates) {
     try {
-      if (await api.profileDirectoryIsDir(profile.id, candidate)) return candidate;
+      // The backend probe resolves whitespace/empty paths. Spawn that exact resolved
+      // path too: returning '' here previously caused the PTY to inherit the app cwd.
+      const resolved = await api.resolveProfilePath(profile.id, candidate);
+      if (resolved && await api.profileDirectoryIsDir(profile.id, resolved)) return resolved;
     } catch {
-      // Try the next likely folder without surfacing private paths.
+      // Only explicitly supplied recovery folders may be tried; never expose probe paths.
     }
   }
-  return profile.kind === 'windows' ? '' : '~';
+  throw new Error('The requested shell folder is unavailable. Reopen the project folder and try again.');
+}
+
+function sameWindowsFolderRepairPath(left: string, right: string) {
+  return left.trim().replace(/\//g, '\\').toLowerCase() === right.trim().replace(/\//g, '\\').toLowerCase();
+}
+
+function repairWindowsShellFolder(profile: ConnectionProfile, requestedCwd: string, workspaceId: string): Promise<string> {
+  const requested = requestedCwd.trim();
+  if (profile.kind !== 'windows' || !/^[A-Za-z]:(?![\\/])/.test(requested)) {
+    return Promise.resolve(requestedCwd);
+  }
+  const suggested = `${requested.slice(0, 2)}\\${requested.slice(2)}`;
+  const activationGeneration = workspaceActivationGeneration;
+  const pathGeneration = workspacePathSwitchGeneration;
+  const root = state.workspaceRoot;
+  const activeProfileId = state.activeProfile?.id;
+  const isCurrent = () => state.activeWorkspaceId === workspaceId
+    && workspaceActivationGeneration === activationGeneration
+    && workspacePathSwitchGeneration === pathGeneration
+    && state.activeProfile?.id === activeProfileId
+    && state.workspaceRoot === root;
+  const key = JSON.stringify([workspaceId, profile.id, activationGeneration, pathGeneration, root, requested]);
+  const pending = windowsFolderRepairRequests.get(key);
+  if (pending) return pending;
+  const repair = Promise.resolve().then(async () => {
+    if (!isCurrent()) throw new Error('Folder correction cancelled because the workspace changed.');
+    let exists: boolean;
+    try {
+      exists = await withTimeout(
+        api.profileDirectoryIsDir(profile.id, suggested),
+        10_000,
+        'Checking the suggested Windows folder'
+      );
+    } catch {
+      throw new Error('Could not verify the corrected Windows folder. Select an existing absolute folder in Root and retry.');
+    }
+    if (!isCurrent()) throw new Error('Folder correction cancelled because the workspace changed.');
+    if (!exists) throw new Error('The suggested Windows folder does not exist. Select an existing absolute folder in Root and retry.');
+    const approved = window.confirm(
+      `This Windows folder is missing the slash after the drive letter.\n\n${requested}\n\u2192 ${suggested}\n\nUse this existing folder and repair the matching workspace / unstarted shell paths?\nRunning shells and file contents will not be changed.`
+    );
+    if (!approved) throw new Error('Folder correction cancelled. No workspace or shell paths were changed.');
+    if (!isCurrent()) throw new Error('Folder correction cancelled because the workspace changed.');
+    applyWindowsShellFolderRepair(profile, workspaceId, requested, suggested);
+    return suggested;
+  }).finally(() => {
+    if (windowsFolderRepairRequests.get(key) === repair) windowsFolderRepairRequests.delete(key);
+  });
+  windowsFolderRepairRequests.set(key, repair);
+  return repair;
+}
+
+function applyWindowsShellFolderRepair(profile: ConnectionProfile, workspaceId: string, previous: string, corrected: string) {
+  if (state.activeWorkspaceId !== workspaceId) return;
+  const repairsRoot = state.activeProfile?.id === profile.id && sameWindowsFolderRepairPath(state.workspaceRoot, previous);
+  if (state.activeProfile?.id === profile.id && sameWindowsFolderRepairPath(el.rootInput.value, previous)) {
+    el.rootInput.value = corrected;
+  }
+  if (repairsRoot) {
+    state.workspaceRoot = corrected;
+    state.currentDir = corrected;
+    clearExplorerBackgroundWork();
+  }
+  // Never relabel a running process as though it has changed directory. Only panes
+  // that have not acquired a backend yet can inherit the approved startup folder.
+  for (const pane of state.terminals) {
+    if (pane.workspaceId !== workspaceId || pane.profileId !== profile.id
+      || pane.backendId || pane.pendingRuntimeOperationId
+      || !sameWindowsFolderRepairPath(pane.cwd, previous)) continue;
+    pane.cwd = corrected;
+    const widget = terminalWidgetForPane(pane);
+    if (widget) updateTerminalWidgetTitle(widget);
+  }
+  // Cold restore suppresses ordinary UI snapshot capture; update the existing
+  // snapshot directly so a failed restore cannot put the ambiguous cwd back.
+  const snapshot = workspaceSnapshotForId(workspaceId);
+  if (snapshot) {
+    if (repairsRoot && snapshot.profileId === profile.id && sameWindowsFolderRepairPath(snapshot.root, previous)) {
+      snapshot.root = corrected;
+      snapshot.currentDir = corrected;
+    }
+    for (const terminal of snapshot.terminals) {
+      if ((terminal.profileId ?? snapshot.profileId) === profile.id && !terminal.backendId
+        && terminal.cwd && sameWindowsFolderRepairPath(terminal.cwd, previous)) terminal.cwd = corrected;
+    }
+    snapshot.updatedAt = new Date().toISOString();
+    scheduleWorkspaceStorePersist();
+  }
+  saveActiveWorkspaceSnapshot({ immediate: true, persist: 'defer' });
+  if (repairsRoot) {
+    renderWorkspaceTabs();
+    if (state.workspaceOpen && !IS_TERMINAL_APP) {
+      loadWorkspaceDirectoryInBackground(corrected, profile.id, workspaceId);
+      scheduleExplorerWatch(1200);
+    }
+  }
 }
 
 function updateTerminalWidgetTitle(widget: TerminalWidget, options: { force?: boolean } = {}) {
@@ -36323,8 +36643,7 @@ function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
     pane.imeDomComposing = false;
     pane.imeCompositionStartedAt = undefined;
     finishTerminalImeCompositionGuard(pane);
-    releasePendingTerminalImeUiSwitch(pane);
-    releaseDeferredTerminalImeBlur(pane, textarea);
+    scheduleTerminalImeCommitBoundary(pane, textarea);
   });
   textarea.addEventListener('beforeinput', (event) => {
     appendTerminalImeInputDiagnostic(pane, 'beforeinput', event as InputEvent, textarea);
@@ -36333,14 +36652,16 @@ function bindTerminalImeCompositionGuard(pane: TerminalPane, attempts = 0) {
     appendTerminalImeInputDiagnostic(pane, 'input', event as InputEvent, textarea);
   }, true);
   textarea.addEventListener('blur', (event) => {
-    appendTerminalImeDiagnostic(pane, 'blur', terminalImeTextareaDiagnostic(textarea));
+    if (state.ideSettings.debugLogEnabled === true) {
+      appendTerminalImeDiagnostic(pane, 'blur', terminalImeTextareaDiagnostic(textarea));
+    }
     // Never write a saved preedit string back into xterm's helper textarea. JavaScript can restore
     // its value and selection, but not the native Windows IME marked range; reconstructing it here
     // can therefore duplicate the commit or lose the final syllable on the next composition event.
     // Instead, keep xterm's own textarea untouched until its canonical composition finalizer has
     // read it. This capture listener blocks only xterm's unconditional blur-clear while a native
     // composition is live; no value or selection is reconstructed by the app.
-    if (pane.imeDomComposing) {
+    if (pane.imeDomComposing || pane.imeCommitPending) {
       event.stopImmediatePropagation();
       pane.imeDeferredXtermBlur = true;
       pane.host.querySelector('.xterm')?.classList.remove('focus');
@@ -36372,11 +36693,34 @@ function updateTerminalImeDomComposition(pane: TerminalPane) {
   beginTerminalImeCompositionGuard(pane);
 }
 
+function scheduleTerminalImeCommitBoundary(pane: TerminalPane, textarea: HTMLTextAreaElement) {
+  // compositionend is not the commit boundary: xterm reads the canonical native
+  // textarea in an earlier zero-delay task. A blur between those two must not clear it.
+  pane.imeCommitPending = true;
+  const generation = (pane.imeCommitGeneration ?? 0) + 1;
+  pane.imeCommitGeneration = generation;
+  if (pane.imeCommitTimer) window.clearTimeout(pane.imeCommitTimer);
+  pane.imeCommitTimer = window.setTimeout(() => {
+    if (pane.imeCommitGeneration !== generation || !isTerminalPaneAlive(pane)) return;
+    pane.imeCommitTimer = undefined;
+    pane.imeCommitPending = false;
+    releasePendingTerminalImeUiSwitch(pane);
+    releaseDeferredTerminalImeBlur(pane, textarea);
+  }, 0);
+}
+
 function releaseDeferredTerminalImeBlur(pane: TerminalPane, textarea = terminalPaneTextarea(pane)) {
-  if (!pane.imeDeferredXtermBlur) return;
-  pane.imeDeferredXtermBlur = false;
-  window.setTimeout(() => {
-    if (!textarea?.isConnected || document.activeElement === textarea || pane.imeDomComposing) return;
+  if (!pane.imeDeferredXtermBlur || pane.imeBlurReplayTimer) return;
+  pane.imeBlurReplayTimer = window.setTimeout(() => {
+    pane.imeBlurReplayTimer = undefined;
+    if (!isTerminalPaneAlive(pane) || !textarea?.isConnected) return;
+    if (document.activeElement === textarea) {
+      pane.imeDeferredXtermBlur = false;
+      return;
+    }
+    // Keep the pending blur if another native composition overtook this task.
+    if (pane.imeDomComposing || pane.imeCommitPending) return;
+    pane.imeDeferredXtermBlur = false;
     // Re-deliver the blur only after xterm's earlier compositionend timer has consumed the
     // textarea. This lets xterm run its normal cleanup/focus notification without clearing preedit.
     textarea.dispatchEvent(new FocusEvent('blur'));
@@ -36384,7 +36728,7 @@ function releaseDeferredTerminalImeBlur(pane: TerminalPane, textarea = terminalP
 }
 
 function deferTerminalImeUiSwitch(pane: TerminalPane, label: string, run: () => void) {
-  if (!pane.imeDomComposing) return false;
+  if (!pane.imeDomComposing && !pane.imeCommitPending) return false;
   if (pendingTerminalImeUiSwitch) window.clearTimeout(pendingTerminalImeUiSwitch.timer);
   const timer = window.setTimeout(() => {
     if (pendingTerminalImeUiSwitch?.sourcePaneId !== pane.paneId) return;
@@ -36399,11 +36743,16 @@ function deferTerminalImeUiSwitch(pane: TerminalPane, label: string, run: () => 
 function releasePendingTerminalImeUiSwitch(pane: TerminalPane) {
   const pending = pendingTerminalImeUiSwitch;
   if (!pending || pending.sourcePaneId !== pane.paneId) return;
+  if (pane.imeDomComposing || pane.imeCommitPending) return;
   window.clearTimeout(pending.timer);
   pendingTerminalImeUiSwitch = null;
   // xterm registered compositionend before this listener and queued its canonical textarea read
   // first. This zero-delay task therefore runs after that commit without reconstructing preedit.
-  window.setTimeout(pending.run, 0);
+  window.setTimeout(() => {
+    if (!isTerminalPaneAlive(pane)) return;
+    if (deferTerminalImeUiSwitch(pane, pending.label, pending.run)) return;
+    pending.run();
+  }, 0);
 }
 
 function cancelPendingTerminalImeUiSwitch(pane: TerminalPane) {
@@ -36414,7 +36763,7 @@ function cancelPendingTerminalImeUiSwitch(pane: TerminalPane) {
 
 function handleTerminalImeProtectedPointerDown(event: PointerEvent) {
   const pane = activeTerminalPane();
-  if (!pane?.imeDomComposing || !(event.target instanceof Element)) return;
+  if (!pane || (!pane.imeDomComposing && !pane.imeCommitPending) || !(event.target instanceof Element)) return;
   const target = event.target;
 
   const workspaceTab = target.closest<HTMLElement>('.workspace-tab-label')
@@ -36460,6 +36809,7 @@ function appendTerminalImeCompositionDiagnostic(
   event: CompositionEvent,
   textarea: HTMLTextAreaElement
 ) {
+  if (state.ideSettings.debugLogEnabled !== true) return;
   appendTerminalImeDiagnostic(
     pane,
     type,
@@ -36473,6 +36823,7 @@ function appendTerminalImeInputDiagnostic(
   event: InputEvent,
   textarea: HTMLTextAreaElement
 ) {
+  if (state.ideSettings.debugLogEnabled !== true) return;
   appendTerminalImeDiagnostic(
     pane,
     type,
@@ -36635,6 +36986,7 @@ function finishTerminalImeCompositionGuard(pane: TerminalPane) {
   if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
   pane.imeReleaseTimer = window.setTimeout(() => {
     pane.imeReleaseTimer = undefined;
+    if (!isTerminalPaneAlive(pane)) return;
     pane.imeComposing = false;
     // The DOM renderer can leave stale/blank cells after a mixed-width (Hangul + ASCII) input line
     // is redrawn through IME composition, so previously-visible glyphs appear to vanish. Force a
@@ -37165,9 +37517,9 @@ function rememberedTerminalSpawnSize() {
 }
 
 function scheduleFitTerminal(pane: TerminalPane, options: { windowWake?: boolean } = {}) {
-  if (!terminalPaneCanFit(pane)) return;
   if (terminalImeCompositionGuardActive(pane)) return;
   if (pane.fitFrame) return;
+  if (!terminalPaneCanFit(pane)) return;
   pane.fitFrame = requestAnimationFrame(() => {
     pane.fitFrame = undefined;
     fitTerminal(pane, { windowWake: options.windowWake });
@@ -37224,16 +37576,13 @@ function updateTerminalTinyWindowLayout(reason: string) {
 }
 
 function terminalPaneCanFit(pane: TerminalPane) {
+  if (pane.closed || pane.workspaceId !== state.activeWorkspaceId
+    || pane.element.classList.contains('hidden') || !pane.host.isConnected
+    || pane.host.classList.contains('hidden') || terminalWindowLayoutTooSmallForFit()) return false;
   const widget = terminalWidgetForPane(pane);
+  if (widget && terminalSplitResizeWidgetIds.has(widget.widgetId)) return false;
   const rect = pane.host.getBoundingClientRect();
-  return pane.workspaceId === state.activeWorkspaceId
-    && !pane.element.classList.contains('hidden')
-    && pane.host.isConnected
-    && !pane.host.classList.contains('hidden')
-    && !terminalWindowLayoutTooSmallForFit()
-    && rect.width > 2
-    && rect.height > 2
-    && !(widget && terminalSplitResizeWidgetIds.has(widget.widgetId));
+  return rect.width > 2 && rect.height > 2;
 }
 
 type TerminalFitProposal = { rows: number; cols: number };
@@ -37281,8 +37630,8 @@ function terminalFitProposalStable(pane: TerminalPane, proposed: TerminalFitProp
 }
 
 function fitTerminal(pane: TerminalPane, options: { windowWake?: boolean } = {}) {
-  if (!terminalPaneCanFit(pane)) return;
   if (terminalImeCompositionGuardActive(pane)) return;
+  if (!terminalPaneCanFit(pane)) return;
   const rect = pane.host.getBoundingClientRect();
   try {
     const proposed = proposeTerminalFitDimensions(pane);
@@ -38513,6 +38862,124 @@ type BrowserForwardScope = {
   root: string;
 };
 
+function normalizedWorkspacePortRules(value: unknown): WorkspacePortRule[] {
+  if (!Array.isArray(value)) return [];
+  const rules: WorkspacePortRule[] = [];
+  const ports = new Set<number>();
+  for (const item of value.slice(0, 32)) {
+    if (!item || !Number.isInteger(item.remotePort) || item.remotePort < 1 || item.remotePort > 65535
+      || !Number.isInteger(item.localPort) || item.localPort < 0 || item.localPort > 65535
+      || ports.has(item.remotePort)) continue;
+    ports.add(item.remotePort);
+    rules.push({ remotePort: item.remotePort, localPort: item.localPort, enabled: item.enabled !== false });
+  }
+  return rules;
+}
+
+function workspacePortRules(scope: BrowserForwardScope | null) {
+  if (!scope) return [];
+  const snapshot = workspaceSnapshotForId(scope.workspaceId);
+  return snapshot?.profileId === scope.profileId && snapshot.root === scope.root
+    ? normalizedWorkspacePortRules(snapshot.portForwards) : [];
+}
+
+function saveWorkspacePortRule(scope: BrowserForwardScope, rule: WorkspacePortRule) {
+  const snapshot = workspaceSnapshotForId(scope.workspaceId);
+  if (!snapshot || snapshot.profileId !== scope.profileId || snapshot.root !== scope.root) return;
+  const rules = workspacePortRules(scope);
+  const index = rules.findIndex((item) => item.remotePort === rule.remotePort);
+  if (index >= 0) {
+    if (rules[index].localPort === rule.localPort && rules[index].enabled === rule.enabled) return;
+    rules[index] = rule;
+  } else {
+    if (rules.length >= 32) return;
+    rules.push(rule);
+  }
+  snapshot.portForwards = normalizedWorkspacePortRules(rules);
+  snapshot.updatedAt = new Date().toISOString();
+  workspaceSnapshotSignatures.delete(snapshot.id);
+  scheduleWorkspaceStorePersist();
+}
+
+function forgetWorkspacePortRule(scope: BrowserForwardScope, remotePort: number) {
+  // Keep the disabled tombstone until a pending start can dispose its late result.
+  if (browserForwardStarts.has(browserForwardStartKey(scope, remotePort))) return;
+  const snapshot = workspaceSnapshotForId(scope.workspaceId);
+  if (!snapshot || snapshot.profileId !== scope.profileId || snapshot.root !== scope.root) return;
+  snapshot.portForwards = workspacePortRules(scope).filter((rule) => rule.remotePort !== remotePort);
+  workspaceSnapshotSignatures.delete(snapshot.id);
+  scheduleWorkspaceStorePersist();
+}
+
+async function restoreWorkspacePortForwards() {
+  if (IS_TERMINAL_APP || appShutdownStarted || !state.workspaceOpen) return;
+  const profile = state.activeProfile;
+  const scope = currentBrowserForwardScope(profile);
+  if (!profile || !scope) return;
+  for (const pane of state.terminals) {
+    if (pane.workspaceId !== scope.workspaceId || pane.profileId !== scope.profileId) continue;
+    if (pane.outputBuffer) scheduleTerminalPortScan(pane);
+    for (const [port, auto] of pane.pendingDetectedPorts ?? []) {
+      const saved = workspacePortRules(scope).find((rule) => rule.remotePort === port);
+      if (auto && profile.kind !== 'windows' && !saved) {
+        saveWorkspacePortRule(scope, { remotePort: port, localPort: port, enabled: true });
+      }
+      // Enqueue display-only; the serial loop below owns restoration/auth IPC.
+      queueDetectedPort(port, pane, false);
+    }
+    pane.pendingDetectedPorts?.clear();
+  }
+  // Serial and bounded: do not flood SSH authentication or block workspace hydration.
+  for (const rule of workspacePortRules(scope)) {
+    if (!rule.enabled) continue;
+    if (appShutdownStarted || !browserForwardScopeIsActive(scope)) return;
+    if (workspacePortRules(scope).find((item) => item.remotePort === rule.remotePort)?.enabled !== true) continue;
+    try {
+      await startBrowserForwardForScope(scope, profile.kind, rule.remotePort, rule.localPort);
+    } catch {
+      // Keep the saved rule visible for Retry; never open/focus a Browser on restore.
+      if (browserForwardScopeIsActive(scope)) setStatus(`Port :${rule.remotePort} could not be restored; retry from Ports`, true);
+    }
+  }
+  if (browserForwardScopeIsActive(scope)) renderForwards();
+}
+
+function renderWorkspacePortRules() {
+  const scope = currentBrowserForwardScope();
+  const container = document.querySelector<HTMLElement>('#workspace-port-rules')!;
+  const rows = document.createDocumentFragment();
+  for (const rule of workspacePortRules(scope)) {
+    if (!scope || forwardForRemotePort(rule.remotePort)) continue;
+    const row = document.createElement('div');
+    row.className = 'forward-row';
+    const retry = document.createElement('button');
+    retry.textContent = rule.enabled ? 'Retry' : 'Enable';
+    const pending = browserForwardStarts.has(browserForwardStartKey(scope, rule.remotePort));
+    retry.disabled = pending;
+    retry.addEventListener('click', () => {
+      if (!browserForwardScopeIsActive(scope) || !state.activeProfile) return;
+      saveWorkspacePortRule(scope, { ...rule, enabled: true });
+      void restoreWorkspacePortForwards();
+      renderForwards();
+    });
+    const detail = document.createElement('span');
+    detail.className = 'forward-detail';
+    detail.textContent = `:${rule.localPort || 'auto'} → :${rule.remotePort} — ${pending ? 'Starting' : rule.enabled ? 'Saved; not connected' : 'Stopped; auto restore off'}`;
+    const stop = document.createElement('button');
+    stop.textContent = rule.enabled ? 'Disable' : 'Forget';
+    stop.disabled = !rule.enabled && pending;
+    stop.addEventListener('click', () => {
+      if (!browserForwardScopeIsActive(scope)) return;
+      if (rule.enabled) saveWorkspacePortRule(scope, { ...rule, enabled: false });
+      else forgetWorkspacePortRule(scope, rule.remotePort);
+      renderForwards();
+    });
+    row.append(retry, detail, stop);
+    rows.append(row);
+  }
+  container.replaceChildren(rows);
+}
+
 function currentBrowserForwardScope(profile = state.activeProfile): BrowserForwardScope | null {
   if (!profile || !state.activeWorkspaceId) return null;
   return {
@@ -38566,6 +39033,10 @@ function ensureCachedBrowserForwardScope(scope: BrowserForwardScope) {
 }
 
 function adoptBrowserForward(scope: BrowserForwardScope, forward: PortForwardResult) {
+  if (appShutdownStarted || workspacePortRules(scope).find((rule) => rule.remotePort === forward.remotePort)?.enabled === false) {
+    void api.stopPortForward(forward.id).catch(() => undefined);
+    return 'stopped' as const;
+  }
   const runtime = ensureCachedBrowserForwardScope(scope);
   if (browserForwardScopeIsActive(scope)) {
     addForward(forward);
@@ -38593,6 +39064,7 @@ function startBrowserForwardForScope(
   const key = browserForwardStartKey(scope, remotePort);
   const pending = browserForwardStarts.get(key);
   if (pending) return pending;
+  if (appShutdownStarted) return Promise.reject(new Error('IDE shutdown is in progress'));
 
   if (browserForwardScopeIsActive(scope)) {
     let existing = forwardForRemotePort(remotePort);
@@ -38606,11 +39078,13 @@ function startBrowserForwardForScope(
       }
     }
     if (existing) {
+      saveWorkspacePortRule(scope, { remotePort, localPort: existing.localPort, enabled: true });
       removeDetectedPortForScope(scope, remotePort);
       return Promise.resolve({ forward: existing, disposition: 'active' });
     }
   }
 
+  saveWorkspacePortRule(scope, { remotePort, localPort: localPort ?? remotePort, enabled: true });
   const request = localPort === undefined
     ? startForwardForProfile(scope.profileId, profileKind, remotePort)
     : api.startPortForward(scope.profileId, remotePort, localPort);
@@ -38618,13 +39092,18 @@ function startBrowserForwardForScope(
   started = request
     .then((forward) => {
       const disposition = adoptBrowserForward(scope, forward);
+      if (disposition !== 'stopped') {
+        saveWorkspacePortRule(scope, { remotePort, localPort: forward.localPort, enabled: true });
+      }
       if (disposition !== 'stopped') removeDetectedPortForScope(scope, remotePort);
       return { forward, disposition };
     })
     .finally(() => {
       if (browserForwardStarts.get(key) === started) browserForwardStarts.delete(key);
+      if (browserForwardScopeIsActive(scope)) renderForwards();
     });
   browserForwardStarts.set(key, started);
+  if (browserForwardScopeIsActive(scope)) renderForwards();
   return started;
 }
 
@@ -38706,8 +39185,9 @@ async function startForward() {
   const profileId = scope.profileId;
   const remotePort = Number(el.remotePort.value);
   const localPort = Number(el.localPort.value || remotePort);
-  if (!Number.isInteger(remotePort) || remotePort <= 0) {
-    setStatus('Enter a valid remote port', true);
+  if (!Number.isInteger(remotePort) || remotePort <= 0 || remotePort > 65535
+    || !Number.isInteger(localPort) || localPort < 0 || localPort > 65535) {
+    setStatus('Enter a remote port from 1–65535 and a local port from 0–65535', true);
     return;
   }
   try {
@@ -38720,7 +39200,7 @@ async function startForward() {
     if (disposition !== 'active' || !browserForwardScopeIsActive(scope)) return;
     removeDetectedPortById(detectedPortId(profileId, remotePort));
     renderForwards();
-    await openLocalBrowserTab(forward.url, portTabLabel(forward.localPort));
+    // Forward only establishes the tunnel. Opening its URL is a separate row action.
     setStatus(`Forwarding ${forward.localPort} -> ${forward.targetHost}:${forward.remotePort}`);
   } catch (error) {
     if (browserForwardScopeIsActive(scope)) setStatus(String(error), true);
@@ -38792,6 +39272,15 @@ async function canUseDirectLocalPreview(url: string) {
   }
 }
 
+function handleBackendTerminalData(pane: TerminalPane, data: string, sequence?: number) {
+  if (pane.closed) return;
+  handleTerminalData(pane, data);
+  if (sequence !== undefined) pane.outputSequence = Math.max(pane.outputSequence ?? 0, sequence);
+  // Return credit only once xterm has parsed the accepted bytes, not when an IPC
+  // callback merely copies them into another queue. History stays independently bounded.
+  acknowledgeTerminalOutputIfDrained(pane);
+}
+
 function handleTerminalData(
   pane: TerminalPane,
   data: string,
@@ -38840,12 +39329,12 @@ function handleTerminalData(
   }
 
   const shouldTrackPromptCwd = terminalDataMayContainPromptCwdHint(pane, data, visibility);
-  const shouldScanPorts = visibility !== 'background'
-    && (Boolean(pane.portScanTimer) || terminalDataMayContainPortHint(pane, data, visibility));
+  const portScanData = terminalPortScanData(pane, data);
+  const shouldScanPorts = portScanData !== null;
   if (!shouldTrackPromptCwd && !shouldScanPorts) return;
 
   if (shouldTrackPromptCwd) trackTerminalPromptCwdFromOutput(pane, data);
-  if (shouldScanPorts) scanTerminalOutputForPorts(pane, data);
+  if (portScanData !== null) scanTerminalOutputForPorts(pane, portScanData);
 }
 
 function scheduleTerminalLlmOutputDetection(
@@ -38942,11 +39431,19 @@ function enqueueTerminalWrite(pane: TerminalPane, data: string) {
 }
 
 function flushTerminalWriteBufferWhenReady(pane: TerminalPane, timeout = TERMINAL_BACKGROUND_WRITE_BATCH_MS) {
+  if (!isTerminalPaneAlive(pane)) return;
   if (terminalPaneVisibility(pane) === 'visible') {
     flushTerminalWriteBuffer(pane);
     return;
   }
-  runWhenUiIdle(() => flushTerminalWriteBuffer(pane), timeout);
+  if (pane.writeIdleScheduled) return;
+  pane.writeIdleScheduled = true;
+  // Native idle priority still favors input, but its deadline must make progress:
+  // indefinite busy deferral would stall a background PTY waiting for output credit.
+  runWhenUiIdle(() => {
+    pane.writeIdleScheduled = false;
+    if (isTerminalPaneAlive(pane)) flushTerminalWriteBuffer(pane);
+  }, timeout, true);
 }
 
 function terminalPaneVisibility(pane: TerminalPane): TerminalVisibility {
@@ -38964,6 +39461,7 @@ function terminalImeCompositionGuardActive(pane: TerminalPane) {
 }
 
 function flushTerminalWriteBuffer(pane: TerminalPane) {
+  if (!isTerminalPaneAlive(pane)) return;
   if (pane.writeFrame) {
     window.cancelAnimationFrame(pane.writeFrame);
     pane.writeFrame = undefined;
@@ -39047,9 +39545,9 @@ function scheduleTerminalWriteContinuation(pane: TerminalPane, visibility = term
     return;
   }
   if (pane.writeTimer) return;
-  const delay = visibility === 'inactive'
-    ? TERMINAL_INACTIVE_WRITE_BATCH_MS
-    : TERMINAL_BACKGROUND_WRITE_BATCH_MS;
+  // Coalesce the first hidden write, then drain a burst in small yielding tasks.
+  // Waiting another 900ms per 8KiB would stall the producer under output flow control.
+  const delay = TERMINAL_HIDDEN_WRITE_CONTINUATION_MS;
   pane.writeTimerScheduledAt = performance.now();
   pane.writeTimer = window.setTimeout(() => {
     pane.writeTimer = undefined;
@@ -39120,6 +39618,7 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.focusFrame) window.cancelAnimationFrame(pane.focusFrame);
   if (pane.openTuiPostWriteRefreshFrame) window.cancelAnimationFrame(pane.openTuiPostWriteRefreshFrame);
   if (pane.writeTimer) window.clearTimeout(pane.writeTimer);
+  if (pane.outputAckRetryTimer) window.clearTimeout(pane.outputAckRetryTimer);
   if (pane.renderWatchdogTimer) window.clearTimeout(pane.renderWatchdogTimer);
   if (pane.llmOutputDetectionTimer) window.clearTimeout(pane.llmOutputDetectionTimer);
   if (pane.llmTitleDataTimer) window.clearTimeout(pane.llmTitleDataTimer);
@@ -39132,6 +39631,8 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   if (pane.inputFlushTimer) window.clearTimeout(pane.inputFlushTimer);
   if (pane.imeFallbackTimer) window.clearTimeout(pane.imeFallbackTimer);
   if (pane.imeReleaseTimer) window.clearTimeout(pane.imeReleaseTimer);
+  if (pane.imeCommitTimer) window.clearTimeout(pane.imeCommitTimer);
+  if (pane.imeBlurReplayTimer) window.clearTimeout(pane.imeBlurReplayTimer);
   if (pane.llmTmuxTitlePollTimer) window.clearTimeout(pane.llmTmuxTitlePollTimer);
   if (pane.tmuxFreezeProbeTimer) window.clearTimeout(pane.tmuxFreezeProbeTimer);
   pane.writeFrame = undefined;
@@ -39140,6 +39641,8 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.openTuiPostWriteRefreshFrame = undefined;
   pane.writeTimer = undefined;
   pane.writeTimerScheduledAt = undefined;
+  pane.writeIdleScheduled = false;
+  pane.outputAckRetryTimer = undefined;
   pane.renderWatchdogTimer = undefined;
   pane.llmOutputDetectionTimer = undefined;
   pane.llmOutputDetectionBuffer = '';
@@ -39156,6 +39659,10 @@ function cleanupTerminalWriteBuffer(pane: TerminalPane) {
   pane.inputFlushTimer = undefined;
   pane.imeFallbackTimer = undefined;
   pane.imeReleaseTimer = undefined;
+  pane.imeCommitTimer = undefined;
+  pane.imeBlurReplayTimer = undefined;
+  pane.imeCommitPending = false;
+  pane.imeCommitGeneration = (pane.imeCommitGeneration ?? 0) + 1;
   pane.llmTmuxTitlePollTimer = undefined;
   pane.llmTmuxTitlePollPromise = undefined;
   pane.llmTmuxTitleLastValue = undefined;
@@ -39195,6 +39702,16 @@ function terminalDataMayContainPromptCwdHint(pane: TerminalPane, data: string, v
   return tail ? terminalOutputMayContainPromptCwdHint(`${tail}${data}`) : false;
 }
 
+function terminalPortScanData(pane: TerminalPane, data: string): string | null {
+  // A URL/"Local:" label can straddle PTY events with neither event matching the
+  // old hint gate. Keep only a tiny carry, never rescan terminal scrollback.
+  const tail = pane.portHintTail ?? '';
+  pane.portHintTail = data.length >= 256 ? data.slice(-256) : `${tail}${data}`.slice(-256);
+  if (!pane.outputBuffer && !terminalOutputMayContainPreviewPortHint(data)
+    && !terminalOutputMayContainPreviewPortHint(`${tail}${data.slice(0, 256)}`)) return null;
+  return pane.outputBuffer ? data : `${tail}${data}`;
+}
+
 function terminalDataMayContainPortHint(pane: TerminalPane, data: string, visibility = terminalPaneVisibility(pane)) {
   if (visibility === 'background') return false;
   if (pane.workspaceId !== state.activeWorkspaceId) return false;
@@ -39203,8 +39720,6 @@ function terminalDataMayContainPortHint(pane: TerminalPane, data: string, visibi
 }
 
 function scanTerminalOutputForPorts(pane: TerminalPane, data: string) {
-  if (pane.workspaceId !== state.activeWorkspaceId) return;
-  if (!state.activeProfile) return;
   pane.outputBuffer = appendLimitedTextBuffer(pane.outputBuffer, data, TERMINAL_PORT_SCAN_LIMIT);
   scheduleTerminalPortScan(pane);
 }
@@ -39227,15 +39742,22 @@ function runTerminalScanWhenReady(pane: TerminalPane, scan: () => void) {
 }
 
 function runTerminalPortScan(pane: TerminalPane) {
-  if (pane.workspaceId !== state.activeWorkspaceId) return;
-  if (!state.activeProfile) return;
-  if (!terminalOutputMayContainPreviewPortHint(pane.outputBuffer)) return;
-  const cleanOutput = cleanTerminalMetadataBuffer(pane.outputBuffer);
+  if (pane.closed) return;
+  const output = pane.outputBuffer;
+  pane.outputBuffer = '';
+  if (!terminalOutputMayContainPreviewPortHint(output)) return;
+  const cleanOutput = cleanTerminalMetadataBuffer(output);
   if (!terminalOutputMayContainPreviewPortHint(cleanOutput)) return;
-  const found = detectNewLocalServerPorts(cleanOutput, pane.seenPorts, (port, autoForward) => {
-    queueDetectedPort(port, pane, autoForward);
+  detectNewLocalServerPorts(cleanOutput, pane.seenPorts, (port, autoForward) => {
+    if (pane.workspaceId === state.activeWorkspaceId && pane.profileId === state.activeProfile?.id) {
+      queueDetectedPort(port, pane, autoForward);
+    } else {
+      // Discover in inactive shells, but do not create tunnels/auth prompts until
+      // their workspace is activated. Keep numbers only, with a per-pane cap.
+      const pending = pane.pendingDetectedPorts ??= new Map<number, boolean>();
+      if (pending.size < 32 || pending.has(port)) pending.set(port, autoForward || pending.get(port) === true);
+    }
   }, false);
-  if (found) pane.outputBuffer = '';
 }
 
 function terminalOutputMayContainPreviewPortHint(text: string) {
@@ -39555,8 +40077,13 @@ function resolvePosixCdTarget(cwd: string, target: string, root = '~') {
 
 function resolveWindowsCdTarget(cwd: string, target: string, root = '') {
   if (!target || target === '~') return root || cwd;
-  if (/^[A-Za-z]:[\\/]/.test(target) || target.startsWith('\\\\')) return target;
-  const base = cwd || root || '';
+  target = target.replace(/\//g, '\\');
+  if (/^[A-Za-z]:\\/.test(target) || target.startsWith('\\\\')) return target;
+  const base = (cwd || root || '').replace(/\//g, '\\');
+  if (target.startsWith('\\')) {
+    const baseRoot = base.match(/^[A-Za-z]:|^\\\\[^\\]+\\[^\\]+/)?.[0] ?? '';
+    return `${baseRoot}${target}`;
+  }
   return `${base.replace(/[\\/]+$/, '')}\\${target}`;
 }
 
@@ -39656,14 +40183,22 @@ function normalizePosixTerminalPath(path: string) {
 
 function normalizeWindowsTerminalPath(path: string) {
   const normalized = path.replace(/\//g, '\\');
+  // Device/extended paths have their own Win32 semantics; do not collapse their segments.
+  if (/^\\\\[?.]\\/.test(normalized)) return normalized;
+  const uncRoot = normalized.match(/^\\\\[^\\]+\\[^\\]+/)?.[0] ?? '';
   const prefix = normalized.match(/^[A-Za-z]:/)?.[0] ?? '';
+  const rooted = Boolean(uncRoot || prefix || normalized.startsWith('\\'));
+  const tail = uncRoot ? normalized.slice(uncRoot.length) : normalized.replace(/^[A-Za-z]:\\?/, '');
   const parts: string[] = [];
-  for (const part of normalized.replace(/^[A-Za-z]:\\?/, '').split('\\')) {
+  for (const part of tail.split('\\')) {
     if (!part || part === '.') continue;
-    if (part === '..') parts.pop();
-    else parts.push(part);
+    if (part === '..') {
+      if (parts.length && parts[parts.length - 1] !== '..') parts.pop();
+      else if (!rooted) parts.push(part);
+    } else parts.push(part);
   }
-  return prefix ? `${prefix}\\${parts.join('\\')}` : parts.join('\\');
+  if (uncRoot) return parts.length ? `${uncRoot}\\${parts.join('\\')}` : uncRoot;
+  return prefix ? `${prefix}\\${parts.join('\\')}` : `${rooted ? '\\' : ''}${parts.join('\\')}`;
 }
 
 function isWindowsPath(path: string) {
@@ -39772,6 +40307,9 @@ function queueDetectedPort(port: number, pane?: TerminalPane, autoForward = fals
   const id = detectedPortId(profile.id, port);
   const url = `http://127.0.0.1:${port}`;
   const shouldAutoForward = autoForward && profile.kind !== 'windows';
+  const rules = workspacePortRules(currentBrowserForwardScope(profile));
+  if (rules.find((rule) => rule.remotePort === port)?.enabled === false) return;
+  if (shouldAutoForward && rules.length >= 32 && !rules.some((rule) => rule.remotePort === port)) return;
   if (detectedPortForId(id)) {
     if (shouldAutoForward) {
       setStatus(`Detected local server on :${port}; auto-forwarding`);
@@ -40161,18 +40699,19 @@ function updateTerminalPortRow(row: HTMLElement, entry: TerminalPortEntry) {
 }
 
 function showTerminalPortsPopover() {
-  if (!IS_TERMINAL_APP) return;
-  renderTerminalPorts();
   el.terminalPortsPopover.classList.remove('hidden');
+  if (IS_TERMINAL_APP) renderTerminalPorts();
+  else renderForwards();
   el.terminalPortsPopover.setAttribute('aria-hidden', 'false');
   el.terminalPortsToggle.setAttribute('aria-expanded', 'true');
   positionTerminalPortsPopover();
-  const firstAction = el.terminalForwardList.querySelector<HTMLButtonElement>('button:not(:disabled)');
+  const firstAction = IS_TERMINAL_APP
+    ? el.terminalForwardList.querySelector<HTMLButtonElement>('button:not(:disabled)')
+    : el.remotePort;
   (firstAction ?? el.terminalPortsClose).focus({ preventScroll: true });
 }
 
 function hideTerminalPortsPopover(options: { restoreFocus?: boolean } = {}) {
-  if (!IS_TERMINAL_APP) return;
   const wasVisible = !el.terminalPortsPopover.classList.contains('hidden');
   el.terminalPortsPopover.classList.add('hidden');
   el.terminalPortsPopover.setAttribute('aria-hidden', 'true');
@@ -40183,7 +40722,7 @@ function hideTerminalPortsPopover(options: { restoreFocus?: boolean } = {}) {
 }
 
 function positionTerminalPortsPopover() {
-  if (!IS_TERMINAL_APP || el.terminalPortsPopover.classList.contains('hidden')) return;
+  if (el.terminalPortsPopover.classList.contains('hidden')) return;
   const anchor = el.terminalPortsToggle.getBoundingClientRect();
   const popover = el.terminalPortsPopover;
   const rect = popover.getBoundingClientRect();
@@ -40197,7 +40736,7 @@ function positionTerminalPortsPopover() {
 }
 
 function scheduleTerminalPortsPopoverPosition() {
-  if (!IS_TERMINAL_APP || el.terminalPortsPopover.classList.contains('hidden')) return;
+  if (el.terminalPortsPopover.classList.contains('hidden')) return;
   if (terminalPortsPositionFrame) return;
   terminalPortsPositionFrame = window.requestAnimationFrame(() => {
     terminalPortsPositionFrame = 0;
@@ -40211,7 +40750,7 @@ function toggleTerminalPortsPopover() {
 }
 
 function handleTerminalPortsPointerDown(event: PointerEvent) {
-  if (!IS_TERMINAL_APP || el.terminalPortsPopover.classList.contains('hidden')) return;
+  if (el.terminalPortsPopover.classList.contains('hidden')) return;
   if (event.target instanceof Node && (
     el.terminalPortsPopover.contains(event.target)
     || el.terminalPortsToggle.contains(event.target)
@@ -40220,7 +40759,7 @@ function handleTerminalPortsPointerDown(event: PointerEvent) {
 }
 
 function handleTerminalPortsKeydown(event: KeyboardEvent) {
-  if (!IS_TERMINAL_APP || event.key !== 'Escape' || el.terminalPortsPopover.classList.contains('hidden')) return;
+  if (event.key !== 'Escape' || el.terminalPortsPopover.classList.contains('hidden')) return;
   event.preventDefault();
   event.stopPropagation();
   hideTerminalPortsPopover();
@@ -40260,7 +40799,14 @@ async function startForwardForProfile(
 }
 
 function renderForwards() {
-  if (isBrowserPanelHidden()) return;
+  if (!IS_TERMINAL_APP) {
+    const count = new Set([...state.forwards.map((item) => item.remotePort), ...state.detectedPorts.map((item) => item.port),
+      ...workspacePortRules(currentBrowserForwardScope()).map((item) => item.remotePort)]).size;
+    setTextContentIfChanged(el.terminalPortsCount, String(count));
+    setTextContentIfChanged(el.terminalPortsSummary, `${state.forwards.length} active · ${count} workspace ports`);
+    if (el.terminalPortsPopover.classList.contains('hidden')) return;
+    renderWorkspacePortRules();
+  } else if (isBrowserPanelHidden()) return;
   const signature = forwardsSignature();
   if (forwardsRenderSignature === signature) return;
   const activeProfileId = state.activeProfile?.id;
@@ -40429,9 +40975,14 @@ function updateForwardRowElement(
       const scope = currentBrowserForwardScope();
       if (!scope) return;
       void (async () => {
-        await api.stopPortForward(id).catch((error) => {
+        const forward = state.forwards.find((item) => item.id === id);
+        try {
+          await api.stopPortForward(id);
+        } catch (error) {
           if (browserForwardScopeIsActive(scope)) setStatus(String(error), true);
-        });
+          return;
+        }
+        if (forward) saveWorkspacePortRule(scope, { remotePort: forward.remotePort, localPort: forward.localPort, enabled: false });
         forgetBrowserForwardForScope(scope, id);
       })();
     });
@@ -40597,12 +41148,14 @@ function scheduleBrowserWorkspaceFrameSuspend(
   cancelScheduledBrowserWorkspaceFrameSuspend(workspaceId);
   const delayMs = options.delayMs ?? BROWSER_HIDDEN_CONTEXT_TTL_MS;
   const timer = window.setTimeout(() => {
-    browserWorkspaceSuspendTimers.delete(workspaceId);
+    // Keep the token while idle work waits, so cancel/rearm still invalidates it.
     runWhenUiIdle(() => {
+      if (browserWorkspaceSuspendTimers.get(workspaceId) !== timer) return;
+      browserWorkspaceSuspendTimers.delete(workspaceId);
       const activeAndVisible = workspaceId === state.activeWorkspaceId && !document.hidden && !isBrowserPanelHidden();
       if (activeAndVisible) return;
       suspendBrowserFramesForWorkspace(workspaceId, { includeActive: options.includeActive });
-    }, BROWSER_FRAME_SUSPEND_IDLE_MS);
+    }, BROWSER_FRAME_SUSPEND_IDLE_MS, false, () => browserWorkspaceSuspendTimers.get(workspaceId) !== timer);
   }, delayMs);
   browserWorkspaceSuspendTimers.set(workspaceId, timer);
   trimHiddenBrowserFrameWorkspaces();
@@ -40696,6 +41249,8 @@ function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
   frame.addEventListener('focus', activateBrowserPanel);
   frame.addEventListener('load', () => {
     if (frame.dataset.suspended === 'true') return;
+    // The bridge belongs to the new document, not the retained iframe element.
+    delete frame.dataset.consoleDetailed;
     const logicalUrl = frame.dataset.loadingUrl;
     if (logicalUrl) {
       frame.dataset.loadedUrl = logicalUrl;
@@ -40710,6 +41265,8 @@ function bindBrowserFrameEvents(frame: HTMLIFrameElement) {
     syncBrowserConsoleCaptureForFrame(frame);
   });
   frame.addEventListener('error', () => {
+    delete frame.dataset.loadingUrl;
+    delete frame.dataset.loadingSrc;
     if (browserFrameIsActiveVisible(frame)) {
       logBrowserConsole('error', `Failed to load ${frame.dataset.displayUrl || state.previewUrl}`);
     }
@@ -40764,7 +41321,10 @@ function loadBrowserFrame(tab: BrowserTab, options: { hard?: boolean; reload?: b
   const frame = showBrowserFrame(tab);
   const frameUrl = tab.frameUrl ?? tab.url;
   frame.dataset.displayUrl = tab.url;
-  if (!options.hard && !options.reload && frame.dataset.loadedUrl === frameUrl) return frame;
+  if (!options.hard && !options.reload && frame.dataset.suspended !== 'true' && (
+    frame.dataset.loadedUrl === frameUrl
+    || (frame.dataset.loadingUrl === frameUrl && Boolean(frame.dataset.loadingSrc))
+  )) return frame;
   delete frame.dataset.suspended;
   delete frame.dataset.suspendedUrl;
   if (options.reload && !options.hard && frame.dataset.loadedUrl === frameUrl) {
@@ -41027,6 +41587,8 @@ function nativeBrowserWebviewLabelForTab(tab: BrowserTab, workspaceId = state.ac
 }
 
 function hideNativeBrowserWebview(options: { all?: boolean; closeDelayMs?: number } = {}) {
+  nativeBrowserWebviewAppliedKey = '';
+  nativeBrowserWebviewPendingKey = '';
   nativeBrowserWebviewRequestSeq += 1;
   if (nativeBrowserWebviewSyncFrame) {
     window.cancelAnimationFrame(nativeBrowserWebviewSyncFrame);
@@ -41044,6 +41606,8 @@ function hideNativeBrowserWebview(options: { all?: boolean; closeDelayMs?: numbe
 }
 
 function closeNativeBrowserWebview(label = nativeBrowserWebviewLabel) {
+  nativeBrowserWebviewAppliedKey = '';
+  nativeBrowserWebviewPendingKey = '';
   if (label) cancelNativeBrowserWebviewClose(label);
   else cancelAllNativeBrowserWebviewCloses();
   nativeBrowserWebviewRequestSeq += 1;
@@ -41062,6 +41626,8 @@ function closeNativeBrowserWebview(label = nativeBrowserWebviewLabel) {
 }
 
 function closeAllNativeBrowserWebviews() {
+  nativeBrowserWebviewAppliedKey = '';
+  nativeBrowserWebviewPendingKey = '';
   cancelAllNativeBrowserWebviewCloses();
   nativeBrowserWebviewRequestSeq += 1;
   if (nativeBrowserWebviewSyncFrame) {
@@ -41113,6 +41679,9 @@ async function closeHiddenNativeBrowserWebview(label: string) {
     || document.hidden) return;
   const tab = browserTabForId(nativeBrowserWebviewTabId);
   if (!tab || nativeBrowserWebviewLabelForTab(tab) !== label) return;
+  // The completed close may have destroyed a child with exactly these bounds.
+  nativeBrowserWebviewAppliedKey = '';
+  nativeBrowserWebviewPendingKey = '';
   void showNativeBrowserWebview(tab, { boundsOnly: true, navigate: false });
 }
 
@@ -41188,11 +41757,21 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
     hideNativeBrowserWebview();
     return;
   }
-  const requestId = ++nativeBrowserWebviewRequestSeq;
   const label = nativeBrowserWebviewLabelForTab(tab);
   const previousLabel = nativeBrowserWebviewLabel;
   const rect = nativeBrowserPreviewRect();
+  const loadUrl = options.loadUrl ?? tab.url;
+  const navigate = options.navigate ?? Boolean(options.loadUrl);
+  const requestKey = rect ? JSON.stringify([label, loadUrl, rect.x, rect.y, rect.width, rect.height]) : '';
+  if (rect && options.boundsOnly && !navigate
+    && nativeBrowserWebviewVisible && nativeBrowserWebviewLabel === label
+    && nativeBrowserWebviewTabId === tab.id
+    && (nativeBrowserWebviewPendingKey === requestKey
+      || (!nativeBrowserWebviewPendingKey && nativeBrowserWebviewAppliedKey === requestKey))) return;
+  const requestId = ++nativeBrowserWebviewRequestSeq;
   if (!rect) {
+    nativeBrowserWebviewAppliedKey = '';
+    nativeBrowserWebviewPendingKey = '';
     nativeBrowserWebviewTabId = '';
     nativeBrowserWebviewLabel = '';
     nativeBrowserWebviewUrl = '';
@@ -41224,8 +41803,7 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
   if (!options.boundsOnly) {
     logBrowserConsole('info', `Loading native WebView preview ${tab.url}`);
   }
-  const loadUrl = options.loadUrl ?? tab.url;
-  const navigate = options.navigate ?? Boolean(options.loadUrl);
+  nativeBrowserWebviewPendingKey = requestKey;
   try {
     await api.showBrowserWebview(label, loadUrl, rect.x, rect.y, rect.width, rect.height, navigate);
     if (requestId !== nativeBrowserWebviewRequestSeq) {
@@ -41233,10 +41811,14 @@ async function showNativeBrowserWebview(tab: BrowserTab, options: { boundsOnly?:
       if (!stillDesired) void api.hideBrowserWebview(label).catch(() => undefined);
       return;
     }
+    nativeBrowserWebviewPendingKey = '';
+    nativeBrowserWebviewAppliedKey = requestKey;
     nativeBrowserWebviewVisible = true;
     nativeBrowserWebviewNeedsBoundsRecovery = false;
   } catch (error) {
     if (requestId !== nativeBrowserWebviewRequestSeq) return;
+    nativeBrowserWebviewPendingKey = '';
+    nativeBrowserWebviewAppliedKey = '';
     nativeBrowserWebviewVisible = false;
     nativeBrowserWebviewTabId = '';
     nativeBrowserWebviewLabel = '';
@@ -41273,25 +41855,39 @@ function handleBrowserWebviewPageLoad(payload: BrowserWebviewPageLoadEvent) {
 }
 
 function loadBrowserTabThroughPreviewProxy(tab: BrowserTab, options: { hard?: boolean; reload?: boolean; clearCache?: boolean } = {}) {
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile?.id;
+  const generation = previewProxyScopeGeneration;
+  const url = tab.url;
   prepareBrowserProxyPendingFrame(tab);
   if (options.clearCache) clearPreviewProxyForBrowserTab(tab);
   const requestId = ++browserLoadRequestSeq;
   browserLoadRequestByTabId.set(tab.id, requestId);
-  void previewFrameUrl(tab.url, { forceProbe: Boolean(options.hard || options.clearCache) }).then((frameUrl) => {
-    if (browserLoadRequestByTabId.get(tab.id) !== requestId) return;
+  const stillCurrent = () => !appShutdownStarted
+    && previewProxyScopeGeneration === generation
+    && state.activeWorkspaceId === workspaceId && state.activeProfile?.id === profileId
+    && browserTabForId(tab.id) === tab && tab.url === url
+    && browserLoadRequestByTabId.get(tab.id) === requestId;
+  void previewFrameUrl(url, { forceProbe: Boolean(options.hard || options.clearCache) }).then((frameUrl) => {
+    if (!stillCurrent()) return;
     if (tab.frameUrl !== frameUrl) {
       tab.frameUrl = frameUrl;
       const frame = browserFrameForTab(tab.id);
       if (frame) delete frame.dataset.loadedUrl;
     }
     if (state.activeBrowserTabId === tab.id) loadBrowserFrame(tab, { hard: options.hard, reload: options.reload });
-  }).catch((error) => setStatus(`Preview proxy failed: ${String(error)}`, true));
+  }).catch((error) => {
+    if (error instanceof Error && error.name === 'AbortError') return;
+    if (stillCurrent()) setStatus(`Preview proxy failed: ${String(error)}`, true);
+  });
 }
 
 function clearPreviewProxyForBrowserTab(tab: BrowserTab) {
   const parsed = localHttpPreviewUrl(tab.url);
   if (!parsed) return false;
   const targetOrigin = normalizedLocalPreviewOrigin(parsed);
+  // A forced refresh also invalidates a not-yet-adopted start/probe.
+  previewProxyStarts.delete(targetOrigin);
   const proxy = previewProxyForTargetOrigin(targetOrigin);
   if (!proxy) return false;
   removePreviewProxy(proxy);
@@ -41960,29 +42556,49 @@ async function previewFrameUrl(url: string, options: { forceProbe?: boolean } = 
 }
 
 async function ensurePreviewProxy(targetOrigin: string, options: { forceProbe?: boolean } = {}) {
-  const existing = previewProxyForTargetOrigin(targetOrigin);
-  if (existing) {
-    const lastProbe = previewProxyProbeAt.get(existing.id) ?? 0;
-    const shouldProbe = Boolean(options.forceProbe) || (lastProbe > 0 && Date.now() - lastProbe > PREVIEW_PROXY_PROBE_TTL_MS);
-    if (!shouldProbe) return existing;
-    try {
-      if (await api.probeLocalHttpUrl(existing.url)) {
-        previewProxyProbeAt.set(existing.id, Date.now());
-        return existing;
-      }
-    } catch {
-      // Treat probe failures as stale proxy state and recreate below.
-    }
-    removePreviewProxy(existing);
-    previewProxyProbeAt.delete(existing.id);
-    void api.stopPortForward(existing.id).catch(() => undefined);
-    logBrowserConsole('warn', `Preview proxy ${existing.url} was stale; reopening ${targetOrigin}`);
-  }
   const pending = previewProxyStarts.get(targetOrigin);
   if (pending) return pending;
-
-  const started = api.startPreviewProxy(targetOrigin)
-    .then((proxy) => {
+  const generation = previewProxyScopeGeneration;
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile?.id;
+  const root = state.workspaceRoot;
+  const stillCurrent = () => !appShutdownStarted
+    && generation === previewProxyScopeGeneration
+    && workspaceId === state.activeWorkspaceId && profileId === state.activeProfile?.id
+    && root === state.workspaceRoot && previewProxyStarts.get(targetOrigin) === started;
+  const assertCurrent = () => {
+    if (stillCurrent()) return;
+    const error = new Error('Preview proxy request was superseded');
+    error.name = 'AbortError';
+    throw error;
+  };
+  // Claim both probing and starting before either can await native IPC.
+  const started = Promise.resolve()
+    .then(async () => {
+      assertCurrent();
+      const existing = previewProxyForTargetOrigin(targetOrigin);
+      if (existing) {
+        const lastProbe = previewProxyProbeAt.get(existing.id) ?? 0;
+        const shouldProbe = Boolean(options.forceProbe) || (lastProbe > 0 && Date.now() - lastProbe > PREVIEW_PROXY_PROBE_TTL_MS);
+        if (!shouldProbe) return existing;
+        let healthy = false;
+        try { healthy = await api.probeLocalHttpUrl(existing.url); }
+        catch { /* Treat probe failures as stale only in their original scope. */ }
+        assertCurrent();
+        if (healthy) {
+          previewProxyProbeAt.set(existing.id, Date.now());
+          return existing;
+        }
+        removePreviewProxy(existing);
+        previewProxyProbeAt.delete(existing.id);
+        void api.stopPortForward(existing.id).catch(() => undefined);
+        logBrowserConsole('warn', `Preview proxy ${existing.url} was stale; reopening ${targetOrigin}`);
+      }
+      const proxy = await api.startPreviewProxy(targetOrigin);
+      if (!stillCurrent()) {
+        void api.stopPortForward(proxy.id).catch(() => undefined);
+        assertCurrent();
+      }
       removePreviewProxiesForTargetOrigin(targetOrigin);
       state.previewProxies.push(proxy);
       rememberPreviewProxy(proxy);
@@ -42015,6 +42631,8 @@ function normalizedLocalPreviewOrigin(url: URL) {
 }
 
 function clearPreviewProxyLookup() {
+  previewProxyScopeGeneration += 1;
+  previewProxyStarts.clear();
   previewProxyByTargetOrigin.clear();
   previewProxyByLocalPort.clear();
   previewProxyLocalPortMisses.clear();
@@ -42741,6 +43359,8 @@ function pruneBrowserConsoleLocalPortScanQueue() {
 }
 
 function clearBrowserConsoleLocalPortScanQueue() {
+  browserConsolePortScanGeneration += 1;
+  browserConsolePortScanIdleScheduled = false;
   browserConsolePortScanQueue = [];
   if (browserConsolePortScanTimer) window.clearTimeout(browserConsolePortScanTimer);
   browserConsolePortScanTimer = 0;
@@ -42748,12 +43368,17 @@ function clearBrowserConsoleLocalPortScanQueue() {
 
 function queueBrowserConsoleHiddenPayloads(payloads: unknown[]) {
   const limit = browserConsoleRuntimeLogLimit(false);
-  let accepted = 0;
-  for (let index = 0; index < payloads.length; index += 1) {
-    if (appendBrowserConsoleHiddenPayload(payloads[index])) accepted += 1;
+  const accepted: object[] = [];
+  // Retain only the newest valid payloads; do not first enqueue a whole burst.
+  for (let index = payloads.length - 1; index >= 0 && accepted.length < limit; index -= 1) {
+    const payload = payloads[index];
+    if (payload && typeof payload === 'object') accepted.push(payload);
   }
-  if (!accepted) return;
-  pruneBrowserConsoleHiddenPayloadQueue(limit, accepted >= limit);
+  if (!accepted.length) return;
+  for (let index = accepted.length - 1; index >= 0; index -= 1) {
+    browserConsoleHiddenPayloadQueue.push(accepted[index]);
+  }
+  pruneBrowserConsoleHiddenPayloadQueue(limit, accepted.length >= limit);
   scheduleBrowserConsoleHiddenPayloadFlush();
 }
 
@@ -42776,14 +43401,21 @@ function pruneBrowserConsoleHiddenPayloadQueue(limit = browserConsoleRuntimeLogL
 }
 
 function scheduleBrowserConsoleHiddenPayloadFlush() {
-  if (browserConsoleHiddenPayloadTimer) return;
+  if (browserConsoleHiddenPayloadTimer || browserConsoleHiddenPayloadIdleScheduled) return;
+  const generation = browserConsoleHiddenPayloadGeneration;
   browserConsoleHiddenPayloadTimer = window.setTimeout(() => {
     browserConsoleHiddenPayloadTimer = 0;
-    runWhenUiIdle(flushBrowserConsoleHiddenPayloadQueue, BROWSER_CONSOLE_HIDDEN_FLUSH_IDLE_MS);
+    browserConsoleHiddenPayloadIdleScheduled = true;
+    runWhenUiIdle(() => {
+      if (generation !== browserConsoleHiddenPayloadGeneration) return;
+      flushBrowserConsoleHiddenPayloadQueue();
+    }, BROWSER_CONSOLE_HIDDEN_FLUSH_IDLE_MS, false, () => generation !== browserConsoleHiddenPayloadGeneration);
   }, BROWSER_CONSOLE_HIDDEN_FLUSH_DEBOUNCE_MS);
 }
 
 function flushBrowserConsoleHiddenPayloadQueue() {
+  browserConsoleHiddenPayloadGeneration += 1;
+  browserConsoleHiddenPayloadIdleScheduled = false;
   if (browserConsoleHiddenPayloadTimer) {
     window.clearTimeout(browserConsoleHiddenPayloadTimer);
     browserConsoleHiddenPayloadTimer = 0;
@@ -42804,20 +43436,31 @@ function flushBrowserConsoleHiddenPayloadQueue() {
 }
 
 function clearBrowserConsoleHiddenPayloadQueue() {
+  browserConsoleHiddenPayloadGeneration += 1;
+  browserConsoleHiddenPayloadIdleScheduled = false;
   browserConsoleHiddenPayloadQueue = [];
   if (browserConsoleHiddenPayloadTimer) window.clearTimeout(browserConsoleHiddenPayloadTimer);
   browserConsoleHiddenPayloadTimer = 0;
 }
 
 function scheduleBrowserConsoleLocalPortScan() {
-  if (browserConsolePortScanTimer) return;
+  if (browserConsolePortScanTimer || browserConsolePortScanIdleScheduled) return;
+  const generation = browserConsolePortScanGeneration;
   browserConsolePortScanTimer = window.setTimeout(() => {
     browserConsolePortScanTimer = 0;
-    runWhenUiIdle(flushBrowserConsoleLocalPortScan, 900);
+    browserConsolePortScanIdleScheduled = true;
+    runWhenUiIdle(() => {
+      if (generation !== browserConsolePortScanGeneration) return;
+      flushBrowserConsoleLocalPortScan();
+    }, 900, false, () => generation !== browserConsolePortScanGeneration);
   }, 320);
 }
 
 function flushBrowserConsoleLocalPortScan() {
+  browserConsolePortScanGeneration += 1;
+  browserConsolePortScanIdleScheduled = false;
+  if (browserConsolePortScanTimer) window.clearTimeout(browserConsolePortScanTimer);
+  browserConsolePortScanTimer = 0;
   if (!shouldScanBrowserConsoleForLocalPorts()) {
     browserConsolePortScanQueue = [];
     return;
@@ -42870,6 +43513,10 @@ function renderBrowserConsole() {
   const renderCount = logs.length - start;
   const signature = browserConsoleSignature(renderCount);
   if (browserConsoleRenderSignature === signature) return;
+  // Decide before DOM writes. New output must not pull a reader to the bottom.
+  const followTail = !el.browserConsoleLog.childElementCount
+    || Boolean(el.browserConsoleLog.firstElementChild?.classList.contains('browser-console-empty'))
+    || el.browserConsoleLog.scrollHeight - el.browserConsoleLog.clientHeight - el.browserConsoleLog.scrollTop <= 24;
   if (!logs.length) {
     browserConsoleRenderSignature = signature;
     browserConsoleLastRenderedLogId = '';
@@ -42926,7 +43573,7 @@ function renderBrowserConsole() {
   browserConsoleRenderSignature = signature;
   browserConsoleLastRenderedLogId = logs[logs.length - 1]?.id ?? '';
   browserConsoleLastRenderedLogIndex = logs.length - 1;
-  el.browserConsoleLog.scrollTop = el.browserConsoleLog.scrollHeight;
+  if (followTail) el.browserConsoleLog.scrollTop = el.browserConsoleLog.scrollHeight;
 }
 
 function clearBrowserConsoleRowElementCache() {
@@ -43074,10 +43721,17 @@ function scheduleBrowserAssetRecovery(tab: BrowserTab) {
     return;
   }
   const delay = BROWSER_ASSET_RECOVERY_DELAYS_MS[Math.min(count, BROWSER_ASSET_RECOVERY_DELAYS_MS.length) - 1];
+  const url = tab.url;
+  const workspaceId = state.activeWorkspaceId;
+  const profileId = state.activeProfile?.id;
+  const generation = previewProxyScopeGeneration;
   const timer = window.setTimeout(() => {
+    if (browserAssetRecoveryTimers.get(tab.id) !== timer) return;
     browserAssetRecoveryTimers.delete(tab.id);
     const current = browserTabForId(tab.id);
-    if (!current || current.id !== state.activeBrowserTabId || current.url !== tab.url) return;
+    if (appShutdownStarted || generation !== previewProxyScopeGeneration
+      || workspaceId !== state.activeWorkspaceId || profileId !== state.activeProfile?.id
+      || current !== tab || current.id !== state.activeBrowserTabId || current.url !== url) return;
     logBrowserConsole('info', `Retrying preview load after asset failure (${count}/${BROWSER_ASSET_RECOVERY_MAX_ATTEMPTS})`);
     if (USE_PREVIEW_PROXY_BROWSER && localHttpPreviewUrl(current.url)) {
       loadBrowserTabThroughPreviewProxy(current, { hard: true, reload: true, clearCache: count > 1 });
@@ -43388,7 +44042,7 @@ function refreshPreview(hard: boolean) {
     return;
   }
 
-  if (USE_NATIVE_BROWSER_WEBVIEW) {
+  if (USE_NATIVE_BROWSER_WEBVIEW && nativeBrowserWebviewAllowedForActiveWorkspace()) {
     const nativeLabel = nativeBrowserWebviewLabelForOperation(tab);
     if (nativeLabel) {
       const action = hard
@@ -43436,7 +44090,7 @@ async function clearBrowserCacheAndReload() {
     return;
   }
 
-  if (USE_NATIVE_BROWSER_WEBVIEW) {
+  if (USE_NATIVE_BROWSER_WEBVIEW && nativeBrowserWebviewAllowedForActiveWorkspace()) {
     await showNativeBrowserWebview(tab, { loadUrl: withPreviewCacheBuster(tab.url), navigate: true });
     state.previewUrl = tab.url;
     setInputValueIfChanged(el.previewUrl, tab.url);
@@ -43626,7 +44280,11 @@ function localServerPortMatchIsHighConfidence(
     Math.min(lineEnd, index + match[0].length + 96)
   );
   if (LOCAL_SERVER_NEGATIVE_CONTEXT_PATTERN.test(context)) return false;
-  if (source === 'url') return LOCAL_SERVER_POSITIVE_CONTEXT_PATTERN.test(context);
+  if (source === 'url') {
+    // Some servers print only a URL, without an English "listening"/"Local" label.
+    return LOCAL_SERVER_POSITIVE_CONTEXT_PATTERN.test(context)
+      || /^\s*(?:[>➜→-]\s*)?(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):\d{2,5}(?:\/\S*)?\s*$/i.test(context);
+  }
   if (/\bport\s*[:=]?\s*\d{4,5}\b/i.test(match[0])) return true;
   return /\b(?:listening|running|serving|available)\b[^\r\n]{0,48}\b(?:on|at)\s*:?[ \t]*\d{4,5}\b/i.test(match[0]);
 }

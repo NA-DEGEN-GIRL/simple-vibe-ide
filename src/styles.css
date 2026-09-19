@@ -1585,6 +1585,17 @@ body.glass-mode-on .window-control-icon {
   background: #111a28;
 }
 .terminal-ports-summary { color: #8fa4bc; font-size: 11px; white-space: nowrap; }
+#workspace-ports-manager {
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+#workspace-ports-manager .port-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+}
+#workspace-ports-manager .port-form input { width: 100%; min-width: 0; }
+#workspace-ports-manager .forward-list { max-height: none; }
 .terminal-ports-popover .terminal-forward-list {
   max-height: none;
   min-height: 42px;

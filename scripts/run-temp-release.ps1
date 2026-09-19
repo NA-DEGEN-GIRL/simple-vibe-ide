@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "windows-build-artifacts.ps1")
 
 function Format-DisplayPath {
   param([string]$Path)
@@ -34,7 +35,7 @@ function Format-FileTimestamp {
   param([string]$Path)
 
   if (-not $Path) { return "" }
-  $item = Get-Item $Path -ErrorAction SilentlyContinue
+  $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
   if (-not $item) { return "missing" }
   return $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
 }
@@ -47,7 +48,7 @@ function Resolve-SourceExe {
   )
 
   if ($Requested) {
-    $resolvedRequested = Resolve-Path $Requested -ErrorAction SilentlyContinue
+    $resolvedRequested = Resolve-Path -LiteralPath $Requested -ErrorAction SilentlyContinue
     if ($resolvedRequested) { return $resolvedRequested.Path }
     if ($Required) {
       throw "Could not find requested $BinaryName.exe: $Requested"
@@ -55,13 +56,15 @@ function Resolve-SourceExe {
   }
 
   $candidates = @()
-  if ($env:CARGO_TARGET_DIR) {
-    $candidates += Join-Path $env:CARGO_TARGET_DIR "simple-vibe-build-sources\$BinaryName.exe"
-    $candidates += Join-Path $env:CARGO_TARGET_DIR "release\$BinaryName.exe"
+  foreach ($targetDir in @(
+    $env:CARGO_TARGET_DIR,
+    (Join-Path $PSScriptRoot "..\src-tauri\target"),
+    "D:\build-cache\simple-vibe-ide-target",
+    $AppRoot
+  )) {
+    if (-not $targetDir) { continue }
+    $candidates += Find-RuntimeBuiltExe -TargetDir $targetDir -BinaryName $BinaryName
   }
-  $candidates += "D:\build-cache\simple-vibe-ide-target\simple-vibe-build-sources\$BinaryName.exe"
-  $candidates += "D:\build-cache\simple-vibe-ide-target\release\$BinaryName.exe"
-  $candidates += Join-Path $PSScriptRoot "..\src-tauri\target\release\$BinaryName.exe"
   $tempReleaseExe = if ($AppRoot) { Join-Path (Join-Path $AppRoot "release") "$BinaryName.exe" } else { $null }
   $tempReleaseFull = if ($tempReleaseExe) {
     try { [System.IO.Path]::GetFullPath($tempReleaseExe) } catch { $null }
@@ -72,10 +75,11 @@ function Resolve-SourceExe {
   $selfReleaseItem = $null
   $seen = @{}
   foreach ($candidate in $candidates) {
-    $resolved = Resolve-Path $candidate -ErrorAction SilentlyContinue
+    if (-not $candidate) { continue }
+    $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
     if (-not $resolved) { continue }
-    $item = Get-Item $resolved.Path -ErrorAction SilentlyContinue
-    if (-not $item) { continue }
+    $item = Get-Item -LiteralPath $resolved.Path -ErrorAction SilentlyContinue
+    if (-not $item -or $item.PSIsContainer) { continue }
     if ($tempReleaseFull -and ([System.IO.Path]::GetFullPath($item.FullName) -ieq $tempReleaseFull)) {
       $selfReleaseItem = $item
       continue
@@ -100,22 +104,8 @@ function Copy-ExeToRelease {
     [Parameter(Mandatory = $true)][string]$ReleaseDir
   )
 
-  $preferredDest = Join-Path $ReleaseDir "$BinaryName.exe"
   $sourceFull = [System.IO.Path]::GetFullPath($Source)
-  $destFull = [System.IO.Path]::GetFullPath($preferredDest)
-  if ($sourceFull -ine $destFull) {
-    try {
-      Copy-Item $sourceFull $destFull -Force
-    } catch {
-      $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-      $destFull = Join-Path $ReleaseDir "$BinaryName-$stamp.exe"
-      Copy-Item $sourceFull $destFull -Force
-      Write-Host "Stable $BinaryName.exe was locked; copied to a timestamped exe instead." -ForegroundColor Yellow
-    }
-    (Get-Item $destFull).LastWriteTime = Get-Date
-  } else {
-    Write-Host "$BinaryName.exe source is already the temp release exe; no separate copy source was found." -ForegroundColor Yellow
-  }
+  $destFull = Save-VersionedBuiltExe -SourceExe $sourceFull -BinaryName $BinaryName -SnapshotDir $ReleaseDir
   return @{
     Source = $sourceFull
     Exe = $destFull
@@ -139,10 +129,11 @@ function Write-LauncherFiles {
     ('shell.CurrentDirectory = {0}' -f $vbsCurrentDirectory),
     ('shell.Run Chr(34) & {0} & Chr(34), 1, False' -f $vbsExe)
   )
-  Set-Content -Path $vbs -Encoding ASCII -Value $vbsLines
+  Set-Content -LiteralPath $vbs -Encoding Unicode -Value $vbsLines
 
   $cmdLines = @(
     '@echo off',
+    'chcp 65001 >nul',
     'setlocal',
     ('echo Launching {0}' -f $Title),
     ('echo Exe: {0}' -f $Exe),
@@ -150,7 +141,7 @@ function Write-LauncherFiles {
     ('start "{0}" /D "%TEMP%" "{1}"' -f $Title, $Exe),
     'timeout /t 2 >nul'
   )
-  Set-Content -Path $cmd -Encoding ASCII -Value $cmdLines
+  [System.IO.File]::WriteAllLines($cmd, $cmdLines, [System.Text.UTF8Encoding]::new($false))
 
   return @{
     Vbs = $vbs
@@ -163,7 +154,7 @@ if (-not $AppRoot) {
 }
 
 $source = Resolve-SourceExe -Requested $SourceExe -BinaryName "simple-vibe-ide" -Required
-$releaseDir = Join-Path $AppRoot "release"
+$releaseDir = Join-Path $AppRoot "simple-vibe-build-sources"
 
 New-Item -ItemType Directory -Force $releaseDir | Out-Null
 

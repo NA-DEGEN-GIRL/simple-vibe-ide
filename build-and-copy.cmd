@@ -7,7 +7,7 @@ if not defined CARGO_INCREMENTAL set "CARGO_INCREMENTAL=0"
 if not defined CARGO_TARGET_DIR set "CARGO_TARGET_DIR=%TEMP%\simple-vibe-ide-target"
 
 set "APP_ROOT=%TEMP%\simple-vibe-ide-target"
-set "APP_RELEASE=%APP_ROOT%\release"
+set "APP_RELEASE=%APP_ROOT%\simple-vibe-build-sources"
 
 echo Simple Vibe IDE + Terminal build and copy
 echo Repo: %CD%
@@ -70,40 +70,20 @@ exit /b 1
 set "BINARY=%~1"
 set "OUTVAR=%~2"
 set "SRC="
-set "DEST=%APP_RELEASE%\%BINARY%.exe"
+set "DEST="
 
-for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\resolve-built-exe.ps1" -BinaryName "%BINARY%" -RepoRoot "%~dp0" -ExcludeReleaseDir "%APP_RELEASE%"`) do set "SRC=%%I"
+for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\resolve-built-exe.ps1" -BinaryName "%BINARY%" -RepoRoot "%~dp0" -PreferRelease`) do set "SRC=%%I"
 
 if not defined SRC (
   echo Built app not found: %BINARY%.exe
   exit /b 1
 )
 
-if /I "%SRC%"=="%DEST%" (
-  set "%OUTVAR%=%DEST%"
-  echo %BINARY%.exe already in copy target.
-  exit /b 0
-)
-
-copy /Y "%SRC%" "%DEST%" >nul
-if errorlevel 1 (
-  for /f %%I in ('powershell.exe -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "STAMP=%%I"
-  set "DEST=%APP_RELEASE%\%BINARY%-!STAMP!.exe"
-  echo Stable %BINARY%.exe was locked; copying timestamped exe instead.
-  copy /Y "%SRC%" "!DEST!" >nul || exit /b 1
-  call :touch_exe "!DEST!"
-) else (
-  call :touch_exe "%DEST%"
-)
+for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\publish-built-exe.ps1" -SourceExe "%SRC%" -BinaryName "%BINARY%" -SnapshotDir "%APP_RELEASE%"`) do set "DEST=%%I"
+if not defined DEST exit /b 1
 
 set "%OUTVAR%=%DEST%"
 echo Copied %BINARY%.exe
-exit /b 0
-
-:touch_exe
-set "SVI_TOUCH_EXE=%~1"
-powershell.exe -NoProfile -Command "$p=$env:SVI_TOUCH_EXE; if ($p) { (Get-Item -LiteralPath $p).LastWriteTime = Get-Date }" >nul 2>nul
-set "SVI_TOUCH_EXE="
 exit /b 0
 
 :write_launcher
